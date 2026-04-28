@@ -254,6 +254,9 @@ def merge_layers(ops: list[AnalyzedOp], num_layers: int | None = None
 
     If the same op (name + shapes) appears N times and N matches the layer count,
     merge them into one entry with layer_count = N.
+
+    Also detects layer repetition when ops are already pre-aggregated (e.g., from
+    trace file parsing) — if call_count is divisible by num_layers, sets layer_count.
     """
     # Group by (name, shapes, dtype, backend)
     groups: dict[tuple, list[AnalyzedOp]] = {}
@@ -264,7 +267,14 @@ def merge_layers(ops: list[AnalyzedOp], num_layers: int | None = None
     merged: list[AnalyzedOp] = []
     for key, group in groups.items():
         if len(group) == 1:
-            merged.append(group[0])
+            op = group[0]
+            # Detect layer repetition in pre-aggregated ops:
+            # if call_count is divisible by num_layers, this op runs once per layer
+            if (num_layers and num_layers > 1
+                    and op.call_count >= num_layers
+                    and op.call_count % num_layers == 0):
+                op.layer_count = num_layers
+            merged.append(op)
             continue
 
         # Merge: sum times and counts, detect layer repetition
