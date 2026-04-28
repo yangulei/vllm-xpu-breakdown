@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>vLLM-XPU Ops/Kernels Breakdown</title>
+<style>
+:root {
+  --bg: #f8f9fa; --card: #fff; --border: #e0e0e0;
+  --text: #1a1a2e; --text2: #555; --accent: #0066cc;
+  --green: #2e7d32; --blue: #1565c0; --orange: #e65100; --grey: #757575; --lgrey: #bdbdbd;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+       background: var(--bg); color: var(--text); line-height: 1.5; }
+
+/* Header */
+.header { background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+           color: #fff; padding: 20px 32px; }
+.header h1 { font-size: 22px; font-weight: 600; }
+.header p { color: rgba(255,255,255,0.7); font-size: 14px; }
+
+.container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+
+/* Cards */
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+        padding: 24px; margin-bottom: 20px; }
+.card h2 { font-size: 16px; font-weight: 600; margin-bottom: 16px; color: var(--text); }
+
+/* Model input */
+.model-input-row { display: flex; gap: 12px; align-items: center; }
+.model-input { flex: 1; padding: 10px 16px; border: 2px solid var(--border); border-radius: 8px;
+               font-size: 15px; outline: none; transition: border-color 0.2s; }
+.model-input:focus { border-color: var(--accent); }
+.model-input::placeholder { color: #aaa; }
+.btn { padding: 10px 20px; border: none; border-radius: 8px; font-size: 14px;
+       font-weight: 500; cursor: pointer; transition: all 0.2s; }
+.btn-primary { background: var(--accent); color: #fff; }
+.btn-primary:hover { background: #0052a3; }
+.btn-primary:disabled { background: #ccc; cursor: not-allowed; }
+.btn-secondary { background: #f0f0f0; color: var(--text); border: 1px solid var(--border); }
+.btn-secondary:hover { background: #e4e4e4; }
+
+/* Model summary */
+.model-summary { display: none; margin-top: 16px; }
+.model-summary.visible { display: block; }
+.model-tags { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.tag { display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 12px;
+       font-weight: 500; background: #e8f0fe; color: #1a5cb0; }
+.tag.moe { background: #fce4ec; color: #b71c1c; }
+.tag.dtype { background: #e8f5e9; color: #2e7d32; }
+.tag.quant { background: #fff3e0; color: #e65100; }
+.model-props { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+               gap: 8px; margin-top: 12px; }
+.prop { font-size: 13px; }
+.prop .label { color: var(--text2); }
+.prop .value { font-weight: 600; }
+
+/* Profile controls */
+.controls-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+.control-group { display: flex; flex-direction: column; gap: 4px; }
+.control-group label { font-size: 12px; color: var(--text2); font-weight: 500; }
+.control-group select, .control-group input[type="number"] {
+  padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px;
+  font-size: 14px; min-width: 120px; }
+
+/* Status */
+.status-banner { display: none; padding: 12px 20px; border-radius: 8px; margin-bottom: 20px;
+                 font-size: 14px; }
+.status-banner.running { display: flex; align-items: center; gap: 12px;
+                          background: #e3f2fd; color: #1565c0; }
+.status-banner.error { display: block; background: #fce4ec; color: #b71c1c; }
+.spinner { width: 20px; height: 20px; border: 3px solid #90caf9; border-top-color: #1565c0;
+           border-radius: 50%; animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Results */
+#results { display: none; }
+#results.visible { display: block; }
+
+.stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+              gap: 12px; margin-bottom: 20px; }
+.stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+             padding: 14px 18px; }
+.stat-card .val { font-size: 22px; font-weight: 700; }
+.stat-card .lbl { font-size: 12px; color: var(--text2); }
+
+/* Backend chart */
+.backend-bars { margin-top: 12px; }
+.bbar-row { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.bbar-label { width: 140px; font-size: 13px; font-weight: 500; text-align: right; }
+.bbar-track { flex: 1; height: 24px; background: #f0f0f0; border-radius: 4px; overflow: hidden;
+              position: relative; }
+.bbar-fill { height: 100%; border-radius: 4px; transition: width 0.5s ease; display: flex;
+             align-items: center; padding-left: 8px; font-size: 11px; color: #fff; font-weight: 600; }
+.bbar-pct { width: 50px; font-size: 13px; font-weight: 600; }
+
+/* Table */
+.table-controls { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+.search-input { padding: 8px 14px; border: 1px solid var(--border); border-radius: 6px;
+                font-size: 14px; width: 260px; }
+.filter-pills { display: flex; gap: 6px; flex-wrap: wrap; }
+.pill { padding: 4px 12px; border-radius: 14px; font-size: 12px; cursor: pointer;
+        border: 1px solid var(--border); background: #fff; transition: all 0.2s; }
+.pill.active { background: var(--text); color: #fff; border-color: var(--text); }
+.pill:hover:not(.active) { background: #f0f0f0; }
+
+.ops-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.ops-table th { background: #fafafa; text-align: left; padding: 10px 12px; font-weight: 600;
+                border-bottom: 2px solid var(--border); cursor: pointer; user-select: none;
+                white-space: nowrap; position: sticky; top: 0; z-index: 1; }
+.ops-table th:hover { background: #f0f0f0; }
+.ops-table th .sort-arrow { font-size: 10px; margin-left: 4px; color: #999; }
+.ops-table td { padding: 8px 12px; border-bottom: 1px solid #f0f0f0; vertical-align: middle; }
+.ops-table tr:hover td { background: #f8fafc; }
+.ops-table .mono { font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace; font-size: 12px; }
+
+.badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px;
+         font-weight: 600; color: #fff; white-space: nowrap; }
+.badge.vllm-xpu-kernels { background: var(--green); }
+.badge.triton { background: var(--blue); }
+.badge.torch-xpu-ops { background: var(--orange); }
+.badge.cpu { background: var(--grey); }
+.badge.framework { background: var(--lgrey); }
+
+.layer-count { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px;
+               font-weight: 600; background: #e8f0fe; color: #1565c0; margin-left: 4px; }
+
+.bar-cell { display: flex; align-items: center; gap: 6px; }
+.mini-bar { height: 14px; border-radius: 3px; min-width: 2px; }
+
+.table-wrapper { overflow-x: auto; max-height: 70vh; overflow-y: auto; }
+
+/* Responsive */
+@media (max-width: 768px) {
+  .container { padding: 12px; }
+  .model-input-row { flex-direction: column; }
+  .controls-row { flex-direction: column; align-items: flex-start; }
+  .stats-grid { grid-template-columns: repeat(2, 1fr); }
+}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>vLLM-XPU Ops/Kernels Breakdown</h1>
+  <p>Profile and visualize op dispatch across vllm-xpu-kernels, torch-xpu-ops, and Triton</p>
+</div>
+
+<div class="container">
+  <!-- Model Input -->
+  <div class="card">
+    <h2>Model</h2>
+    <div class="model-input-row">
+      <input type="text" id="model-input" class="model-input"
+             placeholder="Enter model ID (e.g., Qwen/Qwen3-4B-Instruct-2507)"
+             list="model-suggestions">
+      <datalist id="model-suggestions">
+        <option value="Qwen/Qwen3-4B-Instruct-2507">
+        <option value="Qwen/Qwen3-8B">
+        <option value="Qwen/Qwen3-1.7B">
+        <option value="meta-llama/Llama-3.2-1B-Instruct">
+        <option value="meta-llama/Llama-3.2-3B-Instruct">
+        <option value="deepseek-ai/DeepSeek-V3">
+        <option value="mistralai/Mistral-7B-Instruct-v0.3">
+        <option value="microsoft/Phi-3-mini-4k-instruct">
+      </datalist>
+      <button class="btn btn-secondary" onclick="loadConfig()">Load Config</button>
+    </div>
+
+    <div class="model-summary" id="model-summary">
+      <div id="model-title" style="font-size:16px;font-weight:600;margin-bottom:4px"></div>
+      <div class="model-tags" id="model-tags"></div>
+      <div class="model-props" id="model-props"></div>
+    </div>
+  </div>
+
+  <!-- Profile Controls -->
+  <div class="card">
+    <h2>Profile Settings</h2>
+    <div class="controls-row">
+      <div class="control-group">
+        <label>Mode</label>
+        <select id="mode-select">
+          <option value="eager">Eager</option>
+          <option value="compile">torch.compile</option>
+        </select>
+      </div>
+      <div class="control-group">
+        <label>Max Model Len</label>
+        <input type="number" id="max-model-len" value="4096" min="128" step="128">
+      </div>
+      <div class="control-group">
+        <label>Batch Size</label>
+        <input type="number" id="batch-size" value="1" min="1" max="64">
+      </div>
+      <div class="control-group">
+        <label>Max Tokens</label>
+        <input type="number" id="max-tokens" value="128" min="1" max="4096">
+      </div>
+      <div style="display:flex;gap:8px;align-self:flex-end">
+        <button class="btn btn-primary" id="profile-btn" onclick="startProfile()">▶ Profile</button>
+        <button class="btn btn-secondary" onclick="loadDemo()">Load Demo</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Status -->
+  <div class="status-banner" id="status-banner">
+    <div class="spinner"></div>
+    <span id="status-text">Profiling...</span>
+  </div>
+
+  <!-- Results -->
+  <div id="results">
+    <div class="stats-grid" id="stats-grid"></div>
+
+    <div class="card">
+      <h2>Backend Distribution</h2>
+      <div class="backend-bars" id="backend-bars"></div>
+    </div>
+
+    <div class="card">
+      <h2>Operations</h2>
+      <div class="table-controls">
+        <input type="text" class="search-input" id="table-search"
+               placeholder="Search op name..." oninput="filterTable()">
+        <div class="filter-pills" id="filter-pills">
+          <span class="pill active" data-backend="all" onclick="setFilter(this)">All</span>
+        </div>
+      </div>
+      <div class="table-wrapper">
+        <table class="ops-table" id="ops-table">
+          <thead>
+            <tr>
+              <th onclick="sortTable('name')">Op Name <span class="sort-arrow">⇅</span></th>
+              <th onclick="sortTable('backend')">Backend <span class="sort-arrow">⇅</span></th>
+              <th onclick="sortTable('input_shapes')">Shape</th>
+              <th>dtype</th>
+              <th onclick="sortTable('layer_count')" style="text-align:center">×Layers <span class="sort-arrow">⇅</span></th>
+              <th onclick="sortTable('call_count')" style="text-align:right">Calls <span class="sort-arrow">⇅</span></th>
+              <th onclick="sortTable('device_time_us')" style="text-align:right">Device Time <span class="sort-arrow">⇅</span></th>
+              <th onclick="sortTable('pct')" style="text-align:right">% Time <span class="sort-arrow">⇅</span></th>
+              <th onclick="sortTable('memory_bytes')" style="text-align:right">Memory <span class="sort-arrow">⇅</span></th>
+              <th onclick="sortTable('flops')" style="text-align:right">FLOPs <span class="sort-arrow">⇅</span></th>
+              <th onclick="sortTable('arithmetic_intensity')" style="text-align:right">AI <span class="sort-arrow">⇅</span></th>
+            </tr>
+          </thead>
+          <tbody id="ops-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ---- State ----
+let DATA = null;
+let currentSort = { key: 'device_time_us', asc: false };
+let currentFilter = 'all';
+let searchText = '';
+let modelSummary = null;
+
+const COLORS = {
+  'vllm-xpu-kernels': '#2e7d32',
+  'triton':           '#1565c0',
+  'torch-xpu-ops':    '#e65100',
+  'cpu':              '#757575',
+  'framework':        '#bdbdbd'
+};
+
+// ---- Formatting ----
+function fmtTime(us) {
+  if (!us || us === 0) return '—';
+  if (us >= 1e6) return (us/1e6).toFixed(2) + 's';
+  if (us >= 1e3) return (us/1e3).toFixed(2) + 'ms';
+  return us.toFixed(0) + 'µs';
+}
+
+function fmtBytes(b) {
+  if (!b || b === 0) return '—';
+  if (b >= 1e9) return (b/1e9).toFixed(1) + ' GB';
+  if (b >= 1e6) return (b/1e6).toFixed(1) + ' MB';
+  if (b >= 1e3) return (b/1e3).toFixed(1) + ' KB';
+  return b + ' B';
+}
+
+function fmtFlops(f) {
+  if (!f || f === 0) return '—';
+  if (f >= 1e12) return (f/1e12).toFixed(1) + ' TFLOP';
+  if (f >= 1e9) return (f/1e9).toFixed(1) + ' GFLOP';
+  if (f >= 1e6) return (f/1e6).toFixed(1) + ' MFLOP';
+  if (f >= 1e3) return (f/1e3).toFixed(1) + ' KFLOP';
+  return f + ' FLOP';
+}
+
+function fmtAI(ai) {
+  if (!ai || ai === 0) return '—';
+  return ai.toFixed(1);
+}
+
+function fmtShape(shapes) {
+  if (!shapes || shapes.length === 0) return '—';
+  return shapes.map(s => '[' + s.join(', ') + ']').join(' × ');
+}
+
+// ---- Model Config ----
+async function loadConfig() {
+  const modelId = document.getElementById('model-input').value.trim();
+  if (!modelId) return;
+
+  try {
+    const resp = await fetch('/api/model/' + encodeURIComponent(modelId));
+    const data = await resp.json();
+    if (!data.ok) { alert('Error: ' + data.error); return; }
+
+    modelSummary = data.summary;
+    showModelSummary(modelId, data.summary);
+  } catch(e) {
+    alert('Failed to fetch config: ' + e.message);
+  }
+}
+
+function showModelSummary(modelId, s) {
+  const el = document.getElementById('model-summary');
+  el.classList.add('visible');
+
+  document.getElementById('model-title').textContent =
+    modelId + ' · ' + s.architecture;
+
+  const tags = document.getElementById('model-tags');
+  tags.innerHTML = '';
+  const addTag = (text, cls) => {
+    const t = document.createElement('span');
+    t.className = 'tag' + (cls ? ' '+cls : '');
+    t.textContent = text;
+    tags.appendChild(t);
+  };
+  addTag(s.num_layers + ' layers');
+  addTag(s.is_moe ? 'MoE (' + s.num_experts + ' experts)' : 'Dense', s.is_moe ? 'moe' : '');
+  addTag(s.dtype, 'dtype');
+  if (s.quant_method) addTag(s.quant_method, 'quant');
+  if (s.rope_type) addTag('RoPE: ' + s.rope_type);
+
+  const props = document.getElementById('model-props');
+  props.innerHTML = '';
+  const addProp = (label, value) => {
+    if (value == null) return;
+    const d = document.createElement('div');
+    d.className = 'prop';
+    d.innerHTML = `<span class="label">${label}: </span><span class="value">${value}</span>`;
+    props.appendChild(d);
+  };
+  addProp('Hidden size', s.hidden_size);
+  addProp('Heads', s.num_heads + (s.num_kv_heads !== s.num_heads ? ' (' + s.num_kv_heads + ' KV)' : ''));
+  addProp('Head dim', s.head_dim);
+  addProp('Intermediate', s.intermediate_size);
+  addProp('Vocab', s.vocab_size?.toLocaleString());
+  addProp('Max position', s.max_position_embeddings?.toLocaleString());
+}
+
+// ---- Profiling ----
+let pollTimer = null;
+
+async function startProfile() {
+  const modelId = document.getElementById('model-input').value.trim();
+  if (!modelId) { alert('Enter a model ID first'); return; }
+
+  const body = {
+    model_id: modelId,
+    mode: document.getElementById('mode-select').value,
+    max_model_len: parseInt(document.getElementById('max-model-len').value),
+    batch_size: parseInt(document.getElementById('batch-size').value),
+    max_tokens: parseInt(document.getElementById('max-tokens').value),
+  };
+
+  document.getElementById('profile-btn').disabled = true;
+  showStatus('running', 'Loading model and profiling... This may take several minutes.');
+
+  try {
+    const resp = await fetch('/api/profile', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (!data.ok) {
+      showStatus('error', data.error);
+      document.getElementById('profile-btn').disabled = false;
+      return;
+    }
+    // Poll for results
+    pollTimer = setInterval(pollStatus, 2000);
+  } catch(e) {
+    showStatus('error', 'Request failed: ' + e.message);
+    document.getElementById('profile-btn').disabled = false;
+  }
+}
+
+async function pollStatus() {
+  try {
+    const resp = await fetch('/api/profile/status');
+    const data = await resp.json();
+
+    if (data.status === 'done') {
+      clearInterval(pollTimer);
+      showStatus('hide');
+      document.getElementById('profile-btn').disabled = false;
+      // Fetch results
+      const rr = await fetch('/api/profile/result');
+      const rd = await rr.json();
+      if (rd.ok) renderResults(rd.data);
+    } else if (data.status === 'error') {
+      clearInterval(pollTimer);
+      showStatus('error', data.error || 'Profiling failed');
+      document.getElementById('profile-btn').disabled = false;
+    }
+  } catch(e) {
+    // ignore transient errors
+  }
+}
+
+async function loadDemo() {
+  showStatus('running', 'Loading demo data...');
+  try {
+    const resp = await fetch('/api/demo');
+    const data = await resp.json();
+    showStatus('hide');
+    if (data.ok) {
+      if (data.data.summary) {
+        modelSummary = data.data.summary;
+        showModelSummary(data.data.model_id, data.data.summary);
+        document.getElementById('model-input').value = data.data.model_id;
+      }
+      renderResults(data.data);
+    }
+  } catch(e) {
+    showStatus('error', 'Failed to load demo: ' + e.message);
+  }
+}
+
+function showStatus(type, msg) {
+  const el = document.getElementById('status-banner');
+  el.className = 'status-banner';
+  if (type === 'hide') { el.style.display = 'none'; return; }
+  el.classList.add(type);
+  el.style.display = type === 'running' ? 'flex' : 'block';
+  document.getElementById('status-text').textContent = msg || '';
+}
+
+// ---- Render Results ----
+function renderResults(data) {
+  DATA = data;
+  document.getElementById('results').classList.add('visible');
+
+  // Stats
+  const grid = document.getElementById('stats-grid');
+  grid.innerHTML = '';
+  const addStat = (val, label) => {
+    grid.innerHTML += `<div class="stat-card"><div class="val">${val}</div><div class="lbl">${label}</div></div>`;
+  };
+  addStat(fmtTime(data.total_device_time_us), 'Total Device Time');
+  addStat(fmtTime(data.total_cpu_time_us), 'Total CPU Time');
+  addStat(data.ops.length, 'Unique Ops');
+  addStat(data.mode, 'Mode');
+
+  // Backend bars
+  const bars = document.getElementById('backend-bars');
+  bars.innerHTML = '';
+  const maxDev = Math.max(...Object.values(data.backends).map(b => b.device_time_us), 1);
+  for (const [name, b] of Object.entries(data.backends)) {
+    if (b.num_ops === 0) continue;
+    const pct = b.pct || 0;
+    const w = (b.device_time_us / maxDev * 100);
+    bars.innerHTML += `
+      <div class="bbar-row">
+        <div class="bbar-label">${name}</div>
+        <div class="bbar-track">
+          <div class="bbar-fill" style="width:${w}%;background:${COLORS[name]||'#999'}">
+            ${pct > 5 ? fmtTime(b.device_time_us) : ''}
+          </div>
+        </div>
+        <div class="bbar-pct">${pct}%</div>
+      </div>`;
+  }
+
+  // Filter pills
+  const pills = document.getElementById('filter-pills');
+  pills.innerHTML = '<span class="pill active" data-backend="all" onclick="setFilter(this)">All</span>';
+  for (const [name, b] of Object.entries(data.backends)) {
+    if (b.num_ops === 0) continue;
+    pills.innerHTML += `<span class="pill" data-backend="${name}" onclick="setFilter(this)"
+      style="border-color:${COLORS[name]||'#999'}">${name} (${b.num_ops})</span>`;
+  }
+
+  renderTable();
+}
+
+// ---- Table ----
+function renderTable() {
+  if (!DATA) return;
+  let ops = DATA.ops;
+  const totalDev = DATA.total_device_time_us || 1;
+
+  // Filter
+  if (currentFilter !== 'all') ops = ops.filter(o => o.backend === currentFilter);
+  if (searchText) ops = ops.filter(o => o.name.toLowerCase().includes(searchText));
+
+  // Sort
+  ops = [...ops].sort((a, b) => {
+    let va = a[currentSort.key], vb = b[currentSort.key];
+    if (currentSort.key === 'pct') {
+      va = a.device_time_us; vb = b.device_time_us;
+    }
+    if (currentSort.key === 'input_shapes') {
+      va = JSON.stringify(a.input_shapes); vb = JSON.stringify(b.input_shapes);
+    }
+    if (typeof va === 'string') { va = va.toLowerCase(); vb = (vb||'').toLowerCase(); }
+    if (va < vb) return currentSort.asc ? -1 : 1;
+    if (va > vb) return currentSort.asc ? 1 : -1;
+    return 0;
+  });
+
+  const tbody = document.getElementById('ops-tbody');
+  tbody.innerHTML = '';
+
+  for (const op of ops) {
+    const pct = (op.device_time_us / totalDev * 100);
+    const barW = Math.max(pct, 0.3);
+    const color = COLORS[op.backend] || '#999';
+    const badgeCls = op.backend.replace(/[^a-z-]/g, '');
+
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="mono">${escHtml(op.name)}</td>
+      <td><span class="badge ${badgeCls}">${op.backend}</span></td>
+      <td class="mono" style="font-size:11px">${fmtShape(op.input_shapes)}</td>
+      <td style="font-size:12px">${op.dtype || '—'}</td>
+      <td style="text-align:center">${op.layer_count > 1
+          ? '<span class="layer-count">×' + op.layer_count + '</span>' : '—'}</td>
+      <td style="text-align:right">${op.call_count}</td>
+      <td style="text-align:right">${fmtTime(op.device_time_us)}</td>
+      <td style="text-align:right">
+        <div class="bar-cell" style="justify-content:flex-end">
+          <span class="mini-bar" style="width:${barW}%;max-width:80px;background:${color}"></span>
+          ${pct.toFixed(1)}%
+        </div>
+      </td>
+      <td style="text-align:right">${fmtBytes(op.memory_bytes)}</td>
+      <td style="text-align:right">${fmtFlops(op.flops)}</td>
+      <td style="text-align:right">${fmtAI(op.arithmetic_intensity)}</td>`;
+    tbody.appendChild(tr);
+  }
+}
+
+function sortTable(key) {
+  if (currentSort.key === key) currentSort.asc = !currentSort.asc;
+  else { currentSort.key = key; currentSort.asc = false; }
+  renderTable();
+}
+
+function setFilter(el) {
+  document.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
+  el.classList.add('active');
+  currentFilter = el.dataset.backend;
+  renderTable();
+}
+
+function filterTable() {
+  searchText = document.getElementById('table-search').value.toLowerCase();
+  renderTable();
+}
+
+function escHtml(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+// ---- Init ----
+document.getElementById('model-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') loadConfig();
+});
+</script>
+</body>
+</html>
