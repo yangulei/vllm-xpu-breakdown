@@ -629,10 +629,9 @@ class TestRealTrace(unittest.TestCase):
         backends = {op["backend"] for op in ops}
         self.assertIn("vllm-xpu-kernels", backends,
                        "Should have vllm-xpu-kernels ops")
-        self.assertIn("triton", backends,
-                       "Should have triton ops")
         self.assertIn("torch-xpu-ops", backends,
                        "Should have torch-xpu-ops ops")
+        # triton only present in torch.compile mode traces
 
     def test_has_expected_ops(self):
         ops = parse_trace_file(self.trace_file)

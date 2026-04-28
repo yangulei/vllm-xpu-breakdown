@@ -221,7 +221,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
     </div>
 
     <div class="card">
-      <h2>Operations</h2>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <h2 style="margin-bottom:0">Operations</h2>
+        <button class="btn btn-secondary" onclick="exportExcel()" title="Export to Excel with formulas">
+          📥 Export Excel
+        </button>
+      </div>
       <div class="table-controls">
         <input type="text" class="search-input" id="table-search"
                placeholder="Search op name..." oninput="filterTable()">
@@ -575,6 +580,28 @@ function escHtml(s) {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
+}
+
+// ---- Export Excel ----
+async function exportExcel() {
+  if (!DATA) return alert('No data to export. Run a profile first.');
+  try {
+    const resp = await fetch('/api/export/excel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(DATA),
+    });
+    if (!resp.ok) { alert('Export failed: ' + resp.statusText); return; }
+    const blob = await resp.blob();
+    const cd = resp.headers.get('Content-Disposition') || '';
+    const match = cd.match(/filename="?([^"]+)"?/);
+    const filename = match ? match[1] : 'vllm_xpu_breakdown.xlsx';
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  } catch (e) { alert('Export error: ' + e.message); }
 }
 
 // ---- Init ----
