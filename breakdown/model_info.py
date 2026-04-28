@@ -1,0 +1,141 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Fetch and summarize HuggingFace model configs."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+from typing import Any
+
+
+def fetch_model_config(model_id: str) -> dict[str, Any]:
+    """Fetch config.json from HuggingFace Hub.
+
+    Respects HF_ENDPOINT env variable for mirror support (e.g., hf-mirror.com).
+    """
+    # Try huggingface_hub first
+    try:
+        from huggingface_hub import hf_hub_download
+        path = hf_hub_download(model_id, "config.json")
+        with open(path) as f:
+            return json.load(f)
+    except ImportError:
+        pass
+
+    # Direct HTTP fallback
+    import urllib.request
+    import urllib.error
+
+    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
+    url = f"{endpoint}/{model_id}/resolve/main/config.json"
+
+    try:
+        req = urllib.request.Request(url)
+        token = os.environ.get("HUGGING_FACE_HUB_TOKEN") or os.environ.get("HF_TOKEN")
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Failed to fetch config for {model_id}: HTTP {e.code}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Failed to connect to {endpoint}: {e.reason}") from e
+
+
+def summarize_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Extract key model properties from config.json."""
+    archs = config.get("architectures", [])
+    architecture = archs[0] if archs else config.get("model_type", "Unknown")
+
+    hidden_size = config.get("hidden_size")
+    num_layers = config.get("num_hidden_layers")
+    num_heads = config.get("num_attention_heads")
+    num_kv_heads = config.get("num_key_value_heads", num_heads)
+    head_dim = config.get("head_dim")
+    if head_dim is None and hidden_size and num_heads:
+        head_dim = hidden_size // num_heads
+    intermediate_size = config.get("intermediate_size")
+    vocab_size = config.get("vocab_size")
+    max_position = config.get("max_position_embeddings")
+    dtype = config.get("torch_dtype", "unknown")
+
+    # MoE detection
+    num_experts = (
+        config.get("num_local_experts")
+        or config.get("num_experts")
+        or config.get("n_routed_experts")
+    )
+    is_moe = num_experts is not None and num_experts > 1
+    num_experts_per_tok = (
+        config.get("num_experts_per_tok")
+        or config.get("n_group_top_k", config.get("top_k"))
+    )
+
+    # Quantization config
+    quant_config = config.get("quantization_config")
+    quant_method = None
+    if quant_config:
+        quant_method = quant_config.get("quant_method", "unknown")
+
+    return {
+        "architecture": architecture,
+        "model_type": config.get("model_type", "unknown"),
+        "hidden_size": hidden_size,
+        "num_layers": num_layers,
+        "num_heads": num_heads,
+        "num_kv_heads": num_kv_heads,
+        "head_dim": head_dim,
+        "intermediate_size": intermediate_size,
+        "vocab_size": vocab_size,
+        "max_position_embeddings": max_position,
+        "dtype": dtype,
+        "is_moe": is_moe,
+        "num_experts": num_experts,
+        "num_experts_per_tok": num_experts_per_tok,
+        "quant_method": quant_method,
+        "rope_type": config.get("rope_scaling", {}).get("type") if config.get("rope_scaling") else None,
+    }
+
+
+# Known config dimension names for shape symbolization
+def get_dim_symbols(summary: dict[str, Any]) -> dict[int, str]:
+    """Build a mapping from literal dimension values to symbolic names.
+
+    Returns {dim_value: symbol_name} for dimensions known from the config.
+    """
+    symbols: dict[int, str] = {}
+    if summary.get("hidden_size"):
+        symbols[summary["hidden_size"]] = "H"
+    if summary.get("num_heads"):
+        symbols[summary["num_heads"]] = "n_h"
+    if summary.get("num_kv_heads") and summary["num_kv_heads"] != summary.get("num_heads"):
+        symbols[summary["num_kv_heads"]] = "n_kv"
+    if summary.get("head_dim"):
+        symbols[summary["head_dim"]] = "d"
+    if summary.get("intermediate_size"):
+        symbols[summary["intermediate_size"]] = "I"
+    if summary.get("vocab_size"):
+        symbols[summary["vocab_size"]] = "V"
+    if summary.get("num_experts"):
+        symbols[summary["num_experts"]] = "E"
+
+    # Derived dimensions
+    h = summary.get("hidden_size") or 0
+    n_h = summary.get("num_heads") or 0
+    n_kv = summary.get("num_kv_heads") or n_h
+    d_head = summary.get("head_dim") or 0
+    inter = summary.get("intermediate_size") or 0
+
+    if n_h and d_head:
+        qkv = n_h * d_head + 2 * n_kv * d_head
+        if qkv not in symbols:
+            symbols[qkv] = "QKV"
+        kv_dim = 2 * n_kv * d_head
+        if kv_dim not in symbols:
+            symbols[kv_dim] = "2·n_kv·d"
+    if inter:
+        if inter * 2 not in symbols:
+            symbols[inter * 2] = "2·I"
+
+    return symbols
