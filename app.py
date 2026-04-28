@@ -27,7 +27,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from breakdown.analyzer import AnalyzedOp, analyze_ops
 from breakdown.classifier import Backend, classify_op
 from breakdown.model_info import fetch_model_config, get_dim_symbols, summarize_config
-from breakdown.profiler import _is_overhead_event
 from breakdown.registry import ALL_VLLM_XPU_OPS
 
 app = Flask(__name__, static_folder="static")
@@ -66,18 +65,16 @@ def get_model_config(model_id: str):
 
 def _run_profile(model_id: str, mode: str, max_model_len: int,
                  batch_size: int, max_tokens: int, prompt: str):
-    """Run profiling in a background thread using vLLM's native profiler."""
+    """Run profiling in a background thread using vLLM's native profiler.
+
+    On XPU hardware, vLLM automatically selects XPUWorker which uses
+    the correct profiler activities (["CPU", "XPU"]).
+    """
     global _profile_state
     try:
-        import torch
         from vllm import LLM, SamplingParams
 
-        from breakdown.profiler import _sync_device
         from breakdown.trace_parser import parse_trace_file
-        from breakdown.xpu_patch import patch_vllm_xpu_profiler
-
-        # Ensure XPU profiler activities are patched before LLM init
-        patch_vllm_xpu_profiler()
 
         # Fetch model config for analysis
         try:
@@ -128,12 +125,11 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
         llm.stop_profile()
 
         # --- Parse trace files ---
-        # vLLM writes trace files like: <trace_dir>/<worker_name>.json[.gz]
-        trace_files = []
-        for f in os.listdir(trace_dir):
-            if f.endswith(".json") or f.endswith(".json.gz"):
-                trace_files.append(os.path.join(trace_dir, f))
-        trace_files.sort(key=os.path.getmtime, reverse=True)
+        trace_files = sorted(
+            [os.path.join(trace_dir, f) for f in os.listdir(trace_dir)
+             if f.endswith(".json") or f.endswith(".json.gz")],
+            key=os.path.getmtime, reverse=True,
+        )
 
         if not trace_files:
             raise RuntimeError(
@@ -141,7 +137,6 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
                 "Profiling may have failed in the worker process."
             )
 
-        # Parse the most recent trace file
         op_dicts = parse_trace_file(trace_files[0])
 
         if not op_dicts:
@@ -188,13 +183,12 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             _profile_state["result"] = profile_result
             _profile_state["error"] = None
 
-        # Cleanup compile env
-        os.environ.pop("VLLM_TORCH_COMPILE_LEVEL", None)
-
     except Exception as e:
         with _profile_lock:
             _profile_state["status"] = "error"
             _profile_state["error"] = traceback.format_exc()
+    finally:
+        os.environ.pop("VLLM_TORCH_COMPILE_LEVEL", None)
 
 
 @app.route("/api/profile", methods=["POST"])
