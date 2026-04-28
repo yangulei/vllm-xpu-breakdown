@@ -101,11 +101,13 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             },
         }
 
-        # Set compile mode
+        # Set compile / eager mode
         if mode == "compile":
             os.environ["VLLM_TORCH_COMPILE_LEVEL"] = "3"
+            engine_kwargs["enforce_eager"] = False
         else:
             os.environ.pop("VLLM_TORCH_COMPILE_LEVEL", None)
+            engine_kwargs["enforce_eager"] = True
 
         llm = LLM(**engine_kwargs)
 
