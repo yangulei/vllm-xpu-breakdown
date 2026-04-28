@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import sys
@@ -20,7 +21,7 @@ import traceback
 from dataclasses import asdict
 from pathlib import Path
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -350,6 +351,177 @@ def demo_data():
             "ops": [o.to_dict() for o in analyzed],
         },
     })
+
+
+# ---- Excel Export ----
+
+@app.route("/api/export/excel", methods=["POST"])
+def export_excel():
+    """Export breakdown results to Excel with formulas preserved."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    data = request.json
+    if not data or "ops" not in data:
+        return jsonify({"ok": False, "error": "No data to export"}), 400
+
+    wb = Workbook()
+
+    # ---- Sheet 1: Summary ----
+    ws_sum = wb.active
+    ws_sum.title = "Summary"
+    title_font = Font(bold=True, size=14)
+    header_font = Font(bold=True, size=11, color="FFFFFF")
+    header_fill = PatternFill(start_color="1A1A2E", end_color="1A1A2E",
+                              fill_type="solid")
+    thin_border = Border(
+        bottom=Side(style="thin", color="E0E0E0"),
+    )
+
+    ws_sum["A1"] = "vLLM-XPU Ops/Kernels Breakdown"
+    ws_sum["A1"].font = title_font
+    ws_sum["A2"] = f"Model: {data.get('model_id', 'N/A')}"
+    ws_sum["A3"] = f"Mode: {data.get('mode', 'N/A')}"
+
+    # Model summary
+    summary = data.get("summary", {})
+    if summary:
+        row = 5
+        ws_sum.cell(row, 1, "Model Configuration").font = Font(bold=True, size=12)
+        row += 1
+        for key in ("architecture", "hidden_size", "num_layers", "num_heads",
+                     "num_kv_heads", "head_dim", "intermediate_size",
+                     "vocab_size", "dtype", "is_moe"):
+            if key in summary:
+                ws_sum.cell(row, 1, key).font = Font(bold=True)
+                ws_sum.cell(row, 2, str(summary[key]))
+                row += 1
+
+    # Backend summary
+    backends = data.get("backends", {})
+    if backends:
+        row += 1
+        ws_sum.cell(row, 1, "Backend Distribution").font = Font(bold=True,
+                                                                  size=12)
+        row += 1
+        for col, hdr in enumerate(["Backend", "Device Time (µs)", "% Time",
+                                    "Ops", "Calls"], 1):
+            c = ws_sum.cell(row, col, hdr)
+            c.font = header_font
+            c.fill = header_fill
+        row += 1
+        for name, b in backends.items():
+            if b.get("num_ops", 0) == 0:
+                continue
+            ws_sum.cell(row, 1, name)
+            ws_sum.cell(row, 2, b["device_time_us"])
+            ws_sum.cell(row, 3, b["pct"] / 100)
+            ws_sum.cell(row, 3).number_format = '0.0%'
+            ws_sum.cell(row, 4, b["num_ops"])
+            ws_sum.cell(row, 5, b["num_calls"])
+            row += 1
+
+    ws_sum.column_dimensions["A"].width = 28
+    ws_sum.column_dimensions["B"].width = 20
+
+    # ---- Sheet 2: Operations with formulas ----
+    ws = wb.create_sheet("Operations")
+
+    headers = ["Op Name", "Backend", "Shape", "dtype", "×Layers",
+               "Calls", "Device Time (µs)", "% Time",
+               "Memory (bytes)", "FLOPs", "Arithmetic Intensity"]
+    for col, hdr in enumerate(headers, 1):
+        c = ws.cell(1, col, hdr)
+        c.font = header_font
+        c.fill = header_fill
+        c.alignment = Alignment(horizontal="center")
+
+    ops = data["ops"]
+
+    # Write total device time in a named cell for formula reference
+    # Place it in a helper cell: the sum will be computed by formula
+    # Row 2..N+1 are data rows; we use column G for device time
+    total_dev_time_us = data.get("total_device_time_us", 0)
+
+    for i, op in enumerate(ops):
+        r = i + 2  # data starts at row 2
+        ws.cell(r, 1, op["name"])
+        ws.cell(r, 2, op["backend"])
+
+        shapes = op.get("input_shapes")
+        if shapes:
+            ws.cell(r, 3, json.dumps(shapes))
+        else:
+            ws.cell(r, 3, "—")
+
+        ws.cell(r, 4, op.get("dtype") or "—")
+        ws.cell(r, 5, op.get("layer_count", 1))
+        ws.cell(r, 6, op.get("call_count", 0))
+        ws.cell(r, 7, op.get("device_time_us", 0))
+
+        # % Time as formula: device_time / SUM(device_time_column)
+        last_data_row = len(ops) + 1
+        col_g = get_column_letter(7)  # G = Device Time
+        ws.cell(r, 8).value = f"={col_g}{r}/SUM({col_g}$2:{col_g}${last_data_row})"
+        ws.cell(r, 8).number_format = '0.0%'
+
+        ws.cell(r, 9, op.get("memory_bytes", 0))
+
+        flops = op.get("flops", 0)
+        ws.cell(r, 10, flops)
+
+        # Arithmetic Intensity as formula: FLOPs / Memory (avoid div-by-zero)
+        col_i = get_column_letter(9)   # I = Memory
+        col_j = get_column_letter(10)  # J = FLOPs
+        ws.cell(r, 11).value = (
+            f'=IF({col_i}{r}=0,"—",{col_j}{r}/{col_i}{r})'
+        )
+        ws.cell(r, 11).number_format = '0.00'
+
+    # Totals row
+    total_row = len(ops) + 2
+    ws.cell(total_row, 1, "TOTAL").font = Font(bold=True)
+    col_f = get_column_letter(6)
+    col_g = get_column_letter(7)
+    ws.cell(total_row, 6).value = f"=SUM({col_f}2:{col_f}{len(ops)+1})"
+    ws.cell(total_row, 6).font = Font(bold=True)
+    ws.cell(total_row, 7).value = f"=SUM({col_g}2:{col_g}{len(ops)+1})"
+    ws.cell(total_row, 7).font = Font(bold=True)
+    ws.cell(total_row, 8, 1.0)
+    ws.cell(total_row, 8).number_format = '0.0%'
+    ws.cell(total_row, 8).font = Font(bold=True)
+
+    # Column widths
+    col_widths = [45, 18, 50, 10, 8, 8, 15, 10, 15, 15, 15]
+    for i, w in enumerate(col_widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    # Freeze header row
+    ws.freeze_panes = "A2"
+
+    # Auto-filter
+    ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{len(ops)+1}"
+
+    # Apply border to data rows
+    for r in range(2, len(ops) + 2):
+        for col in range(1, len(headers) + 1):
+            ws.cell(r, col).border = thin_border
+
+    # Write to buffer
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    model_name = data.get("model_id", "breakdown").replace("/", "_")
+    mode = data.get("mode", "eager")
+    filename = f"vllm_xpu_breakdown_{model_name}_{mode}.xlsx"
+
+    return Response(
+        buf.getvalue(),
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 if __name__ == "__main__":
