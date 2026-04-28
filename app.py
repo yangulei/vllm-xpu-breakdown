@@ -66,14 +66,18 @@ def get_model_config(model_id: str):
 
 def _run_profile(model_id: str, mode: str, max_model_len: int,
                  batch_size: int, max_tokens: int, prompt: str):
-    """Run profiling in a background thread."""
+    """Run profiling in a background thread using vLLM's native profiler."""
     global _profile_state
     try:
         import torch
         from vllm import LLM, SamplingParams
 
-        from breakdown.profiler import (ProfileConfig, _sync_device,
-                                        parse_events, simple_profile_context)
+        from breakdown.profiler import _sync_device
+        from breakdown.trace_parser import parse_trace_file
+        from breakdown.xpu_patch import patch_vllm_xpu_profiler
+
+        # Ensure XPU profiler activities are patched before LLM init
+        patch_vllm_xpu_profiler()
 
         # Fetch model config for analysis
         try:
@@ -84,9 +88,20 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             summary = {}
             dim_symbols = {}
 
+        trace_dir = os.path.abspath("output/traces")
+        os.makedirs(trace_dir, exist_ok=True)
+
         engine_kwargs: dict = {
             "model": model_id,
             "max_model_len": max_model_len,
+            "profiler_config": {
+                "profiler": "torch",
+                "torch_profiler_dir": trace_dir,
+                "torch_profiler_record_shapes": True,
+                "torch_profiler_with_stack": False,
+                "torch_profiler_with_flops": True,
+                "torch_profiler_use_gzip": False,
+            },
         }
 
         # Set compile mode
@@ -104,43 +119,43 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
         conversations = [conversation] * batch_size
         sampling_params = SamplingParams(max_tokens=max_tokens)
 
-        # --- Warmup OUTSIDE profiler ---
+        # --- Warmup (no profiling) ---
         llm.chat(conversations, sampling_params, use_tqdm=False)
-        _sync_device()
 
-        # --- Profile with simple context (no schedule) ---
-        prof_config = ProfileConfig(
-            output_dir="output",
-            warmup_steps=0,
-            active_steps=1,
-        )
+        # --- Profiled run ---
+        llm.start_profile()
+        llm.chat(conversations, sampling_params, use_tqdm=False)
+        llm.stop_profile()
 
-        with simple_profile_context(prof_config) as prof:
-            llm.chat(conversations, sampling_params, use_tqdm=False)
-            # _sync_device() is called automatically inside simple_profile_context
+        # --- Parse trace files ---
+        # vLLM writes trace files like: <trace_dir>/<worker_name>.json[.gz]
+        trace_files = []
+        for f in os.listdir(trace_dir):
+            if f.endswith(".json") or f.endswith(".json.gz"):
+                trace_files.append(os.path.join(trace_dir, f))
+        trace_files.sort(key=os.path.getmtime, reverse=True)
 
-        # Parse events (overhead events are filtered out)
-        result = parse_events(prof, prof_config, filter_overhead=True)
+        if not trace_files:
+            raise RuntimeError(
+                f"No trace files found in {trace_dir}. "
+                "Profiling may have failed in the worker process."
+            )
 
-        # Convert to dicts for analyzer
-        op_dicts = []
-        for op in result.ops:
-            op_dicts.append({
-                "name": op.name,
-                "backend": op.backend.value,
-                "category": op.category,
-                "device_time_us": op.device_time_us,
-                "cpu_time_us": op.cpu_time_us,
-                "count": op.count,
-                "input_shapes": op.input_shapes,
-            })
+        # Parse the most recent trace file
+        op_dicts = parse_trace_file(trace_files[0])
+
+        if not op_dicts:
+            raise RuntimeError(
+                f"No ops found in trace file {trace_files[0]}. "
+                "The worker may not have captured any events."
+            )
 
         # Analyze
         analyzed = analyze_ops(
             op_dicts,
             dim_symbols=dim_symbols,
             batch_size=batch_size,
-            seq_len=None,  # determined from profiling
+            seq_len=None,
             model_dtype=summary.get("dtype", "bfloat16"),
             num_layers=summary.get("num_layers"),
         )
