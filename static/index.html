@@ -244,6 +244,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
         <label>Max Tokens</label>
         <input type="number" id="max-tokens" value="128" min="1" max="4096">
       </div>
+      <div class="control-group">
+        <label>Layers</label>
+        <select id="num-layers-select">
+          <option value="all">All</option>
+          <option value="1" selected>1 (large models)</option>
+        </select>
+      </div>
       <div style="display:flex;gap:8px;align-self:flex-end">
         <button class="btn btn-primary" id="static-btn" onclick="runStatic()"
                 style="background:#2e7d32">⚡ Static</button>
@@ -477,10 +484,13 @@ async function startProfile() {
     max_model_len: parseInt(document.getElementById('max-model-len').value),
     batch_size: parseInt(document.getElementById('batch-size').value),
     max_tokens: parseInt(document.getElementById('max-tokens').value),
+    num_profile_layers: document.getElementById('num-layers-select').value === '1' ? 1 : null,
   };
 
   document.getElementById('profile-btn').disabled = true;
-  showStatus('running', 'Loading model and profiling... This may take several minutes.');
+  const layerMode = document.getElementById('num-layers-select').value;
+  const layerNote = layerMode === '1' ? ' (1-layer mode — timing will be extrapolated)' : '';
+  showStatus('running', 'Loading model and profiling...' + layerNote + ' This may take several minutes.');
 
   try {
     const resp = await fetch('/api/profile', {
@@ -575,10 +585,16 @@ function renderResults(data) {
   const addStat = (val, label) => {
     grid.innerHTML += `<div class="stat-card"><div class="val">${val}</div><div class="lbl">${label}</div></div>`;
   };
-  addStat(fmtTime(data.total_device_time_us), 'Total Device Time');
-  addStat(fmtTime(data.total_cpu_time_us), 'Total CPU Time');
+
+  const ls = data.layer_scale || 1;
+  const scaledTotal = data.total_device_time_us * ls;
+  addStat(fmtTime(scaledTotal), ls > 1 ? `Est. Total Device Time (×${ls})` : 'Total Device Time');
+  addStat(fmtTime(data.total_cpu_time_us * ls), ls > 1 ? `Est. Total CPU Time (×${ls})` : 'Total CPU Time');
   addStat(data.ops.length, 'Unique Ops');
   addStat(data.mode, 'Mode');
+  if (data.profiled_layers && data.actual_layers && data.profiled_layers !== data.actual_layers) {
+    addStat(`${data.profiled_layers} → ${data.actual_layers}`, 'Layers (profiled → actual)');
+  }
 
   // Backend bars
   const bars = document.getElementById('backend-bars');
@@ -712,7 +728,9 @@ function switchGraphMode(mode) {
 
   const subtitle = document.getElementById('graph-subtitle');
   if (mode === 'profiled') {
-    subtitle.innerHTML = 'Profiled run — per-call device time overlaid on model structure. Timing is averaged across all profiled iterations.';
+    const ls = DATA?.layer_scale || 1;
+    const lsNote = ls > 1 ? ` <strong>1-layer profiled → ×${DATA.actual_layers} extrapolated</strong> for decoder layers.` : '';
+    subtitle.innerHTML = 'Profiled run — per-call device time overlaid on model structure.' + lsNote;
   } else {
     subtitle.innerHTML = 'Static analysis — derived from model config without profiling. Backends are <em>likely</em> dispatch targets in eager mode.';
   }

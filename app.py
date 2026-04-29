@@ -84,11 +84,18 @@ def get_model_graph(model_id: str):
 # ---- Profile API ----
 
 def _run_profile(model_id: str, mode: str, max_model_len: int,
-                 batch_size: int, max_tokens: int, prompt: str):
+                 batch_size: int, max_tokens: int, prompt: str,
+                 num_profile_layers: int | None = None):
     """Run profiling in a background thread using vLLM's native profiler.
 
     On XPU hardware, vLLM automatically selects XPUWorker which uses
     the correct profiler activities (["CPU", "XPU"]).
+
+    Args:
+        num_profile_layers: If set (e.g. 1), override the model to load only
+            this many layers. Timing is then scaled by actual_layers/profiled
+            for the full model estimate. Enables profiling models too large
+            for the GPU.
     """
     global _profile_state
     try:
@@ -105,6 +112,10 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             summary = {}
             dim_symbols = {}
 
+        actual_layers = summary.get("num_layers") or 1
+        profiled_layers = num_profile_layers or actual_layers
+        layer_scale = actual_layers / profiled_layers
+
         trace_dir = os.path.abspath("output/traces")
         os.makedirs(trace_dir, exist_ok=True)
 
@@ -120,6 +131,12 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
                 "torch_profiler_use_gzip": False,
             },
         }
+
+        # Override layer count for 1-layer profiling
+        if num_profile_layers and num_profile_layers < actual_layers:
+            engine_kwargs["hf_overrides"] = {
+                "num_hidden_layers": num_profile_layers,
+            }
 
         # Set compile / eager mode
         if mode == "compile":
@@ -198,9 +215,14 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             "total_cpu_time_us": sum(o.cpu_time_us for o in analyzed),
             "backends": backend_totals,
             "ops": [o.to_dict() for o in analyzed],
+            # Layer scaling info for 1-layer profiling
+            "profiled_layers": profiled_layers,
+            "actual_layers": actual_layers,
+            "layer_scale": layer_scale,
         }
 
         # Build annotated graph — same tree view with timing overlaid
+        # Use actual_layers in the graph so repeat_count is correct
         try:
             graph = build_model_graph(summary, prefill_len=128,
                                       decode_batch=batch_size)
@@ -241,6 +263,7 @@ def start_profile():
     batch_size = data.get("batch_size", 1)
     max_tokens = data.get("max_tokens", 128)
     prompt = data.get("prompt", "Write a short essay about AI.")
+    num_profile_layers = data.get("num_profile_layers")  # None = all layers
 
     with _profile_lock:
         _profile_state = {
@@ -252,7 +275,8 @@ def start_profile():
 
     thread = threading.Thread(
         target=_run_profile,
-        args=(model_id, mode, max_model_len, batch_size, max_tokens, prompt),
+        args=(model_id, mode, max_model_len, batch_size, max_tokens, prompt,
+              num_profile_layers),
         daemon=True,
     )
     thread.start()
