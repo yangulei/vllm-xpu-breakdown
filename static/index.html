@@ -245,6 +245,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
         <input type="number" id="max-tokens" value="128" min="1" max="4096">
       </div>
       <div style="display:flex;gap:8px;align-self:flex-end">
+        <button class="btn btn-primary" id="static-btn" onclick="runStatic()"
+                style="background:#2e7d32">⚡ Static</button>
         <button class="btn btn-primary" id="profile-btn" onclick="startProfile()">▶ Profile</button>
         <button class="btn btn-secondary" onclick="loadDemo()">Load Demo</button>
       </div>
@@ -257,17 +259,25 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
     <span id="status-text">Profiling...</span>
   </div>
 
-  <!-- Model Graph (static analysis, no profiling needed) -->
+  <!-- Model Graph (static analysis or profiled) -->
   <div id="graph-section">
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-        <h2 style="margin-bottom:0">Model Graph — Op Dispatch by Module</h2>
+        <div style="display:flex;align-items:center;gap:12px">
+          <h2 style="margin-bottom:0">Model Graph — Op Dispatch by Module</h2>
+          <div style="display:flex;gap:4px">
+            <button class="phase-btn active" id="view-static-btn" onclick="switchGraphMode('static')"
+                    style="font-size:11px;padding:3px 10px">⚡ Static</button>
+            <button class="phase-btn" id="view-profiled-btn" onclick="switchGraphMode('profiled')"
+                    style="font-size:11px;padding:3px 10px" disabled>⏱ Profiled</button>
+          </div>
+        </div>
         <div class="graph-phase-toggle">
           <button class="phase-btn active" data-phase="prefill" onclick="setPhase(this)">Prefill</button>
           <button class="phase-btn" data-phase="decode" onclick="setPhase(this)">Decode</button>
         </div>
       </div>
-      <p style="font-size:12px;color:#888;margin-bottom:12px">
+      <p style="font-size:12px;color:#888;margin-bottom:12px" id="graph-subtitle">
         Static analysis — derived from model config without profiling. Backends are <em>likely</em> dispatch targets in eager mode.
       </p>
       <div class="symbol-legend" id="symbol-legend"></div>
@@ -325,7 +335,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 <script>
 // ---- State ----
 let DATA = null;
-let GRAPH_DATA = null;
+let GRAPH_DATA = null;         // currently displayed graph (static or profiled)
+let STATIC_GRAPH_DATA = null;  // saved static graph
+let PROFILED_GRAPH_DATA = null; // saved profiled graph (with timing)
+let graphMode = 'static';      // 'static' or 'profiled'
 let currentPhase = 'prefill';
 let currentSort = { key: 'device_time_us', asc: false };
 let currentFilter = 'all';
@@ -388,21 +401,26 @@ async function loadConfig() {
     modelSummary = data.summary;
     showModelSummary(modelId, data.summary);
 
-    // Load model graph (static analysis)
-    loadModelGraph(modelId);
+    // Auto-run static analysis
+    runStatic();
   } catch(e) {
     alert('Failed to fetch config: ' + e.message);
   }
 }
 
-async function loadModelGraph(modelId) {
+async function runStatic() {
+  const modelId = document.getElementById('model-input').value.trim();
+  if (!modelId) { alert('Enter a model ID first'); return; }
+
   try {
     const resp = await fetch(`/api/model/${encodeURIComponent(modelId)}/graph?prefill_len=128&decode_batch=1`);
     const data = await resp.json();
-    if (!data.ok) return;
-    GRAPH_DATA = data.graph;
+    if (!data.ok) { alert('Graph error: ' + data.error); return; }
+    STATIC_GRAPH_DATA = data.graph;
+    graphMode = 'static';
+    GRAPH_DATA = STATIC_GRAPH_DATA;
     document.getElementById('graph-section').classList.add('visible');
-    renderGraph();
+    switchGraphMode('static');
   } catch(e) {
     console.warn('Graph load failed:', e);
   }
@@ -496,7 +514,18 @@ async function pollStatus() {
       // Fetch results
       const rr = await fetch('/api/profile/result');
       const rd = await rr.json();
-      if (rd.ok) renderResults(rd.data);
+      if (rd.ok) {
+        renderResults(rd.data);
+        // Switch to profiled graph if available
+        if (rd.data.graph) {
+          PROFILED_GRAPH_DATA = rd.data.graph;
+          graphMode = 'profiled';
+          GRAPH_DATA = PROFILED_GRAPH_DATA;
+          document.getElementById('graph-section').classList.add('visible');
+          document.getElementById('view-profiled-btn').disabled = false;
+          switchGraphMode('profiled');
+        }
+      }
     } else if (data.status === 'error') {
       clearInterval(pollTimer);
       showStatus('error', data.error || 'Profiling failed');
@@ -666,9 +695,27 @@ function escHtml(s) {
 
 // ---- Model Graph ----
 function setPhase(el) {
-  document.querySelectorAll('.phase-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.phase-btn[data-phase]').forEach(b => b.classList.remove('active'));
   el.classList.add('active');
   currentPhase = el.dataset.phase;
+  renderGraph();
+}
+
+function switchGraphMode(mode) {
+  if (mode === 'profiled' && !PROFILED_GRAPH_DATA) return;
+  if (mode === 'static' && !STATIC_GRAPH_DATA) return;
+  graphMode = mode;
+  GRAPH_DATA = mode === 'profiled' ? PROFILED_GRAPH_DATA : STATIC_GRAPH_DATA;
+
+  document.getElementById('view-static-btn').classList.toggle('active', mode === 'static');
+  document.getElementById('view-profiled-btn').classList.toggle('active', mode === 'profiled');
+
+  const subtitle = document.getElementById('graph-subtitle');
+  if (mode === 'profiled') {
+    subtitle.innerHTML = 'Profiled run — per-call device time overlaid on model structure. Timing is averaged across all profiled iterations.';
+  } else {
+    subtitle.innerHTML = 'Static analysis — derived from model config without profiling. Backends are <em>likely</em> dispatch targets in eager mode.';
+  }
   renderGraph();
 }
 
@@ -677,10 +724,29 @@ function renderGraph() {
   const tree = GRAPH_DATA[currentPhase];
   if (!tree) return;
 
+  const hasTiming = !!GRAPH_DATA.has_timing;
+
   // Symbol legend
   const symbols = GRAPH_DATA.symbols || {};
   const legend = document.getElementById('symbol-legend');
   legend.innerHTML = '';
+
+  // Show mode indicator
+  const modeTag = document.createElement('span');
+  modeTag.style.cssText = 'font-weight:600;padding:2px 8px;border-radius:4px;font-size:11px;margin-right:8px;';
+  if (hasTiming) {
+    modeTag.style.background = '#e3f2fd';
+    modeTag.style.color = '#1565c0';
+    const matched = GRAPH_DATA.timing_matched || 0;
+    const total = GRAPH_DATA.timing_total_ops || 0;
+    modeTag.textContent = `⏱ Profiled (${matched}/${total} ops matched)`;
+  } else {
+    modeTag.style.background = '#e8f5e9';
+    modeTag.style.color = '#2e7d32';
+    modeTag.textContent = '⚡ Static Analysis';
+  }
+  legend.appendChild(modeTag);
+
   const order = ['S','B','H','n_h','n_kv','d','I','2·I','QKV','n_h·d','V'];
   for (const sym of order) {
     if (!(sym in symbols)) continue;
@@ -698,7 +764,7 @@ function renderGraph() {
 
   const container = document.getElementById('graph-tree');
   container.innerHTML = '';
-  container.appendChild(buildTreeNode(tree, true));
+  container.appendChild(buildTreeNode(tree, true, hasTiming));
 }
 
 function symTooltip(dimStr) {
@@ -738,7 +804,7 @@ function fmtAI2(ai) {
   return 'AI=' + (ai >= 100 ? ai.toFixed(0) : ai.toFixed(1));
 }
 
-function buildTreeNode(node, isRoot) {
+function buildTreeNode(node, isRoot, hasTiming) {
   const div = document.createElement('div');
   div.className = 'tree-node' + (isRoot ? ' root' : '');
 
@@ -775,15 +841,19 @@ function buildTreeNode(node, isRoot) {
   const mem = node.total_memory;
   const flops = node.total_flops;
   const ai = node.total_ai || 0;
+  const devTime = node.total_device_time_us || 0;
   let parts = [];
   if (mem > 0) parts.push(fmtBytes(mem));
   if (flops > 0) parts.push(fmtFlops(flops));
   if (ai > 0) parts.push(fmtAI2(ai));
+  if (hasTiming && devTime > 0) parts.push(fmtTime(devTime));
   let statsText = parts.join(' · ');
-  if (node.repeat_count > 1 && mem > 0) {
-    const totalMem = mem * node.repeat_count;
-    const totalFlops = flops * node.repeat_count;
-    statsText += ` (×${node.repeat_count}: ${fmtBytes(totalMem)} · ${fmtFlops(totalFlops)})`;
+  if (node.repeat_count > 1 && (mem > 0 || devTime > 0)) {
+    const totalParts = [];
+    if (mem > 0) totalParts.push(fmtBytes(mem * node.repeat_count));
+    if (flops > 0) totalParts.push(fmtFlops(flops * node.repeat_count));
+    if (hasTiming && devTime > 0) totalParts.push(fmtTime(devTime * node.repeat_count));
+    statsText += ` (×${node.repeat_count}: ${totalParts.join(' · ')})`;
   }
   stats.textContent = statsText;
   header.appendChild(stats);
@@ -806,13 +876,20 @@ function buildTreeNode(node, isRoot) {
       if (op.memory_bytes > 0) costParts.push(fmtBytes(op.memory_bytes));
       if (op.flops > 0) costParts.push(fmtFlops(op.flops));
       if (op.ai > 0) costParts.push(fmtAI2(op.ai));
+      // Add timing if profiled
+      let timingHtml = '';
+      if (hasTiming && op.device_time_us > 0) {
+        timingHtml = ` <span style="color:#1565c0;font-weight:600;font-size:10px;margin-left:4px">⏱ ${fmtTime(op.device_time_us)}</span>`;
+      } else if (hasTiming) {
+        timingHtml = ' <span style="color:#bbb;font-size:10px">—</span>';
+      }
       opEl.innerHTML = `
         <span class="op-role">${op.role}</span>
         <span class="op-name">${escHtml(op.name)}</span>
         <span class="badge op-backend ${op.backend.replace(/[^a-z-]/g,'')}"
               style="font-size:10px">${op.backend}</span>
         <span class="op-shapes">${shapesHtml}</span>
-        <span class="op-cost">${costParts.join(' · ')}</span>`;
+        <span class="op-cost">${costParts.join(' · ')}${timingHtml}</span>`;
       opsDiv.appendChild(opEl);
     }
     childrenDiv.appendChild(opsDiv);
@@ -821,7 +898,7 @@ function buildTreeNode(node, isRoot) {
   // Sub-modules
   if (node.children) {
     for (const child of node.children) {
-      childrenDiv.appendChild(buildTreeNode(child, false));
+      childrenDiv.appendChild(buildTreeNode(child, false, hasTiming));
     }
   }
 

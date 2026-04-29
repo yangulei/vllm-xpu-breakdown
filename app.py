@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from breakdown.analyzer import AnalyzedOp, analyze_ops
 from breakdown.classifier import Backend, classify_op
-from breakdown.model_graph import build_model_graph
+from breakdown.model_graph import annotate_graph_timing, build_model_graph
 from breakdown.model_info import fetch_model_config, get_dim_symbols, summarize_config
 from breakdown.registry import ALL_VLLM_XPU_OPS
 
@@ -199,6 +199,15 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             "backends": backend_totals,
             "ops": [o.to_dict() for o in analyzed],
         }
+
+        # Build annotated graph — same tree view with timing overlaid
+        try:
+            graph = build_model_graph(summary, prefill_len=128,
+                                      decode_batch=batch_size)
+            annotate_graph_timing(graph, op_dicts)
+            profile_result["graph"] = graph
+        except Exception:
+            pass  # Graph annotation is best-effort
 
         with _profile_lock:
             _profile_state["status"] = "done"
