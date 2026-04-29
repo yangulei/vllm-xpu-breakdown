@@ -146,10 +146,10 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             },
         }
 
-        # Override layer count for 1-layer profiling
-        if num_profile_layers and num_profile_layers < actual_layers:
+        # Override layer count for reduced-layer profiling
+        if profiled_layers < actual_layers:
             engine_kwargs["hf_overrides"] = {
-                "num_hidden_layers": num_profile_layers,
+                "num_hidden_layers": profiled_layers,
             }
 
         # Set compile / eager mode
