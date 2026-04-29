@@ -248,7 +248,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
         <label>Layers</label>
         <select id="num-layers-select">
           <option value="all">All</option>
-          <option value="1" selected>1 (large models)</option>
+          <option value="min" selected>Min (large models)</option>
         </select>
       </div>
       <div style="display:flex;gap:8px;align-self:flex-end">
@@ -428,6 +428,22 @@ async function runStatic() {
     GRAPH_DATA = STATIC_GRAPH_DATA;
     document.getElementById('graph-section').classList.add('visible');
     switchGraphMode('static');
+
+    // Update layers dropdown with min_profile_layers info
+    if (data.min_profile_layers) {
+      const sel = document.getElementById('num-layers-select');
+      const minOpt = sel.querySelector('option[value="min"]');
+      if (minOpt) {
+        const min = data.min_profile_layers;
+        const cfg = data.graph?.config || {};
+        const fk = cfg.first_k_dense_replace || 0;
+        if (fk > 0) {
+          minOpt.textContent = `Min: ${min} (${fk} dense + ${min - fk} MoE)`;
+        } else {
+          minOpt.textContent = `Min: ${min}`;
+        }
+      }
+    }
   } catch(e) {
     console.warn('Graph load failed:', e);
   }
@@ -449,7 +465,12 @@ function showModelSummary(modelId, s) {
     tags.appendChild(t);
   };
   addTag(s.num_layers + ' layers');
-  addTag(s.is_moe ? 'MoE (' + s.num_experts + ' experts)' : 'Dense', s.is_moe ? 'moe' : '');
+  if (s.is_moe && s.first_k_dense_replace > 0) {
+    addTag('Hybrid (' + s.first_k_dense_replace + ' dense + ' +
+           (s.num_layers - s.first_k_dense_replace) + ' MoE)', 'moe');
+  } else {
+    addTag(s.is_moe ? 'MoE (' + s.num_experts + ' experts)' : 'Dense', s.is_moe ? 'moe' : '');
+  }
   addTag(s.dtype, 'dtype');
   if (s.quant_method) addTag(s.quant_method, 'quant');
   if (s.rope_type) addTag('RoPE: ' + s.rope_type);
@@ -484,7 +505,10 @@ async function startProfile() {
     max_model_len: parseInt(document.getElementById('max-model-len').value),
     batch_size: parseInt(document.getElementById('batch-size').value),
     max_tokens: parseInt(document.getElementById('max-tokens').value),
-    num_profile_layers: document.getElementById('num-layers-select').value === '1' ? 1 : null,
+    num_profile_layers: (() => {
+      const v = document.getElementById('num-layers-select').value;
+      return v === 'all' ? null : v;
+    })(),
   };
 
   document.getElementById('profile-btn').disabled = true;
