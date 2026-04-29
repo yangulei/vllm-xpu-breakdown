@@ -27,7 +27,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from breakdown.analyzer import AnalyzedOp, analyze_ops
 from breakdown.classifier import Backend, classify_op
-from breakdown.model_graph import annotate_graph_timing, build_model_graph
+from breakdown.model_graph import (
+    annotate_graph_timing,
+    build_model_graph,
+    min_profile_layers,
+)
 from breakdown.model_info import fetch_model_config, get_dim_symbols, summarize_config
 from breakdown.registry import ALL_VLLM_XPU_OPS
 
@@ -76,7 +80,11 @@ def get_model_graph(model_id: str):
         graph = build_model_graph(summary,
                                   prefill_len=prefill_len,
                                   decode_batch=decode_batch)
-        return jsonify({"ok": True, "graph": graph, "summary": summary})
+        min_layers = min_profile_layers(summary)
+        return jsonify({
+            "ok": True, "graph": graph, "summary": summary,
+            "min_profile_layers": min_layers,
+        })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
 
@@ -113,7 +121,13 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             dim_symbols = {}
 
         actual_layers = summary.get("num_layers") or 1
-        profiled_layers = num_profile_layers or actual_layers
+        if num_profile_layers == "min":
+            # Auto-calculate minimum layers needed
+            profiled_layers = min_profile_layers(summary)
+        elif num_profile_layers:
+            profiled_layers = int(num_profile_layers)
+        else:
+            profiled_layers = actual_layers
         layer_scale = actual_layers / profiled_layers
 
         trace_dir = os.path.abspath("output/traces")

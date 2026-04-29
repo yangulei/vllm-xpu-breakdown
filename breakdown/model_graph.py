@@ -340,7 +340,10 @@ def _build_moe_layer(
     """Build one MoE decoder layer (Mixtral/DeepSeek style)."""
     num_experts = cfg.get("num_experts", 8)
     top_k = cfg.get("num_experts_per_tok", 2)
+    n_shared = cfg.get("n_shared_experts", 0)
     H = cfg["hidden_size"]
+    # MoE may use a different intermediate size than dense layers
+    moe_I = cfg.get("moe_intermediate_size") or cfg["intermediate_size"]
     I = cfg["intermediate_size"]
     dtype_bytes = cfg["dtype_bytes"]
     T = cfg.get(f"_{tokens}", tokens)
@@ -384,39 +387,74 @@ def _build_moe_layer(
         output_shape=[tokens],
         memory_bytes=0, flops=0, phase=phase,
     )
-    # Expert computation (top_k experts active)
+    # Expert computation (top_k experts active) — use moe_intermediate_size
+    moe_I_sym = f"I_moe" if moe_I != I else "I"
+    moe_2I_sym = f"2·I_moe" if moe_I != I else "2·I"
     expert_mm1 = OpNode(
         name="aten::mm", role="expert_gate_up",
         backend="torch-xpu-ops",
-        input_shapes=[[f"{tokens}·{top_k}", "H"], ["H", "2·I"]],
-        output_shape=[f"{tokens}·{top_k}", "2·I"],
-        memory_bytes=_mm_mem(T * top_k, H, 2 * I, dtype_bytes) if isinstance(T, int) else 0,
-        flops=_mm_flops(T * top_k, H, 2 * I) if isinstance(T, int) else 0,
+        input_shapes=[[f"{tokens}·{top_k}", "H"], ["H", moe_2I_sym]],
+        output_shape=[f"{tokens}·{top_k}", moe_2I_sym],
+        memory_bytes=_mm_mem(T * top_k, H, 2 * moe_I, dtype_bytes) if isinstance(T, int) else 0,
+        flops=_mm_flops(T * top_k, H, 2 * moe_I) if isinstance(T, int) else 0,
         phase=phase,
     )
     expert_act = OpNode(
         name="silu_and_mul", role="expert_activation",
         backend="vllm-xpu-kernels",
-        input_shapes=[[f"{tokens}·{top_k}", "2·I"]],
-        output_shape=[f"{tokens}·{top_k}", "I"],
-        memory_bytes=_activation_mem(T * top_k, I, dtype_bytes) if isinstance(T, int) else 0,
-        flops=_activation_flops(T * top_k, I) if isinstance(T, int) else 0,
+        input_shapes=[[f"{tokens}·{top_k}", moe_2I_sym]],
+        output_shape=[f"{tokens}·{top_k}", moe_I_sym],
+        memory_bytes=_activation_mem(T * top_k, moe_I, dtype_bytes) if isinstance(T, int) else 0,
+        flops=_activation_flops(T * top_k, moe_I) if isinstance(T, int) else 0,
         phase=phase,
     )
     expert_mm2 = OpNode(
         name="aten::mm", role="expert_down",
         backend="torch-xpu-ops",
-        input_shapes=[[f"{tokens}·{top_k}", "I"], ["I", "H"]],
+        input_shapes=[[f"{tokens}·{top_k}", moe_I_sym], [moe_I_sym, "H"]],
         output_shape=[f"{tokens}·{top_k}", "H"],
-        memory_bytes=_mm_mem(T * top_k, I, H, dtype_bytes) if isinstance(T, int) else 0,
-        flops=_mm_flops(T * top_k, I, H) if isinstance(T, int) else 0,
+        memory_bytes=_mm_mem(T * top_k, moe_I, H, dtype_bytes) if isinstance(T, int) else 0,
+        flops=_mm_flops(T * top_k, moe_I, H) if isinstance(T, int) else 0,
         phase=phase,
     )
+
+    moe_ops = [gate_op, align_op, expert_mm1, expert_act, expert_mm2]
+
+    # Shared experts (DeepSeek-style)
+    if n_shared > 0:
+        shared_mm1 = OpNode(
+            name="aten::mm", role="shared_expert_gate_up",
+            backend="torch-xpu-ops",
+            input_shapes=[[tokens, "H"], ["H", moe_2I_sym]],
+            output_shape=[tokens, moe_2I_sym],
+            memory_bytes=_mm_mem(T, H, 2 * moe_I * n_shared, dtype_bytes) if isinstance(T, int) else 0,
+            flops=_mm_flops(T, H, 2 * moe_I * n_shared) if isinstance(T, int) else 0,
+            phase=phase,
+        )
+        shared_act = OpNode(
+            name="silu_and_mul", role="shared_expert_activation",
+            backend="vllm-xpu-kernels",
+            input_shapes=[[tokens, moe_2I_sym]],
+            output_shape=[tokens, moe_I_sym],
+            memory_bytes=_activation_mem(T, moe_I * n_shared, dtype_bytes) if isinstance(T, int) else 0,
+            flops=_activation_flops(T, moe_I * n_shared) if isinstance(T, int) else 0,
+            phase=phase,
+        )
+        shared_mm2 = OpNode(
+            name="aten::mm", role="shared_expert_down",
+            backend="torch-xpu-ops",
+            input_shapes=[[tokens, moe_I_sym], [moe_I_sym, "H"]],
+            output_shape=[tokens, "H"],
+            memory_bytes=_mm_mem(T, moe_I * n_shared, H, dtype_bytes) if isinstance(T, int) else 0,
+            flops=_mm_flops(T, moe_I * n_shared, H) if isinstance(T, int) else 0,
+            phase=phase,
+        )
+        moe_ops.extend([shared_mm1, shared_act, shared_mm2])
 
     moe = ModuleNode(
         name="moe", path="model.layers.*.mlp",
         module_type=f"{arch_family}MoE",
-        ops=[gate_op, align_op, expert_mm1, expert_act, expert_mm2],
+        ops=moe_ops,
     )
 
     layer = ModuleNode(
@@ -461,6 +499,19 @@ def _dtype_bytes(dtype: str) -> int:
     return mapping.get(dt, 2)
 
 
+def min_profile_layers(model_summary: dict) -> int:
+    """Compute minimum layers to profile to capture all unique layer types.
+
+    For pure dense or pure MoE models: 1 layer suffices.
+    For hybrid models (e.g. DeepSeek with first_k_dense_replace=3):
+      need first_k_dense + 1 to capture both dense and MoE layers.
+    """
+    first_k = model_summary.get("first_k_dense_replace", 0) or 0
+    if first_k > 0 and model_summary.get("is_moe"):
+        return first_k + 1
+    return 1
+
+
 def build_model_graph(
     model_summary: dict,
     prefill_len: int | None = None,
@@ -497,6 +548,12 @@ def build_model_graph(
     if is_moe:
         cfg["num_experts"] = model_summary.get("num_experts", 8)
         cfg["num_experts_per_tok"] = model_summary.get("num_experts_per_tok", 2)
+        cfg["moe_intermediate_size"] = model_summary.get("moe_intermediate_size")
+        cfg["n_shared_experts"] = model_summary.get("n_shared_experts", 0)
+
+    # Hybrid dense/MoE detection
+    first_k_dense = model_summary.get("first_k_dense_replace", 0) or 0
+    cfg["first_k_dense_replace"] = first_k_dense
 
     # Set numeric token counts if specified
     if prefill_len:
@@ -516,6 +573,7 @@ def build_model_graph(
             "intermediate_size": cfg["intermediate_size"],
             "vocab_size": cfg["vocab_size"],
             "is_moe": is_moe,
+            "first_k_dense_replace": first_k_dense,
         },
         # Symbol → concrete value mapping for tooltips
         "symbols": {
@@ -538,6 +596,12 @@ def build_model_graph(
         result["symbols"]["B"] = decode_batch
     if is_moe:
         result["symbols"][str(cfg.get("num_experts", 8))] = cfg.get("num_experts", 8)
+        moe_I = cfg.get("moe_intermediate_size")
+        if moe_I and moe_I != cfg["intermediate_size"]:
+            result["symbols"]["I_moe"] = moe_I
+            result["symbols"]["2·I_moe"] = 2 * moe_I
+        if cfg.get("n_shared_experts", 0) > 0:
+            result["symbols"]["n_shared"] = cfg["n_shared_experts"]
 
     # Build prefill and decode graphs
     for phase, tok_var, seq_var in [
@@ -560,6 +624,7 @@ def _build_full_model(
     V = cfg["vocab_size"]
     dtype_bytes = cfg["dtype_bytes"]
     T = cfg.get(f"_{tokens}", tokens)
+    first_k_dense = cfg.get("first_k_dense_replace", 0)
 
     # Embedding
     embed = ModuleNode(
@@ -576,11 +641,28 @@ def _build_full_model(
         )],
     )
 
-    # Decoder layers
-    if is_moe:
+    # Decoder layers — handle hybrid dense/MoE
+    layers: list[ModuleNode] = []
+    if is_moe and first_k_dense > 0:
+        # Hybrid: first N layers are dense, rest are MoE
+        dense_layer = _build_decoder_layer(cfg, family, phase, tokens, seq)
+        dense_layer.name = "dense_layer"
+        dense_layer.module_type = f"{family}DenseLayer"
+        dense_layer.repeat_count = first_k_dense
+        layers.append(dense_layer)
+
+        num_moe_layers = cfg["num_layers"] - first_k_dense
+        moe_layer = _build_moe_layer(cfg, family, phase, tokens, seq)
+        moe_layer.name = "moe_layer"
+        moe_layer.module_type = f"{family}MoELayer"
+        moe_layer.repeat_count = num_moe_layers
+        layers.append(moe_layer)
+    elif is_moe:
         layer = _build_moe_layer(cfg, family, phase, tokens, seq)
+        layers.append(layer)
     else:
         layer = _build_decoder_layer(cfg, family, phase, tokens, seq)
+        layers.append(layer)
 
     # Final norm
     final_norm = ModuleNode(
@@ -607,7 +689,7 @@ def _build_full_model(
     root = ModuleNode(
         name="model", path="",
         module_type=f"{family}ForCausalLM",
-        children=[embed, layer, final_norm, lm_head],
+        children=[embed] + layers + [final_norm, lm_head],
     )
     return root
 

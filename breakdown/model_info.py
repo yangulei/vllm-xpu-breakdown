@@ -95,6 +95,16 @@ def summarize_config(config: dict[str, Any]) -> dict[str, Any]:
         "num_experts_per_tok": num_experts_per_tok,
         "quant_method": quant_method,
         "rope_type": config.get("rope_scaling", {}).get("type") if config.get("rope_scaling") else None,
+        # Hybrid dense/MoE: first N layers use dense MLP
+        "first_k_dense_replace": config.get("first_k_dense_replace", 0),
+        # MoE layer frequency (1 = every layer is MoE, 2 = every other, etc.)
+        "moe_layer_freq": config.get("moe_layer_freq", 1),
+        # Qwen-style: decoder_sparse_step (1 = all MoE, 2 = alternating)
+        "decoder_sparse_step": config.get("decoder_sparse_step", 0),
+        # MoE intermediate size (may differ from dense intermediate_size)
+        "moe_intermediate_size": config.get("moe_intermediate_size"),
+        # Shared experts
+        "n_shared_experts": config.get("n_shared_experts", 0),
     }
 
 
