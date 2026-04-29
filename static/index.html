@@ -814,7 +814,7 @@ function symTooltip(dimStr) {
   const s = String(dimStr);
   const val = symbols[s];
   if (val !== undefined) {
-    return `<span class="sym-dim" title="${s} = ${val.toLocaleString()}">${s}</span>`;
+    return { html: `<span class="sym-dim">${s}</span>`, concrete: val.toLocaleString() };
   }
   // Handle composite like "S·8" or "tokens·2"
   const parts = s.split('·');
@@ -823,22 +823,27 @@ function symTooltip(dimStr) {
     let allResolved = true;
     const htmlParts = parts.map(p => {
       const v = symbols[p];
-      if (v !== undefined) { numericProd *= v; return `<span class="sym-dim" title="${p} = ${v.toLocaleString()}">${p}</span>`; }
+      if (v !== undefined) { numericProd *= v; return `<span class="sym-dim">${p}</span>`; }
       const n = parseInt(p);
       if (!isNaN(n)) { numericProd *= n; return p; }
       allResolved = false;
       return p;
     });
-    const title = allResolved ? ` title="${s} = ${numericProd.toLocaleString()}"` : '';
-    return `<span${title}>${htmlParts.join('·')}</span>`;
+    return { html: htmlParts.join('·'), concrete: allResolved ? numericProd.toLocaleString() : null };
   }
-  return s;
+  return { html: s, concrete: s };
 }
 
 function fmtShapeGraph(shapes) {
-  return shapes.map(s =>
-    '[' + s.map(d => symTooltip(d)).join(', ') + ']'
-  ).join(' × ');
+  return shapes.map(tensorDims => {
+    const resolved = tensorDims.map(d => symTooltip(d));
+    const innerHtml = resolved.map(r => r.html).join(', ');
+    const concreteParts = resolved.map(r => r.concrete);
+    const allConcrete = concreteParts.every(c => c !== null);
+    const concreteStr = allConcrete ? `[${concreteParts.join(', ')}]` : '';
+    const title = concreteStr ? ` title="${concreteStr}"` : '';
+    return `<span${title}>[${innerHtml}]</span>`;
+  }).join(' × ');
 }
 
 function fmtAI2(ai) {
