@@ -799,8 +799,9 @@ def _annotate_node(
         cm, ct = _annotate_node(child, lookup, name_lookup, symbols)
         matched += cm
         total += ct
-        child_time += child.get("total_device_time_us", 0)
-        child_cpu += child.get("total_cpu_time_us", 0)
+        mult = child.get("repeat_count", 1)
+        child_time += child.get("total_device_time_us", 0) * mult
+        child_cpu += child.get("total_cpu_time_us", 0) * mult
 
     node["total_device_time_us"] = round(node_time + child_time, 2)
     node["total_cpu_time_us"] = round(node_cpu + child_cpu, 2)
