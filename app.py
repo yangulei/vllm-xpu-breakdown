@@ -76,10 +76,12 @@ def get_model_graph(model_id: str):
 
         prefill_len = request.args.get("prefill_len", 128, type=int)
         decode_batch = request.args.get("decode_batch", 1, type=int)
+        tp_size = request.args.get("tp_size", 1, type=int)
 
         graph = build_model_graph(summary,
                                   prefill_len=prefill_len,
-                                  decode_batch=decode_batch)
+                                  decode_batch=decode_batch,
+                                  tp_size=tp_size)
         min_layers = min_profile_layers(summary)
         return jsonify({
             "ok": True, "graph": graph, "summary": summary,
@@ -93,7 +95,8 @@ def get_model_graph(model_id: str):
 
 def _run_profile(model_id: str, mode: str, max_model_len: int,
                  batch_size: int, max_tokens: int, prompt: str,
-                 num_profile_layers: int | None = None):
+                 num_profile_layers: int | None = None,
+                 tp_size: int = 1):
     """Run profiling in a background thread using vLLM's native profiler.
 
     On XPU hardware, vLLM automatically selects XPUWorker which uses
@@ -104,6 +107,8 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             this many layers. Timing is then scaled by actual_layers/profiled
             for the full model estimate. Enables profiling models too large
             for the GPU.
+        tp_size: tensor parallel size (default 1). With TP>1, vLLM creates
+            one trace file per rank; we parse all and aggregate timing.
     """
     global _profile_state
     try:
@@ -147,6 +152,7 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
         engine_kwargs: dict = {
             "model": model_id,
             "max_model_len": max_model_len,
+            "tensor_parallel_size": tp_size,
             "profiler_config": {
                 "profiler": "torch",
                 "torch_profiler_dir": trace_dir,
@@ -189,6 +195,9 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
         llm.stop_profile()
 
         # --- Parse trace files ---
+        # With TP>1, vLLM produces one trace file per rank.
+        # We parse rank-0 trace as the canonical ops (all ranks have the
+        # same op sequence with identical per-rank shapes).
         trace_files = sorted(
             [os.path.join(trace_dir, f) for f in os.listdir(trace_dir)
              if f.endswith(".json") or f.endswith(".json.gz")],
@@ -201,7 +210,29 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
                 "Profiling may have failed in the worker process."
             )
 
-        op_dicts = parse_trace_file(trace_files[0])
+        # With TP>1, take the tp_size most recent files (one per rank).
+        # Parse rank-0 (most recent) for ops; average timing across all ranks.
+        rank_files = trace_files[:tp_size]
+        op_dicts = parse_trace_file(rank_files[0])
+
+        # If multi-rank, average device times across ranks
+        if tp_size > 1 and len(rank_files) > 1:
+            # Build timing map from additional ranks and average
+            for extra_file in rank_files[1:]:
+                extra_ops = parse_trace_file(extra_file)
+                extra_timing = {
+                    (o["name"], o.get("input_shapes", "")): o.get("device_time_us", 0)
+                    for o in extra_ops
+                }
+                for op in op_dicts:
+                    key = (op["name"], op.get("input_shapes", ""))
+                    extra_t = extra_timing.get(key, 0)
+                    op["device_time_us"] = (
+                        op.get("device_time_us", 0) + extra_t
+                    )
+            # Average across ranks
+            for op in op_dicts:
+                op["device_time_us"] = op.get("device_time_us", 0) / tp_size
 
         if not op_dicts:
             raise RuntimeError(
@@ -250,7 +281,8 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
         # Use actual_layers in the graph so repeat_count is correct
         try:
             graph = build_model_graph(summary, prefill_len=128,
-                                      decode_batch=batch_size)
+                                      decode_batch=batch_size,
+                                      tp_size=tp_size)
             annotate_graph_timing(graph, op_dicts)
             profile_result["graph"] = graph
         except Exception:
@@ -289,6 +321,7 @@ def start_profile():
     max_tokens = data.get("max_tokens", 128)
     prompt = data.get("prompt", "Write a short essay about AI.")
     num_profile_layers = data.get("num_profile_layers")  # None = all layers
+    tp_size = data.get("tensor_parallel_size", 1)
 
     with _profile_lock:
         _profile_state = {
@@ -301,7 +334,7 @@ def start_profile():
     thread = threading.Thread(
         target=_run_profile,
         args=(model_id, mode, max_model_len, batch_size, max_tokens, prompt,
-              num_profile_layers),
+              num_profile_layers, tp_size),
         daemon=True,
     )
     thread.start()

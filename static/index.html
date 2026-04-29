@@ -251,6 +251,16 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
           <option value="min" selected>Min (large models)</option>
         </select>
       </div>
+      <div class="control-group">
+        <label>TP Size</label>
+        <select id="tp-size-select" onchange="runStatic()">
+          <option value="1" selected>1</option>
+          <option value="2">2</option>
+          <option value="4">4</option>
+          <option value="8">8</option>
+          <option value="16">16</option>
+        </select>
+      </div>
       <div style="display:flex;gap:8px;align-self:flex-end">
         <button class="btn btn-primary" id="static-btn" onclick="runStatic()"
                 style="background:#2e7d32">⚡ Static</button>
@@ -418,9 +428,10 @@ async function loadConfig() {
 async function runStatic() {
   const modelId = document.getElementById('model-input').value.trim();
   if (!modelId) { alert('Enter a model ID first'); return; }
+  const tpSize = parseInt(document.getElementById('tp-size-select').value);
 
   try {
-    const resp = await fetch(`/api/model/${encodeURIComponent(modelId)}/graph?prefill_len=128&decode_batch=1`);
+    const resp = await fetch(`/api/model/${encodeURIComponent(modelId)}/graph?prefill_len=128&decode_batch=1&tp_size=${tpSize}`);
     const data = await resp.json();
     if (!data.ok) { alert('Graph error: ' + data.error); return; }
     STATIC_GRAPH_DATA = data.graph;
@@ -509,6 +520,7 @@ async function startProfile() {
       const v = document.getElementById('num-layers-select').value;
       return v === 'all' ? null : v;
     })(),
+    tensor_parallel_size: parseInt(document.getElementById('tp-size-select').value),
   };
 
   document.getElementById('profile-btn').disabled = true;
@@ -788,6 +800,15 @@ function renderGraph() {
     modeTag.textContent = '⚡ Static Analysis';
   }
   legend.appendChild(modeTag);
+
+  // Show TP indicator
+  const tpSize = GRAPH_DATA.config?.tp_size || 1;
+  if (tpSize > 1) {
+    const tpTag = document.createElement('span');
+    tpTag.style.cssText = 'font-weight:600;padding:2px 8px;border-radius:4px;font-size:11px;margin-right:8px;background:#fff3e0;color:#e65100;';
+    tpTag.textContent = `TP=${tpSize} (per-rank)`;
+    legend.appendChild(tpTag);
+  }
 
   const order = ['S','B','H','n_h','n_kv','d','I','2·I','QKV','n_h·d','V'];
   for (const sym of order) {

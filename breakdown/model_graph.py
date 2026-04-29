@@ -516,6 +516,7 @@ def build_model_graph(
     model_summary: dict,
     prefill_len: int | None = None,
     decode_batch: int | None = None,
+    tp_size: int = 1,
 ) -> dict:
     """Build static model graph from model summary (from model_info.py).
 
@@ -524,6 +525,7 @@ def build_model_graph(
                        hidden_size, num_layers, num_heads, etc.
         prefill_len: prefill sequence length (for shape estimation)
         decode_batch: decode batch size (for shape estimation)
+        tp_size: tensor parallel size (splits heads, intermediate, vocab)
 
     Returns:
         Dict with "prefill" and "decode" trees, plus metadata.
@@ -532,23 +534,37 @@ def build_model_graph(
     family = _ARCH_FAMILY_MAP.get(arch, "Unknown")
     is_moe = model_summary.get("is_moe", False)
 
-    # Build config dict for internal use
+    # Full (un-split) dimensions for reference
+    full_num_heads = model_summary["num_heads"]
+    full_num_kv = model_summary.get("num_kv_heads", full_num_heads)
+    full_intermediate = model_summary["intermediate_size"]
+    full_vocab = model_summary["vocab_size"]
+
+    # TP-split dimensions (column-parallel splits output, row-parallel splits input)
+    tp_num_heads = full_num_heads // tp_size
+    tp_num_kv = full_num_kv // tp_size
+    tp_intermediate = full_intermediate // tp_size
+    tp_vocab = full_vocab // tp_size
+
+    # Build config dict — uses TP-adjusted dims for per-rank shapes
     cfg: dict[str, Any] = {
         "hidden_size": model_summary["hidden_size"],
         "num_layers": model_summary["num_layers"],
-        "num_heads": model_summary["num_heads"],
-        "num_kv_heads": model_summary.get("num_kv_heads", model_summary["num_heads"]),
-        "head_dim": model_summary.get("head_dim", model_summary["hidden_size"] // model_summary["num_heads"]),
-        "intermediate_size": model_summary["intermediate_size"],
-        "vocab_size": model_summary["vocab_size"],
+        "num_heads": tp_num_heads,
+        "num_kv_heads": tp_num_kv,
+        "head_dim": model_summary.get("head_dim", model_summary["hidden_size"] // full_num_heads),
+        "intermediate_size": tp_intermediate,
+        "vocab_size": tp_vocab,
         "dtype_bytes": _dtype_bytes(model_summary.get("dtype", "bfloat16")),
         "has_qk_norm": family in _HAS_QK_NORM,
+        "tp_size": tp_size,
     }
 
     if is_moe:
         cfg["num_experts"] = model_summary.get("num_experts", 8)
         cfg["num_experts_per_tok"] = model_summary.get("num_experts_per_tok", 2)
-        cfg["moe_intermediate_size"] = model_summary.get("moe_intermediate_size")
+        raw_moe_I = model_summary.get("moe_intermediate_size")
+        cfg["moe_intermediate_size"] = (raw_moe_I // tp_size) if raw_moe_I else None
         cfg["n_shared_experts"] = model_summary.get("n_shared_experts", 0)
 
     # Hybrid dense/MoE detection
@@ -574,8 +590,10 @@ def build_model_graph(
             "vocab_size": cfg["vocab_size"],
             "is_moe": is_moe,
             "first_k_dense_replace": first_k_dense,
+            "tp_size": tp_size,
         },
         # Symbol → concrete value mapping for tooltips
+        # When TP>1, dimensions shown are per-rank
         "symbols": {
             "H": cfg["hidden_size"],
             "n_h": cfg["num_heads"],
@@ -588,6 +606,9 @@ def build_model_graph(
             "n_h·d": cfg["num_heads"] * cfg["head_dim"],
         },
     }
+
+    if tp_size > 1:
+        result["tp_note"] = f"Per-rank shapes (TP={tp_size})"
 
     # Add phase-specific symbols
     if prefill_len:
