@@ -90,6 +90,11 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 .phase-btn { padding: 6px 14px; border: 1px solid var(--border); border-radius: 6px;
              background: #fff; cursor: pointer; font-size: 13px; }
 .phase-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.symbol-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; padding: 10px 14px;
+                 background: #f5f7fa; border-radius: 8px; margin-bottom: 14px; font-size: 12px; }
+.symbol-legend .sym { font-family: 'SF Mono', SFMono-Regular, monospace; font-weight: 600;
+                      color: var(--accent); }
+.symbol-legend .sym-val { color: var(--text2); }
 .tree-node { margin-left: 20px; border-left: 1px solid #e0e0e0; padding-left: 12px; }
 .tree-node.root { margin-left: 0; border-left: none; padding-left: 0; }
 .tree-header { display: flex; align-items: center; gap: 8px; padding: 6px 0; cursor: pointer;
@@ -108,9 +113,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 .tree-op .op-name { font-family: 'SF Mono', monospace; font-size: 11px; min-width: 200px; }
 .tree-op .op-backend { font-size: 10px; }
 .tree-op .op-shapes { font-family: 'SF Mono', monospace; font-size: 10px; color: #666; }
-.tree-op .op-cost { font-size: 10px; color: #888; margin-left: auto; }
+.tree-op .op-cost { font-size: 10px; color: #888; margin-left: auto; white-space: nowrap; }
 .tree-children { }
 .tree-children.collapsed { display: none; }
+.sym-dim { font-family: 'SF Mono', SFMono-Regular, monospace; color: var(--accent);
+           font-weight: 600; cursor: help; border-bottom: 1px dotted var(--accent);
+           position: relative; }
 
 /* Results */
 #results { display: none; }
@@ -262,6 +270,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
       <p style="font-size:12px;color:#888;margin-bottom:12px">
         Static analysis — derived from model config without profiling. Backends are <em>likely</em> dispatch targets in eager mode.
       </p>
+      <div class="symbol-legend" id="symbol-legend"></div>
       <div id="graph-tree"></div>
     </div>
   </div>
@@ -667,9 +676,66 @@ function renderGraph() {
   if (!GRAPH_DATA) return;
   const tree = GRAPH_DATA[currentPhase];
   if (!tree) return;
+
+  // Symbol legend
+  const symbols = GRAPH_DATA.symbols || {};
+  const legend = document.getElementById('symbol-legend');
+  legend.innerHTML = '';
+  const order = ['S','B','H','n_h','n_kv','d','I','2·I','QKV','n_h·d','V'];
+  for (const sym of order) {
+    if (!(sym in symbols)) continue;
+    const el = document.createElement('span');
+    el.innerHTML = `<span class="sym">${sym}</span> <span class="sym-val">= ${symbols[sym].toLocaleString()}</span>`;
+    legend.appendChild(el);
+  }
+  // Any remaining symbols not in order
+  for (const [sym, val] of Object.entries(symbols)) {
+    if (order.includes(sym)) continue;
+    const el = document.createElement('span');
+    el.innerHTML = `<span class="sym">${sym}</span> <span class="sym-val">= ${val.toLocaleString()}</span>`;
+    legend.appendChild(el);
+  }
+
   const container = document.getElementById('graph-tree');
   container.innerHTML = '';
   container.appendChild(buildTreeNode(tree, true));
+}
+
+function symTooltip(dimStr) {
+  const symbols = GRAPH_DATA?.symbols || {};
+  const s = String(dimStr);
+  const val = symbols[s];
+  if (val !== undefined) {
+    return `<span class="sym-dim" title="${s} = ${val.toLocaleString()}">${s}</span>`;
+  }
+  // Handle composite like "S·8" or "tokens·2"
+  const parts = s.split('·');
+  if (parts.length > 1) {
+    let numericProd = 1;
+    let allResolved = true;
+    const htmlParts = parts.map(p => {
+      const v = symbols[p];
+      if (v !== undefined) { numericProd *= v; return `<span class="sym-dim" title="${p} = ${v.toLocaleString()}">${p}</span>`; }
+      const n = parseInt(p);
+      if (!isNaN(n)) { numericProd *= n; return p; }
+      allResolved = false;
+      return p;
+    });
+    const title = allResolved ? ` title="${s} = ${numericProd.toLocaleString()}"` : '';
+    return `<span${title}>${htmlParts.join('·')}</span>`;
+  }
+  return s;
+}
+
+function fmtShapeGraph(shapes) {
+  return shapes.map(s =>
+    '[' + s.map(d => symTooltip(d)).join(', ') + ']'
+  ).join(' × ');
+}
+
+function fmtAI2(ai) {
+  if (!ai || ai === 0) return '';
+  return 'AI=' + (ai >= 100 ? ai.toFixed(0) : ai.toFixed(1));
 }
 
 function buildTreeNode(node, isRoot) {
@@ -708,13 +774,16 @@ function buildTreeNode(node, isRoot) {
   stats.className = 'tree-stats';
   const mem = node.total_memory;
   const flops = node.total_flops;
-  let statsText = '';
-  if (mem > 0) statsText += fmtBytes(mem) + ' mem';
-  if (flops > 0) statsText += (statsText ? ' · ' : '') + fmtFlops(flops);
-  if (node.repeat_count > 1) {
+  const ai = node.total_ai || 0;
+  let parts = [];
+  if (mem > 0) parts.push(fmtBytes(mem));
+  if (flops > 0) parts.push(fmtFlops(flops));
+  if (ai > 0) parts.push(fmtAI2(ai));
+  let statsText = parts.join(' · ');
+  if (node.repeat_count > 1 && mem > 0) {
     const totalMem = mem * node.repeat_count;
     const totalFlops = flops * node.repeat_count;
-    if (totalMem > 0) statsText += ` (total: ${fmtBytes(totalMem)})`;
+    statsText += ` (×${node.repeat_count}: ${fmtBytes(totalMem)} · ${fmtFlops(totalFlops)})`;
   }
   stats.textContent = statsText;
   header.appendChild(stats);
@@ -732,17 +801,18 @@ function buildTreeNode(node, isRoot) {
     for (const op of node.ops) {
       const opEl = document.createElement('div');
       opEl.className = 'tree-op';
-      const color = COLORS[op.backend] || '#999';
-      const shapesStr = op.input_shapes.map(s =>
-        '[' + s.join(', ') + ']'
-      ).join(' × ');
+      const shapesHtml = fmtShapeGraph(op.input_shapes);
+      let costParts = [];
+      if (op.memory_bytes > 0) costParts.push(fmtBytes(op.memory_bytes));
+      if (op.flops > 0) costParts.push(fmtFlops(op.flops));
+      if (op.ai > 0) costParts.push(fmtAI2(op.ai));
       opEl.innerHTML = `
         <span class="op-role">${op.role}</span>
         <span class="op-name">${escHtml(op.name)}</span>
         <span class="badge op-backend ${op.backend.replace(/[^a-z-]/g,'')}"
               style="font-size:10px">${op.backend}</span>
-        <span class="op-shapes">${shapesStr}</span>
-        <span class="op-cost">${op.memory_bytes > 0 ? fmtBytes(op.memory_bytes) : ''}${op.flops > 0 ? ' · ' + fmtFlops(op.flops) : ''}</span>`;
+        <span class="op-shapes">${shapesHtml}</span>
+        <span class="op-cost">${costParts.join(' · ')}</span>`;
       opsDiv.appendChild(opEl);
     }
     childrenDiv.appendChild(opsDiv);
