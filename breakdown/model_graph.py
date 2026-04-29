@@ -626,3 +626,182 @@ def _compute_totals(node: ModuleNode) -> tuple[int, int]:
     node.total_memory = mem
     node.total_flops = flops
     return mem, flops
+
+
+# ===================================================================
+# Timing annotation — merge profiling data into static graph
+# ===================================================================
+
+def _normalize_trace_name(name: str) -> str:
+    """Strip C++ binding prefixes from trace op names."""
+    for prefix in ("_C_cache_ops::", "_C::", "_xpu_C::", "torch::ops::"):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def _parse_shapes_str(s: str) -> list[list[int]]:
+    """Parse shape string like '[[1, 2560], [2560, 6144]]' to nested list."""
+    if not s or s == "—":
+        return []
+    import ast
+    try:
+        parsed = ast.literal_eval(s)
+        if isinstance(parsed, list):
+            return [
+                [int(d) for d in shape if isinstance(d, (int, float))]
+                for shape in parsed
+                if isinstance(shape, (list, tuple))
+            ]
+    except (ValueError, SyntaxError):
+        pass
+    return []
+
+
+def _resolve_dim(d: Any, symbols: dict) -> Any:
+    """Resolve a symbolic dimension to its concrete value."""
+    if isinstance(d, (int, float)):
+        return int(d)
+    s = str(d)
+    if s in symbols:
+        return symbols[s]
+    parts = s.split("·")
+    if len(parts) > 1:
+        prod = 1
+        for p in parts:
+            if p in symbols:
+                prod *= symbols[p]
+            elif p.isdigit():
+                prod *= int(p)
+            else:
+                return s
+        return prod
+    try:
+        return int(s)
+    except (ValueError, TypeError):
+        return s
+
+
+def _resolve_shapes(shapes: list[list], symbols: dict) -> list[tuple]:
+    """Resolve all symbolic dims in shapes to concrete values."""
+    return [tuple(_resolve_dim(d, symbols) for d in shape) for shape in shapes]
+
+
+def _first_input_nontok_dims(shapes: list) -> tuple:
+    """Extract non-token dims from the first input shape."""
+    if not shapes:
+        return ()
+    first = shapes[0]
+    if isinstance(first, (list, tuple)) and len(first) > 1:
+        return tuple(first[1:])
+    return ()
+
+
+def annotate_graph_timing(graph: dict, trace_ops: list[dict]) -> None:
+    """Annotate graph ops in-place with measured timing from profiling.
+
+    Matches trace ops to graph ops using name + shape signatures.
+    For aten::mm, matches by weight-matrix shape (2nd tensor).
+    For other ops, matches by normalized name + first-input non-token dims.
+    Falls back to name-only matching for unique op names.
+
+    Args:
+        graph: Output of build_model_graph() — modified in place.
+        trace_ops: Raw op dicts from trace_parser.parse_trace_file().
+    """
+    symbols = graph.get("symbols", {})
+
+    # Build lookup: (normalized_name, signature) → {device_us, cpu_us, count}
+    lookup: dict[tuple, dict] = {}
+    # Also build name-only lookup for fallback
+    name_lookup: dict[str, dict] = {}
+    for op in trace_ops:
+        raw_name = op.get("name", "")
+        norm = _normalize_trace_name(raw_name)
+        shapes = _parse_shapes_str(op.get("input_shapes", ""))
+        dur_dev = op.get("device_time_us", 0) or 0
+        dur_cpu = op.get("cpu_time_us", 0) or 0
+        count = op.get("count", 1)
+
+        # Build key based on op type
+        if norm == "aten::mm" and len(shapes) >= 2:
+            key = ("aten::mm", tuple(shapes[1]))
+        else:
+            key = (norm, _first_input_nontok_dims(shapes))
+
+        if key not in lookup:
+            lookup[key] = {"device_us": 0.0, "cpu_us": 0.0, "count": 0}
+        lookup[key]["device_us"] += dur_dev
+        lookup[key]["cpu_us"] += dur_cpu
+        lookup[key]["count"] += count
+
+        # Name-only aggregation for fallback
+        if norm not in name_lookup:
+            name_lookup[norm] = {"device_us": 0.0, "cpu_us": 0.0, "count": 0}
+        name_lookup[norm]["device_us"] += dur_dev
+        name_lookup[norm]["cpu_us"] += dur_cpu
+        name_lookup[norm]["count"] += count
+
+    # Walk graph and annotate
+    matched = 0
+    total_ops = 0
+    for phase in ("prefill", "decode"):
+        if phase in graph:
+            m, t = _annotate_node(graph[phase], lookup, name_lookup, symbols)
+            matched += m
+            total_ops += t
+
+    graph["has_timing"] = True
+    graph["timing_matched"] = matched
+    graph["timing_total_ops"] = total_ops
+
+
+def _annotate_node(
+    node: dict, lookup: dict, name_lookup: dict, symbols: dict
+) -> tuple[int, int]:
+    """Annotate a serialized node dict in-place. Returns (matched, total)."""
+    node_time = 0.0
+    node_cpu = 0.0
+    matched = 0
+    total = 0
+
+    for op in node.get("ops", []):
+        total += 1
+        resolved = _resolve_shapes(op["input_shapes"], symbols)
+
+        # Build key to match against lookup
+        if op["name"] == "aten::mm" and len(resolved) >= 2:
+            key = ("aten::mm", tuple(resolved[1]))
+        else:
+            norm = _normalize_trace_name(op["name"])
+            key = (norm, _first_input_nontok_dims(resolved))
+
+        info = lookup.get(key)
+
+        # Fallback: try name-only match for ops with unique/complex args
+        if info is None:
+            norm = _normalize_trace_name(op["name"])
+            info = name_lookup.get(norm)
+
+        if info is not None:
+            per_call_dev = info["device_us"] / max(info["count"], 1)
+            per_call_cpu = info["cpu_us"] / max(info["count"], 1)
+            op["device_time_us"] = round(per_call_dev, 2)
+            op["cpu_time_us"] = round(per_call_cpu, 2)
+            op["profiled_calls"] = info["count"]
+            node_time += per_call_dev
+            node_cpu += per_call_cpu
+            matched += 1
+
+    child_time = 0.0
+    child_cpu = 0.0
+    for child in node.get("children", []):
+        cm, ct = _annotate_node(child, lookup, name_lookup, symbols)
+        matched += cm
+        total += ct
+        child_time += child.get("total_device_time_us", 0)
+        child_cpu += child.get("total_cpu_time_us", 0)
+
+    node["total_device_time_us"] = round(node_time + child_time, 2)
+    node["total_cpu_time_us"] = round(node_cpu + child_cpu, 2)
+    return matched, total
