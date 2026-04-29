@@ -50,6 +50,7 @@ class ModuleNode:
 
     def to_dict(self) -> dict:
         """Serialize to JSON-friendly dict."""
+        ai = (self.total_flops / self.total_memory) if self.total_memory > 0 else 0
         d: dict[str, Any] = {
             "name": self.name,
             "path": self.path,
@@ -57,6 +58,7 @@ class ModuleNode:
             "repeat_count": self.repeat_count,
             "total_memory": self.total_memory,
             "total_flops": self.total_flops,
+            "total_ai": round(ai, 2),
             "ops": [
                 {
                     "name": op.name,
@@ -66,6 +68,7 @@ class ModuleNode:
                     "output_shape": op.output_shape,
                     "memory_bytes": op.memory_bytes,
                     "flops": op.flops,
+                    "ai": round(op.flops / op.memory_bytes, 2) if op.memory_bytes > 0 else 0,
                     "phase": op.phase,
                 }
                 for op in self.ops
@@ -514,7 +517,27 @@ def build_model_graph(
             "vocab_size": cfg["vocab_size"],
             "is_moe": is_moe,
         },
+        # Symbol → concrete value mapping for tooltips
+        "symbols": {
+            "H": cfg["hidden_size"],
+            "n_h": cfg["num_heads"],
+            "n_kv": cfg["num_kv_heads"],
+            "d": cfg["head_dim"],
+            "I": cfg["intermediate_size"],
+            "2·I": 2 * cfg["intermediate_size"],
+            "V": cfg["vocab_size"],
+            "QKV": (cfg["num_heads"] + 2 * cfg["num_kv_heads"]) * cfg["head_dim"],
+            "n_h·d": cfg["num_heads"] * cfg["head_dim"],
+        },
     }
+
+    # Add phase-specific symbols
+    if prefill_len:
+        result["symbols"]["S"] = prefill_len
+    if decode_batch:
+        result["symbols"]["B"] = decode_batch
+    if is_moe:
+        result["symbols"][str(cfg.get("num_experts", 8))] = cfg.get("num_experts", 8)
 
     # Build prefill and decode graphs
     for phase, tok_var, seq_var in [
