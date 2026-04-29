@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from breakdown.analyzer import AnalyzedOp, analyze_ops
 from breakdown.classifier import Backend, classify_op
+from breakdown.model_graph import build_model_graph
 from breakdown.model_info import fetch_model_config, get_dim_symbols, summarize_config
 from breakdown.registry import ALL_VLLM_XPU_OPS
 
@@ -58,6 +59,24 @@ def get_model_config(model_id: str):
         config = fetch_model_config(model_id)
         summary = summarize_config(config)
         return jsonify({"ok": True, "config": config, "summary": summary})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+
+@app.route("/api/model/<path:model_id>/graph")
+def get_model_graph(model_id: str):
+    """Build static model graph (no profiling needed)."""
+    try:
+        config = fetch_model_config(model_id)
+        summary = summarize_config(config)
+
+        prefill_len = request.args.get("prefill_len", 128, type=int)
+        decode_batch = request.args.get("decode_batch", 1, type=int)
+
+        graph = build_model_graph(summary,
+                                  prefill_len=prefill_len,
+                                  decode_batch=decode_batch)
+        return jsonify({"ok": True, "graph": graph, "summary": summary})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
 

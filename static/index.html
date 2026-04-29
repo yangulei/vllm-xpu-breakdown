@@ -74,6 +74,44 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
            border-radius: 50%; animation: spin 0.8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* Tabs */
+.tab-bar { display: flex; gap: 0; border-bottom: 2px solid var(--border); margin-bottom: 20px; }
+.tab-btn { padding: 10px 20px; border: none; background: none; cursor: pointer;
+           font-size: 14px; font-weight: 500; color: var(--text2); position: relative; }
+.tab-btn.active { color: var(--accent); }
+.tab-btn.active::after { content: ''; position: absolute; bottom: -2px; left: 0; right: 0;
+                          height: 2px; background: var(--accent); }
+.tab-btn:hover { color: var(--accent); }
+
+/* Model Graph */
+#graph-section { display: none; }
+#graph-section.visible { display: block; }
+.graph-phase-toggle { display: flex; gap: 8px; margin-bottom: 16px; }
+.phase-btn { padding: 6px 14px; border: 1px solid var(--border); border-radius: 6px;
+             background: #fff; cursor: pointer; font-size: 13px; }
+.phase-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+.tree-node { margin-left: 20px; border-left: 1px solid #e0e0e0; padding-left: 12px; }
+.tree-node.root { margin-left: 0; border-left: none; padding-left: 0; }
+.tree-header { display: flex; align-items: center; gap: 8px; padding: 6px 0; cursor: pointer;
+               border-radius: 4px; }
+.tree-header:hover { background: #f5f7fa; }
+.tree-toggle { width: 18px; font-size: 12px; color: #888; user-select: none; }
+.tree-module-name { font-weight: 600; font-size: 13px; }
+.tree-module-type { font-size: 11px; color: var(--text2); }
+.tree-repeat { font-size: 11px; color: var(--accent); font-weight: 600; }
+.tree-stats { font-size: 11px; color: #888; margin-left: auto; white-space: nowrap; }
+.tree-ops { margin-left: 30px; margin-top: 2px; margin-bottom: 4px; }
+.tree-op { display: flex; align-items: center; gap: 6px; padding: 3px 8px;
+           font-size: 12px; border-radius: 4px; margin-bottom: 1px; }
+.tree-op:hover { background: #f8f9fa; }
+.tree-op .op-role { width: 140px; color: var(--text2); font-style: italic; }
+.tree-op .op-name { font-family: 'SF Mono', monospace; font-size: 11px; min-width: 200px; }
+.tree-op .op-backend { font-size: 10px; }
+.tree-op .op-shapes { font-family: 'SF Mono', monospace; font-size: 10px; color: #666; }
+.tree-op .op-cost { font-size: 10px; color: #888; margin-left: auto; }
+.tree-children { }
+.tree-children.collapsed { display: none; }
+
 /* Results */
 #results { display: none; }
 #results.visible { display: block; }
@@ -211,7 +249,24 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
     <span id="status-text">Profiling...</span>
   </div>
 
-  <!-- Results -->
+  <!-- Model Graph (static analysis, no profiling needed) -->
+  <div id="graph-section">
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <h2 style="margin-bottom:0">Model Graph — Op Dispatch by Module</h2>
+        <div class="graph-phase-toggle">
+          <button class="phase-btn active" data-phase="prefill" onclick="setPhase(this)">Prefill</button>
+          <button class="phase-btn" data-phase="decode" onclick="setPhase(this)">Decode</button>
+        </div>
+      </div>
+      <p style="font-size:12px;color:#888;margin-bottom:12px">
+        Static analysis — derived from model config without profiling. Backends are <em>likely</em> dispatch targets in eager mode.
+      </p>
+      <div id="graph-tree"></div>
+    </div>
+  </div>
+
+  <!-- Results (from profiling) -->
   <div id="results">
     <div class="stats-grid" id="stats-grid"></div>
 
@@ -261,6 +316,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 <script>
 // ---- State ----
 let DATA = null;
+let GRAPH_DATA = null;
+let currentPhase = 'prefill';
 let currentSort = { key: 'device_time_us', asc: false };
 let currentFilter = 'all';
 let searchText = '';
@@ -321,8 +378,24 @@ async function loadConfig() {
 
     modelSummary = data.summary;
     showModelSummary(modelId, data.summary);
+
+    // Load model graph (static analysis)
+    loadModelGraph(modelId);
   } catch(e) {
     alert('Failed to fetch config: ' + e.message);
+  }
+}
+
+async function loadModelGraph(modelId) {
+  try {
+    const resp = await fetch(`/api/model/${encodeURIComponent(modelId)}/graph?prefill_len=128&decode_batch=1`);
+    const data = await resp.json();
+    if (!data.ok) return;
+    GRAPH_DATA = data.graph;
+    document.getElementById('graph-section').classList.add('visible');
+    renderGraph();
+  } catch(e) {
+    console.warn('Graph load failed:', e);
   }
 }
 
@@ -580,6 +653,119 @@ function escHtml(s) {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
+}
+
+// ---- Model Graph ----
+function setPhase(el) {
+  document.querySelectorAll('.phase-btn').forEach(b => b.classList.remove('active'));
+  el.classList.add('active');
+  currentPhase = el.dataset.phase;
+  renderGraph();
+}
+
+function renderGraph() {
+  if (!GRAPH_DATA) return;
+  const tree = GRAPH_DATA[currentPhase];
+  if (!tree) return;
+  const container = document.getElementById('graph-tree');
+  container.innerHTML = '';
+  container.appendChild(buildTreeNode(tree, true));
+}
+
+function buildTreeNode(node, isRoot) {
+  const div = document.createElement('div');
+  div.className = 'tree-node' + (isRoot ? ' root' : '');
+
+  const hasChildren = (node.children && node.children.length > 0) || (node.ops && node.ops.length > 0);
+
+  // Header row
+  const header = document.createElement('div');
+  header.className = 'tree-header';
+
+  const toggle = document.createElement('span');
+  toggle.className = 'tree-toggle';
+  toggle.textContent = hasChildren ? '▼' : ' ';
+  header.appendChild(toggle);
+
+  const name = document.createElement('span');
+  name.className = 'tree-module-name';
+  name.textContent = node.name;
+  header.appendChild(name);
+
+  const mtype = document.createElement('span');
+  mtype.className = 'tree-module-type';
+  mtype.textContent = node.module_type;
+  header.appendChild(mtype);
+
+  if (node.repeat_count > 1) {
+    const rep = document.createElement('span');
+    rep.className = 'tree-repeat';
+    rep.textContent = `×${node.repeat_count}`;
+    header.appendChild(rep);
+  }
+
+  const stats = document.createElement('span');
+  stats.className = 'tree-stats';
+  const mem = node.total_memory;
+  const flops = node.total_flops;
+  let statsText = '';
+  if (mem > 0) statsText += fmtBytes(mem) + ' mem';
+  if (flops > 0) statsText += (statsText ? ' · ' : '') + fmtFlops(flops);
+  if (node.repeat_count > 1) {
+    const totalMem = mem * node.repeat_count;
+    const totalFlops = flops * node.repeat_count;
+    if (totalMem > 0) statsText += ` (total: ${fmtBytes(totalMem)})`;
+  }
+  stats.textContent = statsText;
+  header.appendChild(stats);
+
+  div.appendChild(header);
+
+  // Children container
+  const childrenDiv = document.createElement('div');
+  childrenDiv.className = 'tree-children';
+
+  // Ops list
+  if (node.ops && node.ops.length > 0) {
+    const opsDiv = document.createElement('div');
+    opsDiv.className = 'tree-ops';
+    for (const op of node.ops) {
+      const opEl = document.createElement('div');
+      opEl.className = 'tree-op';
+      const color = COLORS[op.backend] || '#999';
+      const shapesStr = op.input_shapes.map(s =>
+        '[' + s.join(', ') + ']'
+      ).join(' × ');
+      opEl.innerHTML = `
+        <span class="op-role">${op.role}</span>
+        <span class="op-name">${escHtml(op.name)}</span>
+        <span class="badge op-backend ${op.backend.replace(/[^a-z-]/g,'')}"
+              style="font-size:10px">${op.backend}</span>
+        <span class="op-shapes">${shapesStr}</span>
+        <span class="op-cost">${op.memory_bytes > 0 ? fmtBytes(op.memory_bytes) : ''}${op.flops > 0 ? ' · ' + fmtFlops(op.flops) : ''}</span>`;
+      opsDiv.appendChild(opEl);
+    }
+    childrenDiv.appendChild(opsDiv);
+  }
+
+  // Sub-modules
+  if (node.children) {
+    for (const child of node.children) {
+      childrenDiv.appendChild(buildTreeNode(child, false));
+    }
+  }
+
+  div.appendChild(childrenDiv);
+
+  // Toggle collapse
+  if (hasChildren) {
+    header.addEventListener('click', () => {
+      const collapsed = childrenDiv.classList.toggle('collapsed');
+      toggle.textContent = collapsed ? '▶' : '▼';
+    });
+  }
+
+  return div;
 }
 
 // ---- Export Excel ----
