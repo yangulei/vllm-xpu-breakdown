@@ -55,7 +55,7 @@ def summarize_config(config: dict[str, Any]) -> dict[str, Any]:
     head_dim = config.get("head_dim")
     if head_dim is None and hidden_size and num_heads:
         head_dim = hidden_size // num_heads
-    intermediate_size = config.get("intermediate_size")
+    intermediate_size = config.get("intermediate_size") or config.get("ffn_dim")
     vocab_size = config.get("vocab_size")
     max_position = config.get("max_position_embeddings")
     dtype = config.get("torch_dtype", "unknown")

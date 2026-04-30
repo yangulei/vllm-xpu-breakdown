@@ -21,13 +21,14 @@ import traceback
 from dataclasses import asdict
 from pathlib import Path
 
-from flask import Flask, Response, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_file, send_from_directory
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from breakdown.analyzer import AnalyzedOp, analyze_ops
 from breakdown.classifier import Backend, classify_op
 from breakdown.model_graph import (
+    annotate_graph_from_modules,
     annotate_graph_timing,
     build_model_graph,
     min_profile_layers,
@@ -116,7 +117,7 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
     try:
         from vllm import LLM, SamplingParams
 
-        from breakdown.trace_parser import parse_trace_file
+        from breakdown.trace_parser import parse_trace_file, parse_trace_with_modules
 
         # Fetch model config for analysis
         try:
@@ -159,9 +160,9 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
                 "profiler": "torch",
                 "torch_profiler_dir": trace_dir,
                 "torch_profiler_record_shapes": True,
-                "torch_profiler_with_stack": False,
+                "torch_profiler_with_stack": True,
                 "torch_profiler_with_flops": True,
-                "torch_profiler_use_gzip": False,
+                "torch_profiler_use_gzip": True,
             },
         }
 
@@ -292,6 +293,8 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             "profiled_layers": profiled_layers,
             "actual_layers": actual_layers,
             "layer_scale": layer_scale,
+            # Trace file path for download
+            "trace_file": rank_files[0],
         }
 
         # Build annotated graph — same tree view with timing overlaid
@@ -301,7 +304,13 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
                                       decode_batch=batch_size,
                                       context_len=max_model_len,
                                       tp_size=tp_size)
-            annotate_graph_timing(graph, op_dicts)
+            # Try module-path-based annotation first (more precise)
+            module_ops = parse_trace_with_modules(rank_files[0])
+            if module_ops:
+                annotate_graph_from_modules(graph, module_ops)
+            else:
+                # Fall back to name+shape matching
+                annotate_graph_timing(graph, op_dicts)
             profile_result["graph"] = graph
         except Exception:
             pass  # Graph annotation is best-effort
@@ -381,7 +390,40 @@ def profile_result():
                 "status": _profile_state["status"],
                 "error": _profile_state.get("error"),
             }), 202
-        return jsonify({"ok": True, "data": _profile_state["result"]})
+        result = _profile_state["result"]
+    # Don't expose internal trace_file path; indicate availability
+    client_result = {k: v for k, v in result.items() if k != "trace_file"}
+    client_result["has_trace"] = bool(result.get("trace_file"))
+    return jsonify({"ok": True, "data": client_result})
+
+
+@app.route("/api/profile/trace")
+def download_trace():
+    """Download the profiled trace file with a descriptive filename."""
+    with _profile_lock:
+        if _profile_state["status"] != "done" or not _profile_state.get("result"):
+            return jsonify({"ok": False, "error": "No profile result available"}), 404
+        result = _profile_state["result"]
+
+    trace_path = result.get("trace_file")
+    if not trace_path or not os.path.isfile(trace_path):
+        return jsonify({"ok": False, "error": "Trace file not found"}), 404
+
+    # Build a descriptive filename:
+    # vllm_trace_{model}_{mode}_tp{tp}_layers{n}.json.gz
+    model_short = result["model_id"].replace("/", "_")
+    mode = result.get("mode", "eager")
+    tp = result.get("summary", {}).get("tp_size", 1) or 1
+    layers = result.get("profiled_layers", "all")
+    ext = ".json.gz" if trace_path.endswith(".gz") else ".json"
+    download_name = f"vllm_trace_{model_short}_{mode}_tp{tp}_{layers}layers{ext}"
+
+    return send_file(
+        trace_path,
+        mimetype="application/gzip" if ext == ".json.gz" else "application/json",
+        as_attachment=True,
+        download_name=download_name,
+    )
 
 
 # ---- Demo/mock data for UI development ----
