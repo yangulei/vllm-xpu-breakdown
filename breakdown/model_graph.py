@@ -632,7 +632,7 @@ def build_model_graph(
 
     # Build prefill and decode graphs
     for phase, tok_var, seq_var in [
-        ("prefill", "S", "S"),
+        ("prefill", "S", "cache_len"),
         ("decode", "B", "cache_len"),
     ]:
         root = _build_full_model(cfg, family, is_moe, phase, tok_var, seq_var)
