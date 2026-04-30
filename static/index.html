@@ -809,18 +809,27 @@ function renderGraph() {
     legend.appendChild(tpTag);
   }
 
+  const symNames = {
+    'S': 'seq_len', 'B': 'batch', 'H': 'hidden_size', 'n_h': 'num_heads',
+    'n_kv': 'num_kv_heads', 'd': 'head_dim', 'I': 'intermediate_size',
+    '2·I': '2×intermediate_size', 'QKV': 'qkv_dim', 'n_h·d': 'num_heads×head_dim',
+    'V': 'vocab_size', 'I_moe': 'moe_intermediate_size', '2·I_moe': '2×moe_intermediate_size',
+    'n_shared': 'n_shared_experts',
+  };
   const order = ['S','B','H','n_h','n_kv','d','I','2·I','QKV','n_h·d','V'];
   for (const sym of order) {
     if (!(sym in symbols)) continue;
     const el = document.createElement('span');
-    el.innerHTML = `<span class="sym">${sym}</span> <span class="sym-val">= ${symbols[sym].toLocaleString()}</span>`;
+    const fullName = symNames[sym] || sym;
+    el.innerHTML = `<span class="sym">${sym}</span> <span class="sym-val">= ${fullName} = ${symbols[sym].toLocaleString()}</span>`;
     legend.appendChild(el);
   }
   // Any remaining symbols not in order
   for (const [sym, val] of Object.entries(symbols)) {
     if (order.includes(sym)) continue;
     const el = document.createElement('span');
-    el.innerHTML = `<span class="sym">${sym}</span> <span class="sym-val">= ${val.toLocaleString()}</span>`;
+    const fullName = symNames[sym] || sym;
+    el.innerHTML = `<span class="sym">${sym}</span> <span class="sym-val">= ${fullName} = ${val.toLocaleString()}</span>`;
     legend.appendChild(el);
   }
 
