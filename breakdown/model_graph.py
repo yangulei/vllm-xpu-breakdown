@@ -194,7 +194,7 @@ def _build_attention_ops(
         ops.append(OpNode(
             name="paged_attention", role="attention",
             backend=attn_backend,
-            input_shapes=[[tokens, "n_h", "d"], ["cache_len", "n_kv", "d"]],
+            input_shapes=[[tokens, "n_h", "d"], [seq, "n_kv", "d"]],
             output_shape=[tokens, "n_h", "d"],
             memory_bytes=0,
             flops=0,
@@ -579,7 +579,12 @@ def build_model_graph(
     if decode_batch:
         cfg["_B"] = decode_batch
     if context_len:
-        cfg["_cache_len"] = context_len
+        cfg["_C"] = context_len
+    # kv_len: for prefill = S + C, for decode = C
+    if prefill_len and context_len:
+        cfg["_S+C"] = prefill_len + context_len
+    if context_len:
+        cfg["_kv_len"] = context_len  # decode kv_len = C
 
     result: dict[str, Any] = {
         "architecture": arch,
@@ -620,7 +625,9 @@ def build_model_graph(
     if decode_batch:
         result["symbols"]["B"] = decode_batch
     if context_len:
-        result["symbols"]["cache_len"] = context_len
+        result["symbols"]["C"] = context_len
+    if prefill_len and context_len:
+        result["symbols"]["S+C"] = prefill_len + context_len
     if is_moe:
         result["symbols"][str(cfg.get("num_experts", 8))] = cfg.get("num_experts", 8)
         moe_I = cfg.get("moe_intermediate_size")
@@ -631,9 +638,10 @@ def build_model_graph(
             result["symbols"]["n_shared"] = cfg["n_shared_experts"]
 
     # Build prefill and decode graphs
+    # kv_len = S+C for prefill (new tokens + prior context), C for decode
     for phase, tok_var, seq_var in [
-        ("prefill", "S", "cache_len"),
-        ("decode", "B", "cache_len"),
+        ("prefill", "S", "S+C"),
+        ("decode", "B", "C"),
     ]:
         root = _build_full_model(cfg, family, is_moe, phase, tok_var, seq_var)
         _compute_totals(root)
