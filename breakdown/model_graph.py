@@ -923,3 +923,178 @@ def _annotate_node(
     node["total_device_time_us"] = round(node_time + child_time, 2)
     node["total_cpu_time_us"] = round(node_cpu + child_cpu, 2)
     return matched, total
+
+
+# ===================================================================
+# Module-path-based annotation (stack-aware profiling)
+# ===================================================================
+
+def annotate_graph_from_modules(graph: dict, module_ops: list[dict]) -> None:
+    """Annotate graph using module-path-enriched trace ops.
+
+    This uses the nn.Module hierarchy from profiling with with_stack=True
+    to precisely assign timing to static graph nodes by matching roles
+    within the module tree.
+
+    Args:
+        graph: Output of build_model_graph() — modified in place.
+        module_ops: Output of parse_trace_with_modules().
+    """
+    if not module_ops:
+        return
+
+    # Build lookup: role → list of op timing entries
+    # Group by (layer_idx, role) for per-layer ops, and (None, role) for global ops
+    role_timing: dict[tuple, list[dict]] = {}
+    for op in module_ops:
+        role = op.get("role")
+        if not role:
+            continue
+        layer_idx = op.get("layer_idx")
+        key = (layer_idx, role)
+        if key not in role_timing:
+            role_timing[key] = []
+        role_timing[key].append(op)
+
+    # Compute average timing per role across all layers
+    # For repeated layers, average the timing across layer instances
+    role_avg: dict[str, dict] = {}
+    role_by_layer: dict[str, list[dict]] = {}
+
+    for (layer_idx, role), ops in role_timing.items():
+        if role not in role_by_layer:
+            role_by_layer[role] = []
+        total_dev = sum(o.get("device_time_us", 0) for o in ops)
+        total_cpu = sum(o.get("cpu_time_us", 0) for o in ops)
+        total_count = sum(o.get("count", 0) for o in ops)
+        role_by_layer[role].append({
+            "device_us": total_dev,
+            "cpu_us": total_cpu,
+            "count": total_count,
+            "layer_idx": layer_idx,
+        })
+
+    for role, layer_entries in role_by_layer.items():
+        n_layers = len(layer_entries)
+        avg_dev = sum(e["device_us"] for e in layer_entries) / max(n_layers, 1)
+        avg_cpu = sum(e["cpu_us"] for e in layer_entries) / max(n_layers, 1)
+        avg_count = sum(e["count"] for e in layer_entries) / max(n_layers, 1)
+        role_avg[role] = {
+            "device_us": avg_dev,
+            "cpu_us": avg_cpu,
+            "count": avg_count,
+            "n_layers": n_layers,
+        }
+
+    # Also aggregate norm roles by position within layer
+    # Norms: distinguish by their position (1st norm before attn, 2nd after)
+    # We handle this by matching "norm" roles in order within each layer
+    _assign_norm_positions(module_ops, role_timing, role_avg)
+
+    # Walk graph and annotate ops by their role
+    matched = 0
+    total_ops = 0
+    for phase in ("prefill", "decode"):
+        if phase in graph:
+            m, t = _annotate_node_by_role(graph[phase], role_avg)
+            matched += m
+            total_ops += t
+
+    graph["has_timing"] = True
+    graph["timing_matched"] = matched
+    graph["timing_total_ops"] = total_ops
+    graph["timing_method"] = "module_path"
+
+
+def _assign_norm_positions(module_ops: list[dict],
+                           role_timing: dict, role_avg: dict) -> None:
+    """Distinguish norm ops by position (input_layernorm vs post_attention_layernorm).
+
+    Norms within a layer are initially all assigned role='norm'.
+    We differentiate them by their timestamp order within each layer.
+    """
+    from collections import defaultdict
+
+    # Group norm ops by layer, sorted by their aggregation order
+    layer_norms: dict[int | None, list[dict]] = defaultdict(list)
+    for op in module_ops:
+        if op.get("role") == "norm" and op.get("layer_idx") is not None:
+            layer_norms[op["layer_idx"]].append(op)
+
+    # For each layer, assign positions
+    # Convention: 1st norm = input_layernorm, 2nd = post_attention_layernorm, etc.
+    norm_position_timing: dict[str, list[float]] = defaultdict(list)
+
+    for layer_idx, norms in layer_norms.items():
+        # Norms are already in order of appearance (by timestamp in parse)
+        for i, norm in enumerate(norms):
+            if i == 0:
+                pos_role = "input_layernorm"
+            elif i == 1:
+                pos_role = "post_attention_layernorm"
+            else:
+                pos_role = f"norm_{i}"
+            norm_position_timing[pos_role].append(norm.get("cpu_time_us", 0))
+
+    # Add positional norm averages to role_avg
+    for pos_role, timings in norm_position_timing.items():
+        if timings:
+            # Use cpu time as proxy for device time for norms
+            avg_cpu = sum(timings) / len(timings)
+            # Get device time proportionally from the generic "norm" entry
+            norm_entry = role_avg.get("norm", {})
+            if norm_entry and norm_entry.get("cpu_us", 0) > 0:
+                dev_ratio = norm_entry["device_us"] / norm_entry["cpu_us"]
+            else:
+                dev_ratio = 1.0
+            role_avg[pos_role] = {
+                "device_us": avg_cpu * dev_ratio,
+                "cpu_us": avg_cpu,
+                "count": len(timings),
+                "n_layers": len(timings),
+            }
+
+
+def _annotate_node_by_role(
+    node: dict, role_avg: dict
+) -> tuple[int, int]:
+    """Annotate a serialized node dict in-place using role-based matching."""
+    node_time = 0.0
+    node_cpu = 0.0
+    matched = 0
+    total = 0
+
+    for op in node.get("ops", []):
+        total += 1
+        role = op.get("role", "")
+
+        # Try exact role match
+        info = role_avg.get(role)
+
+        # For "post_attention_layernorm" which may be fused (fused_add_rms_norm)
+        if info is None and "layernorm" in role:
+            info = role_avg.get("norm")
+
+        if info is not None:
+            per_call_dev = info["device_us"] / max(info["count"], 1)
+            per_call_cpu = info["cpu_us"] / max(info["count"], 1)
+            op["device_time_us"] = round(per_call_dev, 2)
+            op["cpu_time_us"] = round(per_call_cpu, 2)
+            op["profiled_calls"] = int(info["count"])
+            node_time += per_call_dev
+            node_cpu += per_call_cpu
+            matched += 1
+
+    child_time = 0.0
+    child_cpu = 0.0
+    for child in node.get("children", []):
+        cm, ct = _annotate_node_by_role(child, role_avg)
+        matched += cm
+        total += ct
+        mult = child.get("repeat_count", 1)
+        child_time += child.get("total_device_time_us", 0) * mult
+        child_cpu += child.get("total_cpu_time_us", 0) * mult
+
+    node["total_device_time_us"] = round(node_time + child_time, 2)
+    node["total_cpu_time_us"] = round(node_cpu + child_cpu, 2)
+    return matched, total
