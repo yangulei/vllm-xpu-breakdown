@@ -155,13 +155,13 @@ def _build_attention_ops(
 
     # Q/K norms (Qwen3-specific)
     if cfg.get("has_qk_norm"):
-        for role in ("q_norm", "k_norm"):
+        for role, sym in [("q_norm", "n_h"), ("k_norm", "n_kv")]:
             n = n_h if role == "q_norm" else n_kv
             ops.append(OpNode(
                 name="rms_norm", role=role,
                 backend="vllm-xpu-kernels",
-                input_shapes=[[tokens, str(n), "d"]],
-                output_shape=[tokens, str(n), "d"],
+                input_shapes=[[tokens, sym, "d"]],
+                output_shape=[tokens, sym, "d"],
                 memory_bytes=_norm_mem(T * n, d, dtype_bytes) if isinstance(T, int) else 0,
                 flops=_norm_flops(T * n, d) if isinstance(T, int) else 0,
                 phase=phase,
