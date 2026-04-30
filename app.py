@@ -165,11 +165,15 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             },
         }
 
-        # Override layer count for reduced-layer profiling
+        # Override layer count for reduced-layer profiling.
+        # Use dummy weights to avoid KeyError when checkpoint contains
+        # weights for layers that don't exist in the reduced model.
+        # Dummy weights are fine for profiling (timing doesn't depend on values).
         if profiled_layers < actual_layers:
             engine_kwargs["hf_overrides"] = {
                 "num_hidden_layers": profiled_layers,
             }
+            engine_kwargs["load_format"] = "dummy"
 
         # Set compile / eager mode
         if mode == "compile":
@@ -181,19 +185,30 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
 
         llm = LLM(**engine_kwargs)
 
-        conversation = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": prompt},
-        ]
-        conversations = [conversation] * batch_size
         sampling_params = SamplingParams(max_tokens=max_tokens)
 
-        # --- Warmup (no profiling) ---
-        llm.chat(conversations, sampling_params, use_tqdm=False)
+        # Use chat() if model supports it, else fall back to generate()
+        try:
+            conversation = [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt},
+            ]
+            conversations = [conversation] * batch_size
+            # Test that chat template works
+            llm.chat(conversations, sampling_params, use_tqdm=False)
+            use_chat = True
+        except Exception:
+            # Model may not have a chat template — use raw generate
+            prompts = [prompt] * batch_size
+            llm.generate(prompts, sampling_params, use_tqdm=False)
+            use_chat = False
 
         # --- Profiled run ---
         llm.start_profile()
-        llm.chat(conversations, sampling_params, use_tqdm=False)
+        if use_chat:
+            llm.chat(conversations, sampling_params, use_tqdm=False)
+        else:
+            llm.generate(prompts, sampling_params, use_tqdm=False)
         llm.stop_profile()
 
         # --- Parse trace files ---
