@@ -232,8 +232,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
         </select>
       </div>
       <div class="control-group">
-        <label>Max Model Len</label>
-        <input type="number" id="max-model-len" value="4096" min="128" step="128">
+        <label>Query Len</label>
+        <input type="number" id="query-len" value="128" min="1" step="1">
+      </div>
+      <div class="control-group">
+        <label>Context Len</label>
+        <input type="number" id="context-len" value="4096" min="1" step="128">
       </div>
       <div class="control-group">
         <label>Batch Size</label>
@@ -428,9 +432,11 @@ async function runStatic() {
   const modelId = document.getElementById('model-input').value.trim();
   if (!modelId) { alert('Enter a model ID first'); return; }
   const tpSize = parseInt(document.getElementById('tp-size-select').value);
+  const queryLen = parseInt(document.getElementById('query-len').value) || 128;
+  const contextLen = parseInt(document.getElementById('context-len').value) || 4096;
 
   try {
-    const resp = await fetch(`/api/model/${encodeURIComponent(modelId)}/graph?prefill_len=128&decode_batch=1&tp_size=${tpSize}`);
+    const resp = await fetch(`/api/model/${encodeURIComponent(modelId)}/graph?prefill_len=${queryLen}&decode_batch=1&context_len=${contextLen}&tp_size=${tpSize}`);
     const data = await resp.json();
     if (!data.ok) { alert('Graph error: ' + data.error); return; }
     STATIC_GRAPH_DATA = data.graph;
@@ -512,7 +518,7 @@ async function startProfile() {
   const body = {
     model_id: modelId,
     mode: document.getElementById('mode-select').value,
-    max_model_len: parseInt(document.getElementById('max-model-len').value),
+    max_model_len: parseInt(document.getElementById('context-len').value),
     batch_size: parseInt(document.getElementById('batch-size').value),
     max_tokens: parseInt(document.getElementById('max-tokens').value),
     num_profile_layers: (() => {
@@ -810,13 +816,14 @@ function renderGraph() {
   }
 
   const symNames = {
-    'S': 'seq_len', 'B': 'batch', 'H': 'hidden_size', 'n_h': 'num_heads',
+    'S': 'query_len', 'B': 'batch', 'H': 'hidden_size', 'n_h': 'num_heads',
     'n_kv': 'num_kv_heads', 'd': 'head_dim', 'I': 'intermediate_size',
     '2·I': '2×intermediate_size', 'QKV': 'qkv_dim', 'n_h·d': 'num_heads×head_dim',
-    'V': 'vocab_size', 'I_moe': 'moe_intermediate_size', '2·I_moe': '2×moe_intermediate_size',
+    'V': 'vocab_size', 'cache_len': 'context_len',
+    'I_moe': 'moe_intermediate_size', '2·I_moe': '2×moe_intermediate_size',
     'n_shared': 'n_shared_experts',
   };
-  const order = ['S','B','H','n_h','n_kv','d','I','2·I','QKV','n_h·d','V'];
+  const order = ['S','B','cache_len','H','n_h','n_kv','d','I','2·I','QKV','n_h·d','V'];
   for (const sym of order) {
     if (!(sym in symbols)) continue;
     const el = document.createElement('span');

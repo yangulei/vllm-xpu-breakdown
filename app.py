@@ -76,11 +76,13 @@ def get_model_graph(model_id: str):
 
         prefill_len = request.args.get("prefill_len", 128, type=int)
         decode_batch = request.args.get("decode_batch", 1, type=int)
+        context_len = request.args.get("context_len", 4096, type=int)
         tp_size = request.args.get("tp_size", 1, type=int)
 
         graph = build_model_graph(summary,
                                   prefill_len=prefill_len,
                                   decode_batch=decode_batch,
+                                  context_len=context_len,
                                   tp_size=tp_size)
         min_layers = min_profile_layers(summary)
         return jsonify({
@@ -282,6 +284,7 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
         try:
             graph = build_model_graph(summary, prefill_len=128,
                                       decode_batch=batch_size,
+                                      context_len=max_model_len,
                                       tp_size=tp_size)
             annotate_graph_timing(graph, op_dicts)
             profile_result["graph"] = graph
