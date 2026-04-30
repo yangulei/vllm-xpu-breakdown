@@ -166,15 +166,15 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             },
         }
 
+        # Always use dummy weights for profiling — timing doesn't depend on
+        # weight values, and dummy avoids KeyError when layers are reduced.
+        engine_kwargs["load_format"] = "dummy"
+
         # Override layer count for reduced-layer profiling.
-        # Use dummy weights to avoid KeyError when checkpoint contains
-        # weights for layers that don't exist in the reduced model.
-        # Dummy weights are fine for profiling (timing doesn't depend on values).
         if profiled_layers < actual_layers:
             engine_kwargs["hf_overrides"] = {
                 "num_hidden_layers": profiled_layers,
             }
-            engine_kwargs["load_format"] = "dummy"
 
         # Set compile / eager mode
         if mode == "compile":
