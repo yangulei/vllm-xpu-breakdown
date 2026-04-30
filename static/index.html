@@ -862,10 +862,13 @@ function fmtShapeGraph(shapes) {
     const allConcrete = concreteParts.every(c => c !== null);
     return { html: `[${innerHtml}]`, concrete: allConcrete ? `[${concreteParts.join(', ')}]` : null };
   });
+  const symHtml = parts.map(p => p.html).join(' × ');
   const allResolved = parts.every(p => p.concrete !== null);
-  const fullConcrete = allResolved ? parts.map(p => p.concrete).join(' × ') : '';
-  const title = fullConcrete ? ` title="${fullConcrete}"` : '';
-  return `<span style="cursor:help"${title}>${parts.map(p => p.html).join(' × ')}</span>`;
+  if (allResolved) {
+    const concreteHtml = parts.map(p => p.concrete).join(' × ');
+    return `${symHtml} <span style="color:#888;font-size:0.85em">${concreteHtml}</span>`;
+  }
+  return symHtml;
 }
 
 function fmtAI2(ai) {
