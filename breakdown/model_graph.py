@@ -516,6 +516,7 @@ def build_model_graph(
     model_summary: dict,
     prefill_len: int | None = None,
     decode_batch: int | None = None,
+    context_len: int | None = None,
     tp_size: int = 1,
 ) -> dict:
     """Build static model graph from model summary (from model_info.py).
@@ -523,8 +524,9 @@ def build_model_graph(
     Args:
         model_summary: output of summarize_config() — contains architecture,
                        hidden_size, num_layers, num_heads, etc.
-        prefill_len: prefill sequence length (for shape estimation)
-        decode_batch: decode batch size (for shape estimation)
+        prefill_len: prefill sequence length (query length for prefill phase)
+        decode_batch: decode batch size
+        context_len: KV cache length for decode phase attention
         tp_size: tensor parallel size (splits heads, intermediate, vocab)
 
     Returns:
@@ -576,6 +578,8 @@ def build_model_graph(
         cfg["_S"] = prefill_len
     if decode_batch:
         cfg["_B"] = decode_batch
+    if context_len:
+        cfg["_cache_len"] = context_len
 
     result: dict[str, Any] = {
         "architecture": arch,
@@ -615,6 +619,8 @@ def build_model_graph(
         result["symbols"]["S"] = prefill_len
     if decode_batch:
         result["symbols"]["B"] = decode_batch
+    if context_len:
+        result["symbols"]["cache_len"] = context_len
     if is_moe:
         result["symbols"][str(cfg.get("num_experts", 8))] = cfg.get("num_experts", 8)
         moe_I = cfg.get("moe_intermediate_size")
