@@ -117,8 +117,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 .tree-children { }
 .tree-children.collapsed { display: none; }
 .sym-dim { font-family: 'SF Mono', SFMono-Regular, monospace; color: var(--accent);
-           font-weight: 600; cursor: help; border-bottom: 1px dotted var(--accent);
-           position: relative; }
+           font-weight: 600; }
 
 /* Results */
 #results { display: none; }
@@ -856,15 +855,17 @@ function symTooltip(dimStr) {
 }
 
 function fmtShapeGraph(shapes) {
-  return shapes.map(tensorDims => {
+  const parts = shapes.map(tensorDims => {
     const resolved = tensorDims.map(d => symTooltip(d));
     const innerHtml = resolved.map(r => r.html).join(', ');
     const concreteParts = resolved.map(r => r.concrete);
     const allConcrete = concreteParts.every(c => c !== null);
-    const concreteStr = allConcrete ? `[${concreteParts.join(', ')}]` : '';
-    const title = concreteStr ? ` title="${concreteStr}"` : '';
-    return `<span${title}>[${innerHtml}]</span>`;
-  }).join(' × ');
+    return { html: `[${innerHtml}]`, concrete: allConcrete ? `[${concreteParts.join(', ')}]` : null };
+  });
+  const allResolved = parts.every(p => p.concrete !== null);
+  const fullConcrete = allResolved ? parts.map(p => p.concrete).join(' × ') : '';
+  const title = fullConcrete ? ` title="${fullConcrete}"` : '';
+  return `<span style="cursor:help"${title}>${parts.map(p => p.html).join(' × ')}</span>`;
 }
 
 function fmtAI2(ai) {
