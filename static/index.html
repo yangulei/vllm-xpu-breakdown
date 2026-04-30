@@ -281,11 +281,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
         <div style="display:flex;align-items:center;gap:12px">
           <h2 style="margin-bottom:0">Model Graph — Op Dispatch by Module</h2>
-          <div style="display:flex;gap:4px">
+          <div style="display:flex;gap:4px;align-items:center">
             <button class="phase-btn active" id="view-static-btn" onclick="switchGraphMode('static')"
                     style="font-size:11px;padding:3px 10px">⚡ Static</button>
             <button class="phase-btn" id="view-profiled-btn" onclick="switchGraphMode('profiled')"
                     style="font-size:11px;padding:3px 10px" disabled>⏱ Profiled</button>
+            <button class="btn btn-secondary" id="download-trace-btn" onclick="downloadTrace()"
+                    style="font-size:11px;padding:3px 10px;display:none">⬇ Download Trace</button>
           </div>
         </div>
         <div class="graph-phase-toggle">
@@ -564,6 +566,9 @@ async function pollStatus() {
       const rd = await rr.json();
       if (rd.ok) {
         renderResults(rd.data);
+        // Show download button if trace available
+        document.getElementById('download-trace-btn').style.display =
+          rd.data.has_trace ? '' : 'none';
         // Switch to profiled graph if available
         if (rd.data.graph) {
           PROFILED_GRAPH_DATA = rd.data.graph;
@@ -1035,6 +1040,10 @@ async function exportExcel() {
     a.click();
     URL.revokeObjectURL(a.href);
   } catch (e) { alert('Export error: ' + e.message); }
+}
+
+function downloadTrace() {
+  window.location.href = '/api/profile/trace';
 }
 
 // ---- Init ----
