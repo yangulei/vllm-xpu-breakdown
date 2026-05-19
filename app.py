@@ -158,6 +158,11 @@ def get_model_graph(model_id: str):
         context_len = request.args.get("context_len", 4096, type=int)
         tp_size = request.args.get("tp_size", 1, type=int)
         quantization = request.args.get("quantization", None, type=str)
+        # "auto" = use model's built-in quant config; "none" = force no quantization
+        if quantization == "auto":
+            quantization = None  # let build_model_graph read from model summary
+        elif quantization == "none":
+            quantization = "none"  # explicit override to disable quant
 
         graph = build_model_graph(summary,
                                   prefill_len=prefill_len,

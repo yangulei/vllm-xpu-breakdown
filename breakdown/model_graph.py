@@ -1260,7 +1260,11 @@ def build_model_graph(
 
     # Quantization: adjust weight dtype and track quant method
     # Activations stay at model dtype; weights use reduced precision
-    quant = quantization or model_summary.get("quant_method")
+    # "none" means explicitly no quantization (overrides model config)
+    if quantization and quantization.lower() == "none":
+        quant = None
+    else:
+        quant = quantization or model_summary.get("quant_method")
     if quant:
         cfg["quantization"] = quant
         cfg["weight_dtype_bytes"] = _quant_weight_bytes(quant)
