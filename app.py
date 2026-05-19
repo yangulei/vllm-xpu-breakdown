@@ -159,10 +159,12 @@ def get_model_graph(model_id: str):
         tp_size = request.args.get("tp_size", 1, type=int)
         quantization = request.args.get("quantization", None, type=str)
         # "auto" = use model's built-in quant config; "none" = force no quantization
+        print(f"[graph API] raw quantization param: {quantization!r}")
         if quantization == "auto":
             quantization = None  # let build_model_graph read from model summary
         elif quantization == "none":
             quantization = "none"  # explicit override to disable quant
+        print(f"[graph API] resolved quantization: {quantization!r}, model quant_method: {summary.get('quant_method')!r}")
 
         graph = build_model_graph(summary,
                                   prefill_len=prefill_len,
@@ -170,6 +172,7 @@ def get_model_graph(model_id: str):
                                   context_len=context_len,
                                   tp_size=tp_size,
                                   quantization=quantization)
+        print(f"[graph API] result config quantization: {graph.get('config', {}).get('quantization')!r}, weight_dtype_bytes: {graph.get('config', {}).get('weight_dtype_bytes')!r}")
         min_layers = min_profile_layers(summary)
         return jsonify({
             "ok": True, "graph": graph, "summary": summary,
