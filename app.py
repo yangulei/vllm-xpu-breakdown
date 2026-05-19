@@ -177,7 +177,8 @@ def get_model_graph(model_id: str):
 def _run_profile(model_id: str, mode: str, max_model_len: int,
                  batch_size: int, max_tokens: int, prompt: str,
                  num_profile_layers: int | None = None,
-                 tp_size: int = 1):
+                 tp_size: int = 1,
+                 quantization: str | None = None):
     """Run profiling in a background thread using vLLM's native profiler.
 
     On XPU hardware, vLLM automatically selects XPUWorker which uses
@@ -190,6 +191,8 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             for the GPU.
         tp_size: tensor parallel size (default 1). With TP>1, vLLM creates
             one trace file per rank; we parse all and aggregate timing.
+        quantization: quantization method (e.g. "fp8", "gptq", "awq").
+            Passed as --quantization to vLLM.
     """
     global _profile_state
     try:
@@ -247,6 +250,10 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
         # Always use dummy weights for profiling — timing doesn't depend on
         # weight values, and dummy avoids KeyError when layers are reduced.
         engine_kwargs["load_format"] = "dummy"
+
+        # Quantization method
+        if quantization:
+            engine_kwargs["quantization"] = quantization
 
         # Override layer count for reduced-layer profiling.
         if profiled_layers < actual_layers:
@@ -427,6 +434,7 @@ def start_profile():
     prompt = data.get("prompt", "Write a short essay about AI.")
     num_profile_layers = data.get("num_profile_layers")  # None = all layers
     tp_size = data.get("tensor_parallel_size", 1)
+    quantization = data.get("quantization")  # None = no quantization
 
     with _profile_lock:
         _profile_state = {
@@ -439,7 +447,7 @@ def start_profile():
     thread = threading.Thread(
         target=_run_profile,
         args=(model_id, mode, max_model_len, batch_size, max_tokens, prompt,
-              num_profile_layers, tp_size),
+              num_profile_layers, tp_size, quantization),
         daemon=True,
     )
     thread.start()
