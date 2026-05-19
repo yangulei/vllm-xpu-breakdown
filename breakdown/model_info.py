@@ -43,6 +43,22 @@ def fetch_model_config(model_id: str) -> dict[str, Any]:
         raise RuntimeError(f"Failed to connect to {endpoint}: {e.reason}") from e
 
 
+def _get_vit_config(config: dict[str, Any], key: str) -> Any | None:
+    """Extract a vision encoder config value from nested VL model configs.
+
+    VL models store vision config in different places:
+    - Qwen2.5-VL: config["vision_config"]["hidden_size"]
+    - InternVL: config["vision_config"]["hidden_size"]
+    - Some models: config["visual"]["hidden_size"]
+    """
+    for section in ("vision_config", "visual", "visual_config",
+                    "vision_tower_config"):
+        sub = config.get(section)
+        if isinstance(sub, dict) and key in sub:
+            return sub[key]
+    return None
+
+
 def summarize_config(config: dict[str, Any]) -> dict[str, Any]:
     """Extract key model properties from config.json."""
     archs = config.get("architectures", [])
@@ -105,6 +121,18 @@ def summarize_config(config: dict[str, Any]) -> dict[str, Any]:
         "moe_intermediate_size": config.get("moe_intermediate_size"),
         # Shared experts
         "n_shared_experts": config.get("n_shared_experts", 0),
+        # MLA (Multi-head Latent Attention) — DeepSeek-V2/V3
+        "kv_lora_rank": config.get("kv_lora_rank"),
+        "q_lora_rank": config.get("q_lora_rank"),
+        "qk_nope_head_dim": config.get("qk_nope_head_dim"),
+        "qk_rope_head_dim": config.get("qk_rope_head_dim"),
+        # Vision encoder (VL models)
+        "vit_hidden_size": _get_vit_config(config, "hidden_size"),
+        "vit_num_layers": _get_vit_config(config, "num_hidden_layers"),
+        "vit_num_heads": _get_vit_config(config, "num_attention_heads"),
+        "vit_intermediate_size": _get_vit_config(config, "intermediate_size"),
+        "patch_size": _get_vit_config(config, "patch_size"),
+        "image_size": _get_vit_config(config, "image_size"),
     }
 
 
@@ -147,5 +175,18 @@ def get_dim_symbols(summary: dict[str, Any]) -> dict[int, str]:
     if inter:
         if inter * 2 not in symbols:
             symbols[inter * 2] = "2·I"
+
+    # MLA dimensions (DeepSeek-V2/V3)
+    kv_lora = summary.get("kv_lora_rank")
+    if kv_lora:
+        symbols[kv_lora] = "kv_lora"
+    q_lora = summary.get("q_lora_rank")
+    if q_lora:
+        symbols[q_lora] = "q_lora"
+
+    # Vision encoder dimensions (VL models)
+    vit_h = summary.get("vit_hidden_size")
+    if vit_h and vit_h not in symbols:
+        symbols[vit_h] = "H_vit"
 
     return symbols
