@@ -776,9 +776,8 @@ def export_excel():
         # Write architecture and dtype first (non-numeric, not formula targets)
         ws_sum.cell(row, 1, "architecture").font = Font(bold=True)
         ws_sum.cell(row, 2, str(summary.get("architecture", "")))
-        row += 1  # row is now _SUMMARY_CONFIG_START_ROW
+        row += 1
 
-        config_start_row = row
         for key in _SUMMARY_CONFIG_KEYS:
             if key in summary:
                 ws_sum.cell(row, 1, key).font = Font(bold=True)
@@ -907,8 +906,8 @@ def export_excel():
                 # Single shape: use formula directly
                 ws.cell(r, 4).value = shape_formulas[0]
             elif has_any_formula and shape_formulas:
-                # Multiple shapes: concatenate concrete values (formula too
-                # complex for multi-shape CONCATENATE)
+                # Multiple shapes: Excel formulas for multi-tensor
+                # expressions become unreadable; use resolved values instead
                 ws.cell(r, 4, ", ".join(concrete_parts))
             else:
                 # No symbolic dims: just show concrete values

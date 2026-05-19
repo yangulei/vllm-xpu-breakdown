@@ -181,7 +181,7 @@ class TestExcelExport(unittest.TestCase):
 
     def test_concrete_shape_formula_references_summary(self):
         """Concrete shapes with symbolic dims should use Summary references."""
-        data = _build_test_payload()
+        data = _build_test_payload(include_graph=False)
         # Use single-shape op to get formula
         data["ops"] = [
             {
@@ -257,7 +257,7 @@ class TestExcelExport(unittest.TestCase):
         wb = self._export(_build_test_payload())
         ws = wb["Model Hierarchy"]
 
-        # Find first op with a shape and verify it has numbers
+        # Find first op with a shape and verify it has correct numbers
         for r in range(2, 100):
             shape = ws.cell(r, 10).value
             if shape and shape != "—":
@@ -266,8 +266,12 @@ class TestExcelExport(unittest.TestCase):
                     shape, r"\d+",
                     f"Shape should contain numbers: {shape}",
                 )
-                return
-        self.fail("No concrete shapes found in hierarchy")
+                # Verify that H=2560 appears (hidden_size from MOCK_SUMMARY)
+                if "2560" in shape:
+                    return
+        # At minimum some shape should have been found with 2560
+        # (embedding op uses [V, H] = [151936, 2560])
+        self.fail("No concrete shape with hidden_size=2560 found")
 
     def test_export_error_no_ops(self):
         """Should return 400 when no ops data provided."""
