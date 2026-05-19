@@ -426,7 +426,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
               <th onclick="sortTable('backend')">Backend <span class="sort-arrow">⇅</span></th>
               <th onclick="sortTable('input_shapes')">Shape</th>
               <th>Shape (concrete)</th>
-              <th>dtype</th>
               <th onclick="sortTable('layer_count')" style="text-align:center">×Layers <span class="sort-arrow">⇅</span></th>
               <th onclick="sortTable('call_count')" style="text-align:right">Calls <span class="sort-arrow">⇅</span></th>
               <th onclick="sortTable('device_time_us')" style="text-align:right">Device Time <span class="sort-arrow">⇅</span></th>
@@ -825,7 +824,6 @@ function renderTable() {
       <td><span class="badge ${badgeCls}">${op.backend}</span></td>
       <td class="mono" style="font-size:11px">${fmtShape(op.input_shapes)}</td>
       <td class="mono" style="font-size:11px;color:#666">${fmtShapeConcrete(op)}</td>
-      <td style="font-size:12px">${op.dtype || '—'}</td>
       <td style="text-align:center">${op.layer_count > 1
           ? '<span class="layer-count">×' + op.layer_count + '</span>' : '—'}</td>
       <td style="text-align:right">${op.call_count}</td>

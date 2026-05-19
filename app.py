@@ -958,7 +958,7 @@ def export_excel():
 
     headers = ["Op Name", "Backend", "Shape (symbolic)", "Shape (concrete)",
                "Shape (concrete + dtype)",
-               "dtype", "×Layers", "Calls", "Device Time (µs)", "% Time",
+               "×Layers", "Calls", "Device Time (µs)", "% Time",
                "Memory (bytes)", "FLOPs", "Arithmetic Intensity"]
     for col, hdr in enumerate(headers, 1):
         c = ws.cell(1, col, hdr)
@@ -1011,45 +1011,44 @@ def export_excel():
 
         ws.cell(r, 5, _shape_concrete_with_dtype(op, symbols))
 
-        ws.cell(r, 6, op.get("dtype") or "—")
-        ws.cell(r, 7, op.get("layer_count", 1))
-        ws.cell(r, 8, op.get("call_count", 0))
-        ws.cell(r, 9, op.get("device_time_us", 0))
+        ws.cell(r, 6, op.get("layer_count", 1))
+        ws.cell(r, 7, op.get("call_count", 0))
+        ws.cell(r, 8, op.get("device_time_us", 0))
 
         # % Time as formula: device_time / SUM(device_time_column)
         last_data_row = len(ops) + 1
-        col_i = get_column_letter(9)  # I = Device Time
-        ws.cell(r, 10).value = f"={col_i}{r}/SUM({col_i}$2:{col_i}${last_data_row})"
-        ws.cell(r, 10).number_format = '0.0%'
+        col_h = get_column_letter(8)  # H = Device Time
+        ws.cell(r, 9).value = f"={col_h}{r}/SUM({col_h}$2:{col_h}${last_data_row})"
+        ws.cell(r, 9).number_format = '0.0%'
 
-        ws.cell(r, 11, op.get("memory_bytes", 0))
+        ws.cell(r, 10, op.get("memory_bytes", 0))
 
         flops = op.get("flops", 0)
-        ws.cell(r, 12, flops)
+        ws.cell(r, 11, flops)
 
         # Arithmetic Intensity as formula: FLOPs / Memory (avoid div-by-zero)
-        col_k = get_column_letter(11)   # K = Memory
-        col_l = get_column_letter(12)   # L = FLOPs
-        ws.cell(r, 13).value = (
-            f'=IF({col_k}{r}=0,"—",{col_l}{r}/{col_k}{r})'
+        col_j = get_column_letter(10)   # J = Memory
+        col_k = get_column_letter(11)   # K = FLOPs
+        ws.cell(r, 12).value = (
+            f'=IF({col_j}{r}=0,"—",{col_k}{r}/{col_j}{r})'
         )
-        ws.cell(r, 13).number_format = '0.00'
+        ws.cell(r, 12).number_format = '0.00'
 
     # Totals row
     total_row = len(ops) + 2
     ws.cell(total_row, 1, "TOTAL").font = Font(bold=True)
+    col_g = get_column_letter(7)
     col_h = get_column_letter(8)
-    col_i = get_column_letter(9)
+    ws.cell(total_row, 7).value = f"=SUM({col_g}2:{col_g}{len(ops)+1})"
+    ws.cell(total_row, 7).font = Font(bold=True)
     ws.cell(total_row, 8).value = f"=SUM({col_h}2:{col_h}{len(ops)+1})"
     ws.cell(total_row, 8).font = Font(bold=True)
-    ws.cell(total_row, 9).value = f"=SUM({col_i}2:{col_i}{len(ops)+1})"
+    ws.cell(total_row, 9, 1.0)
+    ws.cell(total_row, 9).number_format = '0.0%'
     ws.cell(total_row, 9).font = Font(bold=True)
-    ws.cell(total_row, 10, 1.0)
-    ws.cell(total_row, 10).number_format = '0.0%'
-    ws.cell(total_row, 10).font = Font(bold=True)
 
     # Column widths
-    col_widths = [45, 18, 50, 50, 50, 10, 8, 8, 15, 10, 15, 15, 15]
+    col_widths = [45, 18, 50, 50, 50, 8, 8, 15, 10, 15, 15, 15]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 

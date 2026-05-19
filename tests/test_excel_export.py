@@ -177,7 +177,6 @@ class TestExcelExport(unittest.TestCase):
         headers = [ws.cell(1, c).value for c in range(1, 13)]
         self.assertIn("Shape (symbolic)", headers)
         self.assertIn("Shape (concrete)", headers)
-        self.assertIn("dtype", headers)
 
     def test_concrete_shape_formula_references_summary(self):
         """Concrete shapes with symbolic dims should use Summary references."""
