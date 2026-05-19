@@ -530,6 +530,7 @@ async function runStatic() {
   const batchSize = parseInt(document.getElementById('batch-size').value) || 1;
   const contextLen = parseInt(document.getElementById('context-len').value) || 4096;
   const quant = document.getElementById('quant-select').value;
+  console.log('[runStatic] quant:', quant, 'modelId:', modelId);
 
   try {
     let url = `/api/model/${encodeURIComponent(modelId)}/graph?prefill_len=${queryLen}&decode_batch=${batchSize}&context_len=${contextLen}&tp_size=${tpSize}&quantization=${encodeURIComponent(quant)}`;
@@ -904,6 +905,8 @@ function renderGraph() {
   const tree = GRAPH_DATA[currentPhase];
   if (!tree) return;
 
+  console.log('[renderGraph] config:', GRAPH_DATA.config);
+
   const hasTiming = !!GRAPH_DATA.has_timing;
 
   // Symbol legend
@@ -1046,6 +1049,7 @@ function getOpDtypes(op, numInputs) {
 }
 
 function fmtShapeGraph(shapes, op) {
+  if (!shapes || shapes.length === 0) return '—';
   const dtypes = op ? getOpDtypes(op, shapes.length) : [];
   const parts = shapes.map((tensorDims, idx) => {
     const resolved = tensorDims.map(d => symTooltip(d));
