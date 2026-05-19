@@ -82,9 +82,15 @@ class ModuleNode:
 # Shape & cost helpers
 # ===================================================================
 
-def _mm_mem(M: int, K: int, N: int, dtype_bytes: int = 2) -> int:
-    """Memory for matmul: read A[M,K] + B[K,N] + write C[M,N]."""
-    return (M * K + K * N + M * N) * dtype_bytes
+def _mm_mem(M: int, K: int, N: int, dtype_bytes: int = 2,
+            weight_dtype_bytes: int | None = None) -> int:
+    """Memory for matmul: read A[M,K] + B[K,N] + write C[M,N].
+
+    For quantized models, weights (B matrix) use weight_dtype_bytes while
+    activations (A matrix) and output (C matrix) use dtype_bytes.
+    """
+    w_bytes = weight_dtype_bytes if weight_dtype_bytes is not None else dtype_bytes
+    return M * K * dtype_bytes + K * N * w_bytes + M * N * dtype_bytes
 
 
 def _mm_flops(M: int, K: int, N: int) -> int:
@@ -137,6 +143,7 @@ def _build_attention_ops(
     d = cfg["head_dim"]
     qkv_size = (n_h + 2 * n_kv) * d
     dtype_bytes = cfg["dtype_bytes"]
+    w_bytes = cfg.get("weight_dtype_bytes", dtype_bytes)
     T = cfg.get(f"_{tokens}", tokens)  # numeric if available
     S = cfg.get(f"_{seq}", seq)
 
@@ -148,7 +155,7 @@ def _build_attention_ops(
         backend="torch-xpu-ops",
         input_shapes=[[tokens, "H"], ["H", "QKV"]],
         output_shape=[tokens, "QKV"],
-        memory_bytes=_mm_mem(T, H, qkv_size, dtype_bytes) if isinstance(T, int) else 0,
+        memory_bytes=_mm_mem(T, H, qkv_size, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T, H, qkv_size) if isinstance(T, int) else 0,
         phase=phase,
     ))
@@ -218,7 +225,7 @@ def _build_attention_ops(
         backend="torch-xpu-ops",
         input_shapes=[[tokens, "n_h·d"], ["n_h·d", "H"]],
         output_shape=[tokens, "H"],
-        memory_bytes=_mm_mem(T, n_h * d, H, dtype_bytes) if isinstance(T, int) else 0,
+        memory_bytes=_mm_mem(T, n_h * d, H, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T, n_h * d, H) if isinstance(T, int) else 0,
         phase=phase,
     ))
@@ -231,6 +238,7 @@ def _build_mlp_ops(cfg: dict, phase: str, tokens: str) -> list[OpNode]:
     H = cfg["hidden_size"]
     I = cfg["intermediate_size"]
     dtype_bytes = cfg["dtype_bytes"]
+    w_bytes = cfg.get("weight_dtype_bytes", dtype_bytes)
     T = cfg.get(f"_{tokens}", tokens)
 
     ops: list[OpNode] = []
@@ -241,7 +249,7 @@ def _build_mlp_ops(cfg: dict, phase: str, tokens: str) -> list[OpNode]:
         backend="torch-xpu-ops",
         input_shapes=[[tokens, "H"], ["H", "2·I"]],
         output_shape=[tokens, "2·I"],
-        memory_bytes=_mm_mem(T, H, 2 * I, dtype_bytes) if isinstance(T, int) else 0,
+        memory_bytes=_mm_mem(T, H, 2 * I, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T, H, 2 * I) if isinstance(T, int) else 0,
         phase=phase,
     ))
@@ -263,7 +271,7 @@ def _build_mlp_ops(cfg: dict, phase: str, tokens: str) -> list[OpNode]:
         backend="torch-xpu-ops",
         input_shapes=[[tokens, "I"], ["I", "H"]],
         output_shape=[tokens, "H"],
-        memory_bytes=_mm_mem(T, I, H, dtype_bytes) if isinstance(T, int) else 0,
+        memory_bytes=_mm_mem(T, I, H, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T, I, H) if isinstance(T, int) else 0,
         phase=phase,
     ))
@@ -479,6 +487,7 @@ def _build_mla_attention_ops(
     n_kv = cfg["num_kv_heads"]
     d = cfg["head_dim"]
     dtype_bytes = cfg["dtype_bytes"]
+    w_bytes = cfg.get("weight_dtype_bytes", dtype_bytes)
     T = cfg.get(f"_{tokens}", tokens)
     S = cfg.get(f"_{seq}", seq)
 
@@ -498,7 +507,7 @@ def _build_mla_attention_ops(
             backend="torch-xpu-ops",
             input_shapes=[[tokens, "H"], ["H", str(q_lora_rank)]],
             output_shape=[tokens, str(q_lora_rank)],
-            memory_bytes=_mm_mem(T, H, q_lora_rank, dtype_bytes) if isinstance(T, int) else 0,
+            memory_bytes=_mm_mem(T, H, q_lora_rank, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
             flops=_mm_flops(T, H, q_lora_rank) if isinstance(T, int) else 0,
             phase=phase,
         ))
@@ -518,7 +527,7 @@ def _build_mla_attention_ops(
             input_shapes=[[tokens, str(q_lora_rank)],
                           [str(q_lora_rank), str(out_q)]],
             output_shape=[tokens, str(out_q)],
-            memory_bytes=_mm_mem(T, q_lora_rank, out_q, dtype_bytes) if isinstance(T, int) else 0,
+            memory_bytes=_mm_mem(T, q_lora_rank, out_q, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
             flops=_mm_flops(T, q_lora_rank, out_q) if isinstance(T, int) else 0,
             phase=phase,
         ))
@@ -530,7 +539,7 @@ def _build_mla_attention_ops(
             backend="torch-xpu-ops",
             input_shapes=[[tokens, "H"], ["H", "QKV"]],
             output_shape=[tokens, "QKV"],
-            memory_bytes=_mm_mem(T, H, qkv_size, dtype_bytes) if isinstance(T, int) else 0,
+            memory_bytes=_mm_mem(T, H, qkv_size, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
             flops=_mm_flops(T, H, qkv_size) if isinstance(T, int) else 0,
             phase=phase,
         ))
@@ -541,7 +550,7 @@ def _build_mla_attention_ops(
         backend="torch-xpu-ops",
         input_shapes=[[tokens, "H"], ["H", str(kv_lora_rank)]],
         output_shape=[tokens, str(kv_lora_rank)],
-        memory_bytes=_mm_mem(T, H, kv_lora_rank, dtype_bytes) if isinstance(T, int) else 0,
+        memory_bytes=_mm_mem(T, H, kv_lora_rank, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T, H, kv_lora_rank) if isinstance(T, int) else 0,
         phase=phase,
     ))
@@ -596,7 +605,7 @@ def _build_mla_attention_ops(
         backend="torch-xpu-ops",
         input_shapes=[[tokens, "n_h·d"], ["n_h·d", "H"]],
         output_shape=[tokens, "H"],
-        memory_bytes=_mm_mem(T, n_h * d, H, dtype_bytes) if isinstance(T, int) else 0,
+        memory_bytes=_mm_mem(T, n_h * d, H, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T, n_h * d, H) if isinstance(T, int) else 0,
         phase=phase,
     ))
@@ -1139,6 +1148,29 @@ def _dtype_bytes(dtype: str) -> int:
     return mapping.get(dt, 2)
 
 
+def _quant_weight_bytes(quant_method: str) -> int:
+    """Get effective bytes per weight element for a quantization method.
+
+    Weight-only quantization reduces weight storage while keeping activations
+    at full precision. This returns the per-element byte cost of stored weights.
+    """
+    # Map quantization method → effective weight bytes
+    quant_bytes = {
+        "fp8": 1,              # FP8 (E4M3 or E5M2)
+        "gptq": 1,            # GPTQ typically 4-bit packed (0.5B), but with scales ~1B effective
+        "gptq_marlin": 1,     # GPTQ with Marlin kernel (4-bit)
+        "awq": 1,             # AWQ 4-bit, similar to GPTQ
+        "awq_marlin": 1,      # AWQ with Marlin kernel
+        "marlin": 1,          # Marlin 4-bit
+        "squeezellm": 1,      # SqueezeLLM 4-bit
+        "bitsandbytes": 1,    # BitsAndBytes (NF4/INT8)
+        "gguf": 1,            # GGUF various quant levels
+        "int8": 1,            # INT8 weight-only
+        "int4": 1,            # INT4 weight-only (0.5B per element, but metadata overhead → ~1B)
+    }
+    return quant_bytes.get(quant_method.lower(), 2)
+
+
 def min_profile_layers(model_summary: dict) -> int:
     """Compute minimum layers to profile to capture all unique layer types.
 
@@ -1158,6 +1190,7 @@ def build_model_graph(
     decode_batch: int | None = None,
     context_len: int | None = None,
     tp_size: int = 1,
+    quantization: str | None = None,
 ) -> dict:
     """Build static model graph from model summary (from model_info.py).
 
@@ -1168,6 +1201,8 @@ def build_model_graph(
         decode_batch: decode batch size
         context_len: KV cache length for decode phase attention
         tp_size: tensor parallel size (splits heads, intermediate, vocab)
+        quantization: quantization method (e.g. "fp8", "gptq", "awq").
+            Affects weight dtype_bytes and adds dequant ops to the graph.
 
     Returns:
         Dict with "prefill" and "decode" trees, plus metadata.
@@ -1215,6 +1250,16 @@ def build_model_graph(
         "is_mla": is_mla,
         "is_vl": is_vl,
     }
+
+    # Quantization: adjust weight dtype and track quant method
+    # Activations stay at model dtype; weights use reduced precision
+    quant = quantization or model_summary.get("quant_method")
+    if quant:
+        cfg["quantization"] = quant
+        cfg["weight_dtype_bytes"] = _quant_weight_bytes(quant)
+    else:
+        cfg["quantization"] = None
+        cfg["weight_dtype_bytes"] = cfg["dtype_bytes"]
 
     if is_moe:
         cfg["num_experts"] = model_summary.get("num_experts", 8)
@@ -1265,6 +1310,7 @@ def build_model_graph(
         "architecture": arch,
         "family": family,
         "model_type": "mllm" if is_vl else ("moe" if is_moe else "llm"),
+        "quantization": quant,
         "config": {
             "hidden_size": cfg["hidden_size"],
             "num_layers": cfg["num_layers"],
@@ -1276,6 +1322,8 @@ def build_model_graph(
             "is_moe": is_moe,
             "first_k_dense_replace": first_k_dense,
             "tp_size": tp_size,
+            "quantization": quant,
+            "weight_dtype_bytes": cfg["weight_dtype_bytes"],
         },
         # Symbol → concrete value mapping for tooltips
         # When TP>1, dimensions shown are per-rank
