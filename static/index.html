@@ -1190,10 +1190,16 @@ function buildTreeNode(node, isRoot, hasTiming) {
 async function exportExcel() {
   if (!DATA) return alert('No data to export. Run a profile first.');
   try {
+    // Include graph data and current phase for hierarchy export
+    const payload = Object.assign({}, DATA);
+    if (GRAPH_DATA) {
+      payload.graph = GRAPH_DATA;
+      payload.phase = currentPhase;
+    }
     const resp = await fetch('/api/export/excel', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(DATA),
+      body: JSON.stringify(payload),
     });
     if (!resp.ok) { alert('Export failed: ' + resp.statusText); return; }
     const blob = await resp.blob();

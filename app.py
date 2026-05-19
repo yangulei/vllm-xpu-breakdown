@@ -619,6 +619,120 @@ def demo_data():
 
 # ---- Excel Export ----
 
+# Config keys written to the Summary sheet with their row numbers.
+# These are referenced by formulas in the Operations sheet.
+_SUMMARY_CONFIG_KEYS = [
+    "hidden_size", "num_layers", "num_heads", "num_kv_heads",
+    "head_dim", "intermediate_size", "vocab_size",
+]
+
+# Symbol → formula fragment mapping.
+# Each entry maps a symbolic shape token to an Excel formula reference
+# using the named row in the Summary sheet (column B, rows defined by
+# _SUMMARY_CONFIG_START_ROW offset).
+_SUMMARY_CONFIG_START_ROW = 7  # Row where first config value is written
+
+
+def _symbol_to_cell_ref(symbol: str, cfg_cell_map: dict[str, str]) -> str | None:
+    """Map a symbolic dimension name to a Summary sheet cell reference.
+
+    Returns an Excel formula fragment like 'Summary!$B$7' or a compound
+    expression like 'Summary!$B$7*Summary!$B$11' for composite symbols.
+    Returns None if the symbol cannot be resolved.
+    """
+    # Direct match
+    if symbol in cfg_cell_map:
+        return cfg_cell_map[symbol]
+
+    # Composite symbols
+    if symbol == "n_h·d" and "n_h" in cfg_cell_map and "d" in cfg_cell_map:
+        return f"{cfg_cell_map['n_h']}*{cfg_cell_map['d']}"
+    if symbol == "QKV" and "n_h" in cfg_cell_map and "n_kv" in cfg_cell_map and "d" in cfg_cell_map:
+        return f"({cfg_cell_map['n_h']}+2*{cfg_cell_map['n_kv']})*{cfg_cell_map['d']}"
+    if symbol == "2·I" and "I" in cfg_cell_map:
+        return f"2*{cfg_cell_map['I']}"
+
+    return None
+
+
+def _shape_to_formula(shape: list, cfg_cell_map: dict[str, str],
+                      symbols: dict[str, int]) -> str | None:
+    """Convert a symbolic shape list to an Excel formula showing concrete dims.
+
+    Returns a formula string like '="[128, "&Summary!$B$7&"]"' or None if
+    the shape contains no symbolic dimensions.
+    """
+    has_symbol = False
+    parts: list[str] = []
+    for dim in shape:
+        if isinstance(dim, str):
+            ref = _symbol_to_cell_ref(dim, cfg_cell_map)
+            if ref:
+                has_symbol = True
+                parts.append(("ref", ref))
+            elif dim in symbols:
+                # Known symbol with concrete value but no cell ref (e.g. S, B, C)
+                parts.append(("lit", str(symbols[dim])))
+            else:
+                parts.append(("lit", dim))
+        else:
+            parts.append(("lit", str(dim)))
+
+    if not has_symbol:
+        return None
+
+    # Build CONCATENATE formula: ="[" & part & ", " & part & "]"
+    formula_parts = ['"["']
+    for idx, (kind, val) in enumerate(parts):
+        if idx > 0:
+            formula_parts.append('", "')
+        if kind == "ref":
+            formula_parts.append(val)
+        else:
+            formula_parts.append(f'"{val}"')
+    formula_parts.append('"]"')
+    return "=" + "&".join(formula_parts)
+
+
+def _shape_to_concrete(shape: list, symbols: dict[str, int]) -> str:
+    """Convert a symbolic shape list to a concrete string with numeric values."""
+    concrete = []
+    for dim in shape:
+        if isinstance(dim, str) and dim in symbols:
+            concrete.append(str(symbols[dim]))
+        elif isinstance(dim, int):
+            concrete.append(str(dim))
+        else:
+            concrete.append(str(dim))
+    return "[" + ", ".join(concrete) + "]"
+
+
+def _flatten_graph_nodes(node: dict, depth: int = 0,
+                         rows: list | None = None) -> list[dict]:
+    """Flatten a hierarchical graph tree into rows for the hierarchy sheet."""
+    if rows is None:
+        rows = []
+
+    # Add module row
+    rows.append({
+        "depth": depth,
+        "name": node.get("name", ""),
+        "path": node.get("path", ""),
+        "module_type": node.get("module_type", ""),
+        "repeat_count": node.get("repeat_count", 1),
+        "total_memory": node.get("total_memory", 0),
+        "total_flops": node.get("total_flops", 0),
+        "total_ai": node.get("total_ai", 0),
+        "ops": node.get("ops", []),
+    })
+
+    # Recurse into children
+    for child in node.get("children", []):
+        _flatten_graph_nodes(child, depth + 1, rows)
+
+    return rows
+
+
 @app.route("/api/export/excel", methods=["POST"])
 def export_excel():
     """Export breakdown results to Excel with formulas preserved."""
@@ -648,19 +762,77 @@ def export_excel():
     ws_sum["A2"] = f"Model: {data.get('model_id', 'N/A')}"
     ws_sum["A3"] = f"Mode: {data.get('mode', 'N/A')}"
 
-    # Model summary
+    # Model summary — write config values in named cells for formula reference
     summary = data.get("summary", {})
+    # Map: symbol name → "Summary!$B$<row>" for formula references
+    cfg_cell_map: dict[str, str] = {}
+    # Map: config key → row number (for building cfg_cell_map)
+    cfg_row_map: dict[str, int] = {}
+
     if summary:
         row = 5
         ws_sum.cell(row, 1, "Model Configuration").font = Font(bold=True, size=12)
         row += 1
-        for key in ("architecture", "hidden_size", "num_layers", "num_heads",
-                     "num_kv_heads", "head_dim", "intermediate_size",
-                     "vocab_size", "dtype", "is_moe"):
+        # Write architecture and dtype first (non-numeric, not formula targets)
+        ws_sum.cell(row, 1, "architecture").font = Font(bold=True)
+        ws_sum.cell(row, 2, str(summary.get("architecture", "")))
+        row += 1  # row is now _SUMMARY_CONFIG_START_ROW
+
+        config_start_row = row
+        for key in _SUMMARY_CONFIG_KEYS:
             if key in summary:
                 ws_sum.cell(row, 1, key).font = Font(bold=True)
-                ws_sum.cell(row, 2, str(summary[key]))
+                val = summary[key]
+                if isinstance(val, (int, float)):
+                    ws_sum.cell(row, 2, val)
+                else:
+                    ws_sum.cell(row, 2, str(val))
+                cfg_row_map[key] = row
                 row += 1
+
+        # dtype row
+        ws_sum.cell(row, 1, "dtype").font = Font(bold=True)
+        ws_sum.cell(row, 2, str(summary.get("dtype", "bfloat16")))
+        row += 1
+        # is_moe row
+        ws_sum.cell(row, 1, "is_moe").font = Font(bold=True)
+        ws_sum.cell(row, 2, str(summary.get("is_moe", False)))
+        row += 1
+
+        # Build symbol → cell reference map
+        _symbol_key_map = {
+            "H": "hidden_size",
+            "n_h": "num_heads",
+            "n_kv": "num_kv_heads",
+            "d": "head_dim",
+            "I": "intermediate_size",
+            "V": "vocab_size",
+        }
+        for sym, key in _symbol_key_map.items():
+            if key in cfg_row_map:
+                cfg_cell_map[sym] = f"Summary!$B${cfg_row_map[key]}"
+
+    # Get symbols dict from graph data or build from summary
+    graph_data = data.get("graph")
+    symbols: dict[str, int] = {}
+    if graph_data and "symbols" in graph_data:
+        symbols = graph_data["symbols"]
+    elif summary:
+        # Fallback: build symbols from summary
+        for key, val in summary.items():
+            if isinstance(val, int):
+                if key == "hidden_size":
+                    symbols["H"] = val
+                elif key == "num_heads":
+                    symbols["n_h"] = val
+                elif key == "num_kv_heads":
+                    symbols["n_kv"] = val
+                elif key == "head_dim":
+                    symbols["d"] = val
+                elif key == "intermediate_size":
+                    symbols["I"] = val
+                elif key == "vocab_size":
+                    symbols["V"] = val
 
     # Backend summary
     backends = data.get("backends", {})
@@ -692,8 +864,8 @@ def export_excel():
     # ---- Sheet 2: Operations with formulas ----
     ws = wb.create_sheet("Operations")
 
-    headers = ["Op Name", "Backend", "Shape", "dtype", "×Layers",
-               "Calls", "Device Time (µs)", "% Time",
+    headers = ["Op Name", "Backend", "Shape (symbolic)", "Shape (concrete)",
+               "dtype", "×Layers", "Calls", "Device Time (µs)", "% Time",
                "Memory (bytes)", "FLOPs", "Arithmetic Intensity"]
     for col, hdr in enumerate(headers, 1):
         c = ws.cell(1, col, hdr)
@@ -703,61 +875,86 @@ def export_excel():
 
     ops = data["ops"]
 
-    # Write total device time in a named cell for formula reference
-    # Place it in a helper cell: the sum will be computed by formula
-    # Row 2..N+1 are data rows; we use column G for device time
-    total_dev_time_us = data.get("total_device_time_us", 0)
-
     for i, op in enumerate(ops):
         r = i + 2  # data starts at row 2
         ws.cell(r, 1, op["name"])
         ws.cell(r, 2, op["backend"])
 
+        # Shape (symbolic) — original shapes with dimension names
         shapes = op.get("input_shapes")
         if shapes:
             ws.cell(r, 3, json.dumps(shapes))
         else:
             ws.cell(r, 3, "—")
 
-        ws.cell(r, 4, op.get("dtype") or "—")
-        ws.cell(r, 5, op.get("layer_count", 1))
-        ws.cell(r, 6, op.get("call_count", 0))
-        ws.cell(r, 7, op.get("device_time_us", 0))
+        # Shape (concrete) — resolved to numeric values using formulas
+        if shapes and isinstance(shapes, list) and len(shapes) > 0:
+            # Try to build a formula referencing Summary cells
+            shape_formulas = []
+            has_any_formula = False
+            concrete_parts = []
+            for shape in shapes:
+                if isinstance(shape, list):
+                    formula = _shape_to_formula(shape, cfg_cell_map, symbols)
+                    if formula:
+                        has_any_formula = True
+                        shape_formulas.append(formula)
+                    concrete_parts.append(
+                        _shape_to_concrete(shape, symbols)
+                    )
+
+            if has_any_formula and len(shapes) == 1 and shape_formulas:
+                # Single shape: use formula directly
+                ws.cell(r, 4).value = shape_formulas[0]
+            elif has_any_formula and shape_formulas:
+                # Multiple shapes: concatenate concrete values (formula too
+                # complex for multi-shape CONCATENATE)
+                ws.cell(r, 4, ", ".join(concrete_parts))
+            else:
+                # No symbolic dims: just show concrete values
+                ws.cell(r, 4, ", ".join(concrete_parts))
+        else:
+            ws.cell(r, 4, "—")
+
+        ws.cell(r, 5, op.get("dtype") or "—")
+        ws.cell(r, 6, op.get("layer_count", 1))
+        ws.cell(r, 7, op.get("call_count", 0))
+        ws.cell(r, 8, op.get("device_time_us", 0))
 
         # % Time as formula: device_time / SUM(device_time_column)
         last_data_row = len(ops) + 1
-        col_g = get_column_letter(7)  # G = Device Time
-        ws.cell(r, 8).value = f"={col_g}{r}/SUM({col_g}$2:{col_g}${last_data_row})"
-        ws.cell(r, 8).number_format = '0.0%'
+        col_h = get_column_letter(8)  # H = Device Time
+        ws.cell(r, 9).value = f"={col_h}{r}/SUM({col_h}$2:{col_h}${last_data_row})"
+        ws.cell(r, 9).number_format = '0.0%'
 
-        ws.cell(r, 9, op.get("memory_bytes", 0))
+        ws.cell(r, 10, op.get("memory_bytes", 0))
 
         flops = op.get("flops", 0)
-        ws.cell(r, 10, flops)
+        ws.cell(r, 11, flops)
 
         # Arithmetic Intensity as formula: FLOPs / Memory (avoid div-by-zero)
-        col_i = get_column_letter(9)   # I = Memory
-        col_j = get_column_letter(10)  # J = FLOPs
-        ws.cell(r, 11).value = (
-            f'=IF({col_i}{r}=0,"—",{col_j}{r}/{col_i}{r})'
+        col_j = get_column_letter(10)   # J = Memory
+        col_k = get_column_letter(11)   # K = FLOPs
+        ws.cell(r, 12).value = (
+            f'=IF({col_j}{r}=0,"—",{col_k}{r}/{col_j}{r})'
         )
-        ws.cell(r, 11).number_format = '0.00'
+        ws.cell(r, 12).number_format = '0.00'
 
     # Totals row
     total_row = len(ops) + 2
     ws.cell(total_row, 1, "TOTAL").font = Font(bold=True)
-    col_f = get_column_letter(6)
     col_g = get_column_letter(7)
-    ws.cell(total_row, 6).value = f"=SUM({col_f}2:{col_f}{len(ops)+1})"
-    ws.cell(total_row, 6).font = Font(bold=True)
+    col_h = get_column_letter(8)
     ws.cell(total_row, 7).value = f"=SUM({col_g}2:{col_g}{len(ops)+1})"
     ws.cell(total_row, 7).font = Font(bold=True)
-    ws.cell(total_row, 8, 1.0)
-    ws.cell(total_row, 8).number_format = '0.0%'
+    ws.cell(total_row, 8).value = f"=SUM({col_h}2:{col_h}{len(ops)+1})"
     ws.cell(total_row, 8).font = Font(bold=True)
+    ws.cell(total_row, 9, 1.0)
+    ws.cell(total_row, 9).number_format = '0.0%'
+    ws.cell(total_row, 9).font = Font(bold=True)
 
     # Column widths
-    col_widths = [45, 18, 50, 10, 8, 8, 15, 10, 15, 15, 15]
+    col_widths = [45, 18, 50, 50, 10, 8, 8, 15, 10, 15, 15, 15]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -771,6 +968,91 @@ def export_excel():
     for r in range(2, len(ops) + 2):
         for col in range(1, len(headers) + 1):
             ws.cell(r, col).border = thin_border
+
+    # ---- Sheet 3: Model Hierarchy ----
+    if graph_data:
+        phase = data.get("phase", "prefill")
+        tree = graph_data.get(phase) or graph_data.get("prefill")
+        if tree:
+            ws_hier = wb.create_sheet("Model Hierarchy")
+
+            hier_headers = ["Module", "Path", "Type", "×Repeat",
+                            "Memory (bytes)", "FLOPs", "AI",
+                            "Op Name", "Op Backend", "Op Shape", "Op dtype"]
+            for col, hdr in enumerate(hier_headers, 1):
+                c = ws_hier.cell(1, col, hdr)
+                c.font = header_font
+                c.fill = header_fill
+                c.alignment = Alignment(horizontal="center")
+
+            flat_nodes = _flatten_graph_nodes(tree)
+            hier_row = 2
+            indent_fill = PatternFill(start_color="F5F5F5", end_color="F5F5F5",
+                                      fill_type="solid")
+            module_font = Font(bold=True)
+
+            for node_info in flat_nodes:
+                depth = node_info["depth"]
+                indent = "  " * depth
+
+                # Module header row
+                ws_hier.cell(hier_row, 1, indent + node_info["name"])
+                ws_hier.cell(hier_row, 1).font = module_font
+                ws_hier.cell(hier_row, 2, node_info["path"])
+                ws_hier.cell(hier_row, 3, node_info["module_type"])
+                repeat = node_info["repeat_count"]
+                if repeat > 1:
+                    ws_hier.cell(hier_row, 4, repeat)
+                ws_hier.cell(hier_row, 5, node_info["total_memory"])
+                ws_hier.cell(hier_row, 6, node_info["total_flops"])
+                ai = node_info["total_ai"]
+                if ai:
+                    ws_hier.cell(hier_row, 7, ai)
+                    ws_hier.cell(hier_row, 7).number_format = '0.00'
+
+                # Apply light background for module rows
+                for col in range(1, len(hier_headers) + 1):
+                    ws_hier.cell(hier_row, col).fill = indent_fill
+                    ws_hier.cell(hier_row, col).border = thin_border
+
+                hier_row += 1
+
+                # Op rows under this module
+                for op in node_info["ops"]:
+                    op_indent = "  " * (depth + 1)
+                    ws_hier.cell(hier_row, 8, op.get("name", ""))
+                    ws_hier.cell(hier_row, 9, op.get("backend", ""))
+
+                    # Show concrete op shapes
+                    op_shapes = op.get("input_shapes", [])
+                    if op_shapes:
+                        concrete_shapes = []
+                        for shape in op_shapes:
+                            if isinstance(shape, list):
+                                concrete_shapes.append(
+                                    _shape_to_concrete(shape, symbols)
+                                )
+                            else:
+                                concrete_shapes.append(str(shape))
+                        ws_hier.cell(hier_row, 10, ", ".join(concrete_shapes))
+                    else:
+                        ws_hier.cell(hier_row, 10, "—")
+
+                    # Op dtype from phase info
+                    op_dtype = data.get("summary", {}).get("dtype", "")
+                    ws_hier.cell(hier_row, 11, op_dtype)
+
+                    ws_hier.cell(hier_row, 1, op_indent + "↳ " + op.get("role", ""))
+                    for col in range(1, len(hier_headers) + 1):
+                        ws_hier.cell(hier_row, col).border = thin_border
+                    hier_row += 1
+
+            # Column widths for hierarchy sheet
+            hier_col_widths = [35, 35, 25, 8, 15, 15, 10, 30, 18, 50, 10]
+            for i, w in enumerate(hier_col_widths, 1):
+                ws_hier.column_dimensions[get_column_letter(i)].width = w
+
+            ws_hier.freeze_panes = "A2"
 
     # Write to buffer
     buf = io.BytesIO()
