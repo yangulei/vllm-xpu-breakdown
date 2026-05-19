@@ -534,8 +534,10 @@ async function runStatic() {
 
   try {
     let url = `/api/model/${encodeURIComponent(modelId)}/graph?prefill_len=${queryLen}&decode_batch=${batchSize}&context_len=${contextLen}&tp_size=${tpSize}&quantization=${encodeURIComponent(quant)}`;
+    console.log('[runStatic] fetching:', url);
     const resp = await fetch(url);
     const data = await resp.json();
+    console.log('[runStatic] response config:', data.graph?.config);
     if (!data.ok) { alert('Graph error: ' + data.error); return; }
     STATIC_GRAPH_DATA = data.graph;
     graphMode = 'static';
