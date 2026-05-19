@@ -466,26 +466,666 @@ def _build_moe_layer(
     return layer
 
 
+def _build_mla_attention_ops(
+    cfg: dict, phase: str, tokens: str, seq: str
+) -> list[OpNode]:
+    """Build ops for Multi-head Latent Attention (DeepSeek-V2/V3).
+
+    MLA compresses KV into a low-rank latent space, reducing KV cache size.
+    Key ops: Q projection → latent KV projection → decompress → attention.
+    """
+    H = cfg["hidden_size"]
+    n_h = cfg["num_heads"]
+    n_kv = cfg["num_kv_heads"]
+    d = cfg["head_dim"]
+    dtype_bytes = cfg["dtype_bytes"]
+    T = cfg.get(f"_{tokens}", tokens)
+    S = cfg.get(f"_{seq}", seq)
+
+    # MLA-specific dimensions (from config or estimated)
+    kv_lora_rank = cfg.get("kv_lora_rank", 512)
+    q_lora_rank = cfg.get("q_lora_rank", 0)
+    qk_nope_head_dim = cfg.get("qk_nope_head_dim", d // 2)
+    qk_rope_head_dim = cfg.get("qk_rope_head_dim", d - qk_nope_head_dim)
+
+    ops: list[OpNode] = []
+
+    # Q projection (may go through LoRA compression)
+    if q_lora_rank > 0:
+        # Compressed Q: H → q_lora_rank → n_h * d
+        ops.append(OpNode(
+            name="aten::mm", role="q_compress",
+            backend="torch-xpu-ops",
+            input_shapes=[[tokens, "H"], ["H", str(q_lora_rank)]],
+            output_shape=[tokens, str(q_lora_rank)],
+            memory_bytes=_mm_mem(T, H, q_lora_rank, dtype_bytes) if isinstance(T, int) else 0,
+            flops=_mm_flops(T, H, q_lora_rank) if isinstance(T, int) else 0,
+            phase=phase,
+        ))
+        ops.append(OpNode(
+            name="rms_norm", role="q_norm",
+            backend="vllm-xpu-kernels",
+            input_shapes=[[tokens, str(q_lora_rank)]],
+            output_shape=[tokens, str(q_lora_rank)],
+            memory_bytes=_norm_mem(T, q_lora_rank, dtype_bytes) if isinstance(T, int) else 0,
+            flops=_norm_flops(T, q_lora_rank) if isinstance(T, int) else 0,
+            phase=phase,
+        ))
+        out_q = n_h * (qk_nope_head_dim + qk_rope_head_dim)
+        ops.append(OpNode(
+            name="aten::mm", role="q_decompress",
+            backend="torch-xpu-ops",
+            input_shapes=[[tokens, str(q_lora_rank)],
+                          [str(q_lora_rank), str(out_q)]],
+            output_shape=[tokens, str(out_q)],
+            memory_bytes=_mm_mem(T, q_lora_rank, out_q, dtype_bytes) if isinstance(T, int) else 0,
+            flops=_mm_flops(T, q_lora_rank, out_q) if isinstance(T, int) else 0,
+            phase=phase,
+        ))
+    else:
+        # Standard Q projection
+        qkv_size = (n_h + 2 * n_kv) * d
+        ops.append(OpNode(
+            name="aten::mm", role="qkv_proj",
+            backend="torch-xpu-ops",
+            input_shapes=[[tokens, "H"], ["H", "QKV"]],
+            output_shape=[tokens, "QKV"],
+            memory_bytes=_mm_mem(T, H, qkv_size, dtype_bytes) if isinstance(T, int) else 0,
+            flops=_mm_flops(T, H, qkv_size) if isinstance(T, int) else 0,
+            phase=phase,
+        ))
+
+    # KV compression: H → kv_lora_rank (latent)
+    ops.append(OpNode(
+        name="aten::mm", role="kv_compress",
+        backend="torch-xpu-ops",
+        input_shapes=[[tokens, "H"], ["H", str(kv_lora_rank)]],
+        output_shape=[tokens, str(kv_lora_rank)],
+        memory_bytes=_mm_mem(T, H, kv_lora_rank, dtype_bytes) if isinstance(T, int) else 0,
+        flops=_mm_flops(T, H, kv_lora_rank) if isinstance(T, int) else 0,
+        phase=phase,
+    ))
+
+    # KV norm
+    ops.append(OpNode(
+        name="rms_norm", role="kv_norm",
+        backend="vllm-xpu-kernels",
+        input_shapes=[[tokens, str(kv_lora_rank)]],
+        output_shape=[tokens, str(kv_lora_rank)],
+        memory_bytes=_norm_mem(T, kv_lora_rank, dtype_bytes) if isinstance(T, int) else 0,
+        flops=_norm_flops(T, kv_lora_rank) if isinstance(T, int) else 0,
+        phase=phase,
+    ))
+
+    # RoPE on the rope portion
+    ops.append(OpNode(
+        name="deepseek_scaling_rope", role="rotary_emb",
+        backend="vllm-xpu-kernels",
+        input_shapes=[[tokens, "n_h", str(qk_rope_head_dim)]],
+        output_shape=[tokens, "n_h", str(qk_rope_head_dim)],
+        memory_bytes=(T * n_h * qk_rope_head_dim * dtype_bytes * 3) if isinstance(T, int) else 0,
+        flops=(T * n_h * qk_rope_head_dim * 6) if isinstance(T, int) else 0,
+        phase=phase,
+    ))
+
+    # MLA attention kernel
+    ops.append(OpNode(
+        name="gdn_attention", role="attention",
+        backend="vllm-xpu-kernels",
+        input_shapes=[[tokens, "n_h", "d"], [seq, str(kv_lora_rank)]],
+        output_shape=[tokens, "n_h", "d"],
+        memory_bytes=0,
+        flops=(2 * T * S * n_h * d) if isinstance(T, int) and isinstance(S, int) else 0,
+        phase=phase,
+    ))
+
+    # KV cache (compressed — stores latent, not full K/V)
+    ops.append(OpNode(
+        name="concat_and_cache_mla", role="cache_store",
+        backend="vllm-xpu-kernels",
+        input_shapes=[[tokens, str(kv_lora_rank)]],
+        output_shape=[],
+        memory_bytes=(T * kv_lora_rank * dtype_bytes) if isinstance(T, int) else 0,
+        flops=0,
+        phase=phase,
+    ))
+
+    # Output projection
+    ops.append(OpNode(
+        name="aten::mm", role="o_proj",
+        backend="torch-xpu-ops",
+        input_shapes=[[tokens, "n_h·d"], ["n_h·d", "H"]],
+        output_shape=[tokens, "H"],
+        memory_bytes=_mm_mem(T, n_h * d, H, dtype_bytes) if isinstance(T, int) else 0,
+        flops=_mm_flops(T, n_h * d, H) if isinstance(T, int) else 0,
+        phase=phase,
+    ))
+
+    return ops
+
+
+def _build_mla_decoder_layer(
+    cfg: dict, arch_family: str, phase: str, tokens: str, seq: str
+) -> ModuleNode:
+    """Build one decoder layer with MLA attention (DeepSeek-V2/V3)."""
+    input_norm = ModuleNode(
+        name="input_layernorm", path="model.layers.*.input_layernorm",
+        module_type="RMSNorm",
+        ops=[_build_norm_op(cfg, "input_layernorm", tokens, phase)],
+    )
+
+    attn_ops = _build_mla_attention_ops(cfg, phase, tokens, seq)
+    attention = ModuleNode(
+        name="self_attn", path="model.layers.*.self_attn",
+        module_type=f"{arch_family}MLAAttention", ops=attn_ops,
+    )
+
+    post_norm = ModuleNode(
+        name="post_attention_layernorm",
+        path="model.layers.*.post_attention_layernorm",
+        module_type="RMSNorm",
+        ops=[_build_norm_op(cfg, "post_attention_layernorm", tokens, phase)],
+    )
+
+    mlp_ops = _build_mlp_ops(cfg, phase, tokens)
+    mlp = ModuleNode(
+        name="mlp", path="model.layers.*.mlp",
+        module_type=f"{arch_family}MLP", ops=mlp_ops,
+    )
+
+    layer = ModuleNode(
+        name="decoder_layer", path="model.layers.*",
+        module_type=f"{arch_family}DecoderLayer",
+        children=[input_norm, attention, post_norm, mlp],
+        repeat_count=cfg["num_layers"],
+    )
+    return layer
+
+
+def _build_mla_moe_layer(
+    cfg: dict, arch_family: str, phase: str, tokens: str, seq: str
+) -> ModuleNode:
+    """Build one MoE decoder layer with MLA attention (DeepSeek-V2/V3)."""
+    num_experts = cfg.get("num_experts", 8)
+    top_k = cfg.get("num_experts_per_tok", 2)
+    n_shared = cfg.get("n_shared_experts", 0)
+    H = cfg["hidden_size"]
+    moe_I = cfg.get("moe_intermediate_size") or cfg["intermediate_size"]
+    I = cfg["intermediate_size"]
+    dtype_bytes = cfg["dtype_bytes"]
+    T = cfg.get(f"_{tokens}", tokens)
+
+    input_norm = ModuleNode(
+        name="input_layernorm", path="model.layers.*.input_layernorm",
+        module_type="RMSNorm",
+        ops=[_build_norm_op(cfg, "input_layernorm", tokens, phase)],
+    )
+
+    attn_ops = _build_mla_attention_ops(cfg, phase, tokens, seq)
+    attention = ModuleNode(
+        name="self_attn", path="model.layers.*.self_attn",
+        module_type=f"{arch_family}MLAAttention", ops=attn_ops,
+    )
+
+    post_norm = ModuleNode(
+        name="post_attention_layernorm",
+        path="model.layers.*.post_attention_layernorm",
+        module_type="RMSNorm",
+        ops=[_build_norm_op(cfg, "post_attention_layernorm", tokens, phase)],
+    )
+
+    # MoE block (same structure as standard MoE)
+    moe_I_sym = "I_moe" if moe_I != I else "I"
+    moe_2I_sym = "2·I_moe" if moe_I != I else "2·I"
+
+    gate_op = OpNode(
+        name="aten::mm", role="router_gate",
+        backend="torch-xpu-ops",
+        input_shapes=[[tokens, "H"], ["H", str(num_experts)]],
+        output_shape=[tokens, str(num_experts)],
+        memory_bytes=_mm_mem(T, H, num_experts, dtype_bytes) if isinstance(T, int) else 0,
+        flops=_mm_flops(T, H, num_experts) if isinstance(T, int) else 0,
+        phase=phase,
+    )
+    align_op = OpNode(
+        name="moe_align_block_size", role="moe_routing",
+        backend="vllm-xpu-kernels",
+        input_shapes=[[tokens, str(num_experts)]],
+        output_shape=[tokens],
+        memory_bytes=0, flops=0, phase=phase,
+    )
+    expert_mm1 = OpNode(
+        name="aten::mm", role="expert_gate_up",
+        backend="torch-xpu-ops",
+        input_shapes=[[f"{tokens}·{top_k}", "H"], ["H", moe_2I_sym]],
+        output_shape=[f"{tokens}·{top_k}", moe_2I_sym],
+        memory_bytes=_mm_mem(T * top_k, H, 2 * moe_I, dtype_bytes) if isinstance(T, int) else 0,
+        flops=_mm_flops(T * top_k, H, 2 * moe_I) if isinstance(T, int) else 0,
+        phase=phase,
+    )
+    expert_act = OpNode(
+        name="silu_and_mul", role="expert_activation",
+        backend="vllm-xpu-kernels",
+        input_shapes=[[f"{tokens}·{top_k}", moe_2I_sym]],
+        output_shape=[f"{tokens}·{top_k}", moe_I_sym],
+        memory_bytes=_activation_mem(T * top_k, moe_I, dtype_bytes) if isinstance(T, int) else 0,
+        flops=_activation_flops(T * top_k, moe_I) if isinstance(T, int) else 0,
+        phase=phase,
+    )
+    expert_mm2 = OpNode(
+        name="aten::mm", role="expert_down",
+        backend="torch-xpu-ops",
+        input_shapes=[[f"{tokens}·{top_k}", moe_I_sym], [moe_I_sym, "H"]],
+        output_shape=[f"{tokens}·{top_k}", "H"],
+        memory_bytes=_mm_mem(T * top_k, moe_I, H, dtype_bytes) if isinstance(T, int) else 0,
+        flops=_mm_flops(T * top_k, moe_I, H) if isinstance(T, int) else 0,
+        phase=phase,
+    )
+
+    moe_ops = [gate_op, align_op, expert_mm1, expert_act, expert_mm2]
+
+    # Shared experts
+    if n_shared > 0:
+        shared_mm1 = OpNode(
+            name="aten::mm", role="shared_expert_gate_up",
+            backend="torch-xpu-ops",
+            input_shapes=[[tokens, "H"], ["H", moe_2I_sym]],
+            output_shape=[tokens, moe_2I_sym],
+            memory_bytes=_mm_mem(T, H, 2 * moe_I * n_shared, dtype_bytes) if isinstance(T, int) else 0,
+            flops=_mm_flops(T, H, 2 * moe_I * n_shared) if isinstance(T, int) else 0,
+            phase=phase,
+        )
+        shared_act = OpNode(
+            name="silu_and_mul", role="shared_expert_activation",
+            backend="vllm-xpu-kernels",
+            input_shapes=[[tokens, moe_2I_sym]],
+            output_shape=[tokens, moe_I_sym],
+            memory_bytes=_activation_mem(T, moe_I * n_shared, dtype_bytes) if isinstance(T, int) else 0,
+            flops=_activation_flops(T, moe_I * n_shared) if isinstance(T, int) else 0,
+            phase=phase,
+        )
+        shared_mm2 = OpNode(
+            name="aten::mm", role="shared_expert_down",
+            backend="torch-xpu-ops",
+            input_shapes=[[tokens, moe_I_sym], [moe_I_sym, "H"]],
+            output_shape=[tokens, "H"],
+            memory_bytes=_mm_mem(T, moe_I * n_shared, H, dtype_bytes) if isinstance(T, int) else 0,
+            flops=_mm_flops(T, moe_I * n_shared, H) if isinstance(T, int) else 0,
+            phase=phase,
+        )
+        moe_ops.extend([shared_mm1, shared_act, shared_mm2])
+
+    moe = ModuleNode(
+        name="moe", path="model.layers.*.mlp",
+        module_type=f"{arch_family}MoE", ops=moe_ops,
+    )
+
+    layer = ModuleNode(
+        name="decoder_layer", path="model.layers.*",
+        module_type=f"{arch_family}DecoderLayer",
+        children=[input_norm, attention, post_norm, moe],
+        repeat_count=cfg["num_layers"],
+    )
+    return layer
+
+
+def _build_vision_encoder(
+    cfg: dict, phase: str, tokens: str
+) -> ModuleNode:
+    """Build ops for a Vision Transformer (ViT) encoder.
+
+    Used by VL models (Qwen2.5-VL, InternVL, etc.) to encode image patches.
+    """
+    # Vision encoder dimensions (from config or defaults)
+    vit_hidden = cfg.get("vit_hidden_size", 1024)
+    vit_layers = cfg.get("vit_num_layers", 24)
+    vit_heads = cfg.get("vit_num_heads", 16)
+    vit_inter = cfg.get("vit_intermediate_size", vit_hidden * 4)
+    patch_size = cfg.get("patch_size", 14)
+    image_size = cfg.get("image_size", 448)
+    dtype_bytes = cfg["dtype_bytes"]
+
+    num_patches = (image_size // patch_size) ** 2
+    T = num_patches
+
+    # Patch embedding (conv2d → flatten)
+    patch_embed = OpNode(
+        name="aten::conv2d", role="patch_embed",
+        backend="torch-xpu-ops",
+        input_shapes=[["N_img", "3", str(image_size), str(image_size)]],
+        output_shape=["N_img", str(num_patches), str(vit_hidden)],
+        memory_bytes=(3 * patch_size * patch_size * vit_hidden * dtype_bytes),
+        flops=(num_patches * 3 * patch_size * patch_size * vit_hidden * 2),
+        phase=phase,
+    )
+
+    # Self-attention per ViT layer
+    vit_d = vit_hidden // vit_heads
+    qkv_proj = OpNode(
+        name="aten::mm", role="vit_qkv_proj",
+        backend="torch-xpu-ops",
+        input_shapes=[[str(T), str(vit_hidden)],
+                      [str(vit_hidden), str(3 * vit_hidden)]],
+        output_shape=[str(T), str(3 * vit_hidden)],
+        memory_bytes=_mm_mem(T, vit_hidden, 3 * vit_hidden, dtype_bytes),
+        flops=_mm_flops(T, vit_hidden, 3 * vit_hidden),
+        phase=phase,
+    )
+    vit_attn = OpNode(
+        name="aten::scaled_dot_product_attention", role="vit_attention",
+        backend="torch-xpu-ops",
+        input_shapes=[[str(vit_heads), str(T), str(vit_d)],
+                      [str(vit_heads), str(T), str(vit_d)],
+                      [str(vit_heads), str(T), str(vit_d)]],
+        output_shape=[str(vit_heads), str(T), str(vit_d)],
+        memory_bytes=(T * T * vit_heads * dtype_bytes * 3),
+        flops=(2 * T * T * vit_heads * vit_d),
+        phase=phase,
+    )
+    vit_o_proj = OpNode(
+        name="aten::mm", role="vit_o_proj",
+        backend="torch-xpu-ops",
+        input_shapes=[[str(T), str(vit_hidden)],
+                      [str(vit_hidden), str(vit_hidden)]],
+        output_shape=[str(T), str(vit_hidden)],
+        memory_bytes=_mm_mem(T, vit_hidden, vit_hidden, dtype_bytes),
+        flops=_mm_flops(T, vit_hidden, vit_hidden),
+        phase=phase,
+    )
+
+    # MLP per ViT layer
+    vit_mlp_up = OpNode(
+        name="aten::mm", role="vit_mlp_up",
+        backend="torch-xpu-ops",
+        input_shapes=[[str(T), str(vit_hidden)],
+                      [str(vit_hidden), str(vit_inter)]],
+        output_shape=[str(T), str(vit_inter)],
+        memory_bytes=_mm_mem(T, vit_hidden, vit_inter, dtype_bytes),
+        flops=_mm_flops(T, vit_hidden, vit_inter),
+        phase=phase,
+    )
+    vit_act = OpNode(
+        name="aten::gelu", role="vit_activation",
+        backend="torch-xpu-ops",
+        input_shapes=[[str(T), str(vit_inter)]],
+        output_shape=[str(T), str(vit_inter)],
+        memory_bytes=(T * vit_inter * dtype_bytes * 2),
+        flops=(T * vit_inter * 4),
+        phase=phase,
+    )
+    vit_mlp_down = OpNode(
+        name="aten::mm", role="vit_mlp_down",
+        backend="torch-xpu-ops",
+        input_shapes=[[str(T), str(vit_inter)],
+                      [str(vit_inter), str(vit_hidden)]],
+        output_shape=[str(T), str(vit_hidden)],
+        memory_bytes=_mm_mem(T, vit_inter, vit_hidden, dtype_bytes),
+        flops=_mm_flops(T, vit_inter, vit_hidden),
+        phase=phase,
+    )
+
+    vit_layer = ModuleNode(
+        name="vit_layer", path="visual.encoder.layers.*",
+        module_type="ViTLayer",
+        ops=[qkv_proj, vit_attn, vit_o_proj, vit_mlp_up, vit_act, vit_mlp_down],
+        repeat_count=vit_layers,
+    )
+
+    vit_encoder = ModuleNode(
+        name="visual_encoder", path="visual",
+        module_type="VisionEncoder",
+        ops=[patch_embed],
+        children=[vit_layer],
+    )
+    return vit_encoder
+
+
+def _build_vl_projector(
+    cfg: dict, phase: str, tokens: str
+) -> ModuleNode:
+    """Build the visual-to-language projector (bridge between ViT and LLM)."""
+    vit_hidden = cfg.get("vit_hidden_size", 1024)
+    H = cfg["hidden_size"]
+    dtype_bytes = cfg["dtype_bytes"]
+
+    num_patches = cfg.get("_num_patches", 1024)
+
+    proj_op = OpNode(
+        name="aten::mm", role="vl_projector",
+        backend="torch-xpu-ops",
+        input_shapes=[[str(num_patches), str(vit_hidden)],
+                      [str(vit_hidden), "H"]],
+        output_shape=[str(num_patches), "H"],
+        memory_bytes=_mm_mem(num_patches, vit_hidden, H, dtype_bytes),
+        flops=_mm_flops(num_patches, vit_hidden, H),
+        phase=phase,
+    )
+
+    return ModuleNode(
+        name="projector", path="visual.projector",
+        module_type="VLProjector",
+        ops=[proj_op],
+    )
+
+
+def _build_encoder_model(
+    cfg: dict, phase: str, tokens: str
+) -> ModuleNode:
+    """Build encoder-only model graph (BERT/RoBERTa for embedding/reranking).
+
+    Encoder models process all tokens in parallel (no causal mask).
+    """
+    H = cfg["hidden_size"]
+    n_h = cfg["num_heads"]
+    d = cfg.get("head_dim", H // n_h)
+    I = cfg["intermediate_size"]
+    V = cfg["vocab_size"]
+    num_layers = cfg["num_layers"]
+    dtype_bytes = cfg["dtype_bytes"]
+    T = cfg.get(f"_{tokens}", tokens)
+
+    # Token embedding + position embedding
+    embed = ModuleNode(
+        name="embeddings", path="model.embeddings",
+        module_type="Embeddings",
+        ops=[
+            OpNode(
+                name="aten::embedding", role="word_embedding",
+                backend="torch-xpu-ops",
+                input_shapes=[["V", "H"], [tokens]],
+                output_shape=[tokens, "H"],
+                memory_bytes=(T * H * dtype_bytes) if isinstance(T, int) else 0,
+                flops=0, phase=phase,
+            ),
+            OpNode(
+                name="aten::embedding", role="position_embedding",
+                backend="torch-xpu-ops",
+                input_shapes=[[str(512), "H"], [tokens]],
+                output_shape=[tokens, "H"],
+                memory_bytes=(T * H * dtype_bytes) if isinstance(T, int) else 0,
+                flops=0, phase=phase,
+            ),
+            OpNode(
+                name="aten::layer_norm", role="embed_norm",
+                backend="torch-xpu-ops",
+                input_shapes=[[tokens, "H"]],
+                output_shape=[tokens, "H"],
+                memory_bytes=_norm_mem(T, H, dtype_bytes) if isinstance(T, int) else 0,
+                flops=_norm_flops(T, H) if isinstance(T, int) else 0,
+                phase=phase,
+            ),
+        ],
+    )
+
+    # Encoder layers (bidirectional self-attention + MLP)
+    qkv_proj = OpNode(
+        name="aten::mm", role="qkv_proj",
+        backend="torch-xpu-ops",
+        input_shapes=[[tokens, "H"], ["H", str(3 * H)]],
+        output_shape=[tokens, str(3 * H)],
+        memory_bytes=_mm_mem(T, H, 3 * H, dtype_bytes) if isinstance(T, int) else 0,
+        flops=_mm_flops(T, H, 3 * H) if isinstance(T, int) else 0,
+        phase=phase,
+    )
+    attention = OpNode(
+        name="aten::scaled_dot_product_attention", role="attention",
+        backend="torch-xpu-ops",
+        input_shapes=[[tokens, "n_h", "d"], [tokens, "n_h", "d"]],
+        output_shape=[tokens, "n_h", "d"],
+        memory_bytes=0, flops=0, phase=phase,
+    )
+    o_proj = OpNode(
+        name="aten::mm", role="o_proj",
+        backend="torch-xpu-ops",
+        input_shapes=[[tokens, "H"], ["H", "H"]],
+        output_shape=[tokens, "H"],
+        memory_bytes=_mm_mem(T, H, H, dtype_bytes) if isinstance(T, int) else 0,
+        flops=_mm_flops(T, H, H) if isinstance(T, int) else 0,
+        phase=phase,
+    )
+    attn_norm = OpNode(
+        name="aten::layer_norm", role="attn_norm",
+        backend="torch-xpu-ops",
+        input_shapes=[[tokens, "H"]],
+        output_shape=[tokens, "H"],
+        memory_bytes=_norm_mem(T, H, dtype_bytes) if isinstance(T, int) else 0,
+        flops=_norm_flops(T, H) if isinstance(T, int) else 0,
+        phase=phase,
+    )
+    mlp_up = OpNode(
+        name="aten::mm", role="mlp_up",
+        backend="torch-xpu-ops",
+        input_shapes=[[tokens, "H"], ["H", "I"]],
+        output_shape=[tokens, "I"],
+        memory_bytes=_mm_mem(T, H, I, dtype_bytes) if isinstance(T, int) else 0,
+        flops=_mm_flops(T, H, I) if isinstance(T, int) else 0,
+        phase=phase,
+    )
+    mlp_act = OpNode(
+        name="aten::gelu", role="activation",
+        backend="torch-xpu-ops",
+        input_shapes=[[tokens, "I"]],
+        output_shape=[tokens, "I"],
+        memory_bytes=_activation_mem(T, I, dtype_bytes) if isinstance(T, int) else 0,
+        flops=_activation_flops(T, I) if isinstance(T, int) else 0,
+        phase=phase,
+    )
+    mlp_down = OpNode(
+        name="aten::mm", role="mlp_down",
+        backend="torch-xpu-ops",
+        input_shapes=[[tokens, "I"], ["I", "H"]],
+        output_shape=[tokens, "H"],
+        memory_bytes=_mm_mem(T, I, H, dtype_bytes) if isinstance(T, int) else 0,
+        flops=_mm_flops(T, I, H) if isinstance(T, int) else 0,
+        phase=phase,
+    )
+    mlp_norm = OpNode(
+        name="aten::layer_norm", role="mlp_norm",
+        backend="torch-xpu-ops",
+        input_shapes=[[tokens, "H"]],
+        output_shape=[tokens, "H"],
+        memory_bytes=_norm_mem(T, H, dtype_bytes) if isinstance(T, int) else 0,
+        flops=_norm_flops(T, H) if isinstance(T, int) else 0,
+        phase=phase,
+    )
+
+    encoder_layer = ModuleNode(
+        name="encoder_layer", path="model.encoder.layers.*",
+        module_type="TransformerEncoderLayer",
+        ops=[qkv_proj, attention, o_proj, attn_norm,
+             mlp_up, mlp_act, mlp_down, mlp_norm],
+        repeat_count=num_layers,
+    )
+
+    # Pooling (mean or CLS)
+    pool = ModuleNode(
+        name="pooler", path="model.pooler",
+        module_type="Pooler",
+        ops=[OpNode(
+            name="aten::mean", role="pooling",
+            backend="torch-xpu-ops",
+            input_shapes=[[tokens, "H"]],
+            output_shape=["1", "H"],
+            memory_bytes=(T * H * dtype_bytes * 2) if isinstance(T, int) else 0,
+            flops=(T * H) if isinstance(T, int) else 0,
+            phase=phase,
+        )],
+    )
+
+    root = ModuleNode(
+        name="model", path="",
+        module_type="EncoderModel",
+        children=[embed, encoder_layer, pool],
+    )
+    return root
+
+
 # ===================================================================
 # Public API
 # ===================================================================
 
 # Architecture family detection from HuggingFace architecture name
 _ARCH_FAMILY_MAP: dict[str, str] = {
+    # --- Llama family (GQA, RoPE, SwiGLU) ---
     "LlamaForCausalLM": "Llama",
     "MistralForCausalLM": "Llama",
     "YiForCausalLM": "Llama",
     "InternLM2ForCausalLM": "Llama",
+    "MiMoForCausalLM": "Llama",       # Xiaomi MiMo uses Llama architecture
+    "Kimi2ForCausalLM": "Llama",       # Kimi-K2 uses Llama-like architecture
+    "StepForCausalLM": "Llama",        # Step models use Llama-like architecture
+    # --- Qwen family ---
     "Qwen2ForCausalLM": "Qwen2",
     "Qwen3ForCausalLM": "Qwen3",
-    "MixtralForCausalLM": "Mixtral",
+    "Qwen3MoeForCausalLM": "Qwen3Moe",
+    # --- GLM family (ChatGLM / GLM-4 / GLM-5) ---
+    "ChatGLMForConditionalGeneration": "GLM4",
+    "ChatGLMModel": "GLM4",
+    "Glm4ForCausalLM": "GLM4",
+    # --- DeepSeek MLA family ---
     "DeepseekV2ForCausalLM": "DeepSeekV2",
     "DeepseekV3ForCausalLM": "DeepSeekV3",
-    "Qwen3MoeForCausalLM": "Qwen3Moe",
+    # --- MoE models ---
+    "MixtralForCausalLM": "Mixtral",
+    "HunYuanMoEV1ForCausalLM": "Hunyuan",
+    "MiniMaxM1ForCausalLM": "MiniMax",
+    # --- Vision-Language (VL) models ---
+    "Qwen2_5_VLForConditionalGeneration": "Qwen2VL",
+    "Qwen2VLForConditionalGeneration": "Qwen2VL",
+    "Qwen3VLForConditionalGeneration": "Qwen3VL",
+    "Qwen3OmniForConditionalGeneration": "Qwen3VL",
+    "InternVLChatModel": "InternVL",
+    # --- Embedding / Reranker ---
+    "XLMRobertaModel": "RoBERTa",
+    "XLMRobertaForSequenceClassification": "RoBERTa",
+    "BertModel": "BERT",
+    "BertForSequenceClassification": "BERT",
+    "Qwen3ForSequenceClassification": "Qwen3",
+    # --- Diffusion (static analysis only — not vLLM-served) ---
+    "FluxTransformer2DModel": "Flux",
+    "HunyuanDiT2DModel": "HunyuanDiT",
+    "WanTransformer3DModel": "Wan",
+    "LTXVideoTransformer3DModel": "LTX",
+    "CogVideoXTransformer3DModel": "CogVideoX",
+    "UNetSpatioTemporalConditionModel": "SVD",
+    "HunyuanVideoTransformer3DModel": "HunyuanVideo",
 }
 
 # Architectures that have QK normalization
-_HAS_QK_NORM = {"Qwen3", "Qwen3Moe", "DeepSeekV2", "DeepSeekV3"}
+_HAS_QK_NORM = {"Qwen3", "Qwen3Moe", "DeepSeekV2", "DeepSeekV3", "GLM4"}
+
+# Architectures that use Multi-head Latent Attention (MLA)
+_MLA_ARCHS = {"DeepSeekV2", "DeepSeekV3"}
+
+# Vision-language architecture families
+_VL_ARCHS = {"Qwen2VL", "Qwen3VL", "InternVL"}
+
+# Encoder-only architecture families
+_ENCODER_ARCHS = {"RoBERTa", "BERT"}
+
+# Diffusion architecture families (non-vLLM)
+_DIFFUSION_ARCHS = {"Flux", "HunyuanDiT", "Wan", "LTX", "CogVideoX",
+                     "SVD", "HunyuanVideo"}
 
 
 def _dtype_bytes(dtype: str) -> int:
@@ -535,12 +1175,24 @@ def build_model_graph(
     arch = model_summary.get("architecture", "")
     family = _ARCH_FAMILY_MAP.get(arch, "Unknown")
     is_moe = model_summary.get("is_moe", False)
+    is_vl = family in _VL_ARCHS
+    is_encoder = family in _ENCODER_ARCHS
+    is_mla = family in _MLA_ARCHS
+    is_diffusion = family in _DIFFUSION_ARCHS
+
+    # Encoder-only models have a different graph structure
+    if is_encoder:
+        return _build_encoder_graph(model_summary, family, prefill_len, tp_size)
+
+    # Diffusion models: return a placeholder noting static analysis is limited
+    if is_diffusion:
+        return _build_diffusion_placeholder(model_summary, family)
 
     # Full (un-split) dimensions for reference
-    full_num_heads = model_summary["num_heads"]
+    full_num_heads = model_summary.get("num_heads") or 1
     full_num_kv = model_summary.get("num_kv_heads", full_num_heads)
-    full_intermediate = model_summary["intermediate_size"]
-    full_vocab = model_summary["vocab_size"]
+    full_intermediate = model_summary.get("intermediate_size") or 1
+    full_vocab = model_summary.get("vocab_size") or 1
 
     # TP-split dimensions (column-parallel splits output, row-parallel splits input)
     tp_num_heads = full_num_heads // tp_size
@@ -560,6 +1212,8 @@ def build_model_graph(
         "dtype_bytes": _dtype_bytes(model_summary.get("dtype", "bfloat16")),
         "has_qk_norm": family in _HAS_QK_NORM,
         "tp_size": tp_size,
+        "is_mla": is_mla,
+        "is_vl": is_vl,
     }
 
     if is_moe:
@@ -568,6 +1222,27 @@ def build_model_graph(
         raw_moe_I = model_summary.get("moe_intermediate_size")
         cfg["moe_intermediate_size"] = (raw_moe_I // tp_size) if raw_moe_I else None
         cfg["n_shared_experts"] = model_summary.get("n_shared_experts", 0)
+
+    # MLA-specific config (DeepSeek-V2/V3)
+    if is_mla:
+        cfg["kv_lora_rank"] = model_summary.get("kv_lora_rank", 512)
+        cfg["q_lora_rank"] = model_summary.get("q_lora_rank", 0)
+        cfg["qk_nope_head_dim"] = model_summary.get("qk_nope_head_dim", 128)
+        cfg["qk_rope_head_dim"] = model_summary.get("qk_rope_head_dim", 64)
+
+    # VL-specific config
+    if is_vl:
+        cfg["vit_hidden_size"] = model_summary.get("vit_hidden_size", 1024)
+        cfg["vit_num_layers"] = model_summary.get("vit_num_layers", 24)
+        cfg["vit_num_heads"] = model_summary.get("vit_num_heads", 16)
+        cfg["vit_intermediate_size"] = model_summary.get(
+            "vit_intermediate_size",
+            cfg["vit_hidden_size"] * 4,
+        )
+        cfg["patch_size"] = model_summary.get("patch_size", 14)
+        cfg["image_size"] = model_summary.get("image_size", 448)
+        num_patches = (cfg["image_size"] // cfg["patch_size"]) ** 2
+        cfg["_num_patches"] = num_patches
 
     # Hybrid dense/MoE detection
     first_k_dense = model_summary.get("first_k_dense_replace", 0) or 0
@@ -589,6 +1264,7 @@ def build_model_graph(
     result: dict[str, Any] = {
         "architecture": arch,
         "family": family,
+        "model_type": "mllm" if is_vl else ("moe" if is_moe else "llm"),
         "config": {
             "hidden_size": cfg["hidden_size"],
             "num_layers": cfg["num_layers"],
@@ -660,8 +1336,19 @@ def _build_full_model(
     dtype_bytes = cfg["dtype_bytes"]
     T = cfg.get(f"_{tokens}", tokens)
     first_k_dense = cfg.get("first_k_dense_replace", 0)
+    is_mla = cfg.get("is_mla", False)
+    is_vl = cfg.get("is_vl", False)
 
-    # Embedding
+    children: list[ModuleNode] = []
+
+    # Vision encoder (for VL models, prefill phase only)
+    if is_vl and phase == "prefill":
+        vit = _build_vision_encoder(cfg, phase, tokens)
+        children.append(vit)
+        proj = _build_vl_projector(cfg, phase, tokens)
+        children.append(proj)
+
+    # Text embedding
     embed = ModuleNode(
         name="embed_tokens", path="model.embed_tokens",
         module_type="VocabParallelEmbedding",
@@ -675,29 +1362,42 @@ def _build_full_model(
             phase=phase,
         )],
     )
+    children.append(embed)
 
-    # Decoder layers — handle hybrid dense/MoE
+    # Decoder layers — handle MLA, hybrid dense/MoE, standard dense/MoE
     layers: list[ModuleNode] = []
+
+    # Choose the right layer builders based on architecture
+    if is_mla:
+        # MLA architectures (DeepSeek-V2/V3)
+        dense_builder = _build_mla_decoder_layer
+        moe_builder = _build_mla_moe_layer
+    else:
+        dense_builder = _build_decoder_layer
+        moe_builder = _build_moe_layer
+
     if is_moe and first_k_dense > 0:
         # Hybrid: first N layers are dense, rest are MoE
-        dense_layer = _build_decoder_layer(cfg, family, phase, tokens, seq)
+        dense_layer = dense_builder(cfg, family, phase, tokens, seq)
         dense_layer.name = "dense_layer"
         dense_layer.module_type = f"{family}DenseLayer"
         dense_layer.repeat_count = first_k_dense
         layers.append(dense_layer)
 
         num_moe_layers = cfg["num_layers"] - first_k_dense
-        moe_layer = _build_moe_layer(cfg, family, phase, tokens, seq)
+        moe_layer = moe_builder(cfg, family, phase, tokens, seq)
         moe_layer.name = "moe_layer"
         moe_layer.module_type = f"{family}MoELayer"
         moe_layer.repeat_count = num_moe_layers
         layers.append(moe_layer)
     elif is_moe:
-        layer = _build_moe_layer(cfg, family, phase, tokens, seq)
+        layer = moe_builder(cfg, family, phase, tokens, seq)
         layers.append(layer)
     else:
-        layer = _build_decoder_layer(cfg, family, phase, tokens, seq)
+        layer = dense_builder(cfg, family, phase, tokens, seq)
         layers.append(layer)
+
+    children.extend(layers)
 
     # Final norm
     final_norm = ModuleNode(
@@ -705,6 +1405,7 @@ def _build_full_model(
         module_type="RMSNorm",
         ops=[_build_norm_op(cfg, "final_norm", tokens, phase)],
     )
+    children.append(final_norm)
 
     # LM head
     lm_head = ModuleNode(
@@ -720,13 +1421,88 @@ def _build_full_model(
             phase=phase,
         )],
     )
+    children.append(lm_head)
+
+    model_type = f"{family}ForCausalLM"
+    if is_vl:
+        model_type = f"{family}ForConditionalGeneration"
 
     root = ModuleNode(
         name="model", path="",
-        module_type=f"{family}ForCausalLM",
-        children=[embed] + layers + [final_norm, lm_head],
+        module_type=model_type,
+        children=children,
     )
     return root
+
+
+def _build_encoder_graph(
+    model_summary: dict, family: str,
+    seq_len: int | None = None, tp_size: int = 1,
+) -> dict:
+    """Build graph for encoder-only models (BERT/RoBERTa for embedding/reranking)."""
+    full_num_heads = model_summary.get("num_heads") or 12
+    cfg: dict[str, Any] = {
+        "hidden_size": model_summary.get("hidden_size", 768),
+        "num_layers": model_summary.get("num_layers", 12),
+        "num_heads": full_num_heads // tp_size,
+        "head_dim": model_summary.get("head_dim",
+                                       model_summary.get("hidden_size", 768) // full_num_heads),
+        "intermediate_size": model_summary.get("intermediate_size", 3072) // tp_size,
+        "vocab_size": model_summary.get("vocab_size", 30522) // tp_size,
+        "dtype_bytes": _dtype_bytes(model_summary.get("dtype", "float32")),
+    }
+    if seq_len:
+        cfg["_S"] = seq_len
+
+    result: dict[str, Any] = {
+        "architecture": model_summary.get("architecture", ""),
+        "family": family,
+        "model_type": "encoder",
+        "config": {k: v for k, v in cfg.items() if not k.startswith("_")},
+        "symbols": {
+            "H": cfg["hidden_size"],
+            "n_h": cfg["num_heads"],
+            "d": cfg["head_dim"],
+            "I": cfg["intermediate_size"],
+            "V": cfg["vocab_size"],
+        },
+    }
+    if seq_len:
+        result["symbols"]["S"] = seq_len
+
+    # Encoder models only have a "forward" phase (no prefill/decode split)
+    root = _build_encoder_model(cfg, "prefill", "S")
+    _compute_totals(root)
+    result["prefill"] = root.to_dict()
+    # No decode phase for encoder models
+    result["decode"] = None
+
+    return result
+
+
+def _build_diffusion_placeholder(model_summary: dict, family: str) -> dict:
+    """Build placeholder graph for diffusion models.
+
+    Diffusion models (FLUX, Wan, etc.) are not served by vLLM and have
+    fundamentally different op patterns (iterative denoising).
+    Static analysis provides basic structure info.
+    """
+    return {
+        "architecture": model_summary.get("architecture", ""),
+        "family": family,
+        "model_type": "diffusion",
+        "note": (
+            f"Diffusion models ({family}) use iterative denoising pipelines "
+            f"(typically via diffusers, not vLLM). Static op graph analysis "
+            f"is limited. Use profiling with the appropriate pipeline framework."
+        ),
+        "config": {
+            "hidden_size": model_summary.get("hidden_size"),
+            "num_layers": model_summary.get("num_layers"),
+        },
+        "prefill": None,
+        "decode": None,
+    }
 
 
 def _compute_totals(node: ModuleNode) -> tuple[int, int]:
