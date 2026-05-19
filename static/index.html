@@ -337,7 +337,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
       </div>
       <div class="control-group">
         <label>Quantization</label>
-        <select id="quant-select">
+        <select id="quant-select" onchange="runStatic()">
           <option value="" selected>None</option>
           <option value="fp8">FP8</option>
           <option value="gptq">GPTQ</option>
@@ -523,9 +523,12 @@ async function runStatic() {
   const queryLen = parseInt(document.getElementById('query-len').value) || 2048;
   const batchSize = parseInt(document.getElementById('batch-size').value) || 1;
   const contextLen = parseInt(document.getElementById('context-len').value) || 4096;
+  const quant = document.getElementById('quant-select').value;
 
   try {
-    const resp = await fetch(`/api/model/${encodeURIComponent(modelId)}/graph?prefill_len=${queryLen}&decode_batch=${batchSize}&context_len=${contextLen}&tp_size=${tpSize}`);
+    let url = `/api/model/${encodeURIComponent(modelId)}/graph?prefill_len=${queryLen}&decode_batch=${batchSize}&context_len=${contextLen}&tp_size=${tpSize}`;
+    if (quant) url += `&quantization=${encodeURIComponent(quant)}`;
+    const resp = await fetch(url);
     const data = await resp.json();
     if (!data.ok) { alert('Graph error: ' + data.error); return; }
     STATIC_GRAPH_DATA = data.graph;

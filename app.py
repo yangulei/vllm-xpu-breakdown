@@ -157,12 +157,14 @@ def get_model_graph(model_id: str):
         decode_batch = request.args.get("decode_batch", 1, type=int)
         context_len = request.args.get("context_len", 4096, type=int)
         tp_size = request.args.get("tp_size", 1, type=int)
+        quantization = request.args.get("quantization", None, type=str)
 
         graph = build_model_graph(summary,
                                   prefill_len=prefill_len,
                                   decode_batch=decode_batch,
                                   context_len=context_len,
-                                  tp_size=tp_size)
+                                  tp_size=tp_size,
+                                  quantization=quantization)
         min_layers = min_profile_layers(summary)
         return jsonify({
             "ok": True, "graph": graph, "summary": summary,
