@@ -961,7 +961,7 @@ function symTooltip(dimStr) {
   const s = String(dimStr);
   const val = symbols[s];
   if (val !== undefined) {
-    return { html: `<span class="sym-dim">${s}</span>`, concrete: val.toLocaleString() };
+    return { html: `<span class="sym-dim">${s}</span>`, concrete: String(val) };
   }
   // Handle composite like "S·8" or "tokens·2"
   const parts = s.split('·');
@@ -976,18 +976,69 @@ function symTooltip(dimStr) {
       allResolved = false;
       return p;
     });
-    return { html: htmlParts.join('·'), concrete: allResolved ? numericProd.toLocaleString() : null };
+    return { html: htmlParts.join('·'), concrete: allResolved ? String(numericProd) : null };
   }
   return { html: s, concrete: s };
 }
 
-function fmtShapeGraph(shapes) {
-  const parts = shapes.map(tensorDims => {
+// Determine dtype name from byte count
+function bytesToDtype(bytes) {
+  return {4: 'fp32', 2: 'bf16', 1: 'fp8'}[bytes] || (bytes * 8 + 'bit');
+}
+
+// Get quant method display name
+function quantDtypeName(quant) {
+  if (!quant || quant === 'None') return null;
+  const names = {fp8:'fp8', gptq:'int4', gptq_marlin:'int4', awq:'int4',
+                 awq_marlin:'int4', marlin:'int4', squeezellm:'int4',
+                 bitsandbytes:'nf4', gguf:'q4', int4:'int4', int8:'int8'};
+  return names[quant.toLowerCase()] || quant.toLowerCase();
+}
+
+// Roles that have a weight matrix as the 2nd input tensor
+const WEIGHT_ROLES = new Set([
+  'qkv_proj', 'q_proj', 'k_proj', 'v_proj', 'o_proj',
+  'gate_up_proj', 'up_proj', 'gate_proj', 'down_proj',
+  'expert_mm1', 'expert_mm2', 'shared_mm1', 'shared_mm2',
+  'kv_a_proj', 'kv_b_proj', 'q_a_proj', 'q_b_proj',
+  'vit_qkv_proj', 'vit_o_proj', 'vit_mlp_up', 'vit_mlp_down',
+  'patch_embed', 'proj', 'embed', 'lm_head',
+]);
+
+// Get per-tensor dtype labels for an op
+function getOpDtypes(op, numInputs) {
+  const cfg = GRAPH_DATA?.config || {};
+  const actDtype = bytesToDtype(cfg.dtype_bytes || 2);
+  const quant = cfg.quantization;
+  const wDtype = quant && quant !== 'None'
+    ? (quantDtypeName(quant) || bytesToDtype(cfg.weight_dtype_bytes || 2))
+    : actDtype;
+  const dtypes = [];
+  for (let i = 0; i < numInputs; i++) {
+    if (i === 1 && WEIGHT_ROLES.has(op.role)) {
+      dtypes.push(wDtype);
+    } else {
+      dtypes.push(actDtype);
+    }
+  }
+  return dtypes;
+}
+
+function fmtShapeGraph(shapes, op) {
+  const dtypes = op ? getOpDtypes(op, shapes.length) : [];
+  const parts = shapes.map((tensorDims, idx) => {
     const resolved = tensorDims.map(d => symTooltip(d));
     const innerHtml = resolved.map(r => r.html).join(', ');
     const concreteParts = resolved.map(r => r.concrete);
     const allConcrete = concreteParts.every(c => c !== null);
-    return { html: `[${innerHtml}]`, concrete: allConcrete ? `[${concreteParts.join(', ')}]` : null };
+    const dtype = dtypes[idx] || '';
+    if (allConcrete) {
+      const concreteWithDtype = dtype
+        ? `[${concreteParts.join(', ')}, '${dtype}']`
+        : `[${concreteParts.join(', ')}]`;
+      return { html: `[${innerHtml}]`, concrete: concreteWithDtype };
+    }
+    return { html: `[${innerHtml}]`, concrete: null };
   });
   const symHtml = parts.map(p => p.html).join(' × ');
   const allResolved = parts.every(p => p.concrete !== null);
@@ -1070,7 +1121,7 @@ function buildTreeNode(node, isRoot, hasTiming) {
     for (const op of node.ops) {
       const opEl = document.createElement('div');
       opEl.className = 'tree-op';
-      const shapesHtml = fmtShapeGraph(op.input_shapes);
+      const shapesHtml = fmtShapeGraph(op.input_shapes, op);
       let costParts = [];
       if (op.memory_bytes > 0) costParts.push(fmtBytes(op.memory_bytes));
       if (op.flops > 0) costParts.push(fmtFlops(op.flops));
