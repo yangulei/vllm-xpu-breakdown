@@ -543,6 +543,17 @@ _T2V_MODELS: list[ModelEntry] = [
         vllm_supported=False,
     ),
     ModelEntry(
+        name="Hy3 Preview",
+        hf_id="tencent/Hy3-preview",
+        hf_ids=["tencent/Hy3-preview"],
+        precision=["BF16"],
+        model_type="T2V",
+        architecture="HunyuanVideoTransformer3DModel",
+        family="HunyuanVideo",
+        vllm_supported=False,
+        notes="Hunyuan Video 3.0 preview",
+    ),
+    ModelEntry(
         name="StepVideo",
         hf_id=None,
         precision=["BF16"],
