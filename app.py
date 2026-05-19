@@ -395,7 +395,8 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             graph = build_model_graph(summary, prefill_len=128,
                                       decode_batch=batch_size,
                                       context_len=max_model_len,
-                                      tp_size=tp_size)
+                                      tp_size=tp_size,
+                                      quantization=quantization)
             # Try module-path-based annotation first (more precise)
             module_ops = parse_trace_with_modules(rank_files[0])
             if module_ops:
