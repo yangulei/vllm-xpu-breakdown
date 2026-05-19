@@ -997,12 +997,13 @@ function quantDtypeName(quant) {
 
 // Roles that have a weight matrix as the 2nd input tensor
 const WEIGHT_ROLES = new Set([
-  'qkv_proj', 'q_proj', 'k_proj', 'v_proj', 'o_proj',
-  'gate_up_proj', 'up_proj', 'gate_proj', 'down_proj',
-  'expert_mm1', 'expert_mm2', 'shared_mm1', 'shared_mm2',
-  'kv_a_proj', 'kv_b_proj', 'q_a_proj', 'q_b_proj',
+  'qkv_proj', 'o_proj', 'gate_up_proj', 'down_proj',
+  'expert_gate_up', 'expert_down',
+  'shared_expert_gate_up', 'shared_expert_down',
+  'q_compress', 'q_decompress', 'kv_compress',
+  'router_gate', 'lm_head', 'vl_projector',
   'vit_qkv_proj', 'vit_o_proj', 'vit_mlp_up', 'vit_mlp_down',
-  'patch_embed', 'proj', 'embed', 'lm_head',
+  'patch_embed', 'mlp_up', 'mlp_down',
 ]);
 
 // Get per-tensor dtype labels for an op
@@ -1010,7 +1011,7 @@ function getOpDtypes(op, numInputs) {
   const cfg = GRAPH_DATA?.config || {};
   const actDtype = bytesToDtype(cfg.dtype_bytes || 2);
   const quant = cfg.quantization;
-  const wDtype = quant && quant !== 'None'
+  const wDtype = quant
     ? (quantDtypeName(quant) || bytesToDtype(cfg.weight_dtype_bytes || 2))
     : actDtype;
   const dtypes = [];
