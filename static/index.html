@@ -1050,18 +1050,17 @@ function fmtShapeGraph(shapes, op) {
   const parts = shapes.map((tensorDims, idx) => {
     const resolved = tensorDims.map(d => symTooltip(d));
     const innerHtml = resolved.map(r => r.html).join(', ');
-    const concreteParts = resolved.map(r => r.concrete);
-    const allConcrete = concreteParts.every(c => c !== null);
+    const concreteParts = resolved.map(r => r.concrete).filter(c => c !== null);
+    const allConcrete = concreteParts.length === tensorDims.length;
     const dtype = dtypes[idx] || '';
-    if (allConcrete) {
-      const concreteWithDtype = dtype
-        ? `[${concreteParts.join(', ')}, '${dtype}']`
-        : `[${concreteParts.join(', ')}]`;
-      return { html: `[${innerHtml}]`, concrete: concreteWithDtype };
-    }
-    return { html: `[${innerHtml}]`, concrete: null };
+    // Build symbolic part with dtype tag
+    const dtypeTag = dtype ? ` <span style="color:#d32f2f;font-size:0.85em;font-weight:600">${dtype}</span>` : '';
+    const symPart = `[${innerHtml}]${dtypeTag}`;
+    // Build concrete part
+    const concretePart = allConcrete ? `[${concreteParts.join(', ')}]` : null;
+    return { sym: symPart, concrete: concretePart };
   });
-  const symHtml = parts.map(p => p.html).join(' × ');
+  const symHtml = parts.map(p => p.sym).join(' × ');
   const allResolved = parts.every(p => p.concrete !== null);
   if (allResolved) {
     const concreteHtml = parts.map(p => p.concrete).join(' × ');
