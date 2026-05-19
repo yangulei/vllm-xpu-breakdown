@@ -1693,8 +1693,6 @@ def annotate_graph_timing(graph: dict, trace_ops: list[dict]) -> None:
     lookup: dict[tuple, dict] = {}
     # Also build name-only lookup for fallback
     name_lookup: dict[str, dict] = {}
-    # Track all ops per normalized name for sub_ops on complex ops
-    name_all_ops: dict[str, list[dict]] = {}
     for op in trace_ops:
         raw_name = op.get("name", "")
         norm = _normalize_trace_name(raw_name)
@@ -1724,23 +1722,12 @@ def annotate_graph_timing(graph: dict, trace_ops: list[dict]) -> None:
         name_lookup[norm]["cpu_us"] += dur_cpu
         name_lookup[norm]["count"] += count
 
-        # Collect all individual ops by normalized name
-        if norm not in name_all_ops:
-            name_all_ops[norm] = []
-        name_all_ops[norm].append({
-            "name": raw_name,
-            "device_time_us": round(dur_dev / max(count, 1), 2),
-            "cpu_time_us": round(dur_cpu / max(count, 1), 2),
-            "count": count,
-        })
-
     # Walk graph and annotate
     matched = 0
     total_ops = 0
     for phase in ("prefill", "decode"):
         if phase in graph:
-            m, t = _annotate_node(graph[phase], lookup, name_lookup,
-                                  name_all_ops, symbols)
+            m, t = _annotate_node(graph[phase], lookup, name_lookup, symbols)
             matched += m
             total_ops += t
 
@@ -1750,8 +1737,7 @@ def annotate_graph_timing(graph: dict, trace_ops: list[dict]) -> None:
 
 
 def _annotate_node(
-    node: dict, lookup: dict, name_lookup: dict,
-    name_all_ops: dict, symbols: dict
+    node: dict, lookup: dict, name_lookup: dict, symbols: dict
 ) -> tuple[int, int]:
     """Annotate a serialized node dict in-place. Returns (matched, total)."""
     node_time = 0.0
@@ -1784,12 +1770,6 @@ def _annotate_node(
             op["cpu_time_us"] = round(per_call_cpu, 2)
             op["profiled_calls"] = info["count"]
             op["profiled_name"] = info.get("raw_name", "")
-            # Attach sub-ops if multiple trace ops share this normalized name
-            norm_key = _normalize_trace_name(op["name"])
-            sub_ops = name_all_ops.get(norm_key, [])
-            if len(sub_ops) > 1:
-                op["sub_ops"] = sorted(sub_ops,
-                                       key=lambda x: -x["device_time_us"])
             node_time += per_call_dev
             node_cpu += per_call_cpu
             matched += 1
@@ -1797,8 +1777,7 @@ def _annotate_node(
     child_time = 0.0
     child_cpu = 0.0
     for child in node.get("children", []):
-        cm, ct = _annotate_node(child, lookup, name_lookup,
-                                name_all_ops, symbols)
+        cm, ct = _annotate_node(child, lookup, name_lookup, symbols)
         matched += cm
         total += ct
         mult = child.get("repeat_count", 1)

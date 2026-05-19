@@ -1073,7 +1073,8 @@ def export_excel():
 
             hier_headers = ["Module", "Path", "Type", "×Repeat",
                             "Memory (bytes)", "FLOPs", "AI",
-                            "Op Role", "Op Name", "Op Backend", "Op Shape"]
+                            "Op Role", "Op Name", "Op Backend", "Op Shape",
+                            "Sub Op Time"]
             for col, hdr in enumerate(hier_headers, 1):
                 c = ws_hier.cell(1, col, hdr)
                 c.font = header_font
@@ -1164,11 +1165,12 @@ def export_excel():
                     # Sub-ops rows (constituent kernels of complex ops)
                     for sub_op in op.get("sub_ops", []):
                         sub_indent = "  " * (depth + 2)
-                        ws_hier.cell(hier_row, 1, sub_indent + "⤷ " + sub_op["name"])
-                        ws_hier.cell(hier_row, 9, sub_op["name"])
-                        # Show timing for sub-ops
+                        sname = sub_op.get("name", "")
+                        ws_hier.cell(hier_row, 1, sub_indent + "⤷ " + sname)
+                        ws_hier.cell(hier_row, 9, sname)
+                        # Show timing in dedicated Sub Op Time column
                         if sub_op.get("device_time_us", 0) > 0:
-                            ws_hier.cell(hier_row, 10, f'{sub_op["device_time_us"]:.1f}µs')
+                            ws_hier.cell(hier_row, 12, f'{sub_op["device_time_us"]:.1f}µs')
                         for col in range(1, len(hier_headers) + 1):
                             ws_hier.cell(hier_row, col).border = thin_border
                             ws_hier.cell(hier_row, col).font = Font(
@@ -1177,7 +1179,7 @@ def export_excel():
                         hier_row += 1
 
             # Column widths for hierarchy sheet
-            hier_col_widths = [35, 35, 25, 8, 15, 15, 10, 18, 35, 18, 55]
+            hier_col_widths = [35, 35, 25, 8, 15, 15, 10, 18, 35, 18, 55, 12]
             for i, w in enumerate(hier_col_widths, 1):
                 ws_hier.column_dimensions[get_column_letter(i)].width = w
 
