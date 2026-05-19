@@ -1171,6 +1171,13 @@ def _quant_weight_bytes(quant_method: str) -> int:
     return quant_bytes.get(quant_method.lower(), 2)
 
 
+def _bytes_to_dtype_name(nbytes: int, quant_method: str | None = None) -> str:
+    """Convert byte count (and optional quant method) to a display dtype name."""
+    if quant_method:
+        return quant_method.upper()
+    return {4: "fp32", 2: "bf16", 1: "fp8"}.get(nbytes, f"{nbytes*8}bit")
+
+
 def min_profile_layers(model_summary: dict) -> int:
     """Compute minimum layers to profile to capture all unique layer types.
 
@@ -1323,6 +1330,7 @@ def build_model_graph(
             "first_k_dense_replace": first_k_dense,
             "tp_size": tp_size,
             "quantization": quant,
+            "dtype_bytes": cfg["dtype_bytes"],
             "weight_dtype_bytes": cfg["weight_dtype_bytes"],
         },
         # Symbol → concrete value mapping for tooltips
