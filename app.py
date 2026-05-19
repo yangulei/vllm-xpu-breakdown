@@ -707,6 +707,96 @@ def _shape_to_concrete(shape: list, symbols: dict[str, int]) -> str:
     return "[" + ", ".join(concrete) + "]"
 
 
+def _normalize_dtype(dtype: str) -> str:
+    """Normalize dtype string to short form (e.g. bfloat16 -> bf16)."""
+    mapping = {
+        "bfloat16": "bf16",
+        "float16": "fp16",
+        "float32": "fp32",
+        "float8": "fp8",
+    }
+    return mapping.get(dtype, dtype)
+
+
+def _shape_concrete_with_dtype(op: dict, symbols: dict[str, int]) -> str:
+    """Build concrete shape string with dtype appended inside each bracket.
+
+    Example: "[128, 2560, bf16] × [2560, 6144, bf16]"
+    """
+    shapes = op.get("input_shapes")
+    if not shapes or not isinstance(shapes, list):
+        return "—"
+    dtype = _normalize_dtype(op.get("dtype") or "")
+    parts = []
+    for shape in shapes:
+        if isinstance(shape, list):
+            concrete = []
+            for dim in shape:
+                if isinstance(dim, str) and dim in symbols:
+                    concrete.append(str(symbols[dim]))
+                elif isinstance(dim, int):
+                    concrete.append(str(dim))
+                else:
+                    concrete.append(str(dim))
+            if dtype:
+                concrete.append(dtype)
+            parts.append("[" + ", ".join(concrete) + "]")
+        else:
+            parts.append(str(shape))
+    return " × ".join(parts)
+
+
+# Roles whose 2nd input tensor (index 1) is a weight matrix
+_WEIGHT_ROLES = {
+    "qkv_proj", "o_proj", "gate_up_proj", "down_proj",
+    "expert_gate_up", "expert_down",
+    "shared_expert_gate_up", "shared_expert_down",
+    "q_compress", "q_decompress", "kv_compress",
+    "router_gate", "lm_head", "vl_projector",
+    "vit_qkv_proj", "vit_o_proj", "vit_mlp_up", "vit_mlp_down",
+    "patch_embed", "mlp_up", "mlp_down",
+}
+
+
+def _bytes_to_dtype(nbytes: int) -> str:
+    """Convert byte count to short dtype name."""
+    return {4: "fp32", 2: "bf16", 1: "fp8"}.get(nbytes, f"{nbytes * 8}bit")
+
+
+def _quant_dtype_name(quant: str | None) -> str | None:
+    """Map quantization method to weight dtype short name."""
+    if not quant or quant == "None":
+        return None
+    names = {
+        "fp8": "fp8", "gptq": "int4", "gptq_marlin": "int4",
+        "awq": "int4", "awq_marlin": "int4", "marlin": "int4",
+        "squeezellm": "int4", "bitsandbytes": "nf4", "gguf": "q4",
+        "int4": "int4", "int8": "int8",
+    }
+    return names.get(quant.lower(), quant.lower())
+
+
+def _get_tensor_dtype(tensor_idx: int, role: str,
+                      graph_cfg: dict) -> str:
+    """Get the dtype label for a specific tensor in an op.
+
+    Mirrors the frontend getOpDtypes logic: weight tensors (index 1) of
+    projection ops use the weight dtype; everything else uses activation dtype.
+    """
+    act_dtype = _bytes_to_dtype(graph_cfg.get("dtype_bytes", 2))
+    quant = graph_cfg.get("quantization")
+    if quant:
+        w_dtype = _quant_dtype_name(quant) or _bytes_to_dtype(
+            graph_cfg.get("weight_dtype_bytes", 2)
+        )
+    else:
+        w_dtype = act_dtype
+
+    if tensor_idx == 1 and role in _WEIGHT_ROLES:
+        return w_dtype
+    return act_dtype
+
+
 def _flatten_graph_nodes(node: dict, depth: int = 0,
                          rows: list | None = None) -> list[dict]:
     """Flatten a hierarchical graph tree into rows for the hierarchy sheet."""
@@ -814,9 +904,12 @@ def export_excel():
     # Get symbols dict from graph data or build from summary
     graph_data = data.get("graph")
     symbols: dict[str, int] = {}
+    graph_cfg: dict = {}
     if graph_data and "symbols" in graph_data:
         symbols = graph_data["symbols"]
-    elif summary:
+    if graph_data and "config" in graph_data:
+        graph_cfg = graph_data["config"]
+    if not symbols and summary:
         # Fallback: build symbols from summary
         for key, val in summary.items():
             if isinstance(val, int):
@@ -864,6 +957,7 @@ def export_excel():
     ws = wb.create_sheet("Operations")
 
     headers = ["Op Name", "Backend", "Shape (symbolic)", "Shape (concrete)",
+               "Shape (concrete + dtype)",
                "dtype", "×Layers", "Calls", "Device Time (µs)", "% Time",
                "Memory (bytes)", "FLOPs", "Arithmetic Intensity"]
     for col, hdr in enumerate(headers, 1):
@@ -915,45 +1009,47 @@ def export_excel():
         else:
             ws.cell(r, 4, "—")
 
-        ws.cell(r, 5, op.get("dtype") or "—")
-        ws.cell(r, 6, op.get("layer_count", 1))
-        ws.cell(r, 7, op.get("call_count", 0))
-        ws.cell(r, 8, op.get("device_time_us", 0))
+        ws.cell(r, 5, _shape_concrete_with_dtype(op, symbols))
+
+        ws.cell(r, 6, op.get("dtype") or "—")
+        ws.cell(r, 7, op.get("layer_count", 1))
+        ws.cell(r, 8, op.get("call_count", 0))
+        ws.cell(r, 9, op.get("device_time_us", 0))
 
         # % Time as formula: device_time / SUM(device_time_column)
         last_data_row = len(ops) + 1
-        col_h = get_column_letter(8)  # H = Device Time
-        ws.cell(r, 9).value = f"={col_h}{r}/SUM({col_h}$2:{col_h}${last_data_row})"
-        ws.cell(r, 9).number_format = '0.0%'
+        col_i = get_column_letter(9)  # I = Device Time
+        ws.cell(r, 10).value = f"={col_i}{r}/SUM({col_i}$2:{col_i}${last_data_row})"
+        ws.cell(r, 10).number_format = '0.0%'
 
-        ws.cell(r, 10, op.get("memory_bytes", 0))
+        ws.cell(r, 11, op.get("memory_bytes", 0))
 
         flops = op.get("flops", 0)
-        ws.cell(r, 11, flops)
+        ws.cell(r, 12, flops)
 
         # Arithmetic Intensity as formula: FLOPs / Memory (avoid div-by-zero)
-        col_j = get_column_letter(10)   # J = Memory
-        col_k = get_column_letter(11)   # K = FLOPs
-        ws.cell(r, 12).value = (
-            f'=IF({col_j}{r}=0,"—",{col_k}{r}/{col_j}{r})'
+        col_k = get_column_letter(11)   # K = Memory
+        col_l = get_column_letter(12)   # L = FLOPs
+        ws.cell(r, 13).value = (
+            f'=IF({col_k}{r}=0,"—",{col_l}{r}/{col_k}{r})'
         )
-        ws.cell(r, 12).number_format = '0.00'
+        ws.cell(r, 13).number_format = '0.00'
 
     # Totals row
     total_row = len(ops) + 2
     ws.cell(total_row, 1, "TOTAL").font = Font(bold=True)
-    col_g = get_column_letter(7)
     col_h = get_column_letter(8)
-    ws.cell(total_row, 7).value = f"=SUM({col_g}2:{col_g}{len(ops)+1})"
-    ws.cell(total_row, 7).font = Font(bold=True)
+    col_i = get_column_letter(9)
     ws.cell(total_row, 8).value = f"=SUM({col_h}2:{col_h}{len(ops)+1})"
     ws.cell(total_row, 8).font = Font(bold=True)
-    ws.cell(total_row, 9, 1.0)
-    ws.cell(total_row, 9).number_format = '0.0%'
+    ws.cell(total_row, 9).value = f"=SUM({col_i}2:{col_i}{len(ops)+1})"
     ws.cell(total_row, 9).font = Font(bold=True)
+    ws.cell(total_row, 10, 1.0)
+    ws.cell(total_row, 10).number_format = '0.0%'
+    ws.cell(total_row, 10).font = Font(bold=True)
 
     # Column widths
-    col_widths = [45, 18, 50, 50, 10, 8, 8, 15, 10, 15, 15, 15]
+    col_widths = [45, 18, 50, 50, 50, 10, 8, 8, 15, 10, 15, 15, 15]
     for i, w in enumerate(col_widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
@@ -977,7 +1073,7 @@ def export_excel():
 
             hier_headers = ["Module", "Path", "Type", "×Repeat",
                             "Memory (bytes)", "FLOPs", "AI",
-                            "Op Name", "Op Backend", "Op Shape", "Op dtype"]
+                            "Op Role", "Op Name", "Op Backend", "Op Shape"]
             for col, hdr in enumerate(hier_headers, 1):
                 c = ws_hier.cell(1, col, hdr)
                 c.font = header_font
@@ -1019,35 +1115,69 @@ def export_excel():
                 # Op rows under this module
                 for op in node_info["ops"]:
                     op_indent = "  " * (depth + 1)
-                    ws_hier.cell(hier_row, 8, op.get("name", ""))
-                    ws_hier.cell(hier_row, 9, op.get("backend", ""))
+                    op_role = op.get("role", "")
+                    ws_hier.cell(hier_row, 8, op_role)
+                    # Use high-level name when sub-ops show kernel details
+                    if op.get("sub_ops"):
+                        op_name = op.get("name", "")
+                    else:
+                        op_name = op.get("profiled_name") or op.get("name", "")
+                    ws_hier.cell(hier_row, 9, op_name)
+                    ws_hier.cell(hier_row, 10, op.get("backend", ""))
 
-                    # Show concrete op shapes
+                    # Show concrete op shapes with per-tensor dtype
                     op_shapes = op.get("input_shapes", [])
                     if op_shapes:
                         concrete_shapes = []
-                        for shape in op_shapes:
+                        for shape_idx, shape in enumerate(op_shapes):
                             if isinstance(shape, list):
+                                # Determine per-tensor dtype
+                                tensor_dtype = _get_tensor_dtype(
+                                    shape_idx, op_role, graph_cfg
+                                )
+                                parts = []
+                                for dim in shape:
+                                    if isinstance(dim, str) and dim in symbols:
+                                        parts.append(str(symbols[dim]))
+                                    elif isinstance(dim, int):
+                                        parts.append(str(dim))
+                                    else:
+                                        parts.append(str(dim))
+                                if tensor_dtype:
+                                    parts.append(tensor_dtype)
                                 concrete_shapes.append(
-                                    _shape_to_concrete(shape, symbols)
+                                    "[" + ", ".join(parts) + "]"
                                 )
                             else:
                                 concrete_shapes.append(str(shape))
-                        ws_hier.cell(hier_row, 10, ", ".join(concrete_shapes))
+                        ws_hier.cell(
+                            hier_row, 11, " × ".join(concrete_shapes)
+                        )
                     else:
-                        ws_hier.cell(hier_row, 10, "—")
+                        ws_hier.cell(hier_row, 11, "—")
 
-                    # Op dtype from phase info
-                    op_dtype = data.get("summary", {}).get("dtype", "")
-                    ws_hier.cell(hier_row, 11, op_dtype)
-
-                    ws_hier.cell(hier_row, 1, op_indent + "↳ " + op.get("role", ""))
+                    ws_hier.cell(hier_row, 1, op_indent + "↳ " + op_role)
                     for col in range(1, len(hier_headers) + 1):
                         ws_hier.cell(hier_row, col).border = thin_border
                     hier_row += 1
 
+                    # Sub-ops rows (constituent kernels of complex ops)
+                    for sub_op in op.get("sub_ops", []):
+                        sub_indent = "  " * (depth + 2)
+                        ws_hier.cell(hier_row, 1, sub_indent + "⤷ " + sub_op["name"])
+                        ws_hier.cell(hier_row, 9, sub_op["name"])
+                        # Show timing for sub-ops
+                        if sub_op.get("device_time_us", 0) > 0:
+                            ws_hier.cell(hier_row, 10, f'{sub_op["device_time_us"]:.1f}µs')
+                        for col in range(1, len(hier_headers) + 1):
+                            ws_hier.cell(hier_row, col).border = thin_border
+                            ws_hier.cell(hier_row, col).font = Font(
+                                size=9, color="888888"
+                            )
+                        hier_row += 1
+
             # Column widths for hierarchy sheet
-            hier_col_widths = [35, 35, 25, 8, 15, 15, 10, 30, 18, 50, 10]
+            hier_col_widths = [35, 35, 25, 8, 15, 15, 10, 18, 35, 18, 55]
             for i, w in enumerate(hier_col_widths, 1):
                 ws_hier.column_dimensions[get_column_letter(i)].width = w
 

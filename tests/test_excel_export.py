@@ -242,13 +242,13 @@ class TestExcelExport(unittest.TestCase):
         # First data row should be the root "model" module
         self.assertEqual(ws.cell(2, 1).value, "model")
 
-        # Should find op rows (col 8 has op name)
+        # Should find op rows (col 8 has op role)
         found_op = False
         for r in range(2, 100):
             if ws.cell(r, 8).value:
                 found_op = True
-                # Op should have shape info
-                self.assertIsNotNone(ws.cell(r, 10).value)
+                # Op should have shape info (col 11)
+                self.assertIsNotNone(ws.cell(r, 11).value)
                 break
         self.assertTrue(found_op, "No ops found in hierarchy sheet")
 
@@ -257,9 +257,9 @@ class TestExcelExport(unittest.TestCase):
         wb = self._export(_build_test_payload())
         ws = wb["Model Hierarchy"]
 
-        # Find first op with a shape and verify it has correct numbers
+        # Find first op with a shape (col 11) and verify it has correct numbers
         for r in range(2, 100):
-            shape = ws.cell(r, 10).value
+            shape = ws.cell(r, 11).value
             if shape and shape != "—":
                 # Should contain numbers (from resolved symbols)
                 self.assertRegex(

@@ -116,6 +116,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 .tree-op .op-cost { font-size: 10px; color: #888; margin-left: auto; white-space: nowrap; }
 .tree-children { }
 .tree-children.collapsed { display: none; }
+.tree-sub-ops.collapsed { display: none; }
 .sym-dim { font-family: 'SF Mono', SFMono-Regular, monospace; color: var(--accent);
            font-weight: 600; }
 
@@ -424,6 +425,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
               <th onclick="sortTable('name')">Op Name <span class="sort-arrow">⇅</span></th>
               <th onclick="sortTable('backend')">Backend <span class="sort-arrow">⇅</span></th>
               <th onclick="sortTable('input_shapes')">Shape</th>
+              <th>Shape (concrete)</th>
               <th>dtype</th>
               <th onclick="sortTable('layer_count')" style="text-align:center">×Layers <span class="sort-arrow">⇅</span></th>
               <th onclick="sortTable('call_count')" style="text-align:right">Calls <span class="sort-arrow">⇅</span></th>
@@ -495,6 +497,13 @@ function fmtAI(ai) {
 function fmtShape(shapes) {
   if (!shapes || shapes.length === 0) return '—';
   return shapes.map(s => '[' + s.join(', ') + ']').join(' × ');
+}
+
+function fmtShapeConcrete(op) {
+  const rawShapes = op.input_shapes_raw;
+  if (!rawShapes || rawShapes.length === 0) return '—';
+  const dtype = op.dtype ? op.dtype.replace('bfloat16', 'bf16').replace('float16', 'fp16').replace('float32', 'fp32').replace('float8', 'fp8') : '';
+  return rawShapes.map(s => '[' + s.join(', ') + (dtype ? ', ' + dtype : '') + ']').join(' × ');
 }
 
 // ---- Model Config ----
@@ -815,6 +824,7 @@ function renderTable() {
       <td class="mono">${escHtml(op.name)}</td>
       <td><span class="badge ${badgeCls}">${op.backend}</span></td>
       <td class="mono" style="font-size:11px">${fmtShape(op.input_shapes)}</td>
+      <td class="mono" style="font-size:11px;color:#666">${fmtShapeConcrete(op)}</td>
       <td style="font-size:12px">${op.dtype || '—'}</td>
       <td style="text-align:center">${op.layer_count > 1
           ? '<span class="layer-count">×' + op.layer_count + '</span>' : '—'}</td>
@@ -1054,11 +1064,12 @@ function fmtShapeGraph(shapes, op) {
     const concreteParts = resolved.map(r => r.concrete).filter(c => c !== null);
     const allConcrete = concreteParts.length === tensorDims.length;
     const dtype = dtypes[idx] || '';
-    // Build symbolic part with dtype tag
-    const dtypeTag = dtype ? ` <span style="color:#d32f2f;font-size:0.85em;font-weight:600">${dtype}</span>` : '';
-    const symPart = `[${innerHtml}]${dtypeTag}`;
-    // Build concrete part
-    const concretePart = allConcrete ? `[${concreteParts.join(', ')}]` : null;
+    // Symbolic part without dtype
+    const symPart = `[${innerHtml}]`;
+    // Concrete part with dtype appended inside bracket
+    const concretePart = allConcrete
+      ? `[${concreteParts.join(', ')}${dtype ? ', ' + dtype : ''}]`
+      : null;
     return { sym: symPart, concrete: concretePart };
   });
   const symHtml = parts.map(p => p.sym).join(' × ');
@@ -1154,14 +1165,48 @@ function buildTreeNode(node, isRoot, hasTiming) {
       } else if (hasTiming) {
         timingHtml = ' <span style="color:#bbb;font-size:10px">—</span>';
       }
+      // If sub-ops exist, use the high-level name; kernel details are in sub-ops
+      const opName = (op.sub_ops && op.sub_ops.length > 0) ? op.name : (op.profiled_name || op.name);
       opEl.innerHTML = `
         <span class="op-role">${op.role}</span>
-        <span class="op-name">${escHtml(op.name)}</span>
+        <span class="op-name">${escHtml(opName)}</span>
         <span class="badge op-backend ${op.backend.replace(/[^a-z-]/g,'')}"
               style="font-size:10px">${op.backend}</span>
         <span class="op-shapes">${shapesHtml}</span>
         <span class="op-cost">${costParts.join(' · ')}${timingHtml}</span>`;
       opsDiv.appendChild(opEl);
+
+      // Render sub-ops (constituent kernels) if present
+      if (op.sub_ops && op.sub_ops.length > 0) {
+        // Toggle icon for fold/unfold
+        const subToggle = document.createElement('span');
+        subToggle.className = 'tree-toggle';
+        subToggle.style.cssText = 'cursor:pointer;font-size:10px;margin-left:4px;color:#888;';
+        subToggle.textContent = '▶';
+        opEl.appendChild(subToggle);
+
+        const subOpsDiv = document.createElement('div');
+        subOpsDiv.className = 'tree-sub-ops collapsed';
+        subOpsDiv.style.cssText = 'margin-left:28px;padding:2px 0 4px;border-left:2px solid #e0e0e0;padding-left:8px;';
+        for (const sub of op.sub_ops) {
+          const subEl = document.createElement('div');
+          subEl.style.cssText = 'font-size:10px;color:#555;line-height:1.6;font-family:monospace;';
+          const pct = op.device_time_us > 0
+            ? (sub.device_time_us / op.device_time_us * 100).toFixed(1)
+            : '—';
+          subEl.innerHTML = `<span style="color:#888">↳</span> ${escHtml(sub.name)} `
+            + `<span style="color:#1565c0">${fmtTime(sub.device_time_us)}</span> `
+            + `<span style="color:#888">(${pct}%)</span>`;
+          subOpsDiv.appendChild(subEl);
+        }
+        opsDiv.appendChild(subOpsDiv);
+
+        subToggle.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const collapsed = subOpsDiv.classList.toggle('collapsed');
+          subToggle.textContent = collapsed ? '▶' : '▼';
+        });
+      }
     }
     childrenDiv.appendChild(opsDiv);
   }
