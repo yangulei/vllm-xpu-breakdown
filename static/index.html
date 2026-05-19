@@ -338,7 +338,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
       <div class="control-group">
         <label>Quantization</label>
         <select id="quant-select" onchange="runStatic()">
-          <option value="auto" selected>Auto (from model)</option>
+          <option value="auto" selected>None (default)</option>
           <option value="none">None (BF16)</option>
           <option value="fp8">FP8</option>
           <option value="gptq">GPTQ</option>
@@ -509,6 +509,11 @@ async function loadConfig() {
 
     modelSummary = data.summary;
     showModelSummary(modelId, data.summary);
+
+    // Update quant dropdown default label
+    const autoOpt = document.querySelector('#quant-select option[value="auto"]');
+    const mq = data.summary.quant_method;
+    autoOpt.textContent = mq ? `${mq.toUpperCase()} (default)` : 'None (default)';
 
     // Auto-run static analysis
     runStatic();
@@ -697,6 +702,9 @@ async function loadDemo() {
         modelSummary = data.data.summary;
         showModelSummary(data.data.model_id, data.data.summary);
         document.getElementById('model-input').value = data.data.model_id;
+        const autoOpt = document.querySelector('#quant-select option[value="auto"]');
+        const mq = data.data.summary.quant_method;
+        autoOpt.textContent = mq ? `${mq.toUpperCase()} (default)` : 'None (default)';
       }
       renderResults(data.data);
     }
