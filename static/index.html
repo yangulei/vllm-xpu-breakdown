@@ -530,14 +530,11 @@ async function runStatic() {
   const batchSize = parseInt(document.getElementById('batch-size').value) || 1;
   const contextLen = parseInt(document.getElementById('context-len').value) || 4096;
   const quant = document.getElementById('quant-select').value;
-  console.log('[runStatic] quant:', quant, 'modelId:', modelId);
 
   try {
     let url = `/api/model/${encodeURIComponent(modelId)}/graph?prefill_len=${queryLen}&decode_batch=${batchSize}&context_len=${contextLen}&tp_size=${tpSize}&quantization=${encodeURIComponent(quant)}`;
-    console.log('[runStatic] fetching:', url);
     const resp = await fetch(url);
     const data = await resp.json();
-    console.log('[runStatic] response config:', data.graph?.config);
     if (!data.ok) { alert('Graph error: ' + data.error); return; }
     STATIC_GRAPH_DATA = data.graph;
     graphMode = 'static';
@@ -906,8 +903,6 @@ function renderGraph() {
   if (!GRAPH_DATA) return;
   const tree = GRAPH_DATA[currentPhase];
   if (!tree) return;
-
-  console.log('[renderGraph] config:', GRAPH_DATA.config);
 
   const hasTiming = !!GRAPH_DATA.has_timing;
 
