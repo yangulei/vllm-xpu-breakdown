@@ -237,6 +237,26 @@ def _infer_role(module_path: list[str], op_name: str) -> str | None:
     if "QKVParallel" in innermost:
         return "qkv_proj"
 
+    # Rotary embedding
+    if "Rotary" in innermost or "rotary" in op_name.lower():
+        return "rotary_emb"
+
+    # Q/K norms (Qwen3-style QK normalization)
+    if "Norm" in innermost:
+        # Check if inside Attention module → likely q_norm or k_norm
+        in_attention = any("Attention" in p for p in module_path[:-1])
+        if in_attention:
+            # Distinguish by module name hints
+            lower_inner = innermost.lower()
+            if "q_norm" in lower_inner or "q_layernorm" in lower_inner:
+                return "q_norm"
+            if "k_norm" in lower_inner or "k_layernorm" in lower_inner:
+                return "k_norm"
+            # Fallback: generic attention norm (will be disambiguated later)
+            return "attention_norm"
+        # Determine which norm based on position in layer
+        return "norm"
+
     # Attention kernel / cache ops
     if "Attention" in innermost and "Attention" not in _strip_instance_idx(innermost).replace("Attention", "", 1):
         # innermost IS an Attention module (not just contains "Attention" as part of larger name)
@@ -244,6 +264,10 @@ def _infer_role(module_path: list[str], op_name: str) -> str | None:
             return "attention"
         if "cache" in op_name.lower():
             return "cache_store"
+        if "rotary" in op_name.lower():
+            return "rotary_emb"
+        if "norm" in op_name.lower():
+            return "attention_norm"
         if op_name in ("aten::linear", "aten::mm", "aten::addmm"):
             return "attention"  # fallback for attention internal ops
         return "attention"
@@ -268,12 +292,6 @@ def _infer_role(module_path: list[str], op_name: str) -> str | None:
             return "o_proj"
         return "down_proj"
 
-    # Norms
-    if "Norm" in innermost:
-        # Determine which norm based on position in layer
-        # Check if this is pre-attention or post-attention by looking at siblings
-        return "norm"
-
     # Logits / LM head
     if "Logits" in innermost or "lm_head" in innermost.lower():
         return "lm_head"
@@ -281,6 +299,10 @@ def _infer_role(module_path: list[str], op_name: str) -> str | None:
     # Activation functions
     if "silu" in op_name.lower() or "gelu" in op_name.lower() or "relu" in op_name.lower():
         return "activation"
+
+    # Cache ops outside Attention module
+    if "cache" in op_name.lower():
+        return "cache_store"
 
     return None
 

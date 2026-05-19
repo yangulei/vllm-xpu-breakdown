@@ -23,6 +23,7 @@ from typing import Any
 # Data structures
 # ===================================================================
 
+
 @dataclass
 class OpNode:
     """A single operation in the model graph."""
@@ -1593,6 +1594,30 @@ def _normalize_trace_name(name: str) -> str:
     return name
 
 
+# Kernel names that are functionally equivalent to aten::mm (matmul variants)
+_MM_EQUIVALENT_NAMES = frozenset((
+    "fp8_gemm_w8a16",
+    "fp8_gemm",
+    "gemm_w8a16",
+    "int4_gemm",
+    "int8_gemm",
+    "cutlass_gemm",
+    "cublas_gemm",
+    "marlin_gemm",
+    "machete_gemm",
+    "awq_gemm",
+))
+
+
+def _is_matmul_op(norm_name: str) -> bool:
+    """Check if a normalized op name represents a matmul/gemm operation."""
+    if norm_name == "aten::mm":
+        return True
+    # Check base name (without any suffix)
+    base = norm_name.split("_forward")[0]
+    return base in _MM_EQUIVALENT_NAMES or "gemm" in norm_name.lower()
+
+
 def _parse_shapes_str(s: str) -> list[list[int]]:
     """Parse shape string like '[[1, 2560], [2560, 6144]]' to nested list."""
     if not s or s == "—":
@@ -1664,7 +1689,7 @@ def annotate_graph_timing(graph: dict, trace_ops: list[dict]) -> None:
     """
     symbols = graph.get("symbols", {})
 
-    # Build lookup: (normalized_name, signature) → {device_us, cpu_us, count}
+    # Build lookup: (normalized_name, signature) → {device_us, cpu_us, count, raw_name}
     lookup: dict[tuple, dict] = {}
     # Also build name-only lookup for fallback
     name_lookup: dict[str, dict] = {}
@@ -1677,20 +1702,22 @@ def annotate_graph_timing(graph: dict, trace_ops: list[dict]) -> None:
         count = op.get("count", 1)
 
         # Build key based on op type
-        if norm == "aten::mm" and len(shapes) >= 2:
+        if _is_matmul_op(norm) and len(shapes) >= 2:
             key = ("aten::mm", tuple(shapes[1]))
         else:
             key = (norm, _first_input_nontok_dims(shapes))
 
         if key not in lookup:
-            lookup[key] = {"device_us": 0.0, "cpu_us": 0.0, "count": 0}
+            lookup[key] = {"device_us": 0.0, "cpu_us": 0.0, "count": 0,
+                           "raw_name": raw_name}
         lookup[key]["device_us"] += dur_dev
         lookup[key]["cpu_us"] += dur_cpu
         lookup[key]["count"] += count
 
         # Name-only aggregation for fallback
         if norm not in name_lookup:
-            name_lookup[norm] = {"device_us": 0.0, "cpu_us": 0.0, "count": 0}
+            name_lookup[norm] = {"device_us": 0.0, "cpu_us": 0.0, "count": 0,
+                                 "raw_name": raw_name}
         name_lookup[norm]["device_us"] += dur_dev
         name_lookup[norm]["cpu_us"] += dur_cpu
         name_lookup[norm]["count"] += count
@@ -1723,7 +1750,7 @@ def _annotate_node(
         resolved = _resolve_shapes(op["input_shapes"], symbols)
 
         # Build key to match against lookup
-        if op["name"] == "aten::mm" and len(resolved) >= 2:
+        if _is_matmul_op(op["name"]) and len(resolved) >= 2:
             key = ("aten::mm", tuple(resolved[1]))
         else:
             norm = _normalize_trace_name(op["name"])
@@ -1742,6 +1769,7 @@ def _annotate_node(
             op["device_time_us"] = round(per_call_dev, 2)
             op["cpu_time_us"] = round(per_call_cpu, 2)
             op["profiled_calls"] = info["count"]
+            op["profiled_name"] = info.get("raw_name", "")
             node_time += per_call_dev
             node_cpu += per_call_cpu
             matched += 1
@@ -1803,11 +1831,15 @@ def annotate_graph_from_modules(graph: dict, module_ops: list[dict]) -> None:
         total_dev = sum(o.get("device_time_us", 0) for o in ops)
         total_cpu = sum(o.get("cpu_time_us", 0) for o in ops)
         total_count = sum(o.get("count", 0) for o in ops)
+        # Pick the op with the most time as representative name
+        best_op = max(ops, key=lambda o: o.get("device_time_us", 0))
         role_by_layer[role].append({
             "device_us": total_dev,
             "cpu_us": total_cpu,
             "count": total_count,
             "layer_idx": layer_idx,
+            "raw_name": best_op.get("name", ""),
+            "ops": ops,  # keep all ops for sub_ops
         })
 
     for role, layer_entries in role_by_layer.items():
@@ -1815,11 +1847,38 @@ def annotate_graph_from_modules(graph: dict, module_ops: list[dict]) -> None:
         avg_dev = sum(e["device_us"] for e in layer_entries) / max(n_layers, 1)
         avg_cpu = sum(e["cpu_us"] for e in layer_entries) / max(n_layers, 1)
         avg_count = sum(e["count"] for e in layer_entries) / max(n_layers, 1)
+        # Use the raw_name from the entry with the highest device time
+        best_entry = max(layer_entries, key=lambda e: e["device_us"])
+        # Aggregate sub-ops across layers (average per layer)
+        sub_ops_agg: dict[str, dict] = {}
+        for entry in layer_entries:
+            for sub_op in entry.get("ops", []):
+                sname = sub_op.get("name", "")
+                if sname not in sub_ops_agg:
+                    sub_ops_agg[sname] = {"device_us": 0.0, "cpu_us": 0.0,
+                                          "count": 0, "n_entries": 0}
+                sub_ops_agg[sname]["device_us"] += sub_op.get("device_time_us", 0)
+                sub_ops_agg[sname]["cpu_us"] += sub_op.get("cpu_time_us", 0)
+                sub_ops_agg[sname]["count"] += sub_op.get("count", 0)
+                sub_ops_agg[sname]["n_entries"] += 1
+        # Average across layers
+        sub_ops_list = []
+        for sname, sagg in sub_ops_agg.items():
+            nl = max(sagg["n_entries"], 1)
+            sub_ops_list.append({
+                "name": sname,
+                "device_time_us": round(sagg["device_us"] / nl, 2),
+                "cpu_time_us": round(sagg["cpu_us"] / nl, 2),
+                "count": max(1, sagg["count"] // nl),
+            })
+        sub_ops_list.sort(key=lambda x: -x["device_time_us"])
         role_avg[role] = {
             "device_us": avg_dev,
             "cpu_us": avg_cpu,
             "count": avg_count,
             "n_layers": n_layers,
+            "raw_name": best_entry.get("raw_name", ""),
+            "sub_ops": sub_ops_list if len(sub_ops_list) > 1 else [],
         }
 
     # Also aggregate norm roles by position within layer
@@ -1846,23 +1905,29 @@ def _assign_norm_positions(module_ops: list[dict],
                            role_timing: dict, role_avg: dict) -> None:
     """Distinguish norm ops by position (input_layernorm vs post_attention_layernorm).
 
-    Norms within a layer are initially all assigned role='norm'.
+    Also handles attention_norm → q_norm / k_norm disambiguation.
+    Norms within a layer are initially assigned role='norm' or 'attention_norm'.
     We differentiate them by their timestamp order within each layer.
     """
     from collections import defaultdict
 
-    # Group norm ops by layer, sorted by their aggregation order
+    # Group generic norm ops by layer, sorted by their aggregation order
     layer_norms: dict[int | None, list[dict]] = defaultdict(list)
+    layer_attn_norms: dict[int | None, list[dict]] = defaultdict(list)
     for op in module_ops:
-        if op.get("role") == "norm" and op.get("layer_idx") is not None:
-            layer_norms[op["layer_idx"]].append(op)
+        role = op.get("role")
+        layer_idx = op.get("layer_idx")
+        if layer_idx is None:
+            continue
+        if role == "norm":
+            layer_norms[layer_idx].append(op)
+        elif role == "attention_norm":
+            layer_attn_norms[layer_idx].append(op)
 
-    # For each layer, assign positions
-    # Convention: 1st norm = input_layernorm, 2nd = post_attention_layernorm, etc.
-    norm_position_timing: dict[str, list[float]] = defaultdict(list)
-
+    # For each layer, assign positional norms
+    # Convention: 1st norm = input_layernorm, 2nd = post_attention_layernorm
+    norm_position_timing: dict[str, list[dict]] = defaultdict(list)
     for layer_idx, norms in layer_norms.items():
-        # Norms are already in order of appearance (by timestamp in parse)
         for i, norm in enumerate(norms):
             if i == 0:
                 pos_role = "input_layernorm"
@@ -1870,15 +1935,27 @@ def _assign_norm_positions(module_ops: list[dict],
                 pos_role = "post_attention_layernorm"
             else:
                 pos_role = f"norm_{i}"
-            norm_position_timing[pos_role].append(norm.get("cpu_time_us", 0))
+            norm_position_timing[pos_role].append(norm)
+
+    # Attention norms: 1st = q_norm, 2nd = k_norm
+    attn_norm_timing: dict[str, list[dict]] = defaultdict(list)
+    for layer_idx, norms in layer_attn_norms.items():
+        for i, norm in enumerate(norms):
+            if i == 0:
+                pos_role = "q_norm"
+            elif i == 1:
+                pos_role = "k_norm"
+            else:
+                pos_role = f"attention_norm_{i}"
+            attn_norm_timing[pos_role].append(norm)
 
     # Add positional norm averages to role_avg
-    for pos_role, timings in norm_position_timing.items():
-        if timings:
-            # Use cpu time as proxy for device time for norms
-            avg_cpu = sum(timings) / len(timings)
-            # Get device time proportionally from the generic "norm" entry
-            norm_entry = role_avg.get("norm", {})
+    norm_entry = role_avg.get("norm", {})
+    attn_norm_entry = role_avg.get("attention_norm", {})
+
+    for pos_role, ops in norm_position_timing.items():
+        if ops:
+            avg_cpu = sum(o.get("cpu_time_us", 0) for o in ops) / len(ops)
             if norm_entry and norm_entry.get("cpu_us", 0) > 0:
                 dev_ratio = norm_entry["device_us"] / norm_entry["cpu_us"]
             else:
@@ -1886,8 +1963,25 @@ def _assign_norm_positions(module_ops: list[dict],
             role_avg[pos_role] = {
                 "device_us": avg_cpu * dev_ratio,
                 "cpu_us": avg_cpu,
-                "count": len(timings),
-                "n_layers": len(timings),
+                "count": len(ops),
+                "n_layers": len(ops),
+                "raw_name": norm_entry.get("raw_name", ""),
+            }
+
+    for pos_role, ops in attn_norm_timing.items():
+        if ops and pos_role not in role_avg:
+            avg_cpu = sum(o.get("cpu_time_us", 0) for o in ops) / len(ops)
+            source = attn_norm_entry or norm_entry
+            if source and source.get("cpu_us", 0) > 0:
+                dev_ratio = source["device_us"] / source["cpu_us"]
+            else:
+                dev_ratio = 1.0
+            role_avg[pos_role] = {
+                "device_us": avg_cpu * dev_ratio,
+                "cpu_us": avg_cpu,
+                "count": len(ops),
+                "n_layers": len(ops),
+                "raw_name": source.get("raw_name", ""),
             }
 
 
@@ -1907,9 +2001,16 @@ def _annotate_node_by_role(
         # Try exact role match
         info = role_avg.get(role)
 
-        # For "post_attention_layernorm" which may be fused (fused_add_rms_norm)
-        if info is None and "layernorm" in role:
-            info = role_avg.get("norm")
+        # Fallback chain for norms
+        if info is None:
+            if role in ("q_norm", "k_norm"):
+                # Try generic attention_norm, then norm
+                info = role_avg.get("attention_norm") or role_avg.get("norm")
+            elif role in ("input_layernorm", "post_attention_layernorm", "final_norm"):
+                info = role_avg.get("norm")
+            elif role == "rotary_emb":
+                # rotary_embedding may not have been identified by role
+                info = role_avg.get("rotary_embedding")
 
         if info is not None:
             per_call_dev = info["device_us"] / max(info["count"], 1)
@@ -1917,6 +2018,10 @@ def _annotate_node_by_role(
             op["device_time_us"] = round(per_call_dev, 2)
             op["cpu_time_us"] = round(per_call_cpu, 2)
             op["profiled_calls"] = int(info["count"])
+            op["profiled_name"] = info.get("raw_name", "")
+            # Attach sub-ops breakdown for complex ops
+            if info.get("sub_ops"):
+                op["sub_ops"] = info["sub_ops"]
             node_time += per_call_dev
             node_cpu += per_call_cpu
             matched += 1
