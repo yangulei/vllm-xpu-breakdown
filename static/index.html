@@ -1181,7 +1181,7 @@ function buildTreeNode(node, isRoot, hasTiming) {
         // Toggle icon for fold/unfold
         const subToggle = document.createElement('span');
         subToggle.className = 'tree-toggle';
-        subToggle.style.cssText = 'cursor:pointer;margin-left:6px;';
+        subToggle.style.cssText = 'cursor:pointer;font-size:10px;margin-left:4px;color:#888;';
         subToggle.textContent = '▶';
         opEl.appendChild(subToggle);
 
@@ -1201,7 +1201,9 @@ function buildTreeNode(node, isRoot, hasTiming) {
         }
         opsDiv.appendChild(subOpsDiv);
 
-        subToggle.addEventListener('click', (e) => {
+        // Make the entire op row clickable (like parent tree headers)
+        opEl.style.cursor = 'pointer';
+        opEl.addEventListener('click', (e) => {
           e.stopPropagation();
           const collapsed = subOpsDiv.classList.toggle('collapsed');
           subToggle.textContent = collapsed ? '▶' : '▼';
