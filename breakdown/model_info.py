@@ -121,11 +121,14 @@ def summarize_config(config: dict[str, Any]) -> dict[str, Any]:
         "moe_intermediate_size": config.get("moe_intermediate_size"),
         # Shared experts
         "n_shared_experts": config.get("n_shared_experts", 0),
-        # MLA (Multi-head Latent Attention) — DeepSeek-V2/V3
+        # MLA (Multi-head Latent Attention) — DeepSeek-V2/V3/V4
         "kv_lora_rank": config.get("kv_lora_rank"),
         "q_lora_rank": config.get("q_lora_rank"),
         "qk_nope_head_dim": config.get("qk_nope_head_dim"),
         "qk_rope_head_dim": config.get("qk_rope_head_dim"),
+        # V4 grouped low-rank output projection
+        "o_lora_rank": config.get("o_lora_rank"),
+        "o_groups": config.get("o_groups"),
         # Vision encoder (VL models)
         "vit_hidden_size": _get_vit_config(config, "hidden_size"),
         "vit_num_layers": _get_vit_config(config, "num_hidden_layers"),
