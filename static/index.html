@@ -988,8 +988,9 @@ function renderGraph() {
 
   const hasTiming = !!GRAPH_DATA.has_timing;
 
-  // Symbol legend
+  // Symbol legend — show full (undivided) config.json values
   const symbols = GRAPH_DATA.symbols || {};
+  const fullSymbols = GRAPH_DATA.full_symbols || symbols;
   const legend = document.getElementById('symbol-legend');
   legend.innerHTML = '';
 
@@ -1029,6 +1030,7 @@ function renderGraph() {
 
   const symNames = {
     'S': 'query_len', 'B': 'batch', 'C': 'context_len', 'S+C': 'kv_len (query+context)',
+    'TP': 'tensor_parallel',
     'H': 'hidden_size', 'n_h': 'num_heads',
     'n_kv': 'num_kv_heads', 'd': 'head_dim', 'I': 'intermediate_size',
     '2·I': '2×intermediate_size', 'QKV': 'qkv_dim', 'n_h·d': 'num_heads×head_dim',
@@ -1036,16 +1038,19 @@ function renderGraph() {
     'I_moe': 'moe_intermediate_size', '2·I_moe': '2×moe_intermediate_size',
     'n_shared': 'n_shared_experts',
   };
-  const order = ['S','B','C','S+C','H','n_h','n_kv','d','I','2·I','QKV','n_h·d','V'];
+  // Add TP to symbols for legend display
+  const legendSymbols = Object.assign({}, fullSymbols);
+  legendSymbols['TP'] = tpSize;
+  const order = ['S','B','C','S+C','TP','H','n_h','n_kv','d','I','2·I','QKV','n_h·d','V'];
   for (const sym of order) {
-    if (!(sym in symbols)) continue;
+    if (!(sym in legendSymbols)) continue;
     const el = document.createElement('span');
     const fullName = symNames[sym] || sym;
-    el.innerHTML = `<span class="sym">${sym}</span> <span class="sym-val">= ${fullName} = ${symbols[sym]}</span>`;
+    el.innerHTML = `<span class="sym">${sym}</span> <span class="sym-val">= ${fullName} = ${legendSymbols[sym]}</span>`;
     legend.appendChild(el);
   }
   // Any remaining symbols not in order
-  for (const [sym, val] of Object.entries(symbols)) {
+  for (const [sym, val] of Object.entries(legendSymbols)) {
     if (order.includes(sym)) continue;
     const el = document.createElement('span');
     const fullName = symNames[sym] || sym;
@@ -1060,19 +1065,19 @@ function renderGraph() {
 
 function symTooltip(dimStr) {
   const symbols = GRAPH_DATA?.symbols || {};
+  const fullSymbols = GRAPH_DATA?.full_symbols || symbols;
   const s = String(dimStr);
-  const val = symbols[s];
-  if (val !== undefined) {
-    return { html: `<span class="sym-dim">${s}</span>`, concrete: String(val) };
+  // Check if it's a known symbol — symbolic shows full config value, concrete shows per-rank value
+  if (s in fullSymbols) {
+    return { html: `<span class="sym-dim">${s}</span>`, concrete: String(symbols[s] ?? fullSymbols[s]) };
   }
-  // Handle composite like "S·8" or "tokens·2"
+  // Handle composite like "S·8" or "n_h·d"
   const parts = s.split('·');
   if (parts.length > 1) {
     let numericProd = 1;
     let allResolved = true;
     const htmlParts = parts.map(p => {
-      const v = symbols[p];
-      if (v !== undefined) { numericProd *= v; return `<span class="sym-dim">${p}</span>`; }
+      if (p in fullSymbols) { numericProd *= (symbols[p] ?? fullSymbols[p]); return `<span class="sym-dim">${p}</span>`; }
       const n = parseInt(p);
       if (!isNaN(n)) { numericProd *= n; return p; }
       allResolved = false;
