@@ -378,8 +378,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
                     style="font-size:11px;padding:3px 10px">⚡ Static</button>
             <button class="phase-btn" id="view-profiled-btn" onclick="switchGraphMode('profiled')"
                     style="font-size:11px;padding:3px 10px" disabled>⏱ Profiled</button>
-            <button class="btn btn-secondary" id="export-static-graph-btn" onclick="exportStaticGraph()"
-                    style="font-size:11px;padding:3px 10px;display:none">📥 Export Graph</button>
+            <button class="btn btn-secondary" id="export-shape-matrix-btn" onclick="toggleShapeMatrixPanel()"
+                    style="font-size:11px;padding:3px 10px;display:none">📊 Shape Matrix</button>
             <button class="btn btn-secondary" id="download-trace-btn" onclick="downloadTrace()"
                     style="font-size:11px;padding:3px 10px;display:none">⬇ Download Trace</button>
           </div>
@@ -392,6 +392,73 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
       <p style="font-size:12px;color:#888;margin-bottom:12px" id="graph-subtitle">
         Static analysis — derived from model config without profiling. Backends are <em>likely</em> dispatch targets in eager mode.
       </p>
+      <!-- Shape Matrix Export Panel -->
+      <div id="shape-matrix-panel" style="display:none;background:#f8f9fa;border:1px solid #e0e0e0;border-radius:8px;padding:16px;margin-bottom:16px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+          <h3 style="font-size:14px;font-weight:600;margin:0">📊 Shape Matrix Export</h3>
+          <button class="btn btn-secondary" onclick="toggleShapeMatrixPanel()" style="font-size:11px;padding:2px 8px">✕ Close</button>
+        </div>
+        <p style="font-size:12px;color:#666;margin-bottom:12px">
+          Export a flat table of op shapes/dtypes for the current model across all combinations of
+          sequence length, context length, batch size, and TP size. Use Excel filters to select configurations.
+        </p>
+
+        <!-- TP Sizes (shared) -->
+        <div style="margin-bottom:12px">
+          <label style="font-size:12px;font-weight:600;display:block;margin-bottom:4px">TP Sizes (comma-separated)</label>
+          <input id="sm-tp-sizes" type="text" value="1, 2, 4, 8"
+                 style="width:240px;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace">
+        </div>
+
+        <!-- Prefill / Decode side by side -->
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:14px">
+          <!-- Prefill settings -->
+          <fieldset style="border:1px solid #ddd;border-radius:6px;padding:12px;margin:0">
+            <legend style="font-size:12px;font-weight:600;padding:0 6px">Prefill (chunked prefill)</legend>
+            <div style="margin-bottom:8px">
+              <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Sequence Lengths</label>
+              <input id="sm-prefill-seq-lens" type="text" value="128, 256, 512, 1024, 2048, 4096, 8192"
+                     style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace">
+            </div>
+            <div style="margin-bottom:8px">
+              <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Context Lengths</label>
+              <input id="sm-prefill-ctx-lens" type="text" value="0, 8192"
+                     style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace">
+            </div>
+            <div>
+              <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Batch Sizes</label>
+              <input id="sm-prefill-batch-sizes" type="text" value="1"
+                     style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace">
+            </div>
+          </fieldset>
+          <!-- Decode settings -->
+          <fieldset style="border:1px solid #ddd;border-radius:6px;padding:12px;margin:0">
+            <legend style="font-size:12px;font-weight:600;padding:0 6px">Decode</legend>
+            <div style="margin-bottom:8px">
+              <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Sequence Length</label>
+              <input id="sm-decode-seq-len" type="text" value="1" disabled
+                     style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace;background:#eee">
+            </div>
+            <div style="margin-bottom:8px">
+              <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Context Lengths</label>
+              <input id="sm-decode-ctx-lens" type="text" value="8192"
+                     style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace">
+            </div>
+            <div>
+              <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Batch Sizes</label>
+              <input id="sm-decode-batch-sizes" type="text" value="1, 2, 4, 8, 16, 32, 64, 128"
+                     style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace">
+            </div>
+          </fieldset>
+        </div>
+
+        <div style="display:flex;gap:12px;align-items:center">
+          <button class="btn btn-primary" id="sm-download-btn" onclick="downloadShapeMatrix()" style="font-size:13px;padding:8px 20px">
+            📥 Download Shape Matrix
+          </button>
+          <span id="sm-status" style="font-size:12px;color:#666"></span>
+        </div>
+      </div>
       <div class="symbol-legend" id="symbol-legend"></div>
       <div id="graph-tree"></div>
     </div>
@@ -550,7 +617,7 @@ async function runStatic() {
     graphMode = 'static';
     GRAPH_DATA = STATIC_GRAPH_DATA;
     document.getElementById('graph-section').classList.add('visible');
-    document.getElementById('export-static-graph-btn').style.display = 'inline-block';
+    document.getElementById('export-shape-matrix-btn').style.display = 'inline-block';
     switchGraphMode('static');
 
     // Update layers dropdown with min_profile_layers info
@@ -921,7 +988,7 @@ function renderGraph() {
 
   const hasTiming = !!GRAPH_DATA.has_timing;
 
-  // Symbol legend
+  // Symbol legend — show config.json values
   const symbols = GRAPH_DATA.symbols || {};
   const legend = document.getElementById('symbol-legend');
   legend.innerHTML = '';
@@ -962,14 +1029,15 @@ function renderGraph() {
 
   const symNames = {
     'S': 'query_len', 'B': 'batch', 'C': 'context_len', 'S+C': 'kv_len (query+context)',
+    'TP': 'tensor_parallel',
     'H': 'hidden_size', 'n_h': 'num_heads',
     'n_kv': 'num_kv_heads', 'd': 'head_dim', 'I': 'intermediate_size',
     '2·I': '2×intermediate_size', 'QKV': 'qkv_dim', 'n_h·d': 'num_heads×head_dim',
-    'V': 'vocab_size',
+    'V': 'vocab_size', 'TP': 'tensor_parallel_size',
     'I_moe': 'moe_intermediate_size', '2·I_moe': '2×moe_intermediate_size',
     'n_shared': 'n_shared_experts',
   };
-  const order = ['S','B','C','S+C','H','n_h','n_kv','d','I','2·I','QKV','n_h·d','V'];
+  const order = ['S','B','C','S+C','TP','H','n_h','n_kv','d','I','2·I','QKV','n_h·d','V'];
   for (const sym of order) {
     if (!(sym in symbols)) continue;
     const el = document.createElement('span');
@@ -994,11 +1062,25 @@ function renderGraph() {
 function symTooltip(dimStr) {
   const symbols = GRAPH_DATA?.symbols || {};
   const s = String(dimStr);
+
+  // Handle "/TP" suffix: resolve base, show as "base/TP = value/tp_size = result"
+  if (s.endsWith('/TP')) {
+    const base = s.slice(0, -3);
+    const baseResult = symTooltip(base);
+    const tp = symbols['TP'];
+    const html = `<span class="sym-dim">${baseResult.html}/TP</span>`;
+    if (baseResult.concrete && tp !== undefined) {
+      const concrete = String(Math.floor(Number(baseResult.concrete) / tp));
+      return { html, concrete };
+    }
+    return { html, concrete: null };
+  }
+
   const val = symbols[s];
   if (val !== undefined) {
     return { html: `<span class="sym-dim">${s}</span>`, concrete: String(val) };
   }
-  // Handle composite like "S·8" or "tokens·2"
+  // Handle composite like "S·8" or "n_h·d"
   const parts = s.split('·');
   if (parts.length > 1) {
     let numericProd = 1;
@@ -1270,32 +1352,88 @@ function downloadTrace() {
   window.location.href = '/api/profile/trace';
 }
 
-async function exportStaticGraph() {
-  if (!STATIC_GRAPH_DATA) return alert('No static graph data. Load a model first.');
+// ---- Shape Matrix Export ----
+function toggleShapeMatrixPanel() {
+  const panel = document.getElementById('shape-matrix-panel');
+  if (panel.style.display === 'none') {
+    panel.style.display = 'block';
+  } else {
+    panel.style.display = 'none';
+  }
+}
+
+async function downloadShapeMatrix() {
+  const btn = document.getElementById('sm-download-btn');
+  const status = document.getElementById('sm-status');
+
+  const modelId = document.getElementById('model-input').value.trim();
+  if (!modelId) { alert('Enter a model ID first'); return; }
+
+  // Parse TP sizes
+  const tpText = document.getElementById('sm-tp-sizes').value.trim();
+  const tpSizes = tpText.split(',').map(s => parseInt(s.trim())).filter(n => n > 0);
+  if (tpSizes.length === 0) { alert('Enter valid TP sizes'); return; }
+
+  // Prefill settings
+  const prefillSeqLens = document.getElementById('sm-prefill-seq-lens').value.trim()
+    .split(',').map(s => parseInt(s.trim())).filter(n => n >= 0);
+  const prefillCtxLens = document.getElementById('sm-prefill-ctx-lens').value.trim()
+    .split(',').map(s => parseInt(s.trim())).filter(n => n >= 0);
+  const prefillBatchSizes = document.getElementById('sm-prefill-batch-sizes').value.trim()
+    .split(',').map(s => parseInt(s.trim())).filter(n => n > 0);
+
+  // Decode settings
+  const decodeCtxLens = document.getElementById('sm-decode-ctx-lens').value.trim()
+    .split(',').map(s => parseInt(s.trim())).filter(n => n >= 0);
+  const decodeBatchSizes = document.getElementById('sm-decode-batch-sizes').value.trim()
+    .split(',').map(s => parseInt(s.trim())).filter(n => n > 0);
+
+  const quant = document.getElementById('quant-select').value || 'auto';
+
+  const payload = {
+    model_id: modelId,
+    tp_sizes: tpSizes,
+    prefill_seq_lens: prefillSeqLens,
+    prefill_ctx_lens: prefillCtxLens,
+    prefill_batch_sizes: prefillBatchSizes,
+    decode_ctx_lens: decodeCtxLens,
+    decode_batch_sizes: decodeBatchSizes,
+    quantization: quant,
+  };
+
+  btn.disabled = true;
+  status.textContent = 'Generating shape matrix...';
+
   try {
-    const modelId = document.getElementById('model-input').value.trim();
-    const payload = {
-      graph: STATIC_GRAPH_DATA,
-      model_id: modelId,
-      phase: currentPhase,
-      summary: modelSummary || {},
-    };
-    const resp = await fetch('/api/export/static-graph', {
+    const resp = await fetch('/api/export/shape-matrix', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
-    if (!resp.ok) { alert('Export failed: ' + resp.statusText); return; }
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({ error: resp.statusText }));
+      alert('Export failed: ' + (err.error || resp.statusText));
+      status.textContent = '';
+      btn.disabled = false;
+      return;
+    }
     const blob = await resp.blob();
     const cd = resp.headers.get('Content-Disposition') || '';
     const match = cd.match(/filename="?([^"]+)"?/);
-    const filename = match ? match[1] : 'vllm_xpu_static_graph.xlsx';
+    const filename = match ? match[1] : 'vllm_xpu_shape_matrix.xlsx';
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = filename;
     a.click();
     URL.revokeObjectURL(a.href);
-  } catch (e) { alert('Export error: ' + e.message); }
+    status.textContent = '✓ Downloaded';
+    setTimeout(() => { status.textContent = ''; }, 3000);
+  } catch (e) {
+    alert('Export error: ' + e.message);
+    status.textContent = '';
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 // ---- Model Catalog ----

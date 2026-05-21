@@ -131,6 +131,7 @@ def _softmax_flops(tokens: int, seq_len: int, n_heads: int) -> int:
 
 
 # ===================================================================
+# ===================================================================
 # Architecture specs (declarative)
 # ===================================================================
 
@@ -139,14 +140,21 @@ def _build_attention_ops(
 ) -> list[OpNode]:
     """Build ops for attention module."""
     H = cfg["hidden_size"]
-    n_h = cfg["num_heads"]
-    n_kv = cfg["num_kv_heads"]
+    n_h = cfg["_tp_num_heads"]
+    n_kv = cfg["_tp_num_kv_heads"]
     d = cfg["head_dim"]
     qkv_size = (n_h + 2 * n_kv) * d
     dtype_bytes = cfg["dtype_bytes"]
     w_bytes = cfg.get("weight_dtype_bytes", dtype_bytes)
     T = cfg.get(f"_{tokens}", tokens)  # numeric if available
     S = cfg.get(f"_{seq}", seq)
+    tp = cfg["tp_size"]
+
+    # TP-aware symbols for shape annotations
+    nh_sym = "n_h/TP"
+    nkv_sym = "n_kv/TP"
+    qkv_sym = "QKV/TP"
+    nhd_sym = "n_h·d/TP"
 
     ops: list[OpNode] = []
 
@@ -154,8 +162,8 @@ def _build_attention_ops(
     ops.append(OpNode(
         name="aten::mm", role="qkv_proj",
         backend="torch-xpu-ops",
-        input_shapes=[[tokens, "H"], ["H", "QKV"]],
-        output_shape=[tokens, "QKV"],
+        input_shapes=[[tokens, "H"], ["H", qkv_sym]],
+        output_shape=[tokens, qkv_sym],
         memory_bytes=_mm_mem(T, H, qkv_size, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T, H, qkv_size) if isinstance(T, int) else 0,
         phase=phase,
@@ -163,7 +171,7 @@ def _build_attention_ops(
 
     # Q/K norms (Qwen3-specific)
     if cfg.get("has_qk_norm"):
-        for role, sym in [("q_norm", "n_h"), ("k_norm", "n_kv")]:
+        for role, sym in [("q_norm", nh_sym), ("k_norm", nkv_sym)]:
             n = n_h if role == "q_norm" else n_kv
             ops.append(OpNode(
                 name="rms_norm", role=role,
@@ -179,8 +187,8 @@ def _build_attention_ops(
     ops.append(OpNode(
         name="rotary_embedding", role="rotary_emb",
         backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, "n_h", "d"], [tokens, "n_kv", "d"]],
-        output_shape=[tokens, "n_h", "d"],
+        input_shapes=[[tokens, nh_sym, "d"], [tokens, nkv_sym, "d"]],
+        output_shape=[tokens, nh_sym, "d"],
         memory_bytes=(T * (n_h + n_kv) * d * dtype_bytes * 3) if isinstance(T, int) else 0,
         flops=(T * (n_h + n_kv) * d * 6) if isinstance(T, int) else 0,
         phase=phase,
@@ -192,8 +200,8 @@ def _build_attention_ops(
         ops.append(OpNode(
             name="flash_attn_varlen_fwd", role="attention",
             backend=attn_backend,
-            input_shapes=[[tokens, "n_h", "d"], [seq, "n_kv", "d"], [seq, "n_kv", "d"]],
-            output_shape=[tokens, "n_h", "d"],
+            input_shapes=[[tokens, nh_sym, "d"], [seq, nkv_sym, "d"], [seq, nkv_sym, "d"]],
+            output_shape=[tokens, nh_sym, "d"],
             memory_bytes=0,  # complex to estimate
             flops=(2 * T * S * n_h * d) if isinstance(T, int) and isinstance(S, int) else 0,
             phase="prefill",
@@ -202,8 +210,8 @@ def _build_attention_ops(
         ops.append(OpNode(
             name="paged_attention", role="attention",
             backend=attn_backend,
-            input_shapes=[[tokens, "n_h", "d"], [seq, "n_kv", "d"]],
-            output_shape=[tokens, "n_h", "d"],
+            input_shapes=[[tokens, nh_sym, "d"], [seq, nkv_sym, "d"]],
+            output_shape=[tokens, nh_sym, "d"],
             memory_bytes=0,
             flops=0,
             phase="decode",
@@ -213,7 +221,7 @@ def _build_attention_ops(
     ops.append(OpNode(
         name="reshape_and_cache_flash", role="cache_store",
         backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, "n_kv", "d"], [tokens, "n_kv", "d"]],
+        input_shapes=[[tokens, nkv_sym, "d"], [tokens, nkv_sym, "d"]],
         output_shape=[],
         memory_bytes=(T * n_kv * d * dtype_bytes * 2) if isinstance(T, int) else 0,
         flops=0,
@@ -224,7 +232,7 @@ def _build_attention_ops(
     ops.append(OpNode(
         name="aten::mm", role="o_proj",
         backend="torch-xpu-ops",
-        input_shapes=[[tokens, "n_h·d"], ["n_h·d", "H"]],
+        input_shapes=[[tokens, nhd_sym], [nhd_sym, "H"]],
         output_shape=[tokens, "H"],
         memory_bytes=_mm_mem(T, n_h * d, H, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T, n_h * d, H) if isinstance(T, int) else 0,
@@ -237,10 +245,15 @@ def _build_attention_ops(
 def _build_mlp_ops(cfg: dict, phase: str, tokens: str) -> list[OpNode]:
     """Build ops for MLP module."""
     H = cfg["hidden_size"]
-    I = cfg["intermediate_size"]
+    I = cfg["_tp_intermediate_size"]
     dtype_bytes = cfg["dtype_bytes"]
     w_bytes = cfg.get("weight_dtype_bytes", dtype_bytes)
     T = cfg.get(f"_{tokens}", tokens)
+    tp = cfg["tp_size"]
+
+    # TP-aware symbols
+    i_sym = "I/TP"
+    i2_sym = "2·I/TP"
 
     ops: list[OpNode] = []
 
@@ -248,8 +261,8 @@ def _build_mlp_ops(cfg: dict, phase: str, tokens: str) -> list[OpNode]:
     ops.append(OpNode(
         name="aten::mm", role="gate_up_proj",
         backend="torch-xpu-ops",
-        input_shapes=[[tokens, "H"], ["H", "2·I"]],
-        output_shape=[tokens, "2·I"],
+        input_shapes=[[tokens, "H"], ["H", i2_sym]],
+        output_shape=[tokens, i2_sym],
         memory_bytes=_mm_mem(T, H, 2 * I, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T, H, 2 * I) if isinstance(T, int) else 0,
         phase=phase,
@@ -259,8 +272,8 @@ def _build_mlp_ops(cfg: dict, phase: str, tokens: str) -> list[OpNode]:
     ops.append(OpNode(
         name="silu_and_mul", role="activation",
         backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, "2·I"]],
-        output_shape=[tokens, "I"],
+        input_shapes=[[tokens, i2_sym]],
+        output_shape=[tokens, i_sym],
         memory_bytes=_activation_mem(T, I, dtype_bytes) if isinstance(T, int) else 0,
         flops=_activation_flops(T, I) if isinstance(T, int) else 0,
         phase=phase,
@@ -270,7 +283,7 @@ def _build_mlp_ops(cfg: dict, phase: str, tokens: str) -> list[OpNode]:
     ops.append(OpNode(
         name="aten::mm", role="down_proj",
         backend="torch-xpu-ops",
-        input_shapes=[[tokens, "I"], ["I", "H"]],
+        input_shapes=[[tokens, i_sym], [i_sym, "H"]],
         output_shape=[tokens, "H"],
         memory_bytes=_mm_mem(T, I, H, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T, I, H) if isinstance(T, int) else 0,
@@ -351,11 +364,12 @@ def _build_moe_layer(
     top_k = cfg.get("num_experts_per_tok", 2)
     n_shared = cfg.get("n_shared_experts", 0)
     H = cfg["hidden_size"]
-    # MoE may use a different intermediate size than dense layers
-    moe_I = cfg.get("moe_intermediate_size") or cfg["intermediate_size"]
-    I = cfg["intermediate_size"]
+    # MoE uses TP-divided intermediate sizes for numeric calculations
+    moe_I = cfg.get("_tp_moe_intermediate_size") or cfg["_tp_intermediate_size"]
+    I = cfg["_tp_intermediate_size"]
     dtype_bytes = cfg["dtype_bytes"]
     T = cfg.get(f"_{tokens}", tokens)
+    tp = cfg["tp_size"]
 
     # Input LayerNorm
     input_norm = ModuleNode(
@@ -383,8 +397,8 @@ def _build_moe_layer(
     gate_op = OpNode(
         name="aten::mm", role="router_gate",
         backend="torch-xpu-ops",
-        input_shapes=[[tokens, "H"], ["H", str(num_experts)]],
-        output_shape=[tokens, str(num_experts)],
+        input_shapes=[[tokens, "H"], ["H", "E"]],
+        output_shape=[tokens, "E"],
         memory_bytes=_mm_mem(T, H, num_experts, dtype_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T, H, num_experts) if isinstance(T, int) else 0,
         phase=phase,
@@ -392,18 +406,24 @@ def _build_moe_layer(
     align_op = OpNode(
         name="moe_align_block_size", role="moe_routing",
         backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, str(num_experts)]],
+        input_shapes=[[tokens, "E"]],
         output_shape=[tokens],
         memory_bytes=0, flops=0, phase=phase,
     )
     # Expert computation (top_k experts active) — use moe_intermediate_size
-    moe_I_sym = f"I_moe" if moe_I != I else "I"
-    moe_2I_sym = f"2·I_moe" if moe_I != I else "2·I"
+    # Determine base symbol names (before TP division)
+    raw_moe_I = cfg.get("moe_intermediate_size") or cfg["intermediate_size"]
+    raw_I = cfg["intermediate_size"]
+    moe_I_base = "I_moe" if raw_moe_I != raw_I else "I"
+    moe_2I_base = "2·I_moe" if raw_moe_I != raw_I else "2·I"
+    moe_I_sym = f"{moe_I_base}/TP"
+    moe_2I_sym = f"{moe_2I_base}/TP"
+
     expert_mm1 = OpNode(
         name="aten::mm", role="expert_gate_up",
         backend="torch-xpu-ops",
-        input_shapes=[[f"{tokens}·{top_k}", "H"], ["H", moe_2I_sym]],
-        output_shape=[f"{tokens}·{top_k}", moe_2I_sym],
+        input_shapes=[[f"{tokens}·K", "H"], ["H", moe_2I_sym]],
+        output_shape=[f"{tokens}·K", moe_2I_sym],
         memory_bytes=_mm_mem(T * top_k, H, 2 * moe_I, dtype_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T * top_k, H, 2 * moe_I) if isinstance(T, int) else 0,
         phase=phase,
@@ -411,8 +431,8 @@ def _build_moe_layer(
     expert_act = OpNode(
         name="silu_and_mul", role="expert_activation",
         backend="vllm-xpu-kernels",
-        input_shapes=[[f"{tokens}·{top_k}", moe_2I_sym]],
-        output_shape=[f"{tokens}·{top_k}", moe_I_sym],
+        input_shapes=[[f"{tokens}·K", moe_2I_sym]],
+        output_shape=[f"{tokens}·K", moe_I_sym],
         memory_bytes=_activation_mem(T * top_k, moe_I, dtype_bytes) if isinstance(T, int) else 0,
         flops=_activation_flops(T * top_k, moe_I) if isinstance(T, int) else 0,
         phase=phase,
@@ -420,8 +440,8 @@ def _build_moe_layer(
     expert_mm2 = OpNode(
         name="aten::mm", role="expert_down",
         backend="torch-xpu-ops",
-        input_shapes=[[f"{tokens}·{top_k}", moe_I_sym], [moe_I_sym, "H"]],
-        output_shape=[f"{tokens}·{top_k}", "H"],
+        input_shapes=[[f"{tokens}·K", moe_I_sym], [moe_I_sym, "H"]],
+        output_shape=[f"{tokens}·K", "H"],
         memory_bytes=_mm_mem(T * top_k, moe_I, H, dtype_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T * top_k, moe_I, H) if isinstance(T, int) else 0,
         phase=phase,
@@ -484,13 +504,21 @@ def _build_mla_attention_ops(
     Key ops: Q projection → latent KV projection → decompress → attention.
     """
     H = cfg["hidden_size"]
-    n_h = cfg["num_heads"]
-    n_kv = cfg["num_kv_heads"]
+    n_h = cfg["_tp_num_heads"]
+    n_kv = cfg["_tp_num_kv_heads"]
     d = cfg["head_dim"]
     dtype_bytes = cfg["dtype_bytes"]
     w_bytes = cfg.get("weight_dtype_bytes", dtype_bytes)
     T = cfg.get(f"_{tokens}", tokens)
     S = cfg.get(f"_{seq}", seq)
+    tp = cfg["tp_size"]
+
+    # TP-aware symbols
+    nh_sym = "n_h/TP"
+    nkv_sym = "n_kv/TP"
+    qkv_sym = "QKV/TP"
+    nhd_sym = "n_h·d/TP"
+    nhDqh_sym = "n_h·D_qh/TP"
 
     # MLA-specific dimensions (from config or estimated)
     kv_lora_rank = cfg.get("kv_lora_rank", 512)
@@ -506,8 +534,8 @@ def _build_mla_attention_ops(
         ops.append(OpNode(
             name="aten::mm", role="q_compress",
             backend="torch-xpu-ops",
-            input_shapes=[[tokens, "H"], ["H", str(q_lora_rank)]],
-            output_shape=[tokens, str(q_lora_rank)],
+            input_shapes=[[tokens, "H"], ["H", "Q_r"]],
+            output_shape=[tokens, "Q_r"],
             memory_bytes=_mm_mem(T, H, q_lora_rank, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
             flops=_mm_flops(T, H, q_lora_rank) if isinstance(T, int) else 0,
             phase=phase,
@@ -515,8 +543,8 @@ def _build_mla_attention_ops(
         ops.append(OpNode(
             name="rms_norm", role="q_norm",
             backend="vllm-xpu-kernels",
-            input_shapes=[[tokens, str(q_lora_rank)]],
-            output_shape=[tokens, str(q_lora_rank)],
+            input_shapes=[[tokens, "Q_r"]],
+            output_shape=[tokens, "Q_r"],
             memory_bytes=_norm_mem(T, q_lora_rank, dtype_bytes) if isinstance(T, int) else 0,
             flops=_norm_flops(T, q_lora_rank) if isinstance(T, int) else 0,
             phase=phase,
@@ -525,9 +553,9 @@ def _build_mla_attention_ops(
         ops.append(OpNode(
             name="aten::mm", role="q_decompress",
             backend="torch-xpu-ops",
-            input_shapes=[[tokens, str(q_lora_rank)],
-                          [str(q_lora_rank), str(out_q)]],
-            output_shape=[tokens, str(out_q)],
+            input_shapes=[[tokens, "Q_r"],
+                          ["Q_r", nhDqh_sym]],
+            output_shape=[tokens, nhDqh_sym],
             memory_bytes=_mm_mem(T, q_lora_rank, out_q, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
             flops=_mm_flops(T, q_lora_rank, out_q) if isinstance(T, int) else 0,
             phase=phase,
@@ -538,8 +566,8 @@ def _build_mla_attention_ops(
         ops.append(OpNode(
             name="aten::mm", role="qkv_proj",
             backend="torch-xpu-ops",
-            input_shapes=[[tokens, "H"], ["H", "QKV"]],
-            output_shape=[tokens, "QKV"],
+            input_shapes=[[tokens, "H"], ["H", qkv_sym]],
+            output_shape=[tokens, qkv_sym],
             memory_bytes=_mm_mem(T, H, qkv_size, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
             flops=_mm_flops(T, H, qkv_size) if isinstance(T, int) else 0,
             phase=phase,
@@ -549,8 +577,8 @@ def _build_mla_attention_ops(
     ops.append(OpNode(
         name="aten::mm", role="kv_compress",
         backend="torch-xpu-ops",
-        input_shapes=[[tokens, "H"], ["H", str(kv_lora_rank)]],
-        output_shape=[tokens, str(kv_lora_rank)],
+        input_shapes=[[tokens, "H"], ["H", "KV_r"]],
+        output_shape=[tokens, "KV_r"],
         memory_bytes=_mm_mem(T, H, kv_lora_rank, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T, H, kv_lora_rank) if isinstance(T, int) else 0,
         phase=phase,
@@ -560,8 +588,8 @@ def _build_mla_attention_ops(
     ops.append(OpNode(
         name="rms_norm", role="kv_norm",
         backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, str(kv_lora_rank)]],
-        output_shape=[tokens, str(kv_lora_rank)],
+        input_shapes=[[tokens, "KV_r"]],
+        output_shape=[tokens, "KV_r"],
         memory_bytes=_norm_mem(T, kv_lora_rank, dtype_bytes) if isinstance(T, int) else 0,
         flops=_norm_flops(T, kv_lora_rank) if isinstance(T, int) else 0,
         phase=phase,
@@ -571,8 +599,8 @@ def _build_mla_attention_ops(
     ops.append(OpNode(
         name="deepseek_scaling_rope", role="rotary_emb",
         backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, "n_h", str(qk_rope_head_dim)]],
-        output_shape=[tokens, "n_h", str(qk_rope_head_dim)],
+        input_shapes=[[tokens, nh_sym, "D_rope"]],
+        output_shape=[tokens, nh_sym, "D_rope"],
         memory_bytes=(T * n_h * qk_rope_head_dim * dtype_bytes * 3) if isinstance(T, int) else 0,
         flops=(T * n_h * qk_rope_head_dim * 6) if isinstance(T, int) else 0,
         phase=phase,
@@ -582,8 +610,8 @@ def _build_mla_attention_ops(
     ops.append(OpNode(
         name="gdn_attention", role="attention",
         backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, "n_h", "d"], [seq, str(kv_lora_rank)]],
-        output_shape=[tokens, "n_h", "d"],
+        input_shapes=[[tokens, nh_sym, "d"], [seq, "KV_r"]],
+        output_shape=[tokens, nh_sym, "d"],
         memory_bytes=0,
         flops=(2 * T * S * n_h * d) if isinstance(T, int) and isinstance(S, int) else 0,
         phase=phase,
@@ -593,7 +621,7 @@ def _build_mla_attention_ops(
     ops.append(OpNode(
         name="concat_and_cache_mla", role="cache_store",
         backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, str(kv_lora_rank)]],
+        input_shapes=[[tokens, "KV_r"]],
         output_shape=[],
         memory_bytes=(T * kv_lora_rank * dtype_bytes) if isinstance(T, int) else 0,
         flops=0,
@@ -604,7 +632,7 @@ def _build_mla_attention_ops(
     ops.append(OpNode(
         name="aten::mm", role="o_proj",
         backend="torch-xpu-ops",
-        input_shapes=[[tokens, "n_h·d"], ["n_h·d", "H"]],
+        input_shapes=[[tokens, nhd_sym], [nhd_sym, "H"]],
         output_shape=[tokens, "H"],
         memory_bytes=_mm_mem(T, n_h * d, H, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T, n_h * d, H) if isinstance(T, int) else 0,
@@ -660,10 +688,12 @@ def _build_mla_moe_layer(
     top_k = cfg.get("num_experts_per_tok", 2)
     n_shared = cfg.get("n_shared_experts", 0)
     H = cfg["hidden_size"]
-    moe_I = cfg.get("moe_intermediate_size") or cfg["intermediate_size"]
-    I = cfg["intermediate_size"]
+    # Use TP-divided values for numeric calculations
+    moe_I = cfg.get("_tp_moe_intermediate_size") or cfg["_tp_intermediate_size"]
+    I = cfg["_tp_intermediate_size"]
     dtype_bytes = cfg["dtype_bytes"]
     T = cfg.get(f"_{tokens}", tokens)
+    tp = cfg["tp_size"]
 
     input_norm = ModuleNode(
         name="input_layernorm", path="model.layers.*.input_layernorm",
@@ -685,14 +715,19 @@ def _build_mla_moe_layer(
     )
 
     # MoE block (same structure as standard MoE)
-    moe_I_sym = "I_moe" if moe_I != I else "I"
-    moe_2I_sym = "2·I_moe" if moe_I != I else "2·I"
+    # Determine base symbol names (before TP division)
+    raw_moe_I = cfg.get("moe_intermediate_size") or cfg["intermediate_size"]
+    raw_I = cfg["intermediate_size"]
+    moe_I_base = "I_moe" if raw_moe_I != raw_I else "I"
+    moe_2I_base = "2·I_moe" if raw_moe_I != raw_I else "2·I"
+    moe_I_sym = f"{moe_I_base}/TP"
+    moe_2I_sym = f"{moe_2I_base}/TP"
 
     gate_op = OpNode(
         name="aten::mm", role="router_gate",
         backend="torch-xpu-ops",
-        input_shapes=[[tokens, "H"], ["H", str(num_experts)]],
-        output_shape=[tokens, str(num_experts)],
+        input_shapes=[[tokens, "H"], ["H", "E"]],
+        output_shape=[tokens, "E"],
         memory_bytes=_mm_mem(T, H, num_experts, dtype_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T, H, num_experts) if isinstance(T, int) else 0,
         phase=phase,
@@ -700,15 +735,15 @@ def _build_mla_moe_layer(
     align_op = OpNode(
         name="moe_align_block_size", role="moe_routing",
         backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, str(num_experts)]],
+        input_shapes=[[tokens, "E"]],
         output_shape=[tokens],
         memory_bytes=0, flops=0, phase=phase,
     )
     expert_mm1 = OpNode(
         name="aten::mm", role="expert_gate_up",
         backend="torch-xpu-ops",
-        input_shapes=[[f"{tokens}·{top_k}", "H"], ["H", moe_2I_sym]],
-        output_shape=[f"{tokens}·{top_k}", moe_2I_sym],
+        input_shapes=[[f"{tokens}·K", "H"], ["H", moe_2I_sym]],
+        output_shape=[f"{tokens}·K", moe_2I_sym],
         memory_bytes=_mm_mem(T * top_k, H, 2 * moe_I, dtype_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T * top_k, H, 2 * moe_I) if isinstance(T, int) else 0,
         phase=phase,
@@ -716,8 +751,8 @@ def _build_mla_moe_layer(
     expert_act = OpNode(
         name="silu_and_mul", role="expert_activation",
         backend="vllm-xpu-kernels",
-        input_shapes=[[f"{tokens}·{top_k}", moe_2I_sym]],
-        output_shape=[f"{tokens}·{top_k}", moe_I_sym],
+        input_shapes=[[f"{tokens}·K", moe_2I_sym]],
+        output_shape=[f"{tokens}·K", moe_I_sym],
         memory_bytes=_activation_mem(T * top_k, moe_I, dtype_bytes) if isinstance(T, int) else 0,
         flops=_activation_flops(T * top_k, moe_I) if isinstance(T, int) else 0,
         phase=phase,
@@ -725,8 +760,8 @@ def _build_mla_moe_layer(
     expert_mm2 = OpNode(
         name="aten::mm", role="expert_down",
         backend="torch-xpu-ops",
-        input_shapes=[[f"{tokens}·{top_k}", moe_I_sym], [moe_I_sym, "H"]],
-        output_shape=[f"{tokens}·{top_k}", "H"],
+        input_shapes=[[f"{tokens}·K", moe_I_sym], [moe_I_sym, "H"]],
+        output_shape=[f"{tokens}·K", "H"],
         memory_bytes=_mm_mem(T * top_k, moe_I, H, dtype_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T * top_k, moe_I, H) if isinstance(T, int) else 0,
         phase=phase,
@@ -926,13 +961,19 @@ def _build_encoder_model(
     Encoder models process all tokens in parallel (no causal mask).
     """
     H = cfg["hidden_size"]
-    n_h = cfg["num_heads"]
-    d = cfg.get("head_dim", H // n_h)
-    I = cfg["intermediate_size"]
-    V = cfg["vocab_size"]
+    n_h = cfg["_tp_num_heads"]
+    d = cfg.get("head_dim", H // cfg["num_heads"])
+    I = cfg["_tp_intermediate_size"]
+    V = cfg["_tp_vocab_size"]
     num_layers = cfg["num_layers"]
     dtype_bytes = cfg["dtype_bytes"]
     T = cfg.get(f"_{tokens}", tokens)
+    tp = cfg["tp_size"]
+
+    # TP-aware symbols
+    nh_sym = "n_h/TP"
+    i_sym = "I/TP"
+    v_sym = "V/TP"
 
     # Token embedding + position embedding
     embed = ModuleNode(
@@ -942,7 +983,7 @@ def _build_encoder_model(
             OpNode(
                 name="aten::embedding", role="word_embedding",
                 backend="torch-xpu-ops",
-                input_shapes=[["V", "H"], [tokens]],
+                input_shapes=[[v_sym, "H"], [tokens]],
                 output_shape=[tokens, "H"],
                 memory_bytes=(T * H * dtype_bytes) if isinstance(T, int) else 0,
                 flops=0, phase=phase,
@@ -980,8 +1021,8 @@ def _build_encoder_model(
     attention = OpNode(
         name="aten::scaled_dot_product_attention", role="attention",
         backend="torch-xpu-ops",
-        input_shapes=[[tokens, "n_h", "d"], [tokens, "n_h", "d"]],
-        output_shape=[tokens, "n_h", "d"],
+        input_shapes=[[tokens, nh_sym, "d"], [tokens, nh_sym, "d"]],
+        output_shape=[tokens, nh_sym, "d"],
         memory_bytes=0, flops=0, phase=phase,
     )
     o_proj = OpNode(
@@ -1005,8 +1046,8 @@ def _build_encoder_model(
     mlp_up = OpNode(
         name="aten::mm", role="mlp_up",
         backend="torch-xpu-ops",
-        input_shapes=[[tokens, "H"], ["H", "I"]],
-        output_shape=[tokens, "I"],
+        input_shapes=[[tokens, "H"], ["H", i_sym]],
+        output_shape=[tokens, i_sym],
         memory_bytes=_mm_mem(T, H, I, dtype_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T, H, I) if isinstance(T, int) else 0,
         phase=phase,
@@ -1014,8 +1055,8 @@ def _build_encoder_model(
     mlp_act = OpNode(
         name="aten::gelu", role="activation",
         backend="torch-xpu-ops",
-        input_shapes=[[tokens, "I"]],
-        output_shape=[tokens, "I"],
+        input_shapes=[[tokens, i_sym]],
+        output_shape=[tokens, i_sym],
         memory_bytes=_activation_mem(T, I, dtype_bytes) if isinstance(T, int) else 0,
         flops=_activation_flops(T, I) if isinstance(T, int) else 0,
         phase=phase,
@@ -1023,7 +1064,7 @@ def _build_encoder_model(
     mlp_down = OpNode(
         name="aten::mm", role="mlp_down",
         backend="torch-xpu-ops",
-        input_shapes=[[tokens, "I"], ["I", "H"]],
+        input_shapes=[[tokens, i_sym], [i_sym, "H"]],
         output_shape=[tokens, "H"],
         memory_bytes=_mm_mem(T, I, H, dtype_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T, I, H) if isinstance(T, int) else 0,
@@ -1231,7 +1272,7 @@ def build_model_graph(
     if is_diffusion:
         return _build_diffusion_placeholder(model_summary, family)
 
-    # Full (un-split) dimensions for reference
+    # Full (un-split) dimensions from config.json
     full_num_heads = model_summary.get("num_heads") or 1
     full_num_kv = model_summary.get("num_kv_heads", full_num_heads)
     full_intermediate = model_summary.get("intermediate_size") or 1
@@ -1243,20 +1284,26 @@ def build_model_graph(
     tp_intermediate = full_intermediate // tp_size
     tp_vocab = full_vocab // tp_size
 
-    # Build config dict — uses TP-adjusted dims for per-rank shapes
+    # Build config dict — stores original config values as symbols,
+    # with _tp_ prefixed values for per-rank numeric calculations
     cfg: dict[str, Any] = {
         "hidden_size": model_summary["hidden_size"],
         "num_layers": model_summary["num_layers"],
-        "num_heads": tp_num_heads,
-        "num_kv_heads": tp_num_kv,
+        "num_heads": full_num_heads,
+        "num_kv_heads": full_num_kv,
         "head_dim": model_summary.get("head_dim", model_summary["hidden_size"] // full_num_heads),
-        "intermediate_size": tp_intermediate,
-        "vocab_size": tp_vocab,
+        "intermediate_size": full_intermediate,
+        "vocab_size": full_vocab,
         "dtype_bytes": _dtype_bytes(model_summary.get("dtype", "bfloat16")),
         "has_qk_norm": family in _HAS_QK_NORM,
         "tp_size": tp_size,
         "is_mla": is_mla,
         "is_vl": is_vl,
+        # TP-divided values for numeric memory/FLOPs calculations
+        "_tp_num_heads": tp_num_heads,
+        "_tp_num_kv_heads": tp_num_kv,
+        "_tp_intermediate_size": tp_intermediate,
+        "_tp_vocab_size": tp_vocab,
     }
 
     # Quantization: adjust weight dtype and track quant method
@@ -1277,7 +1324,8 @@ def build_model_graph(
         cfg["num_experts"] = model_summary.get("num_experts", 8)
         cfg["num_experts_per_tok"] = model_summary.get("num_experts_per_tok", 2)
         raw_moe_I = model_summary.get("moe_intermediate_size")
-        cfg["moe_intermediate_size"] = (raw_moe_I // tp_size) if raw_moe_I else None
+        cfg["moe_intermediate_size"] = raw_moe_I
+        cfg["_tp_moe_intermediate_size"] = (raw_moe_I // tp_size) if raw_moe_I else None
         cfg["n_shared_experts"] = model_summary.get("n_shared_experts", 0)
 
     # MLA-specific config (DeepSeek-V2/V3)
@@ -1310,6 +1358,8 @@ def build_model_graph(
         cfg["_S"] = prefill_len
     if decode_batch:
         cfg["_B"] = decode_batch
+    if prefill_len and decode_batch:
+        cfg["_B·S"] = decode_batch * prefill_len
     if context_len:
         cfg["_C"] = context_len
     # kv_len: for prefill = S + C, for decode = C
@@ -1326,11 +1376,11 @@ def build_model_graph(
         "config": {
             "hidden_size": cfg["hidden_size"],
             "num_layers": cfg["num_layers"],
-            "num_heads": cfg["num_heads"],
-            "num_kv_heads": cfg["num_kv_heads"],
+            "num_heads": full_num_heads,
+            "num_kv_heads": full_num_kv,
             "head_dim": cfg["head_dim"],
-            "intermediate_size": cfg["intermediate_size"],
-            "vocab_size": cfg["vocab_size"],
+            "intermediate_size": full_intermediate,
+            "vocab_size": full_vocab,
             "is_moe": is_moe,
             "first_k_dense_replace": first_k_dense,
             "tp_size": tp_size,
@@ -1338,47 +1388,65 @@ def build_model_graph(
             "dtype_bytes": cfg["dtype_bytes"],
             "weight_dtype_bytes": cfg["weight_dtype_bytes"],
         },
-        # Symbol → concrete value mapping for tooltips
-        # When TP>1, dimensions shown are per-rank
+        # Symbol → concrete value mapping (original config.json values)
+        # TP appears as its own symbol; shapes use "/TP" notation for split dims
         "symbols": {
             "H": cfg["hidden_size"],
-            "n_h": cfg["num_heads"],
-            "n_kv": cfg["num_kv_heads"],
+            "n_h": full_num_heads,
+            "n_kv": full_num_kv,
             "d": cfg["head_dim"],
-            "I": cfg["intermediate_size"],
-            "2·I": 2 * cfg["intermediate_size"],
-            "V": cfg["vocab_size"],
-            "QKV": (cfg["num_heads"] + 2 * cfg["num_kv_heads"]) * cfg["head_dim"],
-            "n_h·d": cfg["num_heads"] * cfg["head_dim"],
+            "I": full_intermediate,
+            "2·I": 2 * full_intermediate,
+            "V": full_vocab,
+            "QKV": (full_num_heads + 2 * full_num_kv) * cfg["head_dim"],
+            "n_h·d": full_num_heads * cfg["head_dim"],
+            "TP": tp_size,
         },
     }
-
-    if tp_size > 1:
-        result["tp_note"] = f"Per-rank shapes (TP={tp_size})"
 
     # Add phase-specific symbols
     if prefill_len:
         result["symbols"]["S"] = prefill_len
     if decode_batch:
         result["symbols"]["B"] = decode_batch
-    if context_len:
+    if context_len is not None:
         result["symbols"]["C"] = context_len
-    if prefill_len and context_len:
-        result["symbols"]["S+C"] = prefill_len + context_len
+    if prefill_len:
+        result["symbols"]["S+C"] = prefill_len + (context_len or 0)
     if is_moe:
-        result["symbols"][str(cfg.get("num_experts", 8))] = cfg.get("num_experts", 8)
+        result["symbols"]["E"] = cfg.get("num_experts", 8)
+        result["symbols"]["K"] = cfg.get("num_experts_per_tok", 2)
         moe_I = cfg.get("moe_intermediate_size")
-        if moe_I and moe_I != cfg["intermediate_size"]:
+        if moe_I and moe_I != full_intermediate:
             result["symbols"]["I_moe"] = moe_I
             result["symbols"]["2·I_moe"] = 2 * moe_I
         if cfg.get("n_shared_experts", 0) > 0:
             result["symbols"]["n_shared"] = cfg["n_shared_experts"]
 
+    # MLA-specific symbols
+    if is_mla:
+        q_lora_rank = cfg.get("q_lora_rank", 0)
+        kv_lora_rank = cfg.get("kv_lora_rank", 512)
+        qk_nope_head_dim = cfg.get("qk_nope_head_dim", 128)
+        qk_rope_head_dim = cfg.get("qk_rope_head_dim", 64)
+        if q_lora_rank > 0:
+            result["symbols"]["Q_r"] = q_lora_rank
+            result["symbols"]["n_h·D_qh"] = (
+                full_num_heads * (qk_nope_head_dim + qk_rope_head_dim)
+            )
+        result["symbols"]["KV_r"] = kv_lora_rank
+        result["symbols"]["D_rope"] = qk_rope_head_dim
+
     # Build prefill and decode graphs
-    # kv_len = S+C for prefill (new tokens + prior context), C for decode
+    # Both phases use B·S as the token dimension for alignment:
+    #   Prefill: S = prefill_len (e.g. 128), so B·S = batch × seq_len
+    #   Decode:  S = 1 (always), so B·S = batch × 1 = batch
+    # kv_len:
+    #   Prefill: S+C per sequence (query tokens + prior context)
+    #   Decode:  C (full context length)
     for phase, tok_var, seq_var in [
-        ("prefill", "S", "S+C"),
-        ("decode", "B", "C"),
+        ("prefill", "B·S", "S+C"),
+        ("decode", "B·S", "C"),
     ]:
         root = _build_full_model(cfg, family, is_moe, phase, tok_var, seq_var)
         _compute_totals(root)
@@ -1393,12 +1461,14 @@ def _build_full_model(
 ) -> ModuleNode:
     """Build the complete model tree."""
     H = cfg["hidden_size"]
-    V = cfg["vocab_size"]
+    V = cfg["_tp_vocab_size"]
     dtype_bytes = cfg["dtype_bytes"]
     T = cfg.get(f"_{tokens}", tokens)
     first_k_dense = cfg.get("first_k_dense_replace", 0)
     is_mla = cfg.get("is_mla", False)
     is_vl = cfg.get("is_vl", False)
+    tp = cfg["tp_size"]
+    v_sym = "V/TP"
 
     children: list[ModuleNode] = []
 
@@ -1416,7 +1486,7 @@ def _build_full_model(
         ops=[OpNode(
             name="aten::embedding", role="embedding",
             backend="torch-xpu-ops",
-            input_shapes=[["V", "H"], [tokens]],
+            input_shapes=[[v_sym, "H"], [tokens]],
             output_shape=[tokens, "H"],
             memory_bytes=(T * H * dtype_bytes) if isinstance(T, int) else 0,
             flops=0,
@@ -1475,8 +1545,8 @@ def _build_full_model(
         ops=[OpNode(
             name="aten::mm", role="lm_head",
             backend="torch-xpu-ops",
-            input_shapes=[[tokens, "H"], ["H", "V"]],
-            output_shape=[tokens, "V"],
+            input_shapes=[[tokens, "H"], ["H", v_sym]],
+            output_shape=[tokens, v_sym],
             memory_bytes=_mm_mem(T, H, V, dtype_bytes) if isinstance(T, int) else 0,
             flops=_mm_flops(T, H, V) if isinstance(T, int) else 0,
             phase=phase,
@@ -1502,15 +1572,23 @@ def _build_encoder_graph(
 ) -> dict:
     """Build graph for encoder-only models (BERT/RoBERTa for embedding/reranking)."""
     full_num_heads = model_summary.get("num_heads") or 12
+    full_intermediate = model_summary.get("intermediate_size", 3072)
+    full_vocab = model_summary.get("vocab_size", 30522)
+
     cfg: dict[str, Any] = {
         "hidden_size": model_summary.get("hidden_size", 768),
         "num_layers": model_summary.get("num_layers", 12),
-        "num_heads": full_num_heads // tp_size,
+        "num_heads": full_num_heads,
         "head_dim": model_summary.get("head_dim",
                                        model_summary.get("hidden_size", 768) // full_num_heads),
-        "intermediate_size": model_summary.get("intermediate_size", 3072) // tp_size,
-        "vocab_size": model_summary.get("vocab_size", 30522) // tp_size,
+        "intermediate_size": full_intermediate,
+        "vocab_size": full_vocab,
         "dtype_bytes": _dtype_bytes(model_summary.get("dtype", "float32")),
+        "tp_size": tp_size,
+        # TP-divided values for numeric calculations
+        "_tp_num_heads": full_num_heads // tp_size,
+        "_tp_intermediate_size": full_intermediate // tp_size,
+        "_tp_vocab_size": full_vocab // tp_size,
     }
     if seq_len:
         cfg["_S"] = seq_len
@@ -1519,13 +1597,22 @@ def _build_encoder_graph(
         "architecture": model_summary.get("architecture", ""),
         "family": family,
         "model_type": "encoder",
-        "config": {k: v for k, v in cfg.items() if not k.startswith("_")},
+        "config": {
+            "hidden_size": cfg["hidden_size"],
+            "num_layers": cfg["num_layers"],
+            "num_heads": full_num_heads,
+            "head_dim": cfg["head_dim"],
+            "intermediate_size": full_intermediate,
+            "vocab_size": full_vocab,
+            "tp_size": tp_size,
+        },
         "symbols": {
             "H": cfg["hidden_size"],
-            "n_h": cfg["num_heads"],
+            "n_h": full_num_heads,
             "d": cfg["head_dim"],
-            "I": cfg["intermediate_size"],
-            "V": cfg["vocab_size"],
+            "I": full_intermediate,
+            "V": full_vocab,
+            "TP": tp_size,
         },
     }
     if seq_len:
