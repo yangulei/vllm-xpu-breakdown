@@ -498,7 +498,7 @@ def _build_moe_layer(
 def _build_mla_attention_ops(
     cfg: dict, phase: str, tokens: str, seq: str
 ) -> list[OpNode]:
-    """Build ops for Multi-head Latent Attention (DeepSeek-V2/V3).
+    """Build ops for Multi-head Latent Attention (DeepSeek-V2/V3/V4, GLM5).
 
     MLA compresses KV into a low-rank latent space, reducing KV cache size.
     Key ops: Q projection → latent KV projection → decompress → attention.
@@ -507,6 +507,8 @@ def _build_mla_attention_ops(
     n_h = cfg["_tp_num_heads"]
     n_kv = cfg["_tp_num_kv_heads"]
     d = cfg["head_dim"]
+    # v_head_dim may differ from head_dim (e.g. GLM5: head_dim=64, v_head_dim=256)
+    v_d = cfg.get("v_head_dim") or d
     dtype_bytes = cfg["dtype_bytes"]
     w_bytes = cfg.get("weight_dtype_bytes", dtype_bytes)
     T = cfg.get(f"_{tokens}", tokens)
@@ -518,6 +520,7 @@ def _build_mla_attention_ops(
     nkv_sym = "n_kv/TP"
     qkv_sym = "QKV/TP"
     nhd_sym = "n_h·d/TP"
+    nhvd_sym = "n_h·v_d/TP" if v_d != d else nhd_sym
     nhDqh_sym = "n_h·D_qh/TP"
 
     # MLA-specific dimensions (from config or estimated)
@@ -607,13 +610,18 @@ def _build_mla_attention_ops(
     ))
 
     # MLA attention kernel
+    # Q input per head = D_qh (qk_nope_head_dim + qk_rope_head_dim)
+    # Attention output per head uses v_head_dim (may differ from head_dim)
+    d_qh = qk_nope_head_dim + qk_rope_head_dim
+    v_dim_sym = "v_d" if v_d != d else "d"
+    q_dim_sym = "D_qh" if d_qh != d else "d"
     ops.append(OpNode(
         name="gdn_attention", role="attention",
         backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, nh_sym, "d"], [seq, "KV_r"]],
-        output_shape=[tokens, nh_sym, "d"],
+        input_shapes=[[tokens, nh_sym, q_dim_sym], [seq, "KV_r"]],
+        output_shape=[tokens, nh_sym, v_dim_sym],
         memory_bytes=0,
-        flops=(2 * T * S * n_h * d) if isinstance(T, int) and isinstance(S, int) else 0,
+        flops=(2 * T * S * n_h * v_d) if isinstance(T, int) and isinstance(S, int) else 0,
         phase=phase,
     ))
 
@@ -628,16 +636,55 @@ def _build_mla_attention_ops(
         phase=phase,
     ))
 
-    # Output projection
-    ops.append(OpNode(
-        name="aten::mm", role="o_proj",
-        backend="torch-xpu-ops",
-        input_shapes=[[tokens, nhd_sym], [nhd_sym, "H"]],
-        output_shape=[tokens, "H"],
-        memory_bytes=_mm_mem(T, n_h * d, H, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
-        flops=_mm_flops(T, n_h * d, H) if isinstance(T, int) else 0,
-        phase=phase,
-    ))
+    # Output projection — input dim is n_h * v_head_dim (attention output)
+    o_lora_rank = cfg.get("o_lora_rank", 0)
+    o_groups = cfg.get("o_groups", 1)
+    nhvd = n_h * v_d  # per-rank attention output dimension
+    if o_lora_rank > 0:
+        # V4-style grouped low-rank output projection (block-diagonal):
+        #   wo_a (ColumnParallel, batched over groups): attn_out → G·O_r/TP
+        #     Block-diagonal: G/TP groups each doing [n_h*v_d/(G/TP), O_r]
+        #     Weight total per-rank: n_h*v_d * O_r (block-diagonal sum)
+        #     FLOPs = 2 * T * n_h*v_d * O_r (same as dense equivalent)
+        #   wo_b (RowParallel): G·O_r/TP → H
+        #     Weight per-rank: [G*O_r/TP, H]
+        #     FLOPs = 2 * T * (G*O_r/TP) * H
+        go_per_tp = o_groups * o_lora_rank // tp
+        # Block-diagonal memory: input[T, nhvd] + weight[nhvd * O_r] + output[T, go_per_tp]
+        o_compress_mem = (
+            (T * nhvd * dtype_bytes + nhvd * o_lora_rank * w_bytes
+             + T * go_per_tp * dtype_bytes)
+            if isinstance(T, int) else 0
+        )
+        ops.append(OpNode(
+            name="aten::mm", role="o_compress",
+            backend="torch-xpu-ops",
+            input_shapes=[[tokens, nhvd_sym], [nhvd_sym, "G·O_r/TP"]],
+            output_shape=[tokens, "G·O_r/TP"],
+            memory_bytes=o_compress_mem,
+            flops=_mm_flops(T, nhvd, o_lora_rank) if isinstance(T, int) else 0,
+            phase=phase,
+        ))
+        ops.append(OpNode(
+            name="aten::mm", role="o_decompress",
+            backend="torch-xpu-ops",
+            input_shapes=[[tokens, "G·O_r/TP"], ["G·O_r/TP", "H"]],
+            output_shape=[tokens, "H"],
+            memory_bytes=_mm_mem(T, go_per_tp, H, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
+            flops=_mm_flops(T, go_per_tp, H) if isinstance(T, int) else 0,
+            phase=phase,
+        ))
+    else:
+        # Standard output projection (V2/V3 style)
+        ops.append(OpNode(
+            name="aten::mm", role="o_proj",
+            backend="torch-xpu-ops",
+            input_shapes=[[tokens, nhvd_sym], [nhvd_sym, "H"]],
+            output_shape=[tokens, "H"],
+            memory_bytes=_mm_mem(T, nhvd, H, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
+            flops=_mm_flops(T, nhvd, H) if isinstance(T, int) else 0,
+            phase=phase,
+        ))
 
     return ops
 
@@ -1133,9 +1180,11 @@ _ARCH_FAMILY_MAP: dict[str, str] = {
     "ChatGLMForConditionalGeneration": "GLM4",
     "ChatGLMModel": "GLM4",
     "Glm4ForCausalLM": "GLM4",
+    "GlmMoeDsaForCausalLM": "GLM5MoE",
     # --- DeepSeek MLA family ---
     "DeepseekV2ForCausalLM": "DeepSeekV2",
     "DeepseekV3ForCausalLM": "DeepSeekV3",
+    "DeepseekV4ForCausalLM": "DeepSeekV4",
     # --- MoE models ---
     "MixtralForCausalLM": "Mixtral",
     "HunYuanMoEV1ForCausalLM": "Hunyuan",
@@ -1163,10 +1212,10 @@ _ARCH_FAMILY_MAP: dict[str, str] = {
 }
 
 # Architectures that have QK normalization
-_HAS_QK_NORM = {"Qwen3", "Qwen3Moe", "DeepSeekV2", "DeepSeekV3", "GLM4"}
+_HAS_QK_NORM = {"Qwen3", "Qwen3Moe", "DeepSeekV2", "DeepSeekV3", "DeepSeekV4", "GLM4", "GLM5MoE"}
 
 # Architectures that use Multi-head Latent Attention (MLA)
-_MLA_ARCHS = {"DeepSeekV2", "DeepSeekV3"}
+_MLA_ARCHS = {"DeepSeekV2", "DeepSeekV3", "DeepSeekV4", "GLM5MoE"}
 
 # Vision-language architecture families
 _VL_ARCHS = {"Qwen2VL", "Qwen3VL", "InternVL"}
@@ -1275,7 +1324,13 @@ def build_model_graph(
     # Full (un-split) dimensions from config.json
     full_num_heads = model_summary.get("num_heads") or 1
     full_num_kv = model_summary.get("num_kv_heads", full_num_heads)
-    full_intermediate = model_summary.get("intermediate_size") or 1
+    # For pure MoE models without dense layers (e.g. DeepSeek-V4),
+    # intermediate_size may be absent — fall back to moe_intermediate_size
+    full_intermediate = (
+        model_summary.get("intermediate_size")
+        or model_summary.get("moe_intermediate_size")
+        or 1
+    )
     full_vocab = model_summary.get("vocab_size") or 1
 
     # TP-split dimensions (column-parallel splits output, row-parallel splits input)
@@ -1328,12 +1383,23 @@ def build_model_graph(
         cfg["_tp_moe_intermediate_size"] = (raw_moe_I // tp_size) if raw_moe_I else None
         cfg["n_shared_experts"] = model_summary.get("n_shared_experts", 0)
 
-    # MLA-specific config (DeepSeek-V2/V3)
+    # MLA-specific config (DeepSeek-V2/V3/V4)
     if is_mla:
-        cfg["kv_lora_rank"] = model_summary.get("kv_lora_rank", 512)
-        cfg["q_lora_rank"] = model_summary.get("q_lora_rank", 0)
-        cfg["qk_nope_head_dim"] = model_summary.get("qk_nope_head_dim", 128)
-        cfg["qk_rope_head_dim"] = model_summary.get("qk_rope_head_dim", 64)
+        qk_rope_head_dim = model_summary.get("qk_rope_head_dim") or 64
+        cfg["qk_rope_head_dim"] = qk_rope_head_dim
+        # V4 doesn't have kv_lora_rank — uses head_dim as the KV latent dimension
+        cfg["kv_lora_rank"] = model_summary.get("kv_lora_rank") or cfg["head_dim"]
+        cfg["q_lora_rank"] = model_summary.get("q_lora_rank") or 0
+        # V4 doesn't have qk_nope_head_dim — derive from head_dim - rope_dim
+        cfg["qk_nope_head_dim"] = (
+            model_summary.get("qk_nope_head_dim")
+            or (cfg["head_dim"] - qk_rope_head_dim)
+        )
+        # Value head dim may differ from head_dim (e.g. GLM5: head_dim=64, v_head_dim=256)
+        cfg["v_head_dim"] = model_summary.get("v_head_dim") or cfg["head_dim"]
+        # V4 grouped low-rank output projection
+        cfg["o_lora_rank"] = model_summary.get("o_lora_rank") or 0
+        cfg["o_groups"] = model_summary.get("o_groups") or 1
 
     # VL-specific config
     if is_vl:
@@ -1429,13 +1495,24 @@ def build_model_graph(
         kv_lora_rank = cfg.get("kv_lora_rank", 512)
         qk_nope_head_dim = cfg.get("qk_nope_head_dim", 128)
         qk_rope_head_dim = cfg.get("qk_rope_head_dim", 64)
+        v_head_dim = cfg.get("v_head_dim", cfg["head_dim"])
+        d_qh = qk_nope_head_dim + qk_rope_head_dim
         if q_lora_rank > 0:
             result["symbols"]["Q_r"] = q_lora_rank
-            result["symbols"]["n_h·D_qh"] = (
-                full_num_heads * (qk_nope_head_dim + qk_rope_head_dim)
-            )
+            result["symbols"]["n_h·D_qh"] = full_num_heads * d_qh
+        # D_qh symbol (only when it differs from head_dim)
+        if d_qh != cfg["head_dim"]:
+            result["symbols"]["D_qh"] = d_qh
         result["symbols"]["KV_r"] = kv_lora_rank
         result["symbols"]["D_rope"] = qk_rope_head_dim
+        # v_head_dim symbol (only when it differs from head_dim)
+        if v_head_dim != cfg["head_dim"]:
+            result["symbols"]["v_d"] = v_head_dim
+            result["symbols"]["n_h·v_d"] = full_num_heads * v_head_dim
+        o_lora_rank = cfg.get("o_lora_rank", 0)
+        o_groups = cfg.get("o_groups", 1)
+        if o_lora_rank > 0:
+            result["symbols"]["G·O_r"] = o_groups * o_lora_rank
 
     # Build prefill and decode graphs
     # Both phases use B·S as the token dimension for alignment:
