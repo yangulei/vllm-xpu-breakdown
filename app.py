@@ -1547,15 +1547,14 @@ def _partially_resolve_dim(dim, symbols: dict[str, int],
                            tp_divided: set[str] | None = None):
     """Resolve dim keeping only S/B/C/TP symbolic, resolving all else to numbers.
 
-    Model constants from config.json are shown as numbers. When TP>1 and a
-    dimension is TP-divided, it's shown as "value/TP" using the full undivided
-    config value.
-    """
-    if full_symbols is None:
-        full_symbols = symbols
-    if tp_divided is None:
-        tp_divided = set()
+    Model constants from config.json are shown as numbers. When a dimension
+    contains "/TP", it's shown as "value/TP" using the full undivided config
+    value from the symbols dict.
 
+    The full_symbols and tp_divided params are accepted for backwards
+    compatibility but ignored — the graph now embeds /TP directly in shapes
+    and symbols already contain original (undivided) values.
+    """
     if isinstance(dim, (int, float)):
         return str(int(dim))
 
@@ -1569,11 +1568,15 @@ def _partially_resolve_dim(dim, symbols: dict[str, int],
     if _is_variable_composite(s):
         return s
 
+    # Handle "/TP" suffix: resolve the base part, keep /TP
+    if s.endswith("/TP"):
+        base = s[:-3]  # strip "/TP"
+        resolved_base = _resolve_constant_expr(base, symbols)
+        return f"{resolved_base}/TP"
+
     # Check if s is a known symbol directly (handles names with · like "n_h·D_qh")
-    if s in full_symbols or s in symbols:
-        if s in tp_divided:
-            return f"{full_symbols.get(s, symbols[s])}/TP"
-        return str(full_symbols.get(s, symbols.get(s, s)))
+    if s in symbols:
+        return str(symbols[s])
 
     # Check for multiply composites containing a variable (e.g., "B·S·K")
     if "·" in s:
@@ -1585,11 +1588,6 @@ def _partially_resolve_dim(dim, symbols: dict[str, int],
             for p in parts:
                 if p in _VARIABLE_SYMS:
                     resolved_parts.append(p)
-                elif p in tp_divided:
-                    resolved_parts.append(
-                        f"{full_symbols.get(p, symbols.get(p, p))}/TP")
-                elif p in full_symbols:
-                    resolved_parts.append(str(full_symbols[p]))
                 elif p in symbols:
                     resolved_parts.append(str(symbols[p]))
                 elif p.isdigit():
@@ -1598,39 +1596,45 @@ def _partially_resolve_dim(dim, symbols: dict[str, int],
                     resolved_parts.append(p)
             return "·".join(resolved_parts)
         else:
-            # All parts are constants — check if any are TP-divided
-            any_tp = any(p in tp_divided for p in parts)
-            if any_tp:
-                # Compute full product
-                product = 1
-                for p in parts:
-                    val = full_symbols.get(p, symbols.get(p))
-                    if val is not None:
-                        product *= val
-                    elif p.isdigit():
-                        product *= int(p)
-                return f"{product}/TP"
-            else:
-                # Resolve fully
-                product = 1
-                for p in parts:
-                    val = full_symbols.get(p, symbols.get(p))
-                    if val is not None:
-                        product *= val
-                    elif p.isdigit():
-                        product *= int(p)
-                return str(product)
+            # All parts are constants — compute product
+            product = 1
+            for p in parts:
+                val = symbols.get(p)
+                if val is not None:
+                    product *= val
+                elif p.isdigit():
+                    product *= int(p)
+            return str(product)
 
-    # Single symbol — check if TP-divided
-    if s in tp_divided:
-        full_val = full_symbols.get(s, symbols.get(s, s))
-        return f"{full_val}/TP"
-
-    # Pure constant — fully resolve using full (undivided) values
-    if s in full_symbols:
-        return str(full_symbols[s])
+    # Pure constant — fully resolve
+    if s in symbols:
+        return str(symbols[s])
     resolved = _resolve_dim(s, symbols)
     return str(resolved)
+
+
+def _resolve_constant_expr(expr: str, symbols: dict[str, int]) -> str:
+    """Resolve a constant expression (no variables) to its numeric value.
+
+    Handles symbols like "QKV", "n_h·d", "2·I", and plain numbers.
+    """
+    if expr in symbols:
+        return str(symbols[expr])
+    if "·" in expr:
+        parts = expr.split("·")
+        product = 1
+        for p in parts:
+            val = symbols.get(p)
+            if val is not None:
+                product *= val
+            elif p.isdigit():
+                product *= int(p)
+            else:
+                return expr  # can't resolve
+        return str(product)
+    if expr.isdigit():
+        return expr
+    return expr
 
 
 @app.route("/api/export/shape-matrix", methods=["POST"])
@@ -1792,8 +1796,6 @@ def export_shape_matrix():
         )
         graph_cfg = graph.get("config", {})
         symbols = graph.get("symbols", {})
-        full_symbols = graph.get("full_symbols", symbols)
-        tp_divided = set(graph.get("tp_divided", []))
         tree = graph.get(cfg["phase"])
         if not tree:
             continue
@@ -1811,16 +1813,12 @@ def export_shape_matrix():
                     sym_parts = []
                     for s in sym_shapes:
                         if isinstance(s, list):
-                            dims = [_partially_resolve_dim(
-                                        d, symbols, full_symbols,
-                                        tp_divided)
+                            dims = [_partially_resolve_dim(d, symbols)
                                     for d in s]
                             sym_parts.append("[" + ", ".join(dims) + "]")
                         else:
                             sym_parts.append(
-                                _partially_resolve_dim(
-                                    s, symbols, full_symbols,
-                                    tp_divided))
+                                _partially_resolve_dim(s, symbols))
                     symbolic_str = " × ".join(sym_parts)
                 else:
                     symbolic_str = "—"
