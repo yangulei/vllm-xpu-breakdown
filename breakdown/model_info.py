@@ -74,7 +74,7 @@ def summarize_config(config: dict[str, Any]) -> dict[str, Any]:
     intermediate_size = config.get("intermediate_size") or config.get("ffn_dim")
     vocab_size = config.get("vocab_size")
     max_position = config.get("max_position_embeddings")
-    dtype = config.get("torch_dtype", "unknown")
+    dtype = config.get("torch_dtype") or config.get("dtype", "unknown")
 
     # MoE detection
     num_experts = (

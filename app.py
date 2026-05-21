@@ -1480,19 +1480,23 @@ def _format_op_shape_with_dtypes(
 
 
 def _safe_arithmetic_eval(expr: str) -> int:
-    """Safely evaluate a simple arithmetic expression (integers, +, -, *).
+    """Safely evaluate a simple arithmetic expression (integers, +, -, *, /).
 
-    Only allows integer literals and the operators +, -, *.
+    Only allows integer literals and the operators +, -, *, /.
+    Division is performed as integer (floor) division.
     Raises ValueError for anything else.
     """
     import ast
+
+    # Normalize "/" to "//" for integer division in eval
+    expr = expr.replace("//", "/").replace("/", "//")
 
     tree = ast.parse(expr, mode="eval")
     for node in ast.walk(tree):
         if isinstance(node, ast.Expression):
             continue
         if isinstance(node, ast.BinOp):
-            if not isinstance(node.op, (ast.Add, ast.Sub, ast.Mult)):
+            if not isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv)):
                 raise ValueError(f"Unsupported operator: {type(node.op).__name__}")
         elif isinstance(node, ast.UnaryOp):
             if not isinstance(node.op, (ast.USub, ast.UAdd)):
@@ -1500,7 +1504,8 @@ def _safe_arithmetic_eval(expr: str) -> int:
         elif isinstance(node, (ast.Constant,)):
             if not isinstance(node.value, (int, float)):
                 raise ValueError(f"Non-numeric constant: {node.value}")
-        elif not isinstance(node, (ast.Add, ast.Sub, ast.Mult, ast.USub, ast.UAdd)):
+        elif not isinstance(node, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv,
+                                   ast.USub, ast.UAdd)):
             raise ValueError(f"Unsupported node: {type(node).__name__}")
     return int(eval(compile(tree, "<dim>", "eval")))  # noqa: S307
 
@@ -1523,7 +1528,7 @@ def _resolve_dim(dim, symbols: dict[str, int]):
         expr = expr.replace("·", "*")
         try:
             return _safe_arithmetic_eval(expr)
-        except (ValueError, SyntaxError):
+        except (ValueError, SyntaxError, ZeroDivisionError, OverflowError):
             return dim
     return dim
 
