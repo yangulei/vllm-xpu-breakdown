@@ -27,13 +27,18 @@ Then open `http://localhost:8080` in your browser.
 - Search for any HuggingFace model by ID
 - Auto-loads model config (architecture, layers, MoE, dtype)
 - Toggle between eager and torch.compile mode
+- Static model graph with symbolic shapes and TP-aware annotations
+- Quantization support (fp8, gptq, awq) — affects weight dtype and memory estimates
+- Shape Matrix Export: sweep across seq_len, batch_size, context_len, and TP configurations
 - Rich ops table with:
   - Shapes with symbolic dimensions (B=batch, S=seq_len, H=hidden_size, etc.)
+  - Per-tensor dtype tags (bf16, fp8, int4)
+  - TP-divided dimensions shown as `symbol/TP` (e.g., `n_h/TP`, `QKV/TP`)
   - Merged duplicate layers with ×N repetition count
   - Memory estimation, FLOPs, and arithmetic intensity
   - Sortable and filterable by backend
 - Backend distribution chart
-- "Load Demo" button for UI preview without running profiling
+- Model catalog with 65+ models across LLM, MLLM, T2I, T2V, Audio, Embedding
 
 ## CLI (Quick One-Shot)
 
@@ -61,6 +66,26 @@ Reports are written to `output/` (or `--output-dir`):
 | `breakdown.html` | Static HTML report with charts and sortable tables |
 | `trace.json` | Chrome trace (`chrome://tracing`) for timeline analysis |
 
+## Shape Matrix Export
+
+Export op shapes across multiple configurations for analysis:
+
+```
+POST /api/export/shape-matrix
+{
+  "model_id": "Qwen/Qwen3-4B",
+  "prefill_seq_lens": [128, 1024, 4096],
+  "prefill_ctx_lens": [0, 8192],
+  "prefill_batch_sizes": [1],
+  "decode_ctx_lens": [8192],
+  "decode_batch_sizes": [1, 8, 32, 128],
+  "tp_sizes": [1, 4],
+  "quantization": "auto"
+}
+```
+
+Produces an Excel file with one row per (Phase, SeqLen, CtxLen, BatchSize, TP, Op) combination. Columns include symbolic shapes (with `S`, `B`, `C`, `TP` kept as variables), concrete shapes with dtypes, memory, FLOPs, and arithmetic intensity.
+
 ## Comparing Eager vs Compiled
 
 ```bash
@@ -70,17 +95,24 @@ Reports are written to `output/` (or `--output-dir`):
 ## Architecture
 
 ```
-app.py                  Web server (Flask) — model config, profiling, REST API
+app.py                  Web server (Flask) — model config, profiling, exports, REST API
 run_profile.py          CLI entry point — standalone profiling + reports
 static/index.html       Interactive frontend (SPA, vanilla JS)
 breakdown/
+  model_catalog.py      Registry of 65+ target models with metadata
+  model_graph.py        Static model graph builder (core engine)
   model_info.py         HuggingFace model config fetching & summarization
   analyzer.py           Shape symbolization, memory/FLOPs estimation, layer merging
   profiler.py           torch.profiler wrapper (XPU activity, shapes, stacks)
   classifier.py         Op classification: vllm-xpu-kernels | triton | torch-xpu-ops | cpu
   registry.py           Known op list from vllm-xpu-kernels (68 ops across 4 modules)
+  trace_parser.py       Chrome trace JSON parser
   report.py             Console, CSV, JSON report generators
   visualize.py          Static HTML report generator
+tests/
+  test_pipeline.py            Unit tests (requires torch)
+  test_shape_matrix_export.py Shape Matrix Export endpoint tests
+  test_real_profile.py        Integration test (requires GPU)
 ```
 
 ## How Classification Works
@@ -90,3 +122,14 @@ breakdown/
 3. `aten::` compute ops with XPU device time > 0 → **torch-xpu-ops**
 4. Shape/view ops, profiler overhead → **framework**
 5. Everything else with no device time → **cpu**
+
+## Symbolic Shape System
+
+Op shapes use symbolic expressions that represent model config values:
+
+- **Config symbols** (resolved to numbers from `config.json`): `H`, `n_h`, `n_kv`, `d`, `I`, `V`, `QKV`, `n_h·d`
+- **Variable symbols** (stay symbolic — user-defined): `S` (seq_len), `B` (batch), `C` (context_len), `TP` (tensor_parallel)
+- **TP-divided dims** always show `/TP` suffix: `n_h/TP`, `QKV/TP`, `I/TP`, `V/TP`, etc.
+- `TP` is always in the symbols dict (value = tp_size, even when 1)
+
+This makes it easy to identify which dimensions are split across tensor-parallel ranks.

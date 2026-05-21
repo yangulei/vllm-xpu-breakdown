@@ -18,7 +18,7 @@ The tool has two modes:
 ## Project Structure
 
 ```
-app.py                    — Flask web server (API + static serving)
+app.py                    — Flask web server (API + static serving + exports)
 run_profile.py            — CLI profiling entry point
 chat.py                   — Interactive chat with profiling
 breakdown/
@@ -39,9 +39,10 @@ scripts/
   run_catalog_models.sh   — Batch static analysis for catalog models
   compare_modes.sh        — Compare eager vs compile modes
 tests/
-  test_pipeline.py        — Unit tests
+  test_pipeline.py              — Unit tests (requires torch)
+  test_shape_matrix_export.py   — Shape Matrix Export endpoint tests
   test_profile_reduced_layers.py
-  test_real_profile.py    — Integration test (requires GPU)
+  test_real_profile.py          — Integration test (requires GPU)
 ```
 
 ## Build & Run
@@ -62,6 +63,9 @@ python run_profile.py --model Qwen/Qwen3-4B-Instruct-2507 --max-model-len 32768
 ```bash
 # Unit tests (no GPU required)
 pytest tests/test_pipeline.py -v
+
+# Shape Matrix Export tests (no GPU required)
+pytest tests/test_shape_matrix_export.py -v
 
 # Full integration (requires Intel XPU hardware)
 pytest tests/ -v
@@ -89,6 +93,32 @@ Architecture-specific builders:
 | `_build_encoder_model` | BERT/RoBERTa for embedding/reranker |
 | `_build_diffusion_placeholder` | Diffusion models (not vLLM-served) |
 
+### Symbolic Shape System
+
+Op shapes use symbolic expressions for dimensions:
+
+- **`cfg` dict** stores original config.json values (e.g., `cfg["num_heads"] = 32`)
+- **`cfg["_tp_*"]` keys** store TP-divided values for numeric calculations (e.g., `cfg["_tp_num_heads"] = 8` when TP=4)
+- **Shape strings** always use `/TP` for TP-aware dims: `"n_h/TP"`, `"QKV/TP"`, `"I/TP"`, `"V/TP"`
+- **`symbols` dict** in result contains original (undivided) values + `"TP": tp_size` (always present, even TP=1)
+- **Variable symbols** stay symbolic in exports: `S` (seq_len), `B` (batch), `C` (context_len), `TP`
+- Frontend `symTooltip()` resolves `/TP` suffix by dividing base value by TP
+
+### Quantization Support
+
+- Quantization affects `weight_dtype_bytes` (reduced from model dtype)
+- `_get_tensor_dtype()` determines per-tensor dtype based on op role (weight vs activation)
+- Supported: fp8, gptq, awq, marlin, bitsandbytes, int4, int8
+
+### Shape Matrix Export (`/api/export/shape-matrix`)
+
+Exports a flat Excel table sweeping across configurations:
+- Prefill: seq_lens × ctx_lens × batch_sizes × tp_sizes
+- Decode: seq_len=1 × ctx_lens × batch_sizes × tp_sizes
+- Each row = one (Phase, SeqLen, CtxLen, BatchSize, TP, Op) combination
+- Symbolic Shape column keeps S/B/C/TP symbolic, resolves model constants to numbers
+- Row limit guard (`_MAX_MATRIX_ROWS = 50000`) prevents excessive generation
+
 ### Model Catalog (`model_catalog.py`)
 
 Registry of target models with:
@@ -112,8 +142,8 @@ Classifies ops by name prefix/pattern to backends. Priority order:
 - **License header** — All Python files start with `# SPDX-License-Identifier: Apache-2.0`
 - **Type annotations** — Use `from __future__ import annotations` and modern syntax (`dict[str, Any]`, `list[int] | None`)
 - **No external ML dependencies for static analysis** — `model_graph.py` and `model_info.py` must work without PyTorch/vLLM installed
-- **Symbolic shapes** — Op shapes use string symbols (`"H"`, `"S"`, `"n_h·d"`) when concrete values aren't available
-- **TP-awareness** — All graph builders accept `tp_size` and produce per-rank shapes
+- **Symbolic shapes** — Op shapes use string symbols (`"H"`, `"S"`, `"n_h·d/TP"`) with `/TP` for TP-divided dims
+- **TP-awareness** — All graph builders accept `tp_size`; shapes always show `/TP` for split dimensions; `cfg["_tp_*"]` keys hold divided values for numeric calculations
 
 ## Adding a New Model
 
@@ -139,12 +169,43 @@ Classifies ops by name prefix/pattern to backends. Priority order:
 | `/api/profile/start` | POST | Start async profiling |
 | `/api/profile/status` | GET | Poll profiling status |
 | `/api/profile/trace` | GET | Download raw trace file |
+| `/api/export/shape-matrix` | POST | Export multi-config shape sweep to Excel |
+| `/api/export/excel` | POST | Export profiled breakdown to Excel |
+| `/api/export/static-graph` | POST | Export static graph breakdown to Excel |
 
 ## Common Pitfalls
 
-- `model_graph.py` is ~1500 lines — use `view_range` to read targeted sections
+- `model_graph.py` is ~1600 lines — use `view_range` to read targeted sections
+- `app.py` is ~1900 lines — use `view_range` to read targeted sections
 - The `_ARCH_FAMILY_MAP` keys must exactly match HuggingFace `architectures[0]` values
 - Encoder models return `decode: None` (no autoregressive decode phase)
 - Diffusion models return `prefill: None, decode: None` with a `note` field
 - The web UI is a single HTML file with inline CSS/JS — no build step needed
 - `model_info.py` fetches from HuggingFace API — tests should mock HTTP calls
+- Shape strings contain `/TP` always (even when TP=1) — resolve via `symbols["TP"]`
+
+## Updating Documentation
+
+When making significant changes to this repository, update documentation accordingly:
+
+1. **AGENTS.md** — Update when:
+   - New files/directories are added or removed (update Project Structure)
+   - New API endpoints are added (update API Endpoints table)
+   - Architecture decisions change (update Key Architecture Decisions)
+   - Conventions change (update Conventions section)
+   - New model types or builders are added (update builder table)
+   - Common pitfalls are discovered (add to Common Pitfalls)
+
+2. **README.md** — Update when:
+   - User-facing features are added or changed (update Features list)
+   - CLI interface changes (update CLI section)
+   - New output formats are added (update Output table)
+   - Architecture overview changes (update Architecture section)
+   - New export/analysis capabilities are added
+
+3. **When to update** — After any PR that adds features, changes APIs, modifies the project structure, or alters how the tool is used. Run `git log --oneline <last_doc_commit>..HEAD` to see what changed since docs were last updated.
+
+4. **How to verify** — After updating, check that:
+   - Project Structure listing matches actual files (`ls breakdown/ tests/ scripts/`)
+   - API Endpoints table matches routes in `app.py` (`grep "@app.route" app.py`)
+   - Builder table matches functions in `model_graph.py` (`grep "^def _build_" breakdown/model_graph.py`)
