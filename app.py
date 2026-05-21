@@ -1479,6 +1479,32 @@ def _format_op_shape_with_dtypes(
     return " × ".join(parts)
 
 
+def _safe_arithmetic_eval(expr: str) -> int:
+    """Safely evaluate a simple arithmetic expression (integers, +, -, *).
+
+    Only allows integer literals and the operators +, -, *.
+    Raises ValueError for anything else.
+    """
+    import ast
+
+    tree = ast.parse(expr, mode="eval")
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Expression):
+            continue
+        if isinstance(node, ast.BinOp):
+            if not isinstance(node.op, (ast.Add, ast.Sub, ast.Mult)):
+                raise ValueError(f"Unsupported operator: {type(node.op).__name__}")
+        elif isinstance(node, ast.UnaryOp):
+            if not isinstance(node.op, (ast.USub, ast.UAdd)):
+                raise ValueError(f"Unsupported unary op: {type(node.op).__name__}")
+        elif isinstance(node, (ast.Constant,)):
+            if not isinstance(node.value, (int, float)):
+                raise ValueError(f"Non-numeric constant: {node.value}")
+        elif not isinstance(node, (ast.Add, ast.Sub, ast.Mult, ast.USub, ast.UAdd)):
+            raise ValueError(f"Unsupported node: {type(node).__name__}")
+    return int(eval(compile(tree, "<dim>", "eval")))  # noqa: S307
+
+
 def _resolve_dim(dim, symbols: dict[str, int]):
     """Resolve a dimension value to a concrete integer if possible."""
     if isinstance(dim, int):
@@ -1496,8 +1522,8 @@ def _resolve_dim(dim, symbols: dict[str, int]):
         # Replace middle-dot with *
         expr = expr.replace("·", "*")
         try:
-            return int(eval(expr))  # noqa: S307
-        except Exception:
+            return _safe_arithmetic_eval(expr)
+        except (ValueError, SyntaxError):
             return dim
     return dim
 
@@ -1506,10 +1532,19 @@ def _resolve_dim(dim, symbols: dict[str, int]):
 _VARIABLE_SYMS = {"S", "B", "C", "TP"}
 
 
+def _is_variable_composite(expr: str) -> bool:
+    """Check if an expression is composed entirely of variable symbols.
+
+    Handles both additive (S+C) and multiplicative (B·S) composites.
+    """
+    # Split on + and · to get individual parts
+    parts = expr.replace("·", "+").split("+")
+    return all(p.strip() in _VARIABLE_SYMS for p in parts)
+
+
 def _partially_resolve_dim(dim, symbols: dict[str, int],
                            full_symbols: dict[str, int] | None = None,
-                           tp_divided: set[str] | None = None,
-                           tp_size: int = 1):
+                           tp_divided: set[str] | None = None):
     """Resolve dim keeping only S/B/C/TP symbolic, resolving all else to numbers.
 
     Model constants from config.json are shown as numbers. When TP>1 and a
@@ -1530,8 +1565,8 @@ def _partially_resolve_dim(dim, symbols: dict[str, int],
     if s in _VARIABLE_SYMS:
         return s
 
-    # "S+C" — composite of variables → keep as-is
-    if s == "S+C":
+    # Composite of only variable symbols (e.g. "S+C", "B·S") → keep as-is
+    if _is_variable_composite(s):
         return s
 
     # Check if s is a known symbol directly (handles names with · like "n_h·D_qh")
@@ -1649,6 +1684,12 @@ def export_shape_matrix():
     if not isinstance(tp_sizes, list) or not tp_sizes:
         return jsonify({"ok": False,
                         "error": "tp_sizes must be a non-empty list"}), 400
+    if not isinstance(decode_ctx_lens, list) or not decode_ctx_lens:
+        return jsonify({"ok": False,
+                        "error": "decode_ctx_lens must be a non-empty list"}), 400
+    if not isinstance(decode_batch_sizes, list) or not decode_batch_sizes:
+        return jsonify({"ok": False,
+                        "error": "decode_batch_sizes must be a non-empty list"}), 400
 
     # Build list of all configurations to sweep (always both phases)
     configs: list[dict] = []
@@ -1753,7 +1794,6 @@ def export_shape_matrix():
         symbols = graph.get("symbols", {})
         full_symbols = graph.get("full_symbols", symbols)
         tp_divided = set(graph.get("tp_divided", []))
-        current_tp = cfg["tp_size"]
         tree = graph.get(cfg["phase"])
         if not tree:
             continue
@@ -1773,14 +1813,14 @@ def export_shape_matrix():
                         if isinstance(s, list):
                             dims = [_partially_resolve_dim(
                                         d, symbols, full_symbols,
-                                        tp_divided, current_tp)
+                                        tp_divided)
                                     for d in s]
                             sym_parts.append("[" + ", ".join(dims) + "]")
                         else:
                             sym_parts.append(
                                 _partially_resolve_dim(
                                     s, symbols, full_symbols,
-                                    tp_divided, current_tp))
+                                    tp_divided))
                     symbolic_str = " × ".join(sym_parts)
                 else:
                     symbolic_str = "—"
@@ -1809,19 +1849,23 @@ def export_shape_matrix():
                 ws.cell(row, 13, flops)
                 ws.cell(row, 14, ai)
 
-                for col in range(1, len(headers) + 1):
-                    ws.cell(row, col).border = thin_border
+                for c in range(1, len(headers) + 1):
+                    ws.cell(row, c).border = thin_border
                 row += 1
 
-    # AutoFit column widths based on cell content
+    # AutoFit column widths by sampling header + first/last 100 data rows
+    sample_rows = list(range(1, min(row, 102)))  # header + first 100
+    if row > 202:
+        sample_rows += list(range(row - 100, row))  # last 100
+    elif row > 102:
+        sample_rows += list(range(102, row))
     for col_idx in range(1, len(headers) + 1):
         max_len = 0
         col_letter = get_column_letter(col_idx)
-        for r in range(1, row):
+        for r in sample_rows:
             val = ws.cell(r, col_idx).value
             if val is not None:
                 max_len = max(max_len, len(str(val)))
-        # Add padding and cap at reasonable max
         ws.column_dimensions[col_letter].width = min(max_len + 2, 80)
 
     ws.freeze_panes = "A2"

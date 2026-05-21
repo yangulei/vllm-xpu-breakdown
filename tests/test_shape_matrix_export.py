@@ -307,6 +307,24 @@ class TestShapeMatrixExport(unittest.TestCase):
         })
         self.assertEqual(resp.status_code, 400)
 
+    def test_error_empty_decode_ctx_lens(self):
+        """Should return 400 when decode_ctx_lens is empty."""
+        resp = self._export({
+            "model_id": "test",
+            "decode_ctx_lens": [],
+        })
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("decode_ctx_lens", resp.json["error"])
+
+    def test_error_empty_decode_batch_sizes(self):
+        """Should return 400 when decode_batch_sizes is empty."""
+        resp = self._export({
+            "model_id": "test",
+            "decode_batch_sizes": [],
+        })
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("decode_batch_sizes", resp.json["error"])
+
     @patch("app.fetch_model_config", return_value=MOCK_QWEN3_CONFIG)
     def test_error_too_many_rows(self, mock_fetch):
         """Should return 400 when sweep produces too many rows."""
