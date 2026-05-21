@@ -610,12 +610,15 @@ def _build_mla_attention_ops(
     ))
 
     # MLA attention kernel
+    # Q input per head = D_qh (qk_nope_head_dim + qk_rope_head_dim)
     # Attention output per head uses v_head_dim (may differ from head_dim)
+    d_qh = qk_nope_head_dim + qk_rope_head_dim
     v_dim_sym = "v_d" if v_d != d else "d"
+    q_dim_sym = "D_qh" if d_qh != d else "d"
     ops.append(OpNode(
         name="gdn_attention", role="attention",
         backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, nh_sym, "d"], [seq, "KV_r"]],
+        input_shapes=[[tokens, nh_sym, q_dim_sym], [seq, "KV_r"]],
         output_shape=[tokens, nh_sym, v_dim_sym],
         memory_bytes=0,
         flops=(2 * T * S * n_h * v_d) if isinstance(T, int) and isinstance(S, int) else 0,
@@ -1493,11 +1496,13 @@ def build_model_graph(
         qk_nope_head_dim = cfg.get("qk_nope_head_dim", 128)
         qk_rope_head_dim = cfg.get("qk_rope_head_dim", 64)
         v_head_dim = cfg.get("v_head_dim", cfg["head_dim"])
+        d_qh = qk_nope_head_dim + qk_rope_head_dim
         if q_lora_rank > 0:
             result["symbols"]["Q_r"] = q_lora_rank
-            result["symbols"]["n_h·D_qh"] = (
-                full_num_heads * (qk_nope_head_dim + qk_rope_head_dim)
-            )
+            result["symbols"]["n_h·D_qh"] = full_num_heads * d_qh
+        # D_qh symbol (only when it differs from head_dim)
+        if d_qh != cfg["head_dim"]:
+            result["symbols"]["D_qh"] = d_qh
         result["symbols"]["KV_r"] = kv_lora_rank
         result["symbols"]["D_rope"] = qk_rope_head_dim
         # v_head_dim symbol (only when it differs from head_dim)
