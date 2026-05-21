@@ -1528,7 +1528,7 @@ def _resolve_dim(dim, symbols: dict[str, int]):
         expr = expr.replace("·", "*")
         try:
             return _safe_arithmetic_eval(expr)
-        except (ValueError, SyntaxError):
+        except (ValueError, SyntaxError, ZeroDivisionError, OverflowError):
             return dim
     return dim
 
