@@ -383,8 +383,8 @@ def _build_moe_layer(
     gate_op = OpNode(
         name="aten::mm", role="router_gate",
         backend="torch-xpu-ops",
-        input_shapes=[[tokens, "H"], ["H", str(num_experts)]],
-        output_shape=[tokens, str(num_experts)],
+        input_shapes=[[tokens, "H"], ["H", "E"]],
+        output_shape=[tokens, "E"],
         memory_bytes=_mm_mem(T, H, num_experts, dtype_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T, H, num_experts) if isinstance(T, int) else 0,
         phase=phase,
@@ -392,7 +392,7 @@ def _build_moe_layer(
     align_op = OpNode(
         name="moe_align_block_size", role="moe_routing",
         backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, str(num_experts)]],
+        input_shapes=[[tokens, "E"]],
         output_shape=[tokens],
         memory_bytes=0, flops=0, phase=phase,
     )
@@ -402,8 +402,8 @@ def _build_moe_layer(
     expert_mm1 = OpNode(
         name="aten::mm", role="expert_gate_up",
         backend="torch-xpu-ops",
-        input_shapes=[[f"{tokens}·{top_k}", "H"], ["H", moe_2I_sym]],
-        output_shape=[f"{tokens}·{top_k}", moe_2I_sym],
+        input_shapes=[[f"{tokens}·K", "H"], ["H", moe_2I_sym]],
+        output_shape=[f"{tokens}·K", moe_2I_sym],
         memory_bytes=_mm_mem(T * top_k, H, 2 * moe_I, dtype_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T * top_k, H, 2 * moe_I) if isinstance(T, int) else 0,
         phase=phase,
@@ -411,8 +411,8 @@ def _build_moe_layer(
     expert_act = OpNode(
         name="silu_and_mul", role="expert_activation",
         backend="vllm-xpu-kernels",
-        input_shapes=[[f"{tokens}·{top_k}", moe_2I_sym]],
-        output_shape=[f"{tokens}·{top_k}", moe_I_sym],
+        input_shapes=[[f"{tokens}·K", moe_2I_sym]],
+        output_shape=[f"{tokens}·K", moe_I_sym],
         memory_bytes=_activation_mem(T * top_k, moe_I, dtype_bytes) if isinstance(T, int) else 0,
         flops=_activation_flops(T * top_k, moe_I) if isinstance(T, int) else 0,
         phase=phase,
@@ -420,8 +420,8 @@ def _build_moe_layer(
     expert_mm2 = OpNode(
         name="aten::mm", role="expert_down",
         backend="torch-xpu-ops",
-        input_shapes=[[f"{tokens}·{top_k}", moe_I_sym], [moe_I_sym, "H"]],
-        output_shape=[f"{tokens}·{top_k}", "H"],
+        input_shapes=[[f"{tokens}·K", moe_I_sym], [moe_I_sym, "H"]],
+        output_shape=[f"{tokens}·K", "H"],
         memory_bytes=_mm_mem(T * top_k, moe_I, H, dtype_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T * top_k, moe_I, H) if isinstance(T, int) else 0,
         phase=phase,
@@ -506,8 +506,8 @@ def _build_mla_attention_ops(
         ops.append(OpNode(
             name="aten::mm", role="q_compress",
             backend="torch-xpu-ops",
-            input_shapes=[[tokens, "H"], ["H", str(q_lora_rank)]],
-            output_shape=[tokens, str(q_lora_rank)],
+            input_shapes=[[tokens, "H"], ["H", "Q_r"]],
+            output_shape=[tokens, "Q_r"],
             memory_bytes=_mm_mem(T, H, q_lora_rank, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
             flops=_mm_flops(T, H, q_lora_rank) if isinstance(T, int) else 0,
             phase=phase,
@@ -515,8 +515,8 @@ def _build_mla_attention_ops(
         ops.append(OpNode(
             name="rms_norm", role="q_norm",
             backend="vllm-xpu-kernels",
-            input_shapes=[[tokens, str(q_lora_rank)]],
-            output_shape=[tokens, str(q_lora_rank)],
+            input_shapes=[[tokens, "Q_r"]],
+            output_shape=[tokens, "Q_r"],
             memory_bytes=_norm_mem(T, q_lora_rank, dtype_bytes) if isinstance(T, int) else 0,
             flops=_norm_flops(T, q_lora_rank) if isinstance(T, int) else 0,
             phase=phase,
@@ -525,9 +525,9 @@ def _build_mla_attention_ops(
         ops.append(OpNode(
             name="aten::mm", role="q_decompress",
             backend="torch-xpu-ops",
-            input_shapes=[[tokens, str(q_lora_rank)],
-                          [str(q_lora_rank), str(out_q)]],
-            output_shape=[tokens, str(out_q)],
+            input_shapes=[[tokens, "Q_r"],
+                          ["Q_r", "n_h·D_qh"]],
+            output_shape=[tokens, "n_h·D_qh"],
             memory_bytes=_mm_mem(T, q_lora_rank, out_q, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
             flops=_mm_flops(T, q_lora_rank, out_q) if isinstance(T, int) else 0,
             phase=phase,
@@ -549,8 +549,8 @@ def _build_mla_attention_ops(
     ops.append(OpNode(
         name="aten::mm", role="kv_compress",
         backend="torch-xpu-ops",
-        input_shapes=[[tokens, "H"], ["H", str(kv_lora_rank)]],
-        output_shape=[tokens, str(kv_lora_rank)],
+        input_shapes=[[tokens, "H"], ["H", "KV_r"]],
+        output_shape=[tokens, "KV_r"],
         memory_bytes=_mm_mem(T, H, kv_lora_rank, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T, H, kv_lora_rank) if isinstance(T, int) else 0,
         phase=phase,
@@ -560,8 +560,8 @@ def _build_mla_attention_ops(
     ops.append(OpNode(
         name="rms_norm", role="kv_norm",
         backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, str(kv_lora_rank)]],
-        output_shape=[tokens, str(kv_lora_rank)],
+        input_shapes=[[tokens, "KV_r"]],
+        output_shape=[tokens, "KV_r"],
         memory_bytes=_norm_mem(T, kv_lora_rank, dtype_bytes) if isinstance(T, int) else 0,
         flops=_norm_flops(T, kv_lora_rank) if isinstance(T, int) else 0,
         phase=phase,
@@ -571,8 +571,8 @@ def _build_mla_attention_ops(
     ops.append(OpNode(
         name="deepseek_scaling_rope", role="rotary_emb",
         backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, "n_h", str(qk_rope_head_dim)]],
-        output_shape=[tokens, "n_h", str(qk_rope_head_dim)],
+        input_shapes=[[tokens, "n_h", "D_rope"]],
+        output_shape=[tokens, "n_h", "D_rope"],
         memory_bytes=(T * n_h * qk_rope_head_dim * dtype_bytes * 3) if isinstance(T, int) else 0,
         flops=(T * n_h * qk_rope_head_dim * 6) if isinstance(T, int) else 0,
         phase=phase,
@@ -582,7 +582,7 @@ def _build_mla_attention_ops(
     ops.append(OpNode(
         name="gdn_attention", role="attention",
         backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, "n_h", "d"], [seq, str(kv_lora_rank)]],
+        input_shapes=[[tokens, "n_h", "d"], [seq, "KV_r"]],
         output_shape=[tokens, "n_h", "d"],
         memory_bytes=0,
         flops=(2 * T * S * n_h * d) if isinstance(T, int) and isinstance(S, int) else 0,
@@ -593,7 +593,7 @@ def _build_mla_attention_ops(
     ops.append(OpNode(
         name="concat_and_cache_mla", role="cache_store",
         backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, str(kv_lora_rank)]],
+        input_shapes=[[tokens, "KV_r"]],
         output_shape=[],
         memory_bytes=(T * kv_lora_rank * dtype_bytes) if isinstance(T, int) else 0,
         flops=0,
@@ -691,8 +691,8 @@ def _build_mla_moe_layer(
     gate_op = OpNode(
         name="aten::mm", role="router_gate",
         backend="torch-xpu-ops",
-        input_shapes=[[tokens, "H"], ["H", str(num_experts)]],
-        output_shape=[tokens, str(num_experts)],
+        input_shapes=[[tokens, "H"], ["H", "E"]],
+        output_shape=[tokens, "E"],
         memory_bytes=_mm_mem(T, H, num_experts, dtype_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T, H, num_experts) if isinstance(T, int) else 0,
         phase=phase,
@@ -700,15 +700,15 @@ def _build_mla_moe_layer(
     align_op = OpNode(
         name="moe_align_block_size", role="moe_routing",
         backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, str(num_experts)]],
+        input_shapes=[[tokens, "E"]],
         output_shape=[tokens],
         memory_bytes=0, flops=0, phase=phase,
     )
     expert_mm1 = OpNode(
         name="aten::mm", role="expert_gate_up",
         backend="torch-xpu-ops",
-        input_shapes=[[f"{tokens}·{top_k}", "H"], ["H", moe_2I_sym]],
-        output_shape=[f"{tokens}·{top_k}", moe_2I_sym],
+        input_shapes=[[f"{tokens}·K", "H"], ["H", moe_2I_sym]],
+        output_shape=[f"{tokens}·K", moe_2I_sym],
         memory_bytes=_mm_mem(T * top_k, H, 2 * moe_I, dtype_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T * top_k, H, 2 * moe_I) if isinstance(T, int) else 0,
         phase=phase,
@@ -716,8 +716,8 @@ def _build_mla_moe_layer(
     expert_act = OpNode(
         name="silu_and_mul", role="expert_activation",
         backend="vllm-xpu-kernels",
-        input_shapes=[[f"{tokens}·{top_k}", moe_2I_sym]],
-        output_shape=[f"{tokens}·{top_k}", moe_I_sym],
+        input_shapes=[[f"{tokens}·K", moe_2I_sym]],
+        output_shape=[f"{tokens}·K", moe_I_sym],
         memory_bytes=_activation_mem(T * top_k, moe_I, dtype_bytes) if isinstance(T, int) else 0,
         flops=_activation_flops(T * top_k, moe_I) if isinstance(T, int) else 0,
         phase=phase,
@@ -725,8 +725,8 @@ def _build_mla_moe_layer(
     expert_mm2 = OpNode(
         name="aten::mm", role="expert_down",
         backend="torch-xpu-ops",
-        input_shapes=[[f"{tokens}·{top_k}", moe_I_sym], [moe_I_sym, "H"]],
-        output_shape=[f"{tokens}·{top_k}", "H"],
+        input_shapes=[[f"{tokens}·K", moe_I_sym], [moe_I_sym, "H"]],
+        output_shape=[f"{tokens}·K", "H"],
         memory_bytes=_mm_mem(T * top_k, moe_I, H, dtype_bytes) if isinstance(T, int) else 0,
         flops=_mm_flops(T * top_k, moe_I, H) if isinstance(T, int) else 0,
         phase=phase,
@@ -1310,6 +1310,8 @@ def build_model_graph(
         cfg["_S"] = prefill_len
     if decode_batch:
         cfg["_B"] = decode_batch
+    if prefill_len and decode_batch:
+        cfg["_B·S"] = decode_batch * prefill_len
     if context_len:
         cfg["_C"] = context_len
     # kv_len: for prefill = S + C, for decode = C
@@ -1338,8 +1340,7 @@ def build_model_graph(
             "dtype_bytes": cfg["dtype_bytes"],
             "weight_dtype_bytes": cfg["weight_dtype_bytes"],
         },
-        # Symbol → concrete value mapping for tooltips
-        # When TP>1, dimensions shown are per-rank
+        # Symbol → concrete value mapping (TP-divided, for numeric resolution)
         "symbols": {
             "H": cfg["hidden_size"],
             "n_h": cfg["num_heads"],
@@ -1351,6 +1352,20 @@ def build_model_graph(
             "QKV": (cfg["num_heads"] + 2 * cfg["num_kv_heads"]) * cfg["head_dim"],
             "n_h·d": cfg["num_heads"] * cfg["head_dim"],
         },
+        # Full (undivided) config.json values for symbolic display
+        "full_symbols": {
+            "H": model_summary["hidden_size"],
+            "n_h": full_num_heads,
+            "n_kv": full_num_kv,
+            "d": cfg["head_dim"],
+            "I": full_intermediate,
+            "2·I": 2 * full_intermediate,
+            "V": full_vocab,
+            "QKV": (full_num_heads + 2 * full_num_kv) * cfg["head_dim"],
+            "n_h·d": full_num_heads * cfg["head_dim"],
+        },
+        # Symbols that are divided by TP (for symbolic display as "value/TP")
+        "tp_divided": ["n_h", "n_kv", "I", "2·I", "V", "QKV", "n_h·d"],
     }
 
     if tp_size > 1:
@@ -1361,24 +1376,60 @@ def build_model_graph(
         result["symbols"]["S"] = prefill_len
     if decode_batch:
         result["symbols"]["B"] = decode_batch
-    if context_len:
+    if context_len is not None:
         result["symbols"]["C"] = context_len
-    if prefill_len and context_len:
-        result["symbols"]["S+C"] = prefill_len + context_len
+    if prefill_len:
+        result["symbols"]["S+C"] = prefill_len + (context_len or 0)
     if is_moe:
-        result["symbols"][str(cfg.get("num_experts", 8))] = cfg.get("num_experts", 8)
+        result["symbols"]["E"] = cfg.get("num_experts", 8)
+        result["symbols"]["K"] = cfg.get("num_experts_per_tok", 2)
+        result["full_symbols"]["E"] = cfg.get("num_experts", 8)
+        result["full_symbols"]["K"] = cfg.get("num_experts_per_tok", 2)
         moe_I = cfg.get("moe_intermediate_size")
         if moe_I and moe_I != cfg["intermediate_size"]:
             result["symbols"]["I_moe"] = moe_I
             result["symbols"]["2·I_moe"] = 2 * moe_I
+            # Full undivided MoE intermediate
+            raw_moe_I = model_summary.get("moe_intermediate_size") or moe_I
+            result["full_symbols"]["I_moe"] = raw_moe_I
+            result["full_symbols"]["2·I_moe"] = 2 * raw_moe_I
+            result["tp_divided"].append("I_moe")
+            result["tp_divided"].append("2·I_moe")
         if cfg.get("n_shared_experts", 0) > 0:
             result["symbols"]["n_shared"] = cfg["n_shared_experts"]
+            result["full_symbols"]["n_shared"] = cfg["n_shared_experts"]
+
+    # MLA-specific symbols
+    if is_mla:
+        q_lora_rank = cfg.get("q_lora_rank", 0)
+        kv_lora_rank = cfg.get("kv_lora_rank", 512)
+        qk_nope_head_dim = cfg.get("qk_nope_head_dim", 128)
+        qk_rope_head_dim = cfg.get("qk_rope_head_dim", 64)
+        if q_lora_rank > 0:
+            result["symbols"]["Q_r"] = q_lora_rank
+            result["symbols"]["n_h·D_qh"] = (
+                cfg["num_heads"] * (qk_nope_head_dim + qk_rope_head_dim)
+            )
+            result["full_symbols"]["Q_r"] = q_lora_rank
+            result["full_symbols"]["n_h·D_qh"] = (
+                full_num_heads * (qk_nope_head_dim + qk_rope_head_dim)
+            )
+            result["tp_divided"].append("n_h·D_qh")
+        result["symbols"]["KV_r"] = kv_lora_rank
+        result["symbols"]["D_rope"] = qk_rope_head_dim
+        result["full_symbols"]["KV_r"] = kv_lora_rank
+        result["full_symbols"]["D_rope"] = qk_rope_head_dim
 
     # Build prefill and decode graphs
-    # kv_len = S+C for prefill (new tokens + prior context), C for decode
+    # Both phases use B·S as the token dimension for alignment:
+    #   Prefill: S = prefill_len (e.g. 128), so B·S = batch × seq_len
+    #   Decode:  S = 1 (always), so B·S = batch × 1 = batch
+    # kv_len:
+    #   Prefill: S+C per sequence (query tokens + prior context)
+    #   Decode:  C (full context length)
     for phase, tok_var, seq_var in [
-        ("prefill", "S", "S+C"),
-        ("decode", "B", "C"),
+        ("prefill", "B·S", "S+C"),
+        ("decode", "B·S", "C"),
     ]:
         root = _build_full_model(cfg, family, is_moe, phase, tok_var, seq_var)
         _compute_totals(root)
