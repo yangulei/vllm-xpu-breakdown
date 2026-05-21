@@ -219,7 +219,8 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
 
         # Check for known unsupported architectures on XPU
         arch = summary.get("architecture", "")
-        _MLA_ARCHS = {"DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM"}
+        _MLA_ARCHS = {"DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM",
+                      "DeepseekV4ForCausalLM", "GlmMoeDsaForCausalLM"}
         if arch in _MLA_ARCHS:
             raise RuntimeError(
                 f"{model_id} uses MLA (Multi-Head Latent Attention) which "

@@ -126,6 +126,8 @@ def summarize_config(config: dict[str, Any]) -> dict[str, Any]:
         "q_lora_rank": config.get("q_lora_rank"),
         "qk_nope_head_dim": config.get("qk_nope_head_dim"),
         "qk_rope_head_dim": config.get("qk_rope_head_dim"),
+        # Value head dim (may differ from head_dim, e.g. GLM5)
+        "v_head_dim": config.get("v_head_dim"),
         # V4 grouped low-rank output projection
         "o_lora_rank": config.get("o_lora_rank"),
         "o_groups": config.get("o_groups"),
