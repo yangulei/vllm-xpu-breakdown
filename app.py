@@ -20,6 +20,7 @@ import threading
 import traceback
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 from flask import Flask, Response, jsonify, request, send_file, send_from_directory
 
@@ -37,6 +38,46 @@ from breakdown.model_info import fetch_model_config, get_dim_symbols, summarize_
 from breakdown.registry import ALL_VLLM_XPU_OPS
 
 app = Flask(__name__, static_folder="static")
+
+# ---- Config Cache ----
+# Persists successfully loaded model configs to disk so they appear as suggestions.
+
+_CONFIG_CACHE_DIR = Path(__file__).parent / "output" / "config_cache"
+_CONFIG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+_config_cache_lock = threading.Lock()
+
+
+def _cache_key(model_id: str) -> str:
+    """Convert model_id to a safe filename."""
+    return model_id.replace("/", "__")
+
+
+def _save_config_cache(model_id: str, config: dict[str, Any]) -> None:
+    """Persist config.json to disk cache."""
+    key = _cache_key(model_id)
+    path = _CONFIG_CACHE_DIR / f"{key}.json"
+    with _config_cache_lock:
+        path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
+
+
+def _load_cached_model_ids() -> list[str]:
+    """Return list of model IDs that have been successfully cached."""
+    ids: list[str] = []
+    with _config_cache_lock:
+        for p in sorted(_CONFIG_CACHE_DIR.glob("*.json")):
+            ids.append(p.stem.replace("__", "/"))
+    return ids
+
+
+def _load_cached_config(model_id: str) -> dict[str, Any] | None:
+    """Load a cached config from disk, or None if not cached."""
+    key = _cache_key(model_id)
+    path = _CONFIG_CACHE_DIR / f"{key}.json"
+    if path.exists():
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
 
 # Global state for async profiling
 _profile_state = {
@@ -136,11 +177,22 @@ def get_catalog_model(name: str):
 
 # ---- Model API ----
 
+@app.route("/api/cached-models")
+def get_cached_models():
+    """Return list of model IDs whose config.json has been cached locally."""
+    return jsonify({"ok": True, "models": _load_cached_model_ids()})
+
+
 @app.route("/api/model/<path:model_id>")
 def get_model_config(model_id: str):
-    """Fetch config.json from HuggingFace and return summary."""
+    """Fetch config.json from HuggingFace (or cache) and return summary."""
     try:
-        config = fetch_model_config(model_id)
+        # Try cache first
+        config = _load_cached_config(model_id)
+        if config is None:
+            config = fetch_model_config(model_id)
+        # Cache on success
+        _save_config_cache(model_id, config)
         summary = summarize_config(config)
         return jsonify({"ok": True, "config": config, "summary": summary})
     except Exception as e:
@@ -151,7 +203,10 @@ def get_model_config(model_id: str):
 def get_model_graph(model_id: str):
     """Build static model graph (no profiling needed)."""
     try:
-        config = fetch_model_config(model_id)
+        config = _load_cached_config(model_id)
+        if config is None:
+            config = fetch_model_config(model_id)
+            _save_config_cache(model_id, config)
         summary = summarize_config(config)
 
         prefill_len = request.args.get("prefill_len", 128, type=int)

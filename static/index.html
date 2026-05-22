@@ -1515,6 +1515,24 @@ function selectCatalogModel(hfId) {
 document.getElementById('model-input').addEventListener('keydown', e => {
   if (e.key === 'Enter') loadConfig();
 });
+
+// Load cached models into suggestion datalist
+(async function loadCachedModels() {
+  try {
+    const resp = await fetch('/api/cached-models');
+    const data = await resp.json();
+    if (!data.ok || !data.models.length) return;
+    const datalist = document.getElementById('model-suggestions');
+    const existing = new Set(Array.from(datalist.options).map(o => o.value));
+    data.models.forEach(id => {
+      if (!existing.has(id)) {
+        const opt = document.createElement('option');
+        opt.value = id;
+        datalist.appendChild(opt);
+      }
+    });
+  } catch(e) { /* ignore – suggestions are optional */ }
+})();
 </script>
 </body>
 </html>
