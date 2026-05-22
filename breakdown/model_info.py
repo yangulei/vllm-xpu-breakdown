@@ -22,6 +22,8 @@ def fetch_model_config(model_id: str) -> dict[str, Any]:
             return json.load(f)
     except ImportError:
         pass
+    except Exception:
+        pass  # Fall through to HTTP fallback
 
     # Direct HTTP fallback
     import urllib.request
