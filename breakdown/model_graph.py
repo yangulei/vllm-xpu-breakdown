@@ -615,8 +615,15 @@ def _build_mla_attention_ops(
     d_qh = qk_nope_head_dim + qk_rope_head_dim
     v_dim_sym = "v_d" if v_d != d else "d"
     q_dim_sym = "D_qh" if d_qh != d else "d"
+    # MLA prefill runs the flash-attention varlen kernel; decode runs the
+    # cutlass paged-decode kernel. (Do NOT name this "gdn_attention" — that is
+    # the Gated Delta Net linear-attention kernel used by Qwen3-Next, a
+    # different mechanism entirely.)
+    mla_attn_name = (
+        "flash_attn_varlen_fwd" if phase == "prefill" else "cutlass_paged_decode"
+    )
     ops.append(OpNode(
-        name="gdn_attention", role="attention",
+        name=mla_attn_name, role="attention",
         backend="vllm-xpu-kernels",
         input_shapes=[[tokens, nh_sym, q_dim_sym], [seq, "KV_r"]],
         output_shape=[tokens, nh_sym, v_dim_sym],

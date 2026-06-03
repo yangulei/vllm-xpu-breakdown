@@ -798,6 +798,33 @@ class TestMLAModelGraph(unittest.TestCase):
                 attn, f"no attention op for {config['architectures'][0]}"
             )
 
+    def test_mla_attention_not_named_gdn(self):
+        # Regression: MLA attention must NOT be labeled "gdn_attention" — that is
+        # the Gated Delta Net (linear attention) kernel used by Qwen3-Next, not
+        # MLA. Expect the accurate flash/paged-decode kernel names per phase.
+        expected = {
+            "prefill": "flash_attn_varlen_fwd",
+            "decode": "cutlass_paged_decode",
+        }
+        for config in (_DEEPSEEK_V2_CONFIG, _GLM_MOE_DSA_CONFIG):
+            graph = self._build(config)
+            for phase, name in expected.items():
+                attn = [
+                    o for o in _collect_ops(graph[phase])
+                    if o.get("role") == "attention"
+                ]
+                names = {o["name"] for o in attn}
+                self.assertNotIn(
+                    "gdn_attention", names,
+                    f"{config['architectures'][0]} {phase} mislabels MLA "
+                    f"attention as gdn_attention",
+                )
+                self.assertIn(
+                    name, names,
+                    f"{config['architectures'][0]} {phase} missing MLA "
+                    f"attention op {name}",
+                )
+
     def test_mla_ops_use_xpu_backends(self):
         # Regression: MLA must not fall back to CPU on XPU.
         for config in (_DEEPSEEK_V2_CONFIG, _GLM_MOE_DSA_CONFIG):

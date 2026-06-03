@@ -84,6 +84,7 @@ _XPU_C_OPS: set[str] = {
     "int4_gemm_w4a8",
     "cutlass_grouped_gemm_interface",
     "deepseek_scaling_rope",
+    "cutlass_paged_decode",
     "bgmv_shrink",
     "bgmv_expand",
     "bgmv_expand_slice",
