@@ -12,6 +12,16 @@ Profile vLLM inference on Intel XPU and visualize which backend handles each ope
 | **cpu** | Operations running on CPU |
 | **framework** | Tensor reshaping, memory ops, profiler overhead |
 
+## Supported Architectures
+
+Standard GQA decoders (Llama, Qwen, Mistral), MoE (Mixtral, Qwen-MoE), VL,
+and encoder/embedding models are supported for both static analysis and
+profiling. **MLA (Multi-head Latent Attention) models** (DeepSeek-V2/V3/V4,
+GLM-MoE-DSA) are now supported on XPU too — dense MLA routes to the
+`TRITON_MLA` backend and DeepSeek sparse attention routes to the
+`XPU_MLA_SPARSE` backend in vLLM-XPU. Diffusion (T2I/T2V) models support
+static analysis only (not vLLM-served).
+
 ## Web UI (Recommended)
 
 Interactive web application for exploring the breakdown:

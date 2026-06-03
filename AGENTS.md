@@ -93,6 +93,13 @@ Architecture-specific builders:
 | `_build_encoder_model` | BERT/RoBERTa for embedding/reranker |
 | `_build_diffusion_placeholder` | Diffusion models (not vLLM-served) |
 
+> **MLA profiling is supported on XPU.** Dynamic profiling of MLA models
+> (DeepSeek-V2/V3/V4, GLM-MoE-DSA) used to be hard-rejected in `app.py`
+> because MLA required FlashAttention. vLLM-XPU now provides MLA backends
+> (`TRITON_MLA` for dense MLA, `XPU_MLA_SPARSE` for DeepSeek sparse attention),
+> so that block was removed. Do not re-add an MLA architecture guard in the
+> profiling path. See `TestMLAModelGraph` in `tests/test_pipeline.py`.
+
 ### Symbolic Shape System
 
 Op shapes use symbolic expressions for dimensions:
@@ -183,6 +190,8 @@ Classifies ops by name prefix/pattern to backends. Priority order:
 - The web UI is a single HTML file with inline CSS/JS — no build step needed
 - `model_info.py` fetches from HuggingFace API — tests should mock HTTP calls
 - Shape strings contain `/TP` always (even when TP=1) — resolve via `symbols["TP"]`
+- MLA models (DeepSeek-V2/V3/V4, GLM-MoE-DSA) are supported on XPU — do not
+  re-add the removed profiling guard that rejected them
 
 ## Updating Documentation
 

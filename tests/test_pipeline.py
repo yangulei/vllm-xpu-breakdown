@@ -696,5 +696,121 @@ class TestDtypeSize(unittest.TestCase):
         self.assertEqual(dtype_size("torch.bfloat16"), 2)
 
 
+# ---- Offline MLA configs (no HuggingFace fetch / no GPU required) ----
+# MLA (Multi-head Latent Attention) profiling is now supported on XPU via the
+# TRITON_MLA backend (dense MLA) and the XPU_MLA_SPARSE backend (DeepSeek sparse
+# attention). These configs let us exercise the static MLA graph builders
+# without hitting the network.
+_DEEPSEEK_V2_CONFIG = {
+    "architectures": ["DeepseekV2ForCausalLM"],
+    "model_type": "deepseek_v2",
+    "hidden_size": 5120,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 128,
+    "num_key_value_heads": 128,
+    "head_dim": 192,
+    "intermediate_size": 12288,
+    "moe_intermediate_size": 1536,
+    "vocab_size": 102400,
+    "torch_dtype": "bfloat16",
+    "n_routed_experts": 160,
+    "num_experts_per_tok": 6,
+    "n_shared_experts": 2,
+    "first_k_dense_replace": 1,
+    "kv_lora_rank": 512,
+    "q_lora_rank": 1536,
+    "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "v_head_dim": 128,
+}
+
+# GLM-style MLA + DeepSeek Sparse Attention (DSA), routed to XPU_MLA_SPARSE.
+_GLM_MOE_DSA_CONFIG = {
+    "architectures": ["GlmMoeDsaForCausalLM"],
+    "model_type": "glm_moe_dsa",
+    "hidden_size": 4096,
+    "num_hidden_layers": 3,
+    "num_attention_heads": 96,
+    "num_key_value_heads": 96,
+    "head_dim": 64,
+    "intermediate_size": 10944,
+    "moe_intermediate_size": 1408,
+    "vocab_size": 151552,
+    "torch_dtype": "bfloat16",
+    "n_routed_experts": 256,
+    "num_experts_per_tok": 8,
+    "n_shared_experts": 1,
+    "first_k_dense_replace": 1,
+    "kv_lora_rank": 512,
+    "q_lora_rank": 1536,
+    "qk_nope_head_dim": 128,
+    "qk_rope_head_dim": 64,
+    "v_head_dim": 256,
+}
+
+# Backends MLA ops are allowed to run on (XPU-supported, no CPU fallback).
+_XPU_SUPPORTED_BACKENDS = {"vllm-xpu-kernels", "torch-xpu-ops", "triton", "framework"}
+
+
+def _collect_ops(node: dict) -> list[dict]:
+    """Flatten all OpNode dicts in a serialized model-graph tree."""
+    ops = list(node.get("ops", []))
+    for child in node.get("children", []):
+        ops.extend(_collect_ops(child))
+    return ops
+
+
+class TestMLAModelGraph(unittest.TestCase):
+    """MLA architectures are supported on XPU — static graph must build and
+    route attention to XPU backends (regression test for the removed profiling
+    block that hard-rejected MLA models)."""
+
+    def _build(self, config: dict) -> dict:
+        from breakdown.model_graph import build_model_graph
+        from breakdown.model_info import summarize_config
+
+        summary = summarize_config(config)
+        return build_model_graph(
+            summary, prefill_len=128, decode_batch=1, context_len=2048
+        )
+
+    def test_deepseek_v2_graph_builds(self):
+        graph = self._build(_DEEPSEEK_V2_CONFIG)
+        self.assertEqual(graph["family"], "DeepSeekV2")
+        # MLA models have both prefill and decode phases (autoregressive).
+        self.assertIsNotNone(graph["prefill"])
+        self.assertIsNotNone(graph["decode"])
+
+    def test_glm_moe_dsa_graph_builds(self):
+        graph = self._build(_GLM_MOE_DSA_CONFIG)
+        self.assertEqual(graph["family"], "GLM5MoE")
+        self.assertIsNotNone(graph["prefill"])
+        self.assertIsNotNone(graph["decode"])
+        # GLM5 has v_head_dim != head_dim — exercises the differing-head-dim path.
+        self.assertEqual(graph["symbols"].get("v_d"), 256)
+
+    def test_mla_attention_op_present(self):
+        for config in (_DEEPSEEK_V2_CONFIG, _GLM_MOE_DSA_CONFIG):
+            graph = self._build(config)
+            ops = _collect_ops(graph["prefill"])
+            attn = [o for o in ops if o.get("role") == "attention"]
+            self.assertTrue(
+                attn, f"no attention op for {config['architectures'][0]}"
+            )
+
+    def test_mla_ops_use_xpu_backends(self):
+        # Regression: MLA must not fall back to CPU on XPU.
+        for config in (_DEEPSEEK_V2_CONFIG, _GLM_MOE_DSA_CONFIG):
+            graph = self._build(config)
+            for phase in ("prefill", "decode"):
+                for op in _collect_ops(graph[phase]):
+                    self.assertIn(
+                        op["backend"],
+                        _XPU_SUPPORTED_BACKENDS,
+                        f"{config['architectures'][0]} {phase} op "
+                        f"{op['name']} fell back to {op['backend']}",
+                    )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

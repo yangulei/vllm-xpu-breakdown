@@ -272,18 +272,6 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             summary = {}
             dim_symbols = {}
 
-        # Check for known unsupported architectures on XPU
-        arch = summary.get("architecture", "")
-        _MLA_ARCHS = {"DeepseekV2ForCausalLM", "DeepseekV3ForCausalLM",
-                      "DeepseekV4ForCausalLM", "GlmMoeDsaForCausalLM"}
-        if arch in _MLA_ARCHS:
-            raise RuntimeError(
-                f"{model_id} uses MLA (Multi-Head Latent Attention) which "
-                f"requires FlashAttention — not available on XPU. "
-                f"Static analysis works; profiling is not yet supported for "
-                f"this architecture on XPU hardware."
-            )
-
         actual_layers = summary.get("num_layers") or 1
         if num_profile_layers == "min":
             # Auto-calculate minimum layers needed
