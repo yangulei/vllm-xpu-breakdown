@@ -69,6 +69,11 @@ pytest tests/test_shape_matrix_export.py -v
 
 # Full integration (requires Intel XPU hardware)
 pytest tests/ -v
+
+# High-priority real-model coverage matrix (opt-in: needs HF access + XPU).
+# Builds the graph for each production model collection (Qwen3, DeepSeek,
+# Hunyuan, Qwen-VL, ...); blocked models are skipped with a documented reason.
+BREAKDOWN_MODEL_MATRIX=1 pytest tests/test_pipeline.py -k HighPriority -v
 ```
 
 ## Key Architecture Decisions
