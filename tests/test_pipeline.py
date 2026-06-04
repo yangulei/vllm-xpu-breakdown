@@ -144,6 +144,67 @@ class TestModelInfo(unittest.TestCase):
         self.assertIn(32, dim_symbols)     # n_h
         self.assertIn(8, dim_symbols)      # n_kv
 
+    def test_summarize_nested_text_config(self):
+        """Multimodal models nest LLM dims under text_config (regression for
+        the Qwen3.6-27B 'NoneType // int' graph crash)."""
+        config = {
+            "architectures": ["FakeVLForConditionalGeneration"],
+            "model_type": "fake_vl",
+            "text_config": {
+                "hidden_size": 5120,
+                "num_hidden_layers": 64,
+                "num_attention_heads": 40,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "intermediate_size": 25600,
+                "vocab_size": 152064,
+                "max_position_embeddings": 262144,
+            },
+            "vision_config": {
+                "hidden_size": 1280,
+                "num_hidden_layers": 32,
+            },
+        }
+        summary = summarize_config(config)
+        # Core LLM dims must resolve from the nested text_config, not be None.
+        self.assertEqual(summary["hidden_size"], 5120)
+        self.assertEqual(summary["num_layers"], 64)
+        self.assertEqual(summary["num_heads"], 40)
+        self.assertEqual(summary["num_kv_heads"], 8)
+        self.assertEqual(summary["head_dim"], 128)
+        self.assertEqual(summary["intermediate_size"], 25600)
+        self.assertEqual(summary["vocab_size"], 152064)
+
+    def test_graph_build_nested_text_config(self):
+        """build_model_graph must not crash when dims come from text_config."""
+        from breakdown.model_graph import build_model_graph
+        config = {
+            "architectures": ["FakeVLForConditionalGeneration"],
+            "model_type": "fake_vl",
+            "text_config": {
+                "hidden_size": 4096,
+                "num_hidden_layers": 32,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "intermediate_size": 14336,
+                "vocab_size": 152064,
+            },
+            "vision_config": {"hidden_size": 1280},
+        }
+        summary = summarize_config(config)
+        graph = build_model_graph(summary, prefill_len=128)
+        self.assertIn("prefill", graph)
+        self.assertTrue(graph["prefill"].get("children"))
+
+    def test_summarize_missing_dims_no_crash(self):
+        """A config with no resolvable LLM dims must not raise in graph build."""
+        from breakdown.model_graph import build_model_graph
+        config = {"architectures": ["MysteryForCausalLM"], "model_type": "mystery"}
+        summary = summarize_config(config)
+        # Should build without raising even though dims are absent.
+        graph = build_model_graph(summary, prefill_len=128)
+        self.assertIn("prefill", graph)
+
 
 # ===================================================================
 # Classifier Tests
@@ -837,6 +898,433 @@ class TestMLAModelGraph(unittest.TestCase):
                         f"{config['architectures'][0]} {phase} op "
                         f"{op['name']} fell back to {op['backend']}",
                     )
+
+
+# ---- Trace-based graph builder (model_tracer) ----
+
+_TINY_LLAMA_CONFIG = {
+    "architectures": ["LlamaForCausalLM"], "model_type": "llama",
+    "hidden_size": 256, "intermediate_size": 512, "num_hidden_layers": 2,
+    "num_attention_heads": 8, "num_key_value_heads": 4, "vocab_size": 1000,
+    "max_position_embeddings": 2048, "rms_norm_eps": 1e-5,
+    "torch_dtype": "bfloat16", "tie_word_embeddings": False,
+}
+
+# Small DeepSeek-V2: exercises MLA attention + hybrid (1 dense + 2 MoE) layers.
+_TINY_DEEPSEEK_CONFIG = {
+    "architectures": ["DeepseekV2ForCausalLM"], "model_type": "deepseek_v2",
+    "hidden_size": 256, "intermediate_size": 512, "moe_intermediate_size": 128,
+    "num_hidden_layers": 3, "num_attention_heads": 8, "num_key_value_heads": 8,
+    "n_routed_experts": 4, "n_shared_experts": 1, "num_experts_per_tok": 2,
+    "first_k_dense_replace": 1, "moe_layer_freq": 1, "vocab_size": 1000,
+    "max_position_embeddings": 2048, "rms_norm_eps": 1e-5,
+    "q_lora_rank": None, "kv_lora_rank": 128, "qk_rope_head_dim": 32,
+    "qk_nope_head_dim": 64, "v_head_dim": 64, "topk_method": "greedy",
+    "n_group": 1, "topk_group": 1, "routed_scaling_factor": 1.0,
+    "scoring_func": "softmax", "torch_dtype": "bfloat16",
+    "tie_word_embeddings": False,
+}
+
+# Small Qwen2.5-VL: exercises the VL path — text-only export captures the LM
+# stack, the vision tower + projector are spliced analytically.
+_TINY_QWEN2_5_VL_CONFIG = {
+    "architectures": ["Qwen2_5_VLForConditionalGeneration"],
+    "model_type": "qwen2_5_vl",
+    "hidden_size": 256, "intermediate_size": 512, "num_hidden_layers": 2,
+    "num_attention_heads": 8, "num_key_value_heads": 4, "vocab_size": 1000,
+    "max_position_embeddings": 2048, "rms_norm_eps": 1e-5,
+    "torch_dtype": "bfloat16", "tie_word_embeddings": False,
+    "vision_config": {
+        "hidden_size": 128, "depth": 2, "num_heads": 8,
+        "intermediate_size": 256, "patch_size": 14, "spatial_merge_size": 2,
+        "in_chans": 3, "out_hidden_size": 256,
+    },
+    "rope_scaling": {"type": "mrope", "mrope_section": [4, 6, 6]},
+}
+
+
+def _tracer_available() -> bool:
+    """torch.export tracing needs torch (with XPU) + vLLM importable."""
+    try:
+        import torch  # noqa: F401
+        import vllm  # noqa: F401
+    except Exception:
+        return False
+    return bool(getattr(getattr(torch, "xpu", None), "is_available", bool)())
+
+
+@unittest.skipUnless(_tracer_available(),
+                     "torch+vllm+XPU required for trace-based graph builder")
+class TestTracedGraph(unittest.TestCase):
+    """The torch.export builder derives the real op graph + backends with no
+    per-architecture builder code."""
+
+    @classmethod
+    def setUpClass(cls):
+        from breakdown.model_graph import build_model_graph
+        from breakdown.model_info import summarize_config
+        summary = summarize_config(_TINY_LLAMA_CONFIG)
+        cls.graph = build_model_graph(
+            summary, prefill_len=128, decode_batch=1, context_len=4096,
+            tp_size=1, quantization=None, raw_config=_TINY_LLAMA_CONFIG,
+        )
+
+    def test_uses_export_source(self):
+        self.assertEqual(self.graph.get("graph_source"), "torch.export")
+
+    def test_schema_parity(self):
+        for key in ("architecture", "family", "model_type", "symbols",
+                    "config", "prefill", "decode"):
+            self.assertIn(key, self.graph)
+        self.assertEqual(self.graph["architecture"], "LlamaForCausalLM")
+
+    def test_layers_merged_with_repeat_count(self):
+        # The repeated decoder layer must collapse to one node x num_layers.
+        def find(node):
+            if node.get("name") == "decoder_layer":
+                return node
+            for c in node.get("children", []):
+                r = find(c)
+                if r:
+                    return r
+            return None
+        layer = find(self.graph["prefill"])
+        self.assertIsNotNone(layer, "decoder_layer node not found")
+        self.assertEqual(layer["repeat_count"],
+                         _TINY_LLAMA_CONFIG["num_hidden_layers"])
+
+    def test_real_ops_and_backends(self):
+        ops = _collect_ops(self.graph["prefill"])
+        names = {op["name"] for op in ops}
+        backends = {op["name"]: op["backend"] for op in ops}
+        # Real dispatched op names captured from the trace.
+        self.assertIn("aten::linear", names)
+        self.assertIn("silu_and_mul", names)
+        self.assertIn("unified_attention", names)
+        # Steady-state layers use the residual-fused norm.
+        self.assertTrue(
+            {"rms_norm", "fused_add_rms_norm"} & names,
+            "no RMSNorm op captured")
+        # Backends resolved through the shared classifier (single source).
+        self.assertEqual(backends["aten::linear"], "torch-xpu-ops")
+        self.assertEqual(backends["silu_and_mul"], "vllm-xpu-kernels")
+        self.assertEqual(backends["unified_attention"], "vllm-xpu-kernels")
+        norm_op = "fused_add_rms_norm" if "fused_add_rms_norm" in backends \
+            else "rms_norm"
+        self.assertEqual(backends[norm_op], "vllm-xpu-kernels")
+
+    def test_ops_route_to_xpu_backends(self):
+        for phase in ("prefill", "decode"):
+            for op in _collect_ops(self.graph[phase]):
+                self.assertIn(op["backend"], _XPU_SUPPORTED_BACKENDS,
+                              f"{phase} op {op['name']} -> {op['backend']}")
+
+    def test_token_dim_substituted_per_phase(self):
+        # Prefill (128 tokens) must cost more than decode (1 token).
+        self.assertGreater(self.graph["prefill"]["total_memory"],
+                           self.graph["decode"]["total_memory"])
+        self.assertGreater(self.graph["prefill"]["total_flops"],
+                           self.graph["decode"]["total_flops"])
+
+    def test_decode_attention_scales_with_context(self):
+        # Decode attention reads the KV cache over context, so a longer context
+        # must raise decode memory (regression: context was previously unused).
+        from breakdown.model_graph import build_model_graph
+        from breakdown.model_info import summarize_config
+        summary = summarize_config(_TINY_LLAMA_CONFIG)
+
+        def decode_mem(ctx):
+            g = build_model_graph(summary, prefill_len=128, decode_batch=1,
+                                  context_len=ctx, raw_config=_TINY_LLAMA_CONFIG)
+            return g["decode"]["total_memory"]
+        self.assertGreater(decode_mem(8192), decode_mem(512))
+
+    def test_tp_uses_tracer_and_shards_cost(self):
+        # TP>1 is handled analytically by the tracer (export at TP=1, divide
+        # per-rank cost by op role). Sharded ops (attention, projections) halve
+        # at TP=2; replicated ops (norms) are unchanged.
+        from breakdown.model_graph import build_model_graph
+        from breakdown.model_info import summarize_config
+        summary = summarize_config(_TINY_LLAMA_CONFIG)
+        g1 = build_model_graph(summary, prefill_len=128, decode_batch=1,
+                               tp_size=1, raw_config=_TINY_LLAMA_CONFIG)
+        g2 = build_model_graph(summary, prefill_len=128, decode_batch=1,
+                               tp_size=2, raw_config=_TINY_LLAMA_CONFIG)
+        self.assertEqual(g2.get("graph_source"), "torch.export")
+
+        def role_flops(graph, role):
+            return sum(o.get("flops", 0) for o in _collect_ops(graph["prefill"])
+                       if o.get("role") == role)
+
+        def role_mem(graph, role):
+            return sum(o.get("memory_bytes", 0)
+                       for o in _collect_ops(graph["prefill"])
+                       if o.get("role") == role)
+
+        attn1, attn2 = role_flops(g1, "attention"), role_flops(g2, "attention")
+        self.assertGreater(attn1, 0)
+        self.assertAlmostEqual(attn2 / attn1, 0.5, places=2)  # sharded
+        norm1, norm2 = role_mem(g1, "norm"), role_mem(g2, "norm")
+        self.assertGreater(norm1, 0)
+        self.assertEqual(norm1, norm2)  # replicated
+
+    def test_uniform_moe_uses_tracer_with_spliced_experts(self):
+        # A model whose every layer is a MoE layer (uniform) is traced, and the
+        # opaque FusedMoE export op is replaced with real expert/shared-expert
+        # GEMM+activation ops spliced in from the shared FusedMoE builder.
+        from breakdown.model_graph import build_model_graph
+        from breakdown.model_info import summarize_config
+        moe = {
+            "architectures": ["Qwen2MoeForCausalLM"], "model_type": "qwen2_moe",
+            "hidden_size": 256, "intermediate_size": 512,
+            "moe_intermediate_size": 128, "shared_expert_intermediate_size": 256,
+            "num_hidden_layers": 2, "num_attention_heads": 8,
+            "num_key_value_heads": 4, "vocab_size": 1000,
+            "max_position_embeddings": 2048, "rms_norm_eps": 1e-5,
+            "num_experts": 4, "num_experts_per_tok": 2, "decoder_sparse_step": 1,
+            "norm_topk_prob": True, "torch_dtype": "bfloat16",
+            "tie_word_embeddings": False,
+        }
+        g = build_model_graph(summarize_config(moe), prefill_len=128,
+                              decode_batch=1, raw_config=moe)
+        self.assertEqual(g.get("graph_source"), "torch.export+fused_moe")
+        roles = {op.get("role") for op in _collect_ops(g["prefill"])}
+        # Routed + shared expert compute recovered from the opaque export op.
+        for expected in ("expert_gate_up", "expert_activation", "expert_down",
+                         "shared_expert_gate_up", "shared_expert_down"):
+            self.assertIn(expected, roles)
+        # The opaque FusedMoE op must NOT be counted as a real compute op.
+        names = {op.get("name") for op in _collect_ops(g["prefill"])}
+        self.assertFalse(any(n and "moe_forward" in n for n in names))
+
+    def test_hybrid_moe_traces_with_grouped_layers(self):
+        # A hybrid stack with interleaved dense + MoE layers is traced: layers
+        # are grouped by op signature into separate repeated decoder-layer nodes
+        # (one dense, one MoE), instead of falling back to the static builder.
+        from breakdown.model_graph import build_model_graph
+        from breakdown.model_info import summarize_config
+        moe = {
+            "architectures": ["Qwen2MoeForCausalLM"], "model_type": "qwen2_moe",
+            "hidden_size": 256, "intermediate_size": 512,
+            "moe_intermediate_size": 128, "shared_expert_intermediate_size": 256,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 8, "num_key_value_heads": 4,
+            "vocab_size": 1000, "max_position_embeddings": 2048,
+            "rms_norm_eps": 1e-5, "num_experts": 4, "num_experts_per_tok": 2,
+            "decoder_sparse_step": 2, "mlp_only_layers": [],
+            "norm_topk_prob": True, "torch_dtype": "bfloat16",
+            "tie_word_embeddings": False,
+        }
+        g = build_model_graph(summarize_config(moe), prefill_len=128,
+                              decode_batch=1, raw_config=moe)
+        self.assertEqual(g.get("graph_source"), "torch.export+fused_moe")
+
+        # Collect the decoder-layer groups and the roles each contains.
+        groups = []
+
+        def walk(node):
+            if node.get("name") == "decoder_layer":
+                roles = set()
+
+                def rs(m):
+                    for o in m.get("ops", []):
+                        roles.add(o.get("role"))
+                    for c in m.get("children", []):
+                        rs(c)
+                rs(node)
+                groups.append((node.get("repeat_count"), roles))
+            for c in node.get("children", []):
+                walk(c)
+        walk(g["prefill"])
+
+        # Two distinct decoder-layer groups: one MoE (expert ops), one dense.
+        self.assertEqual(len(groups), 2)
+        moe_groups = [gr for gr in groups if "expert_gate_up" in gr[1]]
+        dense_groups = [gr for gr in groups if "activation" in gr[1]
+                        and "expert_gate_up" not in gr[1]]
+        self.assertEqual(len(moe_groups), 1)
+        self.assertEqual(len(dense_groups), 1)
+        # decoder_sparse_step=2 over 4 layers → 2 MoE + 2 dense.
+        self.assertEqual(moe_groups[0][0], 2)
+        self.assertEqual(dense_groups[0][0], 2)
+
+    def test_deepseek_mla_hybrid_traces(self):
+        # DeepSeek-V2 exercises MLA attention + a hybrid stack (1 leading dense
+        # layer, then MoE layers). The tracer must classify the MLA attention
+        # ops, group the layers into a dense node + a MoE node, and splice the
+        # FusedMoE experts — all via torch.export, no static fallback.
+        from breakdown.model_graph import build_model_graph
+        from breakdown.model_info import summarize_config
+        g = build_model_graph(summarize_config(_TINY_DEEPSEEK_CONFIG),
+                              prefill_len=128, decode_batch=1,
+                              raw_config=_TINY_DEEPSEEK_CONFIG)
+        self.assertEqual(g.get("graph_source"), "torch.export+fused_moe")
+
+        groups = []
+
+        def walk(node):
+            if node.get("name") == "decoder_layer":
+                roles = set()
+
+                def rs(m):
+                    for o in m.get("ops", []):
+                        roles.add(o.get("role"))
+                    for c in m.get("children", []):
+                        rs(c)
+                rs(node)
+                groups.append((node.get("repeat_count"), roles))
+            for c in node.get("children", []):
+                walk(c)
+        walk(g["prefill"])
+
+        # One dense group (count 1) and one MoE group (count 2).
+        self.assertEqual(len(groups), 2)
+        moe = [gr for gr in groups if "expert_gate_up" in gr[1]]
+        dense = [gr for gr in groups if "expert_gate_up" not in gr[1]]
+        self.assertEqual(len(moe), 1)
+        self.assertEqual(len(dense), 1)
+        self.assertEqual(dense[0][0], 1)   # first_k_dense_replace=1
+        self.assertEqual(moe[0][0], 2)     # remaining 2 layers
+        # MLA attention is classified and counted in both groups.
+        self.assertIn("attention", moe[0][1])
+        self.assertIn("attention", dense[0][1])
+
+    def test_qwen2_5_vl_traces_lm_and_splices_vision(self):
+        # VL models export text-only (no image inputs), so torch.export captures
+        # just the language-model stack — the vision tower + projector are spliced
+        # analytically (prefill only). The merged graph must report the vision
+        # ops in prefill, none in decode, and still trace the LM attention.
+        from breakdown.model_graph import build_model_graph
+        from breakdown.model_info import summarize_config
+        g = build_model_graph(summarize_config(_TINY_QWEN2_5_VL_CONFIG),
+                              prefill_len=128, decode_batch=1,
+                              raw_config=_TINY_QWEN2_5_VL_CONFIG)
+        self.assertEqual(g.get("graph_source"), "torch.export+vision")
+
+        def roles(node, acc):
+            for o in node.get("ops", []):
+                acc.add(o.get("role"))
+            for c in node.get("children", []):
+                roles(c, acc)
+            return acc
+
+        pre = roles(g["prefill"], set())
+        dec = roles(g["decode"], set())
+        # Vision tower + projector present in prefill...
+        self.assertIn("vit_attention", pre)
+        self.assertIn("patch_embed", pre)
+        self.assertIn("vl_projector", pre)
+        # ...the LM stack is traced (real attention op present)...
+        self.assertIn("attention", pre)
+        # ...and vision is absent from the autoregressive decode phase.
+        self.assertFalse({"vit_attention", "patch_embed", "vl_projector"} & dec)
+        # Vision subtree precedes the language-model stack.
+        names = [c.get("name") for c in g["prefill"].get("children", [])]
+        self.assertIn("visual_encoder", names)
+        self.assertIn("language_model", names)
+        self.assertLess(names.index("visual_encoder"),
+                        names.index("language_model"))
+        # The spliced vision subtree is aggregated into totals (guards against a
+        # future refactor inserting it after _compute_totals): the root prefill
+        # total must exceed the language-model subtree's own total.
+        children = g["prefill"]["children"]
+        vis = next(c for c in children if c["name"] == "visual_encoder")
+        lm = next(c for c in children if c["name"] == "language_model")
+        self.assertGreater(vis["total_flops"], 0)
+        self.assertGreaterEqual(g["prefill"]["total_flops"],
+                                vis["total_flops"] + lm["total_flops"])
+
+    def test_moe_tp_shards_expert_compute(self):
+        # Under TP>1 the spliced FusedMoE expert GEMMs are sharded on the expert
+        # intermediate; per-rank expert FLOPs halve at TP=2.
+        from breakdown.model_graph import build_model_graph
+        from breakdown.model_info import summarize_config
+        moe = {
+            "architectures": ["Qwen2MoeForCausalLM"], "model_type": "qwen2_moe",
+            "hidden_size": 256, "intermediate_size": 512,
+            "moe_intermediate_size": 128, "shared_expert_intermediate_size": 256,
+            "num_hidden_layers": 2, "num_attention_heads": 8,
+            "num_key_value_heads": 4, "vocab_size": 1000,
+            "max_position_embeddings": 2048, "rms_norm_eps": 1e-5,
+            "num_experts": 4, "num_experts_per_tok": 2, "decoder_sparse_step": 1,
+            "norm_topk_prob": True, "torch_dtype": "bfloat16",
+            "tie_word_embeddings": False,
+        }
+        summary = summarize_config(moe)
+        g1 = build_model_graph(summary, prefill_len=128, decode_batch=1,
+                               tp_size=1, raw_config=moe)
+        g2 = build_model_graph(summary, prefill_len=128, decode_batch=1,
+                               tp_size=2, raw_config=moe)
+        self.assertEqual(g2.get("graph_source"), "torch.export+fused_moe")
+
+        def expert_flops(graph):
+            return sum(o.get("flops", 0) for o in _collect_ops(graph["prefill"])
+                       if o.get("role", "").startswith("expert_"))
+
+        e1, e2 = expert_flops(g1), expert_flops(g2)
+        self.assertGreater(e1, 0)
+        self.assertAlmostEqual(e2 / e1, 0.5, places=2)
+
+    def test_quant_traces_and_reduces_weight_bytes(self):
+        # fp8 export breaks inside vLLM on meta tensors, so the tracer strips
+        # quantization, traces in BF16, and applies reduced weight precision
+        # analytically: projection memory drops (weights at 1B) while activations
+        # stay BF16 — and the model still goes through the tracer (no fallback).
+        from breakdown.model_graph import build_model_graph
+        from breakdown.model_info import summarize_config
+        q = dict(_TINY_LLAMA_CONFIG)
+        q["quantization_config"] = {"quant_method": "fp8",
+                                    "activation_scheme": "static"}
+        sb = summarize_config(_TINY_LLAMA_CONFIG)
+        sq = summarize_config(q)
+        gb = build_model_graph(sb, prefill_len=128, decode_batch=1,
+                               tp_size=1, raw_config=_TINY_LLAMA_CONFIG)
+        gq = build_model_graph(sq, prefill_len=128, decode_batch=1,
+                               tp_size=1, raw_config=q)
+        self.assertEqual(gq.get("graph_source"), "torch.export")
+
+        def proj_mem(graph):
+            return sum(o.get("memory_bytes", 0)
+                       for o in _collect_ops(graph["prefill"])
+                       if o.get("role") == "proj")
+
+        mb, mq = proj_mem(gb), proj_mem(gq)
+        self.assertGreater(mb, 0)
+        self.assertLess(mq, mb)       # weights at reduced precision
+        self.assertGreater(mq, mb / 2)  # activations/outputs stay BF16
+
+    def test_tp_shard_factor_keys_off_parallel_layer_class(self):
+        # The TP sharding signal is vLLM's parallel-layer CLASS, not the module
+        # attribute name — so architectures that name their blocks differently
+        # (.feed_forward / .attention / .block_sparse_moe) still shard correctly.
+        from breakdown.model_tracer import _tp_shard_factor as f
+        # A column-parallel projection inside a non-".mlp"-named block shards.
+        cls = {"model.layers.0.feed_forward.w1": "MergedColumnParallelLinear"}
+        self.assertEqual(
+            f("model.layers.0.feed_forward.w1", "proj", "aten::linear", cls, 4), 4)
+        # A row-parallel projection inside a ".attention"-named block shards.
+        cls = {"model.layers.0.attention.dense": "RowParallelLinear"}
+        self.assertEqual(
+            f("model.layers.0.attention.dense", "proj", "aten::linear", cls, 2), 2)
+        # The MoE router gate is a ReplicatedLinear → stays full.
+        cls = {"model.layers.0.block_sparse_moe.gate": "ReplicatedLinear"}
+        self.assertEqual(
+            f("model.layers.0.block_sparse_moe.gate", "proj", "aten::linear",
+              cls, 8), 1)
+        # Vocab-parallel embedding lookup output is all-reduced → stays full.
+        cls = {"model.embed_tokens": "VocabParallelEmbedding"}
+        self.assertEqual(
+            f("model.embed_tokens", "embedding", "aten::embedding", cls, 4), 1)
+        # ParallelLMHead is vocab-parallel on the output → shards.
+        cls = {"lm_head": "ParallelLMHead"}
+        self.assertEqual(f("lm_head", "proj", "aten::linear", cls, 4), 4)
+        # Non-linear head/intermediate-sharded ops shard by role.
+        for role in ("attention", "rotary_emb", "cache_store", "activation"):
+            self.assertEqual(f("p", role, "x", {}, 4), 4)
+        # Replicated norms / residuals stay full; TP=1 is always 1.
+        self.assertEqual(f("p", "norm", "rms_norm", {}, 4), 1)
+        self.assertEqual(f("p", "proj", "aten::linear",
+                           {"p": "RowParallelLinear"}, 1), 1)
 
 
 if __name__ == "__main__":

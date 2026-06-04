@@ -225,7 +225,8 @@ def get_model_graph(model_id: str):
                                   decode_batch=decode_batch,
                                   context_len=context_len,
                                   tp_size=tp_size,
-                                  quantization=quantization)
+                                  quantization=quantization,
+                                  raw_config=config)
         min_layers = min_profile_layers(summary)
         return jsonify({
             "ok": True, "graph": graph, "summary": summary,

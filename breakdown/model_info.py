@@ -45,6 +45,30 @@ def fetch_model_config(model_id: str) -> dict[str, Any]:
         raise RuntimeError(f"Failed to connect to {endpoint}: {e.reason}") from e
 
 
+def _get_text_config(config: dict[str, Any], key: str,
+                     default: Any = None) -> Any:
+    """Resolve a core LLM config value, falling back to nested text configs.
+
+    Multimodal models (e.g. Qwen3-VL, Qwen2.5-Omni) store the language-model
+    dimensions under a nested sub-config rather than at the top level, e.g.
+    ``config["text_config"]["hidden_size"]``. Prefer the top-level value, then
+    look in the common nesting keys.
+    """
+    if config.get(key) is not None:
+        return config[key]
+    for section in ("text_config", "language_config", "llm_config",
+                    "thinker_config", "decoder_config"):
+        sub = config.get(section)
+        if isinstance(sub, dict):
+            # thinker_config nests another text_config (Qwen2.5-Omni).
+            if sub.get(key) is not None:
+                return sub[key]
+            inner = sub.get("text_config")
+            if isinstance(inner, dict) and inner.get(key) is not None:
+                return inner[key]
+    return default
+
+
 def _get_vit_config(config: dict[str, Any], key: str) -> Any | None:
     """Extract a vision encoder config value from nested VL model configs.
 
@@ -66,28 +90,30 @@ def summarize_config(config: dict[str, Any]) -> dict[str, Any]:
     archs = config.get("architectures", [])
     architecture = archs[0] if archs else config.get("model_type", "Unknown")
 
-    hidden_size = config.get("hidden_size")
-    num_layers = config.get("num_hidden_layers")
-    num_heads = config.get("num_attention_heads")
-    num_kv_heads = config.get("num_key_value_heads", num_heads)
-    head_dim = config.get("head_dim")
+    hidden_size = _get_text_config(config, "hidden_size")
+    num_layers = _get_text_config(config, "num_hidden_layers")
+    num_heads = _get_text_config(config, "num_attention_heads")
+    num_kv_heads = _get_text_config(config, "num_key_value_heads", num_heads)
+    head_dim = _get_text_config(config, "head_dim")
     if head_dim is None and hidden_size and num_heads:
         head_dim = hidden_size // num_heads
-    intermediate_size = config.get("intermediate_size") or config.get("ffn_dim")
-    vocab_size = config.get("vocab_size")
-    max_position = config.get("max_position_embeddings")
-    dtype = config.get("torch_dtype") or config.get("dtype", "unknown")
+    intermediate_size = (_get_text_config(config, "intermediate_size")
+                         or _get_text_config(config, "ffn_dim"))
+    vocab_size = _get_text_config(config, "vocab_size")
+    max_position = _get_text_config(config, "max_position_embeddings")
+    dtype = (config.get("torch_dtype") or _get_text_config(config, "torch_dtype")
+             or config.get("dtype", "unknown"))
 
     # MoE detection
     num_experts = (
-        config.get("num_local_experts")
-        or config.get("num_experts")
-        or config.get("n_routed_experts")
+        _get_text_config(config, "num_local_experts")
+        or _get_text_config(config, "num_experts")
+        or _get_text_config(config, "n_routed_experts")
     )
     is_moe = num_experts is not None and num_experts > 1
     num_experts_per_tok = (
-        config.get("num_experts_per_tok")
-        or config.get("n_group_top_k", config.get("top_k"))
+        _get_text_config(config, "num_experts_per_tok")
+        or _get_text_config(config, "n_group_top_k", config.get("top_k"))
     )
 
     # Quantization config
@@ -112,27 +138,32 @@ def summarize_config(config: dict[str, Any]) -> dict[str, Any]:
         "num_experts": num_experts,
         "num_experts_per_tok": num_experts_per_tok,
         "quant_method": quant_method,
-        "rope_type": config.get("rope_scaling", {}).get("type") if config.get("rope_scaling") else None,
+        "rope_type": (config.get("rope_scaling", {}) or {}).get("type")
+        if config.get("rope_scaling") else None,
         # Hybrid dense/MoE: first N layers use dense MLP
-        "first_k_dense_replace": config.get("first_k_dense_replace", 0),
+        "first_k_dense_replace": _get_text_config(config, "first_k_dense_replace", 0),
         # MoE layer frequency (1 = every layer is MoE, 2 = every other, etc.)
-        "moe_layer_freq": config.get("moe_layer_freq", 1),
+        "moe_layer_freq": _get_text_config(config, "moe_layer_freq", 1),
         # Qwen-style: decoder_sparse_step (1 = all MoE, 2 = alternating)
-        "decoder_sparse_step": config.get("decoder_sparse_step", 0),
+        "decoder_sparse_step": _get_text_config(config, "decoder_sparse_step", 0),
         # MoE intermediate size (may differ from dense intermediate_size)
-        "moe_intermediate_size": config.get("moe_intermediate_size"),
+        "moe_intermediate_size": _get_text_config(config, "moe_intermediate_size"),
         # Shared experts
-        "n_shared_experts": config.get("n_shared_experts", 0),
+        "n_shared_experts": _get_text_config(config, "n_shared_experts", 0),
+        # Qwen2-MoE shared-expert scheme: explicit shared-expert intermediate
+        # size (rather than n_shared_experts × moe_intermediate_size).
+        "shared_expert_intermediate_size": _get_text_config(
+            config, "shared_expert_intermediate_size"),
         # MLA (Multi-head Latent Attention) — DeepSeek-V2/V3/V4
-        "kv_lora_rank": config.get("kv_lora_rank"),
-        "q_lora_rank": config.get("q_lora_rank"),
-        "qk_nope_head_dim": config.get("qk_nope_head_dim"),
-        "qk_rope_head_dim": config.get("qk_rope_head_dim"),
+        "kv_lora_rank": _get_text_config(config, "kv_lora_rank"),
+        "q_lora_rank": _get_text_config(config, "q_lora_rank"),
+        "qk_nope_head_dim": _get_text_config(config, "qk_nope_head_dim"),
+        "qk_rope_head_dim": _get_text_config(config, "qk_rope_head_dim"),
         # Value head dim (may differ from head_dim, e.g. GLM5)
-        "v_head_dim": config.get("v_head_dim"),
+        "v_head_dim": _get_text_config(config, "v_head_dim"),
         # V4 grouped low-rank output projection
-        "o_lora_rank": config.get("o_lora_rank"),
-        "o_groups": config.get("o_groups"),
+        "o_lora_rank": _get_text_config(config, "o_lora_rank"),
+        "o_groups": _get_text_config(config, "o_groups"),
         # Vision encoder (VL models)
         "vit_hidden_size": _get_vit_config(config, "hidden_size"),
         "vit_num_layers": _get_vit_config(config, "num_hidden_layers"),
@@ -164,6 +195,17 @@ def get_dim_symbols(summary: dict[str, Any]) -> dict[int, str]:
         symbols[summary["vocab_size"]] = "V"
     if summary.get("num_experts"):
         symbols[summary["num_experts"]] = "E"
+    # MoE expert intermediate (may differ from dense intermediate_size) and the
+    # Qwen2-MoE shared-expert intermediate — referenced as I_moe / I_sh in the
+    # spliced FusedMoE op shapes.
+    moe_inter = summary.get("moe_intermediate_size")
+    if moe_inter and moe_inter != summary.get("intermediate_size"):
+        symbols.setdefault(moe_inter, "I_moe")
+        symbols.setdefault(moe_inter * 2, "2·I_moe")
+    shared_inter = summary.get("shared_expert_intermediate_size")
+    if shared_inter:
+        symbols.setdefault(shared_inter, "I_sh")
+        symbols.setdefault(shared_inter * 2, "2·I_sh")
 
     # Derived dimensions
     h = summary.get("hidden_size") or 0

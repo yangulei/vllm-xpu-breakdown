@@ -2,6 +2,42 @@
 
 Profile vLLM inference on Intel XPU and visualize which backend handles each operation.
 
+## Requirements / Environment Assumptions
+
+This tool assumes it runs inside the standard vLLM-XPU development environment
+(e.g. the `intel/vllm:*-xpu` Docker image):
+
+- **PyTorch is installed** (with XPU support).
+- **vLLM (vllm-xpu) is installed.**
+- **An Intel XPU (GPU) is available.**
+
+Both the static model-graph analysis and the dynamic profiling paths may import
+PyTorch / vLLM and use the live model definitions and runtime dispatch. There is
+no separate "no-GPU / no-ML-dependencies" mode — install
+`requirements.txt` on top of an existing PyTorch + vLLM-XPU install.
+
+### Model Graph: trace-based vs. static
+
+The Model Graph (op tree + per-op backend, without profiling) is built two ways:
+
+- **Trace-based (default for dense models).** The tool instantiates the *real*
+  vLLM `nn.Module` offline on the `meta` device (no weights, no download) and
+  runs a single `torch.export` symbolic trace with the token dimension kept
+  symbolic. The op tree, op names, and backends come straight from the real
+  dispatch, so the graph tracks vLLM/vllm-xpu-kernels changes automatically —
+  no per-architecture builder code. Backends are resolved through the shared
+  `classifier`, the single source of truth. Implemented in
+  `breakdown/model_tracer.py`; the result carries `graph_source: "torch.export"`.
+- **Static (fallback).** Hand-written per-architecture builders in
+  `breakdown/model_graph.py`. Used for MoE, multimodal, tensor-parallel
+  (`tp_size > 1`), or quantized models, and whenever tracing fails for any
+  reason. The result carries `graph_source: "static"`.
+
+The trace-based path is intentionally limited to dense, single-stack, TP=1,
+unquantized models: a single symbolic export does not fully capture fused-expert
+(`FusedMoE`) or vision-tower compute, so those stay on the static builders to
+avoid silently under-counting cost.
+
 ## Backends Tracked
 
 | Backend | What it covers |
@@ -110,7 +146,8 @@ run_profile.py          CLI entry point — standalone profiling + reports
 static/index.html       Interactive frontend (SPA, vanilla JS)
 breakdown/
   model_catalog.py      Registry of 65+ target models with metadata
-  model_graph.py        Static model graph builder (core engine)
+  model_graph.py        Static model graph builder + trace/static dispatch (core engine)
+  model_tracer.py       Trace-based graph builder (real vLLM nn.Module + torch.export)
   model_info.py         HuggingFace model config fetching & summarization
   analyzer.py           Shape symbolization, memory/FLOPs estimation, layer merging
   profiler.py           torch.profiler wrapper (XPU activity, shapes, stacks)

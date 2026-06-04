@@ -14,9 +14,12 @@ Each architecture is defined declaratively as a tree of ModuleSpec → OpSpec.
 """
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 # ===================================================================
@@ -356,6 +359,99 @@ def _build_decoder_layer(
     return layer
 
 
+def fused_moe_expert_ops(
+    *, phase: str, token_symbol: str, token_value, top_k: int,
+    hidden_size: int, expert_intermediate: int, shared_intermediate: int = 0,
+    num_experts: int = 8, dtype_bytes: int = 2, tp_size: int = 1,
+    weight_dtype_bytes: int | None = None,
+) -> list[OpNode]:
+    """Expert compute for one FusedMoE block — the only thing torch.export hides.
+
+    ``torch.export`` collapses the whole expert path into a single opaque
+    ``vllm.moe_forward*`` op, so the tracer splices these ops in to recover the
+    routed-expert and shared-expert GEMM/activation cost. The static MoE builder
+    uses the same helper so there is a single source of truth for FusedMoE.
+
+    The router gate is intentionally excluded — it is a plain ``Linear`` that the
+    tracer already captures (and the static builder adds separately).
+    ``expert_intermediate`` / ``shared_intermediate`` are the FULL (un-sharded)
+    intermediate sizes; they are divided by ``tp_size`` here. Expert GEMMs scale
+    with ``token_value · top_k`` (each token is routed to ``top_k`` experts);
+    shared-expert GEMMs scale with     ``token_value``. ``weight_dtype_bytes`` bills the expert/shared GEMM weight
+    operands at reduced precision for quantized models (activations stay full).
+    """
+    H = hidden_size
+    I = (expert_intermediate or 0) // tp_size
+    wb = weight_dtype_bytes if weight_dtype_bytes else dtype_bytes
+    tp = tp_size > 1
+    moe_I = "I_moe/TP" if tp else "I_moe"
+    moe_2I = "2·I_moe/TP" if tp else "2·I_moe"
+    tk = f"{token_symbol}·K"
+    isint = isinstance(token_value, int)
+    Tk = token_value * top_k if isint else None
+
+    ops = [
+        OpNode(
+            name="moe_align_block_size", role="moe_routing",
+            backend="vllm-xpu-kernels",
+            input_shapes=[[token_symbol, "E"]], output_shape=[token_symbol],
+            memory_bytes=0, flops=0, phase=phase,
+        ),
+        OpNode(
+            name="aten::mm", role="expert_gate_up", backend="torch-xpu-ops",
+            input_shapes=[[tk, "H"], ["H", moe_2I]], output_shape=[tk, moe_2I],
+            memory_bytes=_mm_mem(Tk, H, 2 * I, dtype_bytes, wb) if isint else 0,
+            flops=_mm_flops(Tk, H, 2 * I) if isint else 0, phase=phase,
+        ),
+        OpNode(
+            name="silu_and_mul", role="expert_activation",
+            backend="vllm-xpu-kernels",
+            input_shapes=[[tk, moe_2I]], output_shape=[tk, moe_I],
+            memory_bytes=_activation_mem(Tk, I, dtype_bytes) if isint else 0,
+            flops=_activation_flops(Tk, I) if isint else 0, phase=phase,
+        ),
+        OpNode(
+            name="aten::mm", role="expert_down", backend="torch-xpu-ops",
+            input_shapes=[[tk, moe_I], [moe_I, "H"]], output_shape=[tk, "H"],
+            memory_bytes=_mm_mem(Tk, I, H, dtype_bytes, wb) if isint else 0,
+            flops=_mm_flops(Tk, I, H) if isint else 0, phase=phase,
+        ),
+    ]
+
+    if shared_intermediate:
+        si = shared_intermediate // tp_size
+        sh_I = "I_sh/TP" if tp else "I_sh"
+        sh_2I = "2·I_sh/TP" if tp else "2·I_sh"
+        T = token_value
+        ops += [
+            OpNode(
+                name="aten::mm", role="shared_expert_gate_up",
+                backend="torch-xpu-ops",
+                input_shapes=[[token_symbol, "H"], ["H", sh_2I]],
+                output_shape=[token_symbol, sh_2I],
+                memory_bytes=_mm_mem(T, H, 2 * si, dtype_bytes, wb) if isint else 0,
+                flops=_mm_flops(T, H, 2 * si) if isint else 0, phase=phase,
+            ),
+            OpNode(
+                name="silu_and_mul", role="shared_expert_activation",
+                backend="vllm-xpu-kernels",
+                input_shapes=[[token_symbol, sh_2I]],
+                output_shape=[token_symbol, sh_I],
+                memory_bytes=_activation_mem(T, si, dtype_bytes) if isint else 0,
+                flops=_activation_flops(T, si) if isint else 0, phase=phase,
+            ),
+            OpNode(
+                name="aten::mm", role="shared_expert_down",
+                backend="torch-xpu-ops",
+                input_shapes=[[token_symbol, sh_I], [sh_I, "H"]],
+                output_shape=[token_symbol, "H"],
+                memory_bytes=_mm_mem(T, si, H, dtype_bytes, wb) if isint else 0,
+                flops=_mm_flops(T, si, H) if isint else 0, phase=phase,
+            ),
+        ]
+    return ops
+
+
 def _build_moe_layer(
     cfg: dict, arch_family: str, phase: str, tokens: str, seq: str
 ) -> ModuleNode:
@@ -364,10 +460,8 @@ def _build_moe_layer(
     top_k = cfg.get("num_experts_per_tok", 2)
     n_shared = cfg.get("n_shared_experts", 0)
     H = cfg["hidden_size"]
-    # MoE uses TP-divided intermediate sizes for numeric calculations
-    moe_I = cfg.get("_tp_moe_intermediate_size") or cfg["_tp_intermediate_size"]
-    I = cfg["_tp_intermediate_size"]
     dtype_bytes = cfg["dtype_bytes"]
+    weight_dtype_bytes = cfg.get("weight_dtype_bytes", dtype_bytes)
     T = cfg.get(f"_{tokens}", tokens)
     tp = cfg["tp_size"]
 
@@ -403,82 +497,29 @@ def _build_moe_layer(
         flops=_mm_flops(T, H, num_experts) if isinstance(T, int) else 0,
         phase=phase,
     )
-    align_op = OpNode(
-        name="moe_align_block_size", role="moe_routing",
-        backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, "E"]],
-        output_shape=[tokens],
-        memory_bytes=0, flops=0, phase=phase,
-    )
-    # Expert computation (top_k experts active) — use moe_intermediate_size
-    # Determine base symbol names (before TP division)
+
+    # Routing + expert + shared-expert ops come from the single shared FusedMoE
+    # builder (also used by the tracer to splice past the opaque export op).
     raw_moe_I = cfg.get("moe_intermediate_size") or cfg["intermediate_size"]
-    raw_I = cfg["intermediate_size"]
-    moe_I_base = "I_moe" if raw_moe_I != raw_I else "I"
-    moe_2I_base = "2·I_moe" if raw_moe_I != raw_I else "2·I"
-    moe_I_sym = f"{moe_I_base}/TP"
-    moe_2I_sym = f"{moe_2I_base}/TP"
-
-    expert_mm1 = OpNode(
-        name="aten::mm", role="expert_gate_up",
-        backend="torch-xpu-ops",
-        input_shapes=[[f"{tokens}·K", "H"], ["H", moe_2I_sym]],
-        output_shape=[f"{tokens}·K", moe_2I_sym],
-        memory_bytes=_mm_mem(T * top_k, H, 2 * moe_I, dtype_bytes) if isinstance(T, int) else 0,
-        flops=_mm_flops(T * top_k, H, 2 * moe_I) if isinstance(T, int) else 0,
-        phase=phase,
-    )
-    expert_act = OpNode(
-        name="silu_and_mul", role="expert_activation",
-        backend="vllm-xpu-kernels",
-        input_shapes=[[f"{tokens}·K", moe_2I_sym]],
-        output_shape=[f"{tokens}·K", moe_I_sym],
-        memory_bytes=_activation_mem(T * top_k, moe_I, dtype_bytes) if isinstance(T, int) else 0,
-        flops=_activation_flops(T * top_k, moe_I) if isinstance(T, int) else 0,
-        phase=phase,
-    )
-    expert_mm2 = OpNode(
-        name="aten::mm", role="expert_down",
-        backend="torch-xpu-ops",
-        input_shapes=[[f"{tokens}·K", moe_I_sym], [moe_I_sym, "H"]],
-        output_shape=[f"{tokens}·K", "H"],
-        memory_bytes=_mm_mem(T * top_k, moe_I, H, dtype_bytes) if isinstance(T, int) else 0,
-        flops=_mm_flops(T * top_k, moe_I, H) if isinstance(T, int) else 0,
-        phase=phase,
+    token_value = T if isinstance(T, int) else None
+    # Shared-expert size: Qwen2-MoE gives an explicit intermediate; DeepSeek
+    # uses n_shared_experts × moe_intermediate_size.
+    shared_explicit = cfg.get("shared_expert_intermediate_size")
+    if shared_explicit:
+        shared_intermediate = shared_explicit
+    elif n_shared:
+        shared_intermediate = n_shared * raw_moe_I
+    else:
+        shared_intermediate = 0
+    expert_ops = fused_moe_expert_ops(
+        phase=phase, token_symbol=tokens, token_value=token_value, top_k=top_k,
+        hidden_size=H, expert_intermediate=raw_moe_I,
+        shared_intermediate=shared_intermediate,
+        num_experts=num_experts, dtype_bytes=dtype_bytes, tp_size=tp,
+        weight_dtype_bytes=weight_dtype_bytes,
     )
 
-    moe_ops = [gate_op, align_op, expert_mm1, expert_act, expert_mm2]
-
-    # Shared experts (DeepSeek-style)
-    if n_shared > 0:
-        shared_mm1 = OpNode(
-            name="aten::mm", role="shared_expert_gate_up",
-            backend="torch-xpu-ops",
-            input_shapes=[[tokens, "H"], ["H", moe_2I_sym]],
-            output_shape=[tokens, moe_2I_sym],
-            memory_bytes=_mm_mem(T, H, 2 * moe_I * n_shared, dtype_bytes) if isinstance(T, int) else 0,
-            flops=_mm_flops(T, H, 2 * moe_I * n_shared) if isinstance(T, int) else 0,
-            phase=phase,
-        )
-        shared_act = OpNode(
-            name="silu_and_mul", role="shared_expert_activation",
-            backend="vllm-xpu-kernels",
-            input_shapes=[[tokens, moe_2I_sym]],
-            output_shape=[tokens, moe_I_sym],
-            memory_bytes=_activation_mem(T, moe_I * n_shared, dtype_bytes) if isinstance(T, int) else 0,
-            flops=_activation_flops(T, moe_I * n_shared) if isinstance(T, int) else 0,
-            phase=phase,
-        )
-        shared_mm2 = OpNode(
-            name="aten::mm", role="shared_expert_down",
-            backend="torch-xpu-ops",
-            input_shapes=[[tokens, moe_I_sym], [moe_I_sym, "H"]],
-            output_shape=[tokens, "H"],
-            memory_bytes=_mm_mem(T, moe_I * n_shared, H, dtype_bytes) if isinstance(T, int) else 0,
-            flops=_mm_flops(T, moe_I * n_shared, H) if isinstance(T, int) else 0,
-            phase=phase,
-        )
-        moe_ops.extend([shared_mm1, shared_act, shared_mm2])
+    moe_ops = [gate_op, *expert_ops]
 
     moe = ModuleNode(
         name="moe", path="model.layers.*.mlp",
@@ -1227,6 +1268,12 @@ _MLA_ARCHS = {"DeepSeekV2", "DeepSeekV3", "DeepSeekV4", "GLM5MoE"}
 # Vision-language architecture families
 _VL_ARCHS = {"Qwen2VL", "Qwen3VL", "InternVL"}
 
+# VL families whose multimodal cost decomposes cleanly into "vision encoder +
+# projector + ordinary decoder prefill", verified to export text-only with NO
+# vision/fusion ops in the trace. Only these use the torch.export tracer (with
+# an analytic vision splice); other VL families stay on the static builder.
+_TRACER_VERIFIED_VL = {"Qwen2VL"}
+
 # Encoder-only architecture families
 _ENCODER_ARCHS = {"RoBERTa", "BERT"}
 
@@ -1296,6 +1343,7 @@ def build_model_graph(
     context_len: int | None = None,
     tp_size: int = 1,
     quantization: str | None = None,
+    raw_config: dict | None = None,
 ) -> dict:
     """Build static model graph from model summary (from model_info.py).
 
@@ -1308,6 +1356,11 @@ def build_model_graph(
         tp_size: tensor parallel size (splits heads, intermediate, vocab)
         quantization: quantization method (e.g. "fp8", "gptq", "awq").
             Affects weight dtype_bytes and adds dequant ops to the graph.
+        raw_config: raw HF ``config.json`` dict. When provided (and TP=1, no
+            quantization), the prefill/decode trees are derived from a real
+            ``torch.export`` trace of the vLLM model instead of the static
+            per-architecture builders. Falls back to the static builders on any
+            tracing failure.
 
     Returns:
         Dict with "prefill" and "decode" trees, plus metadata.
@@ -1330,7 +1383,7 @@ def build_model_graph(
 
     # Full (un-split) dimensions from config.json
     full_num_heads = model_summary.get("num_heads") or 1
-    full_num_kv = model_summary.get("num_kv_heads", full_num_heads)
+    full_num_kv = model_summary.get("num_kv_heads") or full_num_heads
     # For pure MoE models without dense layers (e.g. DeepSeek-V4),
     # intermediate_size may be absent — fall back to moe_intermediate_size
     full_intermediate = (
@@ -1339,6 +1392,8 @@ def build_model_graph(
         or 1
     )
     full_vocab = model_summary.get("vocab_size") or 1
+    full_hidden = model_summary.get("hidden_size") or (full_num_heads
+                                                       * (model_summary.get("head_dim") or 1))
 
     # TP-split dimensions (column-parallel splits output, row-parallel splits input)
     tp_num_heads = full_num_heads // tp_size
@@ -1349,11 +1404,11 @@ def build_model_graph(
     # Build config dict — stores original config values as symbols,
     # with _tp_ prefixed values for per-rank numeric calculations
     cfg: dict[str, Any] = {
-        "hidden_size": model_summary["hidden_size"],
-        "num_layers": model_summary["num_layers"],
+        "hidden_size": full_hidden,
+        "num_layers": model_summary.get("num_layers") or 1,
         "num_heads": full_num_heads,
         "num_kv_heads": full_num_kv,
-        "head_dim": model_summary.get("head_dim", model_summary["hidden_size"] // full_num_heads),
+        "head_dim": model_summary.get("head_dim") or (full_hidden // full_num_heads),
         "intermediate_size": full_intermediate,
         "vocab_size": full_vocab,
         "dtype_bytes": _dtype_bytes(model_summary.get("dtype", "bfloat16")),
@@ -1389,6 +1444,8 @@ def build_model_graph(
         cfg["moe_intermediate_size"] = raw_moe_I
         cfg["_tp_moe_intermediate_size"] = (raw_moe_I // tp_size) if raw_moe_I else None
         cfg["n_shared_experts"] = model_summary.get("n_shared_experts", 0)
+        cfg["shared_expert_intermediate_size"] = (
+            model_summary.get("shared_expert_intermediate_size"))
 
     # MLA-specific config (DeepSeek-V2/V3/V4)
     if is_mla:
@@ -1408,17 +1465,19 @@ def build_model_graph(
         cfg["o_lora_rank"] = model_summary.get("o_lora_rank") or 0
         cfg["o_groups"] = model_summary.get("o_groups") or 1
 
-    # VL-specific config
+    # VL-specific config. ``model_summary`` may carry explicit ``None`` values
+    # (so ``dict.get(k, default)`` returns ``None``, not the default) — coalesce
+    # with ``or`` so missing vision dims fall back to sane defaults.
     if is_vl:
-        cfg["vit_hidden_size"] = model_summary.get("vit_hidden_size", 1024)
-        cfg["vit_num_layers"] = model_summary.get("vit_num_layers", 24)
-        cfg["vit_num_heads"] = model_summary.get("vit_num_heads", 16)
-        cfg["vit_intermediate_size"] = model_summary.get(
-            "vit_intermediate_size",
-            cfg["vit_hidden_size"] * 4,
+        cfg["vit_hidden_size"] = model_summary.get("vit_hidden_size") or 1024
+        cfg["vit_num_layers"] = model_summary.get("vit_num_layers") or 24
+        cfg["vit_num_heads"] = model_summary.get("vit_num_heads") or 16
+        cfg["vit_intermediate_size"] = (
+            model_summary.get("vit_intermediate_size")
+            or cfg["vit_hidden_size"] * 4
         )
-        cfg["patch_size"] = model_summary.get("patch_size", 14)
-        cfg["image_size"] = model_summary.get("image_size", 448)
+        cfg["patch_size"] = model_summary.get("patch_size") or 14
+        cfg["image_size"] = model_summary.get("image_size") or 448
         num_patches = (cfg["image_size"] // cfg["patch_size"]) ** 2
         cfg["_num_patches"] = num_patches
 
@@ -1521,7 +1580,63 @@ def build_model_graph(
         if o_lora_rank > 0:
             result["symbols"]["G·O_r"] = o_groups * o_lora_rank
 
-    # Build prefill and decode graphs
+    # Build prefill and decode graphs.
+    #
+    # Preferred path: derive the op graph from a single ``torch.export`` trace of
+    # the real vLLM model (see model_tracer). This makes the graph and its
+    # backend labels track the actual vLLM/kernels code instead of hand-written
+    # per-architecture builders.
+    #
+    # Scope: dense or uniform-MoE single-stack models. Multimodal (vision tower
+    # + LM) and quantized models are left to the static builders for now. TP>1
+    # is supported analytically — the model is exported at TP=1 and per-rank cost
+    # is divided by op role (see model_tracer._tp_shard_factor). Any tracing
+    # failure also falls back to the static builders below.
+    traced = None
+    # The tracer groups decoder layers by op signature, so it handles uniform
+    # MoE *and* hybrid stacks (leading dense layers via ``first_k_dense_replace``
+    # or alternating ``decoder_sparse_step``/``moe_layer_freq``) and MLA. For VL
+    # models the text-only export captures just the language-model stack (no
+    # image inputs → no vision ops, so no multi-ModuleList), and the vision tower
+    # + projector are spliced in analytically below — mirroring the static path.
+    #
+    # VL tracing is gated to architecture families whose multimodal cost is known
+    # to decompose cleanly into "vision encoder + projector + ordinary decoder
+    # prefill" (verified text-only export captures NO vision/fusion ops). Other
+    # VL families (cross-attention, Q-former/resampler, unconditional vision) may
+    # export text-only "successfully" yet silently omit fusion compute, so they
+    # stay on the static builder until individually validated.
+    vl_tracer_ok = (not is_vl) or (family in _TRACER_VERIFIED_VL)
+    use_tracer = raw_config is not None and vl_tracer_ok
+    if use_tracer:
+        # VL: build the vision tower + projector (prefill only) from the same
+        # helpers the static builder uses, to splice into the traced LM graph.
+        extra_children = None
+        if is_vl:
+            extra_children = {"prefill": [
+                _build_vision_encoder(cfg, "prefill", "S"),
+                _build_vl_projector(cfg, "prefill", "S"),
+            ]}
+        try:
+            from .model_tracer import build_traced_graph
+            traced = build_traced_graph(
+                raw_config, model_summary, result["symbols"],
+                prefill_len, decode_batch, context_len, tp_size=tp_size,
+                weight_dtype_bytes=cfg.get("weight_dtype_bytes"),
+                extra_children=extra_children,
+            )
+        except Exception as e:  # noqa: BLE001 — fall back to static builders
+            logger.warning("torch.export tracing failed (%s); "
+                           "falling back to static builder", e)
+            traced = None
+
+    if traced is not None:
+        result["prefill"] = traced["prefill"]
+        result["decode"] = traced["decode"]
+        result["graph_source"] = traced.get("graph_source", "torch.export")
+        return result
+
+    result["graph_source"] = "static"
     # Both phases use B·S as the token dimension for alignment:
     #   Prefill: S = prefill_len (e.g. 128), so B·S = batch × seq_len
     #   Decode:  S = 1 (always), so B·S = batch × 1 = batch
