@@ -1250,6 +1250,20 @@ _HIGH_PRIORITY_MODELS = [
     ("HY3.0", "tencent/Hy3-preview", None, "ok", ""),
     ("HY3.0", "tencent/Hy3-preview", "fp8", "ok", ""),
     ("Qwen2.5-VL-7B", "Qwen/Qwen2.5-VL-7B-Instruct", None, "ok", ""),
+    # Gated Delta Net (GDN) linear-attention hybrids (Qwen3.5/3.6). The tracer
+    # traces the GDN core as the opaque ``gdn_attention_core_xpu`` op, the
+    # full-attention layers as ``unified_attention``, and the gate-norm as real
+    # elementwise ops. NOTE: these are also multimodal (Image-Text-to-Text);
+    # vision-tower splicing for the Qwen3_5 VL family is a separate follow-up, so
+    # the graph here covers the (GDN/MoE) language model.
+    ("Qwen3.5-27B", "Qwen/Qwen3.5-27B", None, "ok", ""),
+    ("Qwen3.5-27B-FP8", "Qwen/Qwen3.5-27B-FP8", "fp8", "ok", ""),
+    ("Qwen3.5-35B-A3B", "Qwen/Qwen3.5-35B-A3B", None, "ok", ""),
+    ("Qwen3.5-35B-A3B-FP8", "Qwen/Qwen3.5-35B-A3B-FP8", "fp8", "ok", ""),
+    ("Qwen3.6-27B", "Qwen/Qwen3.6-27B", None, "ok", ""),
+    ("Qwen3.6-27B-FP8", "Qwen/Qwen3.6-27B-FP8", "fp8", "ok", ""),
+    ("Qwen3.6-35B-A3B", "Qwen/Qwen3.6-35B-A3B", None, "ok", ""),
+    ("Qwen3.6-35B-A3B-FP8", "Qwen/Qwen3.6-35B-A3B-FP8", "fp8", "ok", ""),
     # --- Blocked by external (non-breakdown) issues; documented + skipped ---
     ("DeepSeek-V4", "deepseek-ai/DeepSeek-V4-Pro", None, "blocked",
      "model code hardcodes torch.cuda.Stream() — fails on no-CUDA XPU"),
@@ -1267,12 +1281,15 @@ _HIGH_PRIORITY_MODELS = [
      "custom configuration_*.py not staged in offline tracer workdir"),
     ("Kimi-K2.5", "moonshotai/Kimi-K2.5", "int4", "blocked",
      "meta-tensor .to() during model __init__ (needs to_empty())"),
-    ("Qwen3.6-27B", "Qwen/Qwen3.6-27B", None, "blocked",
-     "GDN linear-attention Triton rmsnorm not opaque — needs Qwen3-Next-style "
-     "linear-attention support in the tracer"),
-    ("Qwen3.6-35B-A3B", "Qwen/Qwen3.6-35B-A3B", None, "blocked",
-     "GDN linear-attention Triton rmsnorm not opaque (see Qwen3.6-27B)"),
 ]
+
+# GDN linear-attention models — the graph must contain the spliced GDN op.
+_GDN_MODEL_IDS = frozenset({
+    "Qwen/Qwen3.5-27B", "Qwen/Qwen3.5-27B-FP8",
+    "Qwen/Qwen3.5-35B-A3B", "Qwen/Qwen3.5-35B-A3B-FP8",
+    "Qwen/Qwen3.6-27B", "Qwen/Qwen3.6-27B-FP8",
+    "Qwen/Qwen3.6-35B-A3B", "Qwen/Qwen3.6-35B-A3B-FP8",
+})
 
 _PER_LAYER_LIST_KEYS = ("layer_types", "moe_layer_freq")
 
@@ -1360,6 +1377,14 @@ class TestHighPriorityModels(unittest.TestCase):
                                     for o in _collect_ops(graph["prefill"]))
                 self.assertGreater(
                     prefill_flops, 0, f"{model_id}: zero prefill FLOPs")
+
+                # GDN models: the linear-attention core must be captured (it is
+                # an opaque custom op the tracer maps to ``gdn_linear_attention``).
+                if model_id in _GDN_MODEL_IDS:
+                    names = {o["name"] for o in _collect_ops(graph["prefill"])}
+                    self.assertIn(
+                        "gdn_linear_attention", names,
+                        f"{model_id}: GDN linear-attention op missing from graph")
 
                 # The profiling endpoint serializes the graph to JSON.
                 try:

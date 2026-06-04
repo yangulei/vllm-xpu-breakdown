@@ -64,6 +64,11 @@ _VLLM_DISPATCH_OPS: dict[str, tuple[str, str, str]] = {
     "unified_mla_attention_with_output": ("unified_mla_attention", "vllm-xpu-kernels", "attention"),
     "unified_mla_attention": ("unified_mla_attention", "vllm-xpu-kernels", "attention"),
     "unified_mla_kv_cache_update": ("reshape_and_cache", "vllm-xpu-kernels", "cache_store"),
+    # Gated Delta Net linear attention (Qwen3-Next / Qwen3.5/3.6). The whole
+    # chunked-recurrent core is one opaque custom op; the XPU variant runs the
+    # SYCL kernel, the reference variant the Triton/FLA kernel.
+    "gdn_attention_core_xpu": ("gdn_linear_attention", "vllm-xpu-kernels", "attention"),
+    "gdn_attention_core": ("gdn_linear_attention", "triton", "attention"),
 }
 
 # torch.export collapses the whole FusedMoE expert path into a single opaque
@@ -86,17 +91,27 @@ _FRAMEWORK_TARGETS = re.compile(
 
 @contextlib.contextmanager
 def _export_friendly_rmsnorm():
-    """Make ``RMSNorm`` export-traceable.
+    """Make vLLM's normalization layers ``torch.export``-traceable.
 
-    ``RMSNorm.forward_native`` passes ``self.weight.data``; accessing ``.data``
-    on a ``Parameter`` during ``torch.export`` turns it into a lifted *constant*
-    that becomes a fake tensor ("fake tensor in constant's list"), which aborts
-    whole-model export. Here we temporarily pass the ``Parameter`` itself so it
-    is lifted as a proper input. Only active during the export call; vLLM
-    runtime behavior is untouched.
+    Three norm variants defeat whole-model export and are temporarily patched
+    here (restored in ``finally``; vLLM runtime behavior is untouched):
+
+    * ``RMSNorm.forward_native`` passes ``self.weight.data``; accessing ``.data``
+      on a ``Parameter`` during export turns it into a lifted *constant* that
+      becomes a fake tensor ("fake tensor in constant's list"), aborting export.
+      We pass the ``Parameter`` itself so it is lifted as a proper input.
+    * ``GemmaRMSNorm.forward_native`` (used as ``Qwen3NextRMSNorm`` by the
+      Qwen3-Next / Qwen3.5/3.6 stacks) has the same ``self.weight.data`` issue.
+    * ``RMSNormGated`` (the GDN linear-attention output gate-norm) dispatches to
+      a Triton/FLA kernel that export cannot trace into ("Cannot access data
+      pointer ... wrap the custom kernel into an opaque custom op"). Its
+      ``forward_native`` is pure PyTorch, so we route the dispatch there.
     """
     from vllm import ir
-    from vllm.model_executor.layers.layernorm import RMSNorm
+    from vllm.model_executor.layers.layernorm import (
+        GemmaRMSNorm, RMSNorm, RMSNormGated,
+    )
+    import torch
 
     original = RMSNorm.forward_native
 
@@ -116,11 +131,36 @@ def _export_friendly_rmsnorm():
             self.variance_size_override,
         )
 
+    gemma_original = GemmaRMSNorm.forward_native
+
+    def gemma_patched(self, x, residual=None):
+        # Same as the original but without ``.data`` (which lifts a constant).
+        orig_dtype = x.dtype
+        weight = self.weight.float() + 1.0
+        if residual is not None:
+            x = (x.float() + residual.float()
+                 if orig_dtype == torch.float16 else x + residual)
+            residual = x
+        out = ir.ops.rms_norm(x, weight, self.variance_epsilon)
+        return (out.to(orig_dtype) if residual is None
+                else (out.to(orig_dtype), residual))
+
+    # ``forward_xpu`` and ``forward_cuda`` both delegate to ``forward_cuda``;
+    # routing it to the (pure-PyTorch) native path avoids the Triton kernel.
+    gated_original = RMSNormGated.forward_cuda
+
+    def gated_patched(self, x, z=None):
+        return RMSNormGated.forward_native(self, x, z)
+
     RMSNorm.forward_native = patched
+    GemmaRMSNorm.forward_native = gemma_patched
+    RMSNormGated.forward_cuda = gated_patched
     try:
         yield
     finally:
         RMSNorm.forward_native = original
+        GemmaRMSNorm.forward_native = gemma_original
+        RMSNormGated.forward_cuda = gated_original
 
 
 def _ensure_distributed() -> None:
@@ -208,7 +248,29 @@ def _instantiate_model(raw_config: dict, dtype: str, workdir: str):
         ensure_model_parallel_initialized(1, 1)
         with torch.device("meta"):
             model = initialize_model(vllm_config=vllm_config, model_class=None)
+    _force_meta(model)
     return model, vllm_config
+
+
+def _force_meta(model) -> None:
+    """Move any non-``meta`` parameters/buffers onto the ``meta`` device.
+
+    ``initialize_model`` runs under ``torch.device("meta")``, but some layers
+    pass an explicit ``device=`` (e.g. GDN linear attention builds its gate-norm
+    with ``device=current_platform.current_device()``), materializing a real
+    ``xpu:0`` tensor that defeats the meta context and later raises "Tensor on
+    device xpu:0 is not on the expected device meta!" during export. Tracing is
+    offline (no real weights), so normalizing everything to ``meta`` is correct.
+    """
+    import torch
+    for module in model.modules():
+        for name, param in list(module._parameters.items()):
+            if param is not None and param.device.type != "meta":
+                module._parameters[name] = torch.nn.Parameter(
+                    param.data.to("meta"), requires_grad=param.requires_grad)
+        for name, buf in list(module._buffers.items()):
+            if buf is not None and buf.device.type != "meta":
+                module._buffers[name] = buf.to("meta")
 
 
 def _normalize_dtype(dtype: str) -> str:
@@ -769,6 +831,14 @@ def _cost(name: str, role: str, in_shapes: list, out_shape: list | None,
     n = name.replace("aten::", "")
     w_bytes = weight_dtype_bytes if weight_dtype_bytes is not None else dtype_bytes
 
+    # Gated Delta Net (Qwen3-Next / Qwen3.5/3.6) is *linear* attention: its cost
+    # is O(T) in the recurrent state, NOT the O(T·C) of softmax attention. It
+    # must be handled before the generic attention branch or its 3-D q/k/v-like
+    # inputs would be mis-costed as quadratic softmax attention.
+    if "gdn" in n or "linear_attention" in n:
+        return _linear_attention_cost(in_shapes, out_shape, token_value,
+                                      dtype_bytes)
+
     if role == "attention" or "attention" in n:
         return _attention_cost(in_shapes, token_value, dtype_bytes,
                                phase, context_len)
@@ -852,4 +922,45 @@ def _attention_cost(in_shapes: list, token_value: int, dtype_bytes: int,
     mem = q_bytes + o_bytes + kv_bytes
     # QK^T then (softmax)·V, each ~2·(new·kv_len·n_h·d) flops.
     flops = 2 * (2 * new * kv_len * n_h * d)
+    return mem, flops
+
+
+def _linear_attention_cost(in_shapes: list, out_shape: list | None,
+                           token_value: int, dtype_bytes: int) -> tuple[int, int]:
+    """Cost of a Gated-Delta-Net / linear-attention core op.
+
+    Unlike softmax attention, a linear-attention layer carries a fixed-size
+    recurrent state (per head: ``head_k_dim × head_v_dim``) and streams the
+    sequence through it, so both compute and memory are **O(T)** in the token
+    count — never O(T·C). Costing it through ``_attention_cost`` would bill it
+    as quadratic softmax attention and grossly overstate it for long context.
+
+    The op is opaque (the SYCL/Triton kernel), so we bill:
+      * memory  — the bytes of its inputs/output actually touched (linear in T);
+      * flops   — the recurrent state update + read, ~4·head_k·head_v per token
+        per head, derived from the 3-D ``[T, n_heads, head_dim]`` operands.
+    The surrounding in/out projections are separate GEMM ops already counted.
+    """
+    mem = 0
+    for s in in_shapes:
+        num = _numeric(s, token_value)
+        if num:
+            mem += _prod(num) * dtype_bytes
+    if out_shape:
+        num = _numeric(out_shape, token_value)
+        if num:
+            mem += _prod(num) * dtype_bytes
+
+    threed = [s for s in in_shapes if len(s) == 3]
+    flops = 0
+    if threed:
+        n_h = max((s[1] for s in threed if isinstance(s[1], int)), default=1)
+        d = max((s[2] for s in threed if isinstance(s[2], int)), default=1)
+        # state update (k⊗v) + state read (q·state) ≈ 4·head_k·head_v per
+        # token per head; linear in the token count.
+        flops = 4 * token_value * n_h * d * d
+    elif out_shape:
+        num = _numeric(out_shape, token_value)
+        if num:
+            flops = 4 * _prod(num)
     return mem, flops
