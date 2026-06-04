@@ -16,27 +16,32 @@ PyTorch / vLLM and use the live model definitions and runtime dispatch. There is
 no separate "no-GPU / no-ML-dependencies" mode — install
 `requirements.txt` on top of an existing PyTorch + vLLM-XPU install.
 
-### Model Graph: trace-based vs. static
+### Model Graph: trace-based builder
 
-The Model Graph (op tree + per-op backend, without profiling) is built two ways:
+The Model Graph (op tree + per-op backend, without profiling) is built from a
+single `torch.export` trace of the *real* vLLM model — there is **no** static
+per-architecture builder fallback. Assume PyTorch, vLLM, and an XPU device are
+available.
 
-- **Trace-based (default for dense models).** The tool instantiates the *real*
-  vLLM `nn.Module` offline on the `meta` device (no weights, no download) and
-  runs a single `torch.export` symbolic trace with the token dimension kept
-  symbolic. The op tree, op names, and backends come straight from the real
-  dispatch, so the graph tracks vLLM/vllm-xpu-kernels changes automatically —
-  no per-architecture builder code. Backends are resolved through the shared
-  `classifier`, the single source of truth. Implemented in
-  `breakdown/model_tracer.py`; the result carries `graph_source: "torch.export"`.
-- **Static (fallback).** Hand-written per-architecture builders in
-  `breakdown/model_graph.py`. Used for MoE, multimodal, tensor-parallel
-  (`tp_size > 1`), or quantized models, and whenever tracing fails for any
-  reason. The result carries `graph_source: "static"`.
-
-The trace-based path is intentionally limited to dense, single-stack, TP=1,
-unquantized models: a single symbolic export does not fully capture fused-expert
-(`FusedMoE`) or vision-tower compute, so those stay on the static builders to
-avoid silently under-counting cost.
+- **How it works.** The tool instantiates the *real* vLLM `nn.Module` offline on
+  the `meta` device (no weights, no download) and runs a single `torch.export`
+  symbolic trace with the token dimension kept symbolic. The op tree, op names,
+  and backends come straight from the real dispatch, so the graph tracks
+  vLLM/vllm-xpu-kernels changes automatically — no per-architecture builder
+  code. Backends are resolved through the shared `classifier`, the single source
+  of truth. Implemented in `breakdown/model_tracer.py`; the result carries
+  `graph_source: "torch.export"`.
+- **Coverage.** Dense, uniform- and hybrid-MoE (the opaque `FusedMoE` op is
+  re-expanded via the one remaining builder, `fused_moe_expert_ops` in
+  `breakdown/model_graph.py`), MLA (DeepSeek), tensor-parallel (`tp_size > 1`,
+  modelled analytically), quantization (modelled analytically), and Qwen2/2.5-VL
+  (the vision tower + projector are spliced in analytically; `graph_source`
+  gains `+fused_moe` / `+vision` suffixes accordingly).
+- **Hard-fail, no fallback.** `build_model_graph` requires `raw_config` for
+  decoder LLMs. A missing `raw_config`, an unvalidated VL family
+  (only `Qwen2VL`/Qwen2.5-VL are validated), or any tracing failure raises a
+  clear error rather than silently degrading. Encoder-only and diffusion models
+  use their own dedicated builders and do not require `raw_config`.
 
 ## Backends Tracked
 

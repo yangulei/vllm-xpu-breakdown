@@ -1,16 +1,20 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Static model graph builder — derives op dispatch from model architecture.
+"""Model graph builder — derives op dispatch for a vLLM model.
 
-Builds a hierarchical module tree with ops, shapes, memory, and FLOPs for
-each submodule, WITHOUT requiring model weights or actual profiling. This
-enables analysis of models that don't fit in current hardware.
+For decoder LLMs the op graph is produced by ``torch.export`` tracing of the
+real vLLM ``nn.Module`` (see ``model_tracer.py``); this module no longer holds
+per-architecture decoder builders. What remains here:
+  - ``build_model_graph`` — entry point: routes encoder/diffusion models to
+    their dedicated builders and everything else through the tracer (hard-fails
+    with a clear error when ``raw_config`` is missing or tracing fails).
+  - ``fused_moe_expert_ops`` — re-expands the opaque ``FusedMoE`` op the trace
+    hides behind a single dispatch (single source of truth for expert cost).
+  - Vision-tower / projector builders (spliced into traced VL graphs).
+  - Encoder-only and diffusion builders (distinct, non-decoder paths).
+  - Shared cost helpers (GEMM/norm/activation/softmax mem + FLOPs).
 
-Supports architecture families:
-  - Llama-like (Llama, Mistral, Yi)
-  - Qwen2/Qwen3
-  - More can be added via ARCH_SPECS registry
-
-Each architecture is defined declaratively as a tree of ModuleSpec → OpSpec.
+Builds a hierarchical module tree with ops, shapes, memory, and FLOPs WITHOUT
+requiring model weights or actual profiling.
 """
 from __future__ import annotations
 
@@ -135,228 +139,8 @@ def _softmax_flops(tokens: int, seq_len: int, n_heads: int) -> int:
 
 # ===================================================================
 # ===================================================================
-# Architecture specs (declarative)
+# Reusable graph builders (FusedMoE experts, vision tower, encoder)
 # ===================================================================
-
-def _build_attention_ops(
-    cfg: dict, phase: str, tokens: str, seq: str
-) -> list[OpNode]:
-    """Build ops for attention module."""
-    H = cfg["hidden_size"]
-    n_h = cfg["_tp_num_heads"]
-    n_kv = cfg["_tp_num_kv_heads"]
-    d = cfg["head_dim"]
-    qkv_size = (n_h + 2 * n_kv) * d
-    dtype_bytes = cfg["dtype_bytes"]
-    w_bytes = cfg.get("weight_dtype_bytes", dtype_bytes)
-    T = cfg.get(f"_{tokens}", tokens)  # numeric if available
-    S = cfg.get(f"_{seq}", seq)
-    tp = cfg["tp_size"]
-
-    # TP-aware symbols for shape annotations
-    nh_sym = "n_h/TP"
-    nkv_sym = "n_kv/TP"
-    qkv_sym = "QKV/TP"
-    nhd_sym = "n_h·d/TP"
-
-    ops: list[OpNode] = []
-
-    # QKV projection
-    ops.append(OpNode(
-        name="aten::mm", role="qkv_proj",
-        backend="torch-xpu-ops",
-        input_shapes=[[tokens, "H"], ["H", qkv_sym]],
-        output_shape=[tokens, qkv_sym],
-        memory_bytes=_mm_mem(T, H, qkv_size, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
-        flops=_mm_flops(T, H, qkv_size) if isinstance(T, int) else 0,
-        phase=phase,
-    ))
-
-    # Q/K norms (Qwen3-specific)
-    if cfg.get("has_qk_norm"):
-        for role, sym in [("q_norm", nh_sym), ("k_norm", nkv_sym)]:
-            n = n_h if role == "q_norm" else n_kv
-            ops.append(OpNode(
-                name="rms_norm", role=role,
-                backend="vllm-xpu-kernels",
-                input_shapes=[[tokens, sym, "d"]],
-                output_shape=[tokens, sym, "d"],
-                memory_bytes=_norm_mem(T * n, d, dtype_bytes) if isinstance(T, int) else 0,
-                flops=_norm_flops(T * n, d) if isinstance(T, int) else 0,
-                phase=phase,
-            ))
-
-    # Rotary embedding
-    ops.append(OpNode(
-        name="rotary_embedding", role="rotary_emb",
-        backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, nh_sym, "d"], [tokens, nkv_sym, "d"]],
-        output_shape=[tokens, nh_sym, "d"],
-        memory_bytes=(T * (n_h + n_kv) * d * dtype_bytes * 3) if isinstance(T, int) else 0,
-        flops=(T * (n_h + n_kv) * d * 6) if isinstance(T, int) else 0,
-        phase=phase,
-    ))
-
-    # Attention kernel
-    attn_backend = "vllm-xpu-kernels"
-    if phase == "prefill":
-        ops.append(OpNode(
-            name="flash_attn_varlen_fwd", role="attention",
-            backend=attn_backend,
-            input_shapes=[[tokens, nh_sym, "d"], [seq, nkv_sym, "d"], [seq, nkv_sym, "d"]],
-            output_shape=[tokens, nh_sym, "d"],
-            memory_bytes=0,  # complex to estimate
-            flops=(2 * T * S * n_h * d) if isinstance(T, int) and isinstance(S, int) else 0,
-            phase="prefill",
-        ))
-    else:
-        ops.append(OpNode(
-            name="paged_attention", role="attention",
-            backend=attn_backend,
-            input_shapes=[[tokens, nh_sym, "d"], [seq, nkv_sym, "d"]],
-            output_shape=[tokens, nh_sym, "d"],
-            memory_bytes=0,
-            flops=0,
-            phase="decode",
-        ))
-
-    # KV cache store
-    ops.append(OpNode(
-        name="reshape_and_cache_flash", role="cache_store",
-        backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, nkv_sym, "d"], [tokens, nkv_sym, "d"]],
-        output_shape=[],
-        memory_bytes=(T * n_kv * d * dtype_bytes * 2) if isinstance(T, int) else 0,
-        flops=0,
-        phase=phase,
-    ))
-
-    # Output projection
-    ops.append(OpNode(
-        name="aten::mm", role="o_proj",
-        backend="torch-xpu-ops",
-        input_shapes=[[tokens, nhd_sym], [nhd_sym, "H"]],
-        output_shape=[tokens, "H"],
-        memory_bytes=_mm_mem(T, n_h * d, H, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
-        flops=_mm_flops(T, n_h * d, H) if isinstance(T, int) else 0,
-        phase=phase,
-    ))
-
-    return ops
-
-
-def _build_mlp_ops(cfg: dict, phase: str, tokens: str) -> list[OpNode]:
-    """Build ops for MLP module."""
-    H = cfg["hidden_size"]
-    I = cfg["_tp_intermediate_size"]
-    dtype_bytes = cfg["dtype_bytes"]
-    w_bytes = cfg.get("weight_dtype_bytes", dtype_bytes)
-    T = cfg.get(f"_{tokens}", tokens)
-    tp = cfg["tp_size"]
-
-    # TP-aware symbols
-    i_sym = "I/TP"
-    i2_sym = "2·I/TP"
-
-    ops: list[OpNode] = []
-
-    # Gate+Up fused projection
-    ops.append(OpNode(
-        name="aten::mm", role="gate_up_proj",
-        backend="torch-xpu-ops",
-        input_shapes=[[tokens, "H"], ["H", i2_sym]],
-        output_shape=[tokens, i2_sym],
-        memory_bytes=_mm_mem(T, H, 2 * I, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
-        flops=_mm_flops(T, H, 2 * I) if isinstance(T, int) else 0,
-        phase=phase,
-    ))
-
-    # SiLU and Mul activation
-    ops.append(OpNode(
-        name="silu_and_mul", role="activation",
-        backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, i2_sym]],
-        output_shape=[tokens, i_sym],
-        memory_bytes=_activation_mem(T, I, dtype_bytes) if isinstance(T, int) else 0,
-        flops=_activation_flops(T, I) if isinstance(T, int) else 0,
-        phase=phase,
-    ))
-
-    # Down projection
-    ops.append(OpNode(
-        name="aten::mm", role="down_proj",
-        backend="torch-xpu-ops",
-        input_shapes=[[tokens, i_sym], [i_sym, "H"]],
-        output_shape=[tokens, "H"],
-        memory_bytes=_mm_mem(T, I, H, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
-        flops=_mm_flops(T, I, H) if isinstance(T, int) else 0,
-        phase=phase,
-    ))
-
-    return ops
-
-
-def _build_norm_op(cfg: dict, role: str, tokens: str, phase: str) -> OpNode:
-    """Build RMSNorm op."""
-    H = cfg["hidden_size"]
-    dtype_bytes = cfg["dtype_bytes"]
-    T = cfg.get(f"_{tokens}", tokens)
-
-    fused = "fused_add_" if role.startswith("post") else ""
-    return OpNode(
-        name=f"{fused}rms_norm", role=role,
-        backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, "H"]],
-        output_shape=[tokens, "H"],
-        memory_bytes=_norm_mem(T, H, dtype_bytes) if isinstance(T, int) else 0,
-        flops=_norm_flops(T, H) if isinstance(T, int) else 0,
-        phase=phase,
-    )
-
-
-def _build_decoder_layer(
-    cfg: dict, arch_family: str, phase: str, tokens: str, seq: str
-) -> ModuleNode:
-    """Build one decoder layer module."""
-    attn_type = f"{arch_family}Attention"
-    mlp_type = f"{arch_family}MLP"
-
-    # Input LayerNorm
-    input_norm = ModuleNode(
-        name="input_layernorm", path="model.layers.*.input_layernorm",
-        module_type="RMSNorm",
-        ops=[_build_norm_op(cfg, "input_layernorm", tokens, phase)],
-    )
-
-    # Attention
-    attn_ops = _build_attention_ops(cfg, phase, tokens, seq)
-    attention = ModuleNode(
-        name="self_attn", path="model.layers.*.self_attn",
-        module_type=attn_type, ops=attn_ops,
-    )
-
-    # Post-attention LayerNorm
-    post_norm = ModuleNode(
-        name="post_attention_layernorm",
-        path="model.layers.*.post_attention_layernorm",
-        module_type="RMSNorm",
-        ops=[_build_norm_op(cfg, "post_attention_layernorm", tokens, phase)],
-    )
-
-    # MLP
-    mlp_ops = _build_mlp_ops(cfg, phase, tokens)
-    mlp = ModuleNode(
-        name="mlp", path="model.layers.*.mlp",
-        module_type=mlp_type, ops=mlp_ops,
-    )
-
-    layer = ModuleNode(
-        name="decoder_layer", path="model.layers.*",
-        module_type=f"{arch_family}DecoderLayer",
-        children=[input_norm, attention, post_norm, mlp],
-        repeat_count=cfg["num_layers"],
-    )
-    return layer
 
 
 def fused_moe_expert_ops(
@@ -450,463 +234,6 @@ def fused_moe_expert_ops(
             ),
         ]
     return ops
-
-
-def _build_moe_layer(
-    cfg: dict, arch_family: str, phase: str, tokens: str, seq: str
-) -> ModuleNode:
-    """Build one MoE decoder layer (Mixtral/DeepSeek style)."""
-    num_experts = cfg.get("num_experts", 8)
-    top_k = cfg.get("num_experts_per_tok", 2)
-    n_shared = cfg.get("n_shared_experts", 0)
-    H = cfg["hidden_size"]
-    dtype_bytes = cfg["dtype_bytes"]
-    weight_dtype_bytes = cfg.get("weight_dtype_bytes", dtype_bytes)
-    T = cfg.get(f"_{tokens}", tokens)
-    tp = cfg["tp_size"]
-
-    # Input LayerNorm
-    input_norm = ModuleNode(
-        name="input_layernorm", path="model.layers.*.input_layernorm",
-        module_type="RMSNorm",
-        ops=[_build_norm_op(cfg, "input_layernorm", tokens, phase)],
-    )
-
-    # Attention (same as dense)
-    attn_ops = _build_attention_ops(cfg, phase, tokens, seq)
-    attention = ModuleNode(
-        name="self_attn", path="model.layers.*.self_attn",
-        module_type=f"{arch_family}Attention", ops=attn_ops,
-    )
-
-    # Post-attention LayerNorm
-    post_norm = ModuleNode(
-        name="post_attention_layernorm",
-        path="model.layers.*.post_attention_layernorm",
-        module_type="RMSNorm",
-        ops=[_build_norm_op(cfg, "post_attention_layernorm", tokens, phase)],
-    )
-
-    # MoE block
-    gate_op = OpNode(
-        name="aten::mm", role="router_gate",
-        backend="torch-xpu-ops",
-        input_shapes=[[tokens, "H"], ["H", "E"]],
-        output_shape=[tokens, "E"],
-        memory_bytes=_mm_mem(T, H, num_experts, dtype_bytes) if isinstance(T, int) else 0,
-        flops=_mm_flops(T, H, num_experts) if isinstance(T, int) else 0,
-        phase=phase,
-    )
-
-    # Routing + expert + shared-expert ops come from the single shared FusedMoE
-    # builder (also used by the tracer to splice past the opaque export op).
-    raw_moe_I = cfg.get("moe_intermediate_size") or cfg["intermediate_size"]
-    token_value = T if isinstance(T, int) else None
-    # Shared-expert size: Qwen2-MoE gives an explicit intermediate; DeepSeek
-    # uses n_shared_experts × moe_intermediate_size.
-    shared_explicit = cfg.get("shared_expert_intermediate_size")
-    if shared_explicit:
-        shared_intermediate = shared_explicit
-    elif n_shared:
-        shared_intermediate = n_shared * raw_moe_I
-    else:
-        shared_intermediate = 0
-    expert_ops = fused_moe_expert_ops(
-        phase=phase, token_symbol=tokens, token_value=token_value, top_k=top_k,
-        hidden_size=H, expert_intermediate=raw_moe_I,
-        shared_intermediate=shared_intermediate,
-        num_experts=num_experts, dtype_bytes=dtype_bytes, tp_size=tp,
-        weight_dtype_bytes=weight_dtype_bytes,
-    )
-
-    moe_ops = [gate_op, *expert_ops]
-
-    moe = ModuleNode(
-        name="moe", path="model.layers.*.mlp",
-        module_type=f"{arch_family}MoE",
-        ops=moe_ops,
-    )
-
-    layer = ModuleNode(
-        name="decoder_layer", path="model.layers.*",
-        module_type=f"{arch_family}DecoderLayer",
-        children=[input_norm, attention, post_norm, moe],
-        repeat_count=cfg["num_layers"],
-    )
-    return layer
-
-
-def _build_mla_attention_ops(
-    cfg: dict, phase: str, tokens: str, seq: str
-) -> list[OpNode]:
-    """Build ops for Multi-head Latent Attention (DeepSeek-V2/V3/V4, GLM5).
-
-    MLA compresses KV into a low-rank latent space, reducing KV cache size.
-    Key ops: Q projection → latent KV projection → decompress → attention.
-    """
-    H = cfg["hidden_size"]
-    n_h = cfg["_tp_num_heads"]
-    n_kv = cfg["_tp_num_kv_heads"]
-    d = cfg["head_dim"]
-    # v_head_dim may differ from head_dim (e.g. GLM5: head_dim=64, v_head_dim=256)
-    v_d = cfg.get("v_head_dim") or d
-    dtype_bytes = cfg["dtype_bytes"]
-    w_bytes = cfg.get("weight_dtype_bytes", dtype_bytes)
-    T = cfg.get(f"_{tokens}", tokens)
-    S = cfg.get(f"_{seq}", seq)
-    tp = cfg["tp_size"]
-
-    # TP-aware symbols
-    nh_sym = "n_h/TP"
-    nkv_sym = "n_kv/TP"
-    qkv_sym = "QKV/TP"
-    nhd_sym = "n_h·d/TP"
-    nhvd_sym = "n_h·v_d/TP" if v_d != d else nhd_sym
-    nhDqh_sym = "n_h·D_qh/TP"
-
-    # MLA-specific dimensions (from config or estimated)
-    kv_lora_rank = cfg.get("kv_lora_rank", 512)
-    q_lora_rank = cfg.get("q_lora_rank", 0)
-    qk_nope_head_dim = cfg.get("qk_nope_head_dim", d // 2)
-    qk_rope_head_dim = cfg.get("qk_rope_head_dim", d - qk_nope_head_dim)
-
-    ops: list[OpNode] = []
-
-    # Q projection (may go through LoRA compression)
-    if q_lora_rank > 0:
-        # Compressed Q: H → q_lora_rank → n_h * d
-        ops.append(OpNode(
-            name="aten::mm", role="q_compress",
-            backend="torch-xpu-ops",
-            input_shapes=[[tokens, "H"], ["H", "Q_r"]],
-            output_shape=[tokens, "Q_r"],
-            memory_bytes=_mm_mem(T, H, q_lora_rank, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
-            flops=_mm_flops(T, H, q_lora_rank) if isinstance(T, int) else 0,
-            phase=phase,
-        ))
-        ops.append(OpNode(
-            name="rms_norm", role="q_norm",
-            backend="vllm-xpu-kernels",
-            input_shapes=[[tokens, "Q_r"]],
-            output_shape=[tokens, "Q_r"],
-            memory_bytes=_norm_mem(T, q_lora_rank, dtype_bytes) if isinstance(T, int) else 0,
-            flops=_norm_flops(T, q_lora_rank) if isinstance(T, int) else 0,
-            phase=phase,
-        ))
-        out_q = n_h * (qk_nope_head_dim + qk_rope_head_dim)
-        ops.append(OpNode(
-            name="aten::mm", role="q_decompress",
-            backend="torch-xpu-ops",
-            input_shapes=[[tokens, "Q_r"],
-                          ["Q_r", nhDqh_sym]],
-            output_shape=[tokens, nhDqh_sym],
-            memory_bytes=_mm_mem(T, q_lora_rank, out_q, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
-            flops=_mm_flops(T, q_lora_rank, out_q) if isinstance(T, int) else 0,
-            phase=phase,
-        ))
-    else:
-        # Standard Q projection
-        qkv_size = (n_h + 2 * n_kv) * d
-        ops.append(OpNode(
-            name="aten::mm", role="qkv_proj",
-            backend="torch-xpu-ops",
-            input_shapes=[[tokens, "H"], ["H", qkv_sym]],
-            output_shape=[tokens, qkv_sym],
-            memory_bytes=_mm_mem(T, H, qkv_size, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
-            flops=_mm_flops(T, H, qkv_size) if isinstance(T, int) else 0,
-            phase=phase,
-        ))
-
-    # KV compression: H → kv_lora_rank (latent)
-    ops.append(OpNode(
-        name="aten::mm", role="kv_compress",
-        backend="torch-xpu-ops",
-        input_shapes=[[tokens, "H"], ["H", "KV_r"]],
-        output_shape=[tokens, "KV_r"],
-        memory_bytes=_mm_mem(T, H, kv_lora_rank, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
-        flops=_mm_flops(T, H, kv_lora_rank) if isinstance(T, int) else 0,
-        phase=phase,
-    ))
-
-    # KV norm
-    ops.append(OpNode(
-        name="rms_norm", role="kv_norm",
-        backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, "KV_r"]],
-        output_shape=[tokens, "KV_r"],
-        memory_bytes=_norm_mem(T, kv_lora_rank, dtype_bytes) if isinstance(T, int) else 0,
-        flops=_norm_flops(T, kv_lora_rank) if isinstance(T, int) else 0,
-        phase=phase,
-    ))
-
-    # RoPE on the rope portion
-    ops.append(OpNode(
-        name="deepseek_scaling_rope", role="rotary_emb",
-        backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, nh_sym, "D_rope"]],
-        output_shape=[tokens, nh_sym, "D_rope"],
-        memory_bytes=(T * n_h * qk_rope_head_dim * dtype_bytes * 3) if isinstance(T, int) else 0,
-        flops=(T * n_h * qk_rope_head_dim * 6) if isinstance(T, int) else 0,
-        phase=phase,
-    ))
-
-    # MLA attention kernel
-    # Q input per head = D_qh (qk_nope_head_dim + qk_rope_head_dim)
-    # Attention output per head uses v_head_dim (may differ from head_dim)
-    d_qh = qk_nope_head_dim + qk_rope_head_dim
-    v_dim_sym = "v_d" if v_d != d else "d"
-    q_dim_sym = "D_qh" if d_qh != d else "d"
-    # MLA prefill runs the flash-attention varlen kernel; decode runs the
-    # cutlass paged-decode kernel. (Do NOT name this "gdn_attention" — that is
-    # the Gated Delta Net linear-attention kernel used by Qwen3-Next, a
-    # different mechanism entirely.)
-    mla_attn_name = (
-        "flash_attn_varlen_fwd" if phase == "prefill" else "cutlass_paged_decode"
-    )
-    ops.append(OpNode(
-        name=mla_attn_name, role="attention",
-        backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, nh_sym, q_dim_sym], [seq, "KV_r"]],
-        output_shape=[tokens, nh_sym, v_dim_sym],
-        memory_bytes=0,
-        flops=(2 * T * S * n_h * v_d) if isinstance(T, int) and isinstance(S, int) else 0,
-        phase=phase,
-    ))
-
-    # KV cache (compressed — stores latent, not full K/V)
-    ops.append(OpNode(
-        name="concat_and_cache_mla", role="cache_store",
-        backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, "KV_r"]],
-        output_shape=[],
-        memory_bytes=(T * kv_lora_rank * dtype_bytes) if isinstance(T, int) else 0,
-        flops=0,
-        phase=phase,
-    ))
-
-    # Output projection — input dim is n_h * v_head_dim (attention output)
-    o_lora_rank = cfg.get("o_lora_rank", 0)
-    o_groups = cfg.get("o_groups", 1)
-    nhvd = n_h * v_d  # per-rank attention output dimension
-    if o_lora_rank > 0:
-        # V4-style grouped low-rank output projection (block-diagonal):
-        #   wo_a (ColumnParallel, batched over groups): attn_out → G·O_r/TP
-        #     Block-diagonal: G/TP groups each doing [n_h*v_d/(G/TP), O_r]
-        #     Weight total per-rank: n_h*v_d * O_r (block-diagonal sum)
-        #     FLOPs = 2 * T * n_h*v_d * O_r (same as dense equivalent)
-        #   wo_b (RowParallel): G·O_r/TP → H
-        #     Weight per-rank: [G*O_r/TP, H]
-        #     FLOPs = 2 * T * (G*O_r/TP) * H
-        go_per_tp = o_groups * o_lora_rank // tp
-        # Block-diagonal memory: input[T, nhvd] + weight[nhvd * O_r] + output[T, go_per_tp]
-        o_compress_mem = (
-            (T * nhvd * dtype_bytes + nhvd * o_lora_rank * w_bytes
-             + T * go_per_tp * dtype_bytes)
-            if isinstance(T, int) else 0
-        )
-        ops.append(OpNode(
-            name="aten::mm", role="o_compress",
-            backend="torch-xpu-ops",
-            input_shapes=[[tokens, nhvd_sym], [nhvd_sym, "G·O_r/TP"]],
-            output_shape=[tokens, "G·O_r/TP"],
-            memory_bytes=o_compress_mem,
-            flops=_mm_flops(T, nhvd, o_lora_rank) if isinstance(T, int) else 0,
-            phase=phase,
-        ))
-        ops.append(OpNode(
-            name="aten::mm", role="o_decompress",
-            backend="torch-xpu-ops",
-            input_shapes=[[tokens, "G·O_r/TP"], ["G·O_r/TP", "H"]],
-            output_shape=[tokens, "H"],
-            memory_bytes=_mm_mem(T, go_per_tp, H, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
-            flops=_mm_flops(T, go_per_tp, H) if isinstance(T, int) else 0,
-            phase=phase,
-        ))
-    else:
-        # Standard output projection (V2/V3 style)
-        ops.append(OpNode(
-            name="aten::mm", role="o_proj",
-            backend="torch-xpu-ops",
-            input_shapes=[[tokens, nhvd_sym], [nhvd_sym, "H"]],
-            output_shape=[tokens, "H"],
-            memory_bytes=_mm_mem(T, nhvd, H, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
-            flops=_mm_flops(T, nhvd, H) if isinstance(T, int) else 0,
-            phase=phase,
-        ))
-
-    return ops
-
-
-def _build_mla_decoder_layer(
-    cfg: dict, arch_family: str, phase: str, tokens: str, seq: str
-) -> ModuleNode:
-    """Build one decoder layer with MLA attention (DeepSeek-V2/V3)."""
-    input_norm = ModuleNode(
-        name="input_layernorm", path="model.layers.*.input_layernorm",
-        module_type="RMSNorm",
-        ops=[_build_norm_op(cfg, "input_layernorm", tokens, phase)],
-    )
-
-    attn_ops = _build_mla_attention_ops(cfg, phase, tokens, seq)
-    attention = ModuleNode(
-        name="self_attn", path="model.layers.*.self_attn",
-        module_type=f"{arch_family}MLAAttention", ops=attn_ops,
-    )
-
-    post_norm = ModuleNode(
-        name="post_attention_layernorm",
-        path="model.layers.*.post_attention_layernorm",
-        module_type="RMSNorm",
-        ops=[_build_norm_op(cfg, "post_attention_layernorm", tokens, phase)],
-    )
-
-    mlp_ops = _build_mlp_ops(cfg, phase, tokens)
-    mlp = ModuleNode(
-        name="mlp", path="model.layers.*.mlp",
-        module_type=f"{arch_family}MLP", ops=mlp_ops,
-    )
-
-    layer = ModuleNode(
-        name="decoder_layer", path="model.layers.*",
-        module_type=f"{arch_family}DecoderLayer",
-        children=[input_norm, attention, post_norm, mlp],
-        repeat_count=cfg["num_layers"],
-    )
-    return layer
-
-
-def _build_mla_moe_layer(
-    cfg: dict, arch_family: str, phase: str, tokens: str, seq: str
-) -> ModuleNode:
-    """Build one MoE decoder layer with MLA attention (DeepSeek-V2/V3)."""
-    num_experts = cfg.get("num_experts", 8)
-    top_k = cfg.get("num_experts_per_tok", 2)
-    n_shared = cfg.get("n_shared_experts", 0)
-    H = cfg["hidden_size"]
-    # Use TP-divided values for numeric calculations
-    moe_I = cfg.get("_tp_moe_intermediate_size") or cfg["_tp_intermediate_size"]
-    I = cfg["_tp_intermediate_size"]
-    dtype_bytes = cfg["dtype_bytes"]
-    T = cfg.get(f"_{tokens}", tokens)
-    tp = cfg["tp_size"]
-
-    input_norm = ModuleNode(
-        name="input_layernorm", path="model.layers.*.input_layernorm",
-        module_type="RMSNorm",
-        ops=[_build_norm_op(cfg, "input_layernorm", tokens, phase)],
-    )
-
-    attn_ops = _build_mla_attention_ops(cfg, phase, tokens, seq)
-    attention = ModuleNode(
-        name="self_attn", path="model.layers.*.self_attn",
-        module_type=f"{arch_family}MLAAttention", ops=attn_ops,
-    )
-
-    post_norm = ModuleNode(
-        name="post_attention_layernorm",
-        path="model.layers.*.post_attention_layernorm",
-        module_type="RMSNorm",
-        ops=[_build_norm_op(cfg, "post_attention_layernorm", tokens, phase)],
-    )
-
-    # MoE block (same structure as standard MoE)
-    # Determine base symbol names (before TP division)
-    raw_moe_I = cfg.get("moe_intermediate_size") or cfg["intermediate_size"]
-    raw_I = cfg["intermediate_size"]
-    moe_I_base = "I_moe" if raw_moe_I != raw_I else "I"
-    moe_2I_base = "2·I_moe" if raw_moe_I != raw_I else "2·I"
-    moe_I_sym = f"{moe_I_base}/TP"
-    moe_2I_sym = f"{moe_2I_base}/TP"
-
-    gate_op = OpNode(
-        name="aten::mm", role="router_gate",
-        backend="torch-xpu-ops",
-        input_shapes=[[tokens, "H"], ["H", "E"]],
-        output_shape=[tokens, "E"],
-        memory_bytes=_mm_mem(T, H, num_experts, dtype_bytes) if isinstance(T, int) else 0,
-        flops=_mm_flops(T, H, num_experts) if isinstance(T, int) else 0,
-        phase=phase,
-    )
-    align_op = OpNode(
-        name="moe_align_block_size", role="moe_routing",
-        backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, "E"]],
-        output_shape=[tokens],
-        memory_bytes=0, flops=0, phase=phase,
-    )
-    expert_mm1 = OpNode(
-        name="aten::mm", role="expert_gate_up",
-        backend="torch-xpu-ops",
-        input_shapes=[[f"{tokens}·K", "H"], ["H", moe_2I_sym]],
-        output_shape=[f"{tokens}·K", moe_2I_sym],
-        memory_bytes=_mm_mem(T * top_k, H, 2 * moe_I, dtype_bytes) if isinstance(T, int) else 0,
-        flops=_mm_flops(T * top_k, H, 2 * moe_I) if isinstance(T, int) else 0,
-        phase=phase,
-    )
-    expert_act = OpNode(
-        name="silu_and_mul", role="expert_activation",
-        backend="vllm-xpu-kernels",
-        input_shapes=[[f"{tokens}·K", moe_2I_sym]],
-        output_shape=[f"{tokens}·K", moe_I_sym],
-        memory_bytes=_activation_mem(T * top_k, moe_I, dtype_bytes) if isinstance(T, int) else 0,
-        flops=_activation_flops(T * top_k, moe_I) if isinstance(T, int) else 0,
-        phase=phase,
-    )
-    expert_mm2 = OpNode(
-        name="aten::mm", role="expert_down",
-        backend="torch-xpu-ops",
-        input_shapes=[[f"{tokens}·K", moe_I_sym], [moe_I_sym, "H"]],
-        output_shape=[f"{tokens}·K", "H"],
-        memory_bytes=_mm_mem(T * top_k, moe_I, H, dtype_bytes) if isinstance(T, int) else 0,
-        flops=_mm_flops(T * top_k, moe_I, H) if isinstance(T, int) else 0,
-        phase=phase,
-    )
-
-    moe_ops = [gate_op, align_op, expert_mm1, expert_act, expert_mm2]
-
-    # Shared experts
-    if n_shared > 0:
-        shared_mm1 = OpNode(
-            name="aten::mm", role="shared_expert_gate_up",
-            backend="torch-xpu-ops",
-            input_shapes=[[tokens, "H"], ["H", moe_2I_sym]],
-            output_shape=[tokens, moe_2I_sym],
-            memory_bytes=_mm_mem(T, H, 2 * moe_I * n_shared, dtype_bytes) if isinstance(T, int) else 0,
-            flops=_mm_flops(T, H, 2 * moe_I * n_shared) if isinstance(T, int) else 0,
-            phase=phase,
-        )
-        shared_act = OpNode(
-            name="silu_and_mul", role="shared_expert_activation",
-            backend="vllm-xpu-kernels",
-            input_shapes=[[tokens, moe_2I_sym]],
-            output_shape=[tokens, moe_I_sym],
-            memory_bytes=_activation_mem(T, moe_I * n_shared, dtype_bytes) if isinstance(T, int) else 0,
-            flops=_activation_flops(T, moe_I * n_shared) if isinstance(T, int) else 0,
-            phase=phase,
-        )
-        shared_mm2 = OpNode(
-            name="aten::mm", role="shared_expert_down",
-            backend="torch-xpu-ops",
-            input_shapes=[[tokens, moe_I_sym], [moe_I_sym, "H"]],
-            output_shape=[tokens, "H"],
-            memory_bytes=_mm_mem(T, moe_I * n_shared, H, dtype_bytes) if isinstance(T, int) else 0,
-            flops=_mm_flops(T, moe_I * n_shared, H) if isinstance(T, int) else 0,
-            phase=phase,
-        )
-        moe_ops.extend([shared_mm1, shared_act, shared_mm2])
-
-    moe = ModuleNode(
-        name="moe", path="model.layers.*.mlp",
-        module_type=f"{arch_family}MoE", ops=moe_ops,
-    )
-
-    layer = ModuleNode(
-        name="decoder_layer", path="model.layers.*",
-        module_type=f"{arch_family}DecoderLayer",
-        children=[input_norm, attention, post_norm, moe],
-        repeat_count=cfg["num_layers"],
-    )
-    return layer
 
 
 def _build_vision_encoder(
@@ -1356,11 +683,13 @@ def build_model_graph(
         tp_size: tensor parallel size (splits heads, intermediate, vocab)
         quantization: quantization method (e.g. "fp8", "gptq", "awq").
             Affects weight dtype_bytes and adds dequant ops to the graph.
-        raw_config: raw HF ``config.json`` dict. When provided (and TP=1, no
-            quantization), the prefill/decode trees are derived from a real
-            ``torch.export`` trace of the vLLM model instead of the static
-            per-architecture builders. Falls back to the static builders on any
-            tracing failure.
+        raw_config: raw HF ``config.json`` dict. REQUIRED for decoder LLMs —
+            the prefill/decode trees are derived from a real ``torch.export``
+            trace of the vLLM model (see model_tracer). The static
+            per-architecture builders have been removed; there is no fallback,
+            so a tracing failure (or a missing ``raw_config``) hard-fails with a
+            clear error. Encoder-only and diffusion models use their own
+            dedicated builders and do not require ``raw_config``.
 
     Returns:
         Dict with "prefill" and "decode" trees, plus metadata.
@@ -1580,189 +909,69 @@ def build_model_graph(
         if o_lora_rank > 0:
             result["symbols"]["G·O_r"] = o_groups * o_lora_rank
 
-    # Build prefill and decode graphs.
+    # Build prefill and decode graphs by deriving the op graph from a single
+    # ``torch.export`` trace of the real vLLM model (see model_tracer). This is
+    # the SOLE builder for decoder LLMs — the graph and its backend labels track
+    # the actual vLLM/kernels code instead of hand-written per-architecture
+    # builders. The static builders have been removed, so there is NO fallback:
+    # any tracing failure (or a missing ``raw_config``) hard-fails below with a
+    # clear error.
     #
-    # Preferred path: derive the op graph from a single ``torch.export`` trace of
-    # the real vLLM model (see model_tracer). This makes the graph and its
-    # backend labels track the actual vLLM/kernels code instead of hand-written
-    # per-architecture builders.
-    #
-    # Scope: dense or uniform-MoE single-stack models. Multimodal (vision tower
-    # + LM) and quantized models are left to the static builders for now. TP>1
-    # is supported analytically — the model is exported at TP=1 and per-rank cost
-    # is divided by op role (see model_tracer._tp_shard_factor). Any tracing
-    # failure also falls back to the static builders below.
-    traced = None
     # The tracer groups decoder layers by op signature, so it handles uniform
     # MoE *and* hybrid stacks (leading dense layers via ``first_k_dense_replace``
-    # or alternating ``decoder_sparse_step``/``moe_layer_freq``) and MLA. For VL
+    # or alternating ``decoder_sparse_step``/``moe_layer_freq``) and MLA. TP>1
+    # and quantization are modelled analytically (the model is exported at TP=1
+    # in BF16 and per-op cost is adjusted by role; see model_tracer). For VL
     # models the text-only export captures just the language-model stack (no
     # image inputs → no vision ops, so no multi-ModuleList), and the vision tower
-    # + projector are spliced in analytically below — mirroring the static path.
+    # + projector are spliced in analytically below.
     #
     # VL tracing is gated to architecture families whose multimodal cost is known
     # to decompose cleanly into "vision encoder + projector + ordinary decoder
     # prefill" (verified text-only export captures NO vision/fusion ops). Other
     # VL families (cross-attention, Q-former/resampler, unconditional vision) may
     # export text-only "successfully" yet silently omit fusion compute, so they
-    # stay on the static builder until individually validated.
+    # are rejected (hard-fail) until individually validated.
+    if raw_config is None:
+        raise ValueError(
+            f"build_model_graph requires raw_config to trace decoder model "
+            f"family '{family}' (arch '{arch}'); the static per-architecture "
+            f"builders have been removed. Pass raw_config=<HF config.json dict>."
+        )
     vl_tracer_ok = (not is_vl) or (family in _TRACER_VERIFIED_VL)
-    use_tracer = raw_config is not None and vl_tracer_ok
-    if use_tracer:
-        # VL: build the vision tower + projector (prefill only) from the same
-        # helpers the static builder uses, to splice into the traced LM graph.
-        extra_children = None
-        if is_vl:
-            extra_children = {"prefill": [
-                _build_vision_encoder(cfg, "prefill", "S"),
-                _build_vl_projector(cfg, "prefill", "S"),
-            ]}
-        try:
-            from .model_tracer import build_traced_graph
-            traced = build_traced_graph(
-                raw_config, model_summary, result["symbols"],
-                prefill_len, decode_batch, context_len, tp_size=tp_size,
-                weight_dtype_bytes=cfg.get("weight_dtype_bytes"),
-                extra_children=extra_children,
-            )
-        except Exception as e:  # noqa: BLE001 — fall back to static builders
-            logger.warning("torch.export tracing failed (%s); "
-                           "falling back to static builder", e)
-            traced = None
+    if not vl_tracer_ok:
+        raise ValueError(
+            f"VL family '{family}' is not validated for torch.export tracing "
+            f"(supported VL families: {sorted(_TRACER_VERIFIED_VL)}); the "
+            f"static fallback builder has been removed."
+        )
 
-    if traced is not None:
-        result["prefill"] = traced["prefill"]
-        result["decode"] = traced["decode"]
-        result["graph_source"] = traced.get("graph_source", "torch.export")
-        return result
-
-    result["graph_source"] = "static"
-    # Both phases use B·S as the token dimension for alignment:
-    #   Prefill: S = prefill_len (e.g. 128), so B·S = batch × seq_len
-    #   Decode:  S = 1 (always), so B·S = batch × 1 = batch
-    # kv_len:
-    #   Prefill: S+C per sequence (query tokens + prior context)
-    #   Decode:  C (full context length)
-    for phase, tok_var, seq_var in [
-        ("prefill", "B·S", "S+C"),
-        ("decode", "B·S", "C"),
-    ]:
-        root = _build_full_model(cfg, family, is_moe, phase, tok_var, seq_var)
-        _compute_totals(root)
-        result[phase] = root.to_dict()
-
-    return result
-
-
-def _build_full_model(
-    cfg: dict, family: str, is_moe: bool, phase: str,
-    tokens: str, seq: str,
-) -> ModuleNode:
-    """Build the complete model tree."""
-    H = cfg["hidden_size"]
-    V = cfg["_tp_vocab_size"]
-    dtype_bytes = cfg["dtype_bytes"]
-    T = cfg.get(f"_{tokens}", tokens)
-    first_k_dense = cfg.get("first_k_dense_replace", 0)
-    is_mla = cfg.get("is_mla", False)
-    is_vl = cfg.get("is_vl", False)
-    tp = cfg["tp_size"]
-    v_sym = "V/TP"
-
-    children: list[ModuleNode] = []
-
-    # Vision encoder (for VL models, prefill phase only)
-    if is_vl and phase == "prefill":
-        vit = _build_vision_encoder(cfg, phase, tokens)
-        children.append(vit)
-        proj = _build_vl_projector(cfg, phase, tokens)
-        children.append(proj)
-
-    # Text embedding
-    embed = ModuleNode(
-        name="embed_tokens", path="model.embed_tokens",
-        module_type="VocabParallelEmbedding",
-        ops=[OpNode(
-            name="aten::embedding", role="embedding",
-            backend="torch-xpu-ops",
-            input_shapes=[[v_sym, "H"], [tokens]],
-            output_shape=[tokens, "H"],
-            memory_bytes=(T * H * dtype_bytes) if isinstance(T, int) else 0,
-            flops=0,
-            phase=phase,
-        )],
-    )
-    children.append(embed)
-
-    # Decoder layers — handle MLA, hybrid dense/MoE, standard dense/MoE
-    layers: list[ModuleNode] = []
-
-    # Choose the right layer builders based on architecture
-    if is_mla:
-        # MLA architectures (DeepSeek-V2/V3)
-        dense_builder = _build_mla_decoder_layer
-        moe_builder = _build_mla_moe_layer
-    else:
-        dense_builder = _build_decoder_layer
-        moe_builder = _build_moe_layer
-
-    if is_moe and first_k_dense > 0:
-        # Hybrid: first N layers are dense, rest are MoE
-        dense_layer = dense_builder(cfg, family, phase, tokens, seq)
-        dense_layer.name = "dense_layer"
-        dense_layer.module_type = f"{family}DenseLayer"
-        dense_layer.repeat_count = first_k_dense
-        layers.append(dense_layer)
-
-        num_moe_layers = cfg["num_layers"] - first_k_dense
-        moe_layer = moe_builder(cfg, family, phase, tokens, seq)
-        moe_layer.name = "moe_layer"
-        moe_layer.module_type = f"{family}MoELayer"
-        moe_layer.repeat_count = num_moe_layers
-        layers.append(moe_layer)
-    elif is_moe:
-        layer = moe_builder(cfg, family, phase, tokens, seq)
-        layers.append(layer)
-    else:
-        layer = dense_builder(cfg, family, phase, tokens, seq)
-        layers.append(layer)
-
-    children.extend(layers)
-
-    # Final norm
-    final_norm = ModuleNode(
-        name="norm", path="model.norm",
-        module_type="RMSNorm",
-        ops=[_build_norm_op(cfg, "final_norm", tokens, phase)],
-    )
-    children.append(final_norm)
-
-    # LM head
-    lm_head = ModuleNode(
-        name="lm_head", path="lm_head",
-        module_type="ParallelLMHead",
-        ops=[OpNode(
-            name="aten::mm", role="lm_head",
-            backend="torch-xpu-ops",
-            input_shapes=[[tokens, "H"], ["H", v_sym]],
-            output_shape=[tokens, v_sym],
-            memory_bytes=_mm_mem(T, H, V, dtype_bytes) if isinstance(T, int) else 0,
-            flops=_mm_flops(T, H, V) if isinstance(T, int) else 0,
-            phase=phase,
-        )],
-    )
-    children.append(lm_head)
-
-    model_type = f"{family}ForCausalLM"
+    # VL: build the vision tower + projector (prefill only) to splice into the
+    # traced LM graph.
+    extra_children = None
     if is_vl:
-        model_type = f"{family}ForConditionalGeneration"
+        extra_children = {"prefill": [
+            _build_vision_encoder(cfg, "prefill", "S"),
+            _build_vl_projector(cfg, "prefill", "S"),
+        ]}
+    from .model_tracer import build_traced_graph
+    try:
+        traced = build_traced_graph(
+            raw_config, model_summary, result["symbols"],
+            prefill_len, decode_batch, context_len, tp_size=tp_size,
+            weight_dtype_bytes=cfg.get("weight_dtype_bytes"),
+            extra_children=extra_children,
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"torch.export tracing failed for model family '{family}' "
+            f"(arch '{arch}'); the static fallback builder has been removed."
+        ) from e
 
-    root = ModuleNode(
-        name="model", path="",
-        module_type=model_type,
-        children=children,
-    )
-    return root
+    result["prefill"] = traced["prefill"]
+    result["decode"] = traced["decode"]
+    result["graph_source"] = traced.get("graph_source", "torch.export")
+    return result
 
 
 def _build_encoder_graph(

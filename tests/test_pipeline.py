@@ -175,8 +175,10 @@ class TestModelInfo(unittest.TestCase):
         self.assertEqual(summary["intermediate_size"], 25600)
         self.assertEqual(summary["vocab_size"], 152064)
 
-    def test_graph_build_nested_text_config(self):
-        """build_model_graph must not crash when dims come from text_config."""
+    def test_graph_build_nested_text_config_requires_raw_config(self):
+        """Decoder graph building now requires raw_config (static builders
+        removed). Without it, build_model_graph must hard-fail with a clear
+        error rather than silently producing a static graph."""
         from breakdown.model_graph import build_model_graph
         config = {
             "architectures": ["FakeVLForConditionalGeneration"],
@@ -192,18 +194,41 @@ class TestModelInfo(unittest.TestCase):
             "vision_config": {"hidden_size": 1280},
         }
         summary = summarize_config(config)
-        graph = build_model_graph(summary, prefill_len=128)
-        self.assertIn("prefill", graph)
-        self.assertTrue(graph["prefill"].get("children"))
+        with self.assertRaises(ValueError) as ctx:
+            build_model_graph(summary, prefill_len=128)
+        self.assertIn("raw_config", str(ctx.exception))
 
-    def test_summarize_missing_dims_no_crash(self):
-        """A config with no resolvable LLM dims must not raise in graph build."""
+    def test_summarize_missing_dims_hard_fails_without_raw_config(self):
+        """A config with no resolvable LLM dims and no raw_config must raise a
+        clear error (the static graceful-degradation path has been removed)."""
         from breakdown.model_graph import build_model_graph
         config = {"architectures": ["MysteryForCausalLM"], "model_type": "mystery"}
         summary = summarize_config(config)
-        # Should build without raising even though dims are absent.
-        graph = build_model_graph(summary, prefill_len=128)
-        self.assertIn("prefill", graph)
+        with self.assertRaises(ValueError) as ctx:
+            build_model_graph(summary, prefill_len=128)
+        self.assertIn("raw_config", str(ctx.exception))
+
+    def test_unsupported_vl_family_hard_fails(self):
+        """A VL family not validated for tracing must hard-fail with a clear
+        error even when raw_config IS provided (no static VL fallback)."""
+        from breakdown.model_graph import build_model_graph
+        config = {
+            "architectures": ["Qwen3VLForConditionalGeneration"],
+            "model_type": "qwen3_vl",
+            "text_config": {
+                "hidden_size": 2048,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 4,
+                "intermediate_size": 8192,
+                "vocab_size": 152064,
+            },
+            "vision_config": {"hidden_size": 1280},
+        }
+        summary = summarize_config(config)
+        with self.assertRaises(ValueError) as ctx:
+            build_model_graph(summary, prefill_len=128, raw_config=config)
+        self.assertIn("VL family", str(ctx.exception))
 
 
 # ===================================================================
@@ -757,59 +782,7 @@ class TestDtypeSize(unittest.TestCase):
         self.assertEqual(dtype_size("torch.bfloat16"), 2)
 
 
-# ---- Offline MLA configs (no HuggingFace fetch / no GPU required) ----
-# MLA (Multi-head Latent Attention) profiling is now supported on XPU via the
-# TRITON_MLA backend (dense MLA) and the XPU_MLA_SPARSE backend (DeepSeek sparse
-# attention). These configs let us exercise the static MLA graph builders
-# without hitting the network.
-_DEEPSEEK_V2_CONFIG = {
-    "architectures": ["DeepseekV2ForCausalLM"],
-    "model_type": "deepseek_v2",
-    "hidden_size": 5120,
-    "num_hidden_layers": 4,
-    "num_attention_heads": 128,
-    "num_key_value_heads": 128,
-    "head_dim": 192,
-    "intermediate_size": 12288,
-    "moe_intermediate_size": 1536,
-    "vocab_size": 102400,
-    "torch_dtype": "bfloat16",
-    "n_routed_experts": 160,
-    "num_experts_per_tok": 6,
-    "n_shared_experts": 2,
-    "first_k_dense_replace": 1,
-    "kv_lora_rank": 512,
-    "q_lora_rank": 1536,
-    "qk_nope_head_dim": 128,
-    "qk_rope_head_dim": 64,
-    "v_head_dim": 128,
-}
-
-# GLM-style MLA + DeepSeek Sparse Attention (DSA), routed to XPU_MLA_SPARSE.
-_GLM_MOE_DSA_CONFIG = {
-    "architectures": ["GlmMoeDsaForCausalLM"],
-    "model_type": "glm_moe_dsa",
-    "hidden_size": 4096,
-    "num_hidden_layers": 3,
-    "num_attention_heads": 96,
-    "num_key_value_heads": 96,
-    "head_dim": 64,
-    "intermediate_size": 10944,
-    "moe_intermediate_size": 1408,
-    "vocab_size": 151552,
-    "torch_dtype": "bfloat16",
-    "n_routed_experts": 256,
-    "num_experts_per_tok": 8,
-    "n_shared_experts": 1,
-    "first_k_dense_replace": 1,
-    "kv_lora_rank": 512,
-    "q_lora_rank": 1536,
-    "qk_nope_head_dim": 128,
-    "qk_rope_head_dim": 64,
-    "v_head_dim": 256,
-}
-
-# Backends MLA ops are allowed to run on (XPU-supported, no CPU fallback).
+# Backends ops are allowed to run on (XPU-supported, no CPU fallback).
 _XPU_SUPPORTED_BACKENDS = {"vllm-xpu-kernels", "torch-xpu-ops", "triton", "framework"}
 
 
@@ -820,84 +793,6 @@ def _collect_ops(node: dict) -> list[dict]:
         ops.extend(_collect_ops(child))
     return ops
 
-
-class TestMLAModelGraph(unittest.TestCase):
-    """MLA architectures are supported on XPU — static graph must build and
-    route attention to XPU backends (regression test for the removed profiling
-    block that hard-rejected MLA models)."""
-
-    def _build(self, config: dict) -> dict:
-        from breakdown.model_graph import build_model_graph
-        from breakdown.model_info import summarize_config
-
-        summary = summarize_config(config)
-        return build_model_graph(
-            summary, prefill_len=128, decode_batch=1, context_len=2048
-        )
-
-    def test_deepseek_v2_graph_builds(self):
-        graph = self._build(_DEEPSEEK_V2_CONFIG)
-        self.assertEqual(graph["family"], "DeepSeekV2")
-        # MLA models have both prefill and decode phases (autoregressive).
-        self.assertIsNotNone(graph["prefill"])
-        self.assertIsNotNone(graph["decode"])
-
-    def test_glm_moe_dsa_graph_builds(self):
-        graph = self._build(_GLM_MOE_DSA_CONFIG)
-        self.assertEqual(graph["family"], "GLM5MoE")
-        self.assertIsNotNone(graph["prefill"])
-        self.assertIsNotNone(graph["decode"])
-        # GLM5 has v_head_dim != head_dim — exercises the differing-head-dim path.
-        self.assertEqual(graph["symbols"].get("v_d"), 256)
-
-    def test_mla_attention_op_present(self):
-        for config in (_DEEPSEEK_V2_CONFIG, _GLM_MOE_DSA_CONFIG):
-            graph = self._build(config)
-            ops = _collect_ops(graph["prefill"])
-            attn = [o for o in ops if o.get("role") == "attention"]
-            self.assertTrue(
-                attn, f"no attention op for {config['architectures'][0]}"
-            )
-
-    def test_mla_attention_not_named_gdn(self):
-        # Regression: MLA attention must NOT be labeled "gdn_attention" — that is
-        # the Gated Delta Net (linear attention) kernel used by Qwen3-Next, not
-        # MLA. Expect the accurate flash/paged-decode kernel names per phase.
-        expected = {
-            "prefill": "flash_attn_varlen_fwd",
-            "decode": "cutlass_paged_decode",
-        }
-        for config in (_DEEPSEEK_V2_CONFIG, _GLM_MOE_DSA_CONFIG):
-            graph = self._build(config)
-            for phase, name in expected.items():
-                attn = [
-                    o for o in _collect_ops(graph[phase])
-                    if o.get("role") == "attention"
-                ]
-                names = {o["name"] for o in attn}
-                self.assertNotIn(
-                    "gdn_attention", names,
-                    f"{config['architectures'][0]} {phase} mislabels MLA "
-                    f"attention as gdn_attention",
-                )
-                self.assertIn(
-                    name, names,
-                    f"{config['architectures'][0]} {phase} missing MLA "
-                    f"attention op {name}",
-                )
-
-    def test_mla_ops_use_xpu_backends(self):
-        # Regression: MLA must not fall back to CPU on XPU.
-        for config in (_DEEPSEEK_V2_CONFIG, _GLM_MOE_DSA_CONFIG):
-            graph = self._build(config)
-            for phase in ("prefill", "decode"):
-                for op in _collect_ops(graph[phase]):
-                    self.assertIn(
-                        op["backend"],
-                        _XPU_SUPPORTED_BACKENDS,
-                        f"{config['architectures'][0]} {phase} op "
-                        f"{op['name']} fell back to {op['backend']}",
-                    )
 
 
 # ---- Trace-based graph builder (model_tracer) ----

@@ -270,6 +270,7 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             summary = summarize_config(config)
             dim_symbols = get_dim_symbols(summary)
         except Exception:
+            config = None
             summary = {}
             dim_symbols = {}
 
@@ -446,7 +447,8 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
                                       decode_batch=batch_size,
                                       context_len=max_model_len,
                                       tp_size=tp_size,
-                                      quantization=quantization)
+                                      quantization=quantization,
+                                      raw_config=config)
             # Try module-path-based annotation first (more precise)
             module_ops = parse_trace_with_modules(rank_files[0])
             if module_ops:
@@ -1792,6 +1794,7 @@ def export_shape_matrix():
     test_graph = build_model_graph(
         summary, prefill_len=1, decode_batch=1, context_len=1,
         tp_size=tp_sizes[0], quantization=quantization,
+        raw_config=config,
     )
     test_tree = test_graph.get("prefill") or test_graph.get("decode")
     test_ops_count = 0
@@ -1843,6 +1846,7 @@ def export_shape_matrix():
             context_len=cfg["context_len"],
             tp_size=cfg["tp_size"],
             quantization=quantization,
+            raw_config=config,
         )
         graph_cfg = graph.get("config", {})
         symbols = graph.get("symbols", {})

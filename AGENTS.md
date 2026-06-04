@@ -75,22 +75,23 @@ pytest tests/ -v
 
 ### Model Graph Builder (`model_graph.py`)
 
-The core engine for static analysis. Key concepts:
+The entry point for the op graph. Decoder LLMs are traced via
+`model_tracer.py` (`torch.export`); this module keeps only the FusedMoE
+re-expansion, vision/projector, encoder, and diffusion builders. Key concepts:
 
-- **`_ARCH_FAMILY_MAP`** — Maps HuggingFace `architectures` field to family names (35+ entries). This determines which graph builder is used.
-- **Architecture category sets** — `_MLA_ARCHS`, `_VL_ARCHS`, `_ENCODER_ARCHS`, `_DIFFUSION_ARCHS` control routing in `build_model_graph()`.
+- **`_ARCH_FAMILY_MAP`** — Maps HuggingFace `architectures` field to family names (35+ entries). This determines routing (encoder/diffusion vs. traced decoder).
+- **Architecture category sets** — `_MLA_ARCHS`, `_VL_ARCHS`, `_ENCODER_ARCHS`, `_DIFFUSION_ARCHS`, `_TRACER_VERIFIED_VL` control routing in `build_model_graph()`.
 - **`ModuleNode` / `OpNode`** — Tree structure representing model modules and their ops with shapes, backends, memory, and FLOPs.
 - **Phase-aware** — Each model gets separate `prefill` and `decode` graphs (different token dimensions).
+- **No static fallback** — `build_model_graph` requires `raw_config` for decoder LLMs and hard-fails (clear error) on a missing config, an unvalidated VL family, or any tracing failure.
 
-Architecture-specific builders:
+Remaining builders (everything else is produced by the tracer):
 | Builder | Used for |
 |---------|----------|
-| `_build_decoder_layer` | Standard GQA decoder (Llama, Qwen, Mistral) |
-| `_build_moe_layer` | MoE decoder (Mixtral, Qwen-MoE) |
-| `_build_mla_decoder_layer` | MLA attention (DeepSeek-V2/V3) |
-| `_build_mla_moe_layer` | MLA + MoE (DeepSeek-V3) |
-| `_build_vision_encoder` | ViT for VL models |
-| `_build_encoder_model` | BERT/RoBERTa for embedding/reranker |
+| `fused_moe_expert_ops` | Re-expands the opaque `FusedMoE` op the trace hides (routing + routed/shared expert GEMMs); reused by the tracer splice |
+| `_build_vision_encoder` | ViT for VL models (spliced into traced VL graph) |
+| `_build_vl_projector` | Vision→LM projector (spliced into traced VL graph) |
+| `_build_encoder_model` | BERT/RoBERTa for embedding/reranker (non-decoder path) |
 | `_build_diffusion_placeholder` | Diffusion models (not vLLM-served) |
 
 > **MLA profiling is supported on XPU.** Dynamic profiling of MLA models
