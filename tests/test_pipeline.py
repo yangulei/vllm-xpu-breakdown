@@ -983,6 +983,49 @@ class TestTracedGraph(unittest.TestCase):
         f4 = decode(4, 128)[1]
         self.assertAlmostEqual(f4 / f1, 4.0, places=5)
 
+    def test_attention_shapes_show_kv_length(self):
+        # The softmax-attention inputs must expose the KV-cache length the op
+        # reads: ``S+C`` for prefill, ``C`` for decode (the raw traced q/k/v
+        # only carry the new tokens, hiding the context).
+        def attn_inputs(node):
+            for op in _collect_ops(node):
+                n = op["name"]
+                if "attention" in n and "gdn" not in n and "linear_attention" not in n:
+                    return op["input_shapes"]
+            return None
+
+        def flat(shapes):
+            return {d for shp in (shapes or []) for d in shp}
+
+        prefill_dims = flat(attn_inputs(self.graph["prefill"]))
+        decode_dims = flat(attn_inputs(self.graph["decode"]))
+        # Prefill K/V token dim is the per-sequence cache length S+C; query is S.
+        self.assertIn("S+C", prefill_dims)
+        self.assertIn("S", prefill_dims)
+        # Decode attends one new token (B) against the length-C cache.
+        self.assertIn("C", decode_dims)
+        self.assertIn("B", decode_dims)
+
+    def test_moe_router_gate_recognized_as_replicated(self):
+        # A custom-named MoE router gate (e.g. Hy3's ``GateLinear``) must be
+        # recognised as the replicated router so TP>1 can be modelled instead of
+        # hard-failing the fail-closed parallel-linear guard.
+        from breakdown.model_tracer import _is_moe_router_gate
+        # Custom class name + gate path + out dim == num_experts → router.
+        self.assertTrue(_is_moe_router_gate(
+            "model.layers.1.mlp.gate", {"x": "GateLinear"}, ["S", 256], 256))
+        # Standard ReplicatedLinear gate, dims unknown → still a router.
+        self.assertTrue(_is_moe_router_gate(
+            "model.layers.0.mlp.gate", {"x": "ReplicatedLinear"}, None, 8))
+        # A SwiGLU gate_proj (basename gate_proj, out dim = intermediate) is NOT
+        # the router and must not be misclassified as replicated.
+        self.assertFalse(_is_moe_router_gate(
+            "model.layers.0.mlp.gate_proj", {"x": "MergedColumnParallelLinear"},
+            ["S", 4096], 256))
+        # A ``gate``-named proj whose out dim != num_experts is rejected.
+        self.assertFalse(_is_moe_router_gate(
+            "model.layers.0.mlp.gate", {"x": "GateLinear"}, ["S", 4096], 256))
+
     def test_tp_uses_tracer_and_shards_cost(self):
         # TP>1 is handled analytically by the tracer (export at TP=1, divide
         # per-rank cost by op role). Sharded ops (attention, projections) halve

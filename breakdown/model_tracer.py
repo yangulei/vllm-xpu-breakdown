@@ -546,6 +546,29 @@ _TP_SHARDED_LINEAR = frozenset({
 _TP_REPLICATED_LINEAR = frozenset({"ReplicatedLinear"})
 
 
+def _is_moe_router_gate(path: str | None, classes: dict | None,
+                        out_shape: list | None, num_experts: int | None) -> bool:
+    """Whether a ``proj`` op is the MoE router/gate (replicated under TP).
+
+    The router gate projects ``hidden -> num_experts`` and is replicated across
+    tensor-parallel ranks (each rank routes its own tokens). vLLM's standard
+    gate is a ``ReplicatedLinear``, but custom architectures name the class
+    differently (e.g. Hy3's ``GateLinear``), so detect it structurally: a
+    ``gate`` projection whose output feature dim equals the expert count. This
+    keeps the fail-closed TP guard from rejecting an otherwise-modellable model.
+    """
+    base = (path or "").rsplit(".", 1)[-1].lower()
+    cls = {str(c).lower() for c in (classes or {}).values()}
+    name_hint = base == "gate" or any("gate" in c and "linear" in c for c in cls)
+    if not name_hint:
+        return False
+    # When the output dim is known it must equal the expert count (rejects a
+    # SwiGLU ``gate_proj`` — basename ``gate_proj`` won't match ``gate`` anyway).
+    if num_experts and out_shape and isinstance(out_shape[-1], int):
+        return out_shape[-1] == num_experts
+    return True
+
+
 def _tp_shard_factor(path: str, role: str, name: str,
                      classes: dict, tp_size: int) -> int:
     """How an op's per-rank cost scales under tensor parallelism.
@@ -685,13 +708,17 @@ def build_traced_graph(
     # back to the static builder rather than guess.
     if tp_size > 1:
         _known_linears = _TP_SHARDED_LINEAR | _TP_REPLICATED_LINEAR
-        for (path, classes, name, _backend, role, *_rest) in collected:
+        _n_experts = model_summary.get("num_experts")
+        for (path, classes, name, _backend, role, _in, out_shape) in collected:
             if role == "proj":
                 cls = set((classes or {}).values())
-                if not (cls & _known_linears):
-                    raise ValueError(
-                        f"projection {path!r} has no recognised parallel-linear "
-                        f"class {sorted(cls)!r}; cannot model TP={tp_size}")
+                if cls & _known_linears:
+                    continue
+                if _is_moe_router_gate(path, classes, out_shape, _n_experts):
+                    continue  # replicated router gate (custom class name)
+                raise ValueError(
+                    f"projection {path!r} has no recognised parallel-linear "
+                    f"class {sorted(cls)!r}; cannot model TP={tp_size}")
 
     # The opaque FusedMoE ops are dropped before layer grouping, so the MoE
     # group's representative is chosen from its (post-removal) signature. Guard
@@ -754,12 +781,16 @@ def build_traced_graph(
             "symbol": "B·S" if batch > 1 else "S",
             "attn_new": prefill_seq,
             "attn_seqs": batch,
+            # KV the attention reads is the per-sequence cache (new S + prior C).
+            "kv_symbol": "S+C",
         },
         "decode": {
             "tokens": batch,
             "symbol": "B",
             "attn_new": batch,
             "attn_seqs": 1,
+            # Decode attends a single new token against the length-C KV cache.
+            "kv_symbol": "C",
         },
     }
     for phase, meta in phase_meta.items():
@@ -777,9 +808,18 @@ def build_traced_graph(
             if factor > 1:
                 mem //= factor
                 flops //= factor
+            _n = name.replace("aten::", "")
+            _is_softmax_attn = (
+                (role == "attention" or "attention" in _n)
+                and "gdn" not in _n and "linear_attention" not in _n)
+            if _is_softmax_attn:
+                in_rendered = _render_attention_shapes(
+                    in_shapes, sym, meta["kv_symbol"])
+            else:
+                in_rendered = [_render_shape(s, sym) for s in in_shapes]
             op = OpNode(
                 name=name, role=role, backend=backend,
-                input_shapes=[_render_shape(s, sym) for s in in_shapes],
+                input_shapes=in_rendered,
                 output_shape=_render_shape(out_shape, sym) if out_shape else [],
                 memory_bytes=mem, flops=flops, phase=phase,
             )
@@ -885,6 +925,39 @@ def _group_layers(collected: list) -> list[tuple[int, int]]:
 def _render_shape(shape: list, token_symbol: str) -> list:
     """Replace the symbolic token dim with a readable symbol (``S``/``B``)."""
     return [d if isinstance(d, int) else token_symbol for d in shape]
+
+
+def _render_attention_shapes(in_shapes: list, new_sym: str,
+                             kv_sym: str) -> list:
+    """Render softmax-attention inputs so the KV cache length (incl. context).
+
+    The traced attention op only carries the *new* tokens' q/k/v as ``[T,h,d]``
+    tensors, so the context the attention actually reads (the length-``C`` KV
+    cache) is invisible in the raw shapes. Substitute the K/V token dim with the
+    KV-length symbol (``S+C`` for prefill, ``C`` for decode) while the query
+    keeps the new-token symbol. K/V are the lower-head-count 3-D tensors under
+    GQA; when head counts are equal (MHA) the first 3-D input is the query and
+    the rest are K/V by trace argument order (``attn(q, k, v, ...)``).
+    """
+    threed = [s for s in in_shapes if len(s) == 3]
+    heads = [s[1] for s in threed if isinstance(s[1], int)]
+    n_h = max(heads) if heads else None
+    n_kv = min(heads) if heads else None
+    gqa = n_h is not None and n_kv is not None and n_h != n_kv
+    out: list = []
+    seen_3d = 0
+    for s in in_shapes:
+        if len(s) == 3:
+            if gqa:
+                is_kv = isinstance(s[1], int) and s[1] == n_kv
+            else:
+                is_kv = seen_3d > 0  # first 3-D = query, rest = K/V
+            seen_3d += 1
+            tok = kv_sym if is_kv else new_sym
+            out.append([d if isinstance(d, int) else tok for d in s])
+        else:
+            out.append([d if isinstance(d, int) else new_sym for d in s])
+    return out
 
 
 def _cost(name: str, role: str, in_shapes: list, out_shape: list | None,
