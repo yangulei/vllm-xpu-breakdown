@@ -894,6 +894,11 @@ def build_model_graph(
         result["symbols"]["C"] = context_len
     if prefill_len:
         result["symbols"]["S+C"] = prefill_len + (context_len or 0)
+    # Prefill packs ``B`` sequences of ``S`` tokens into one varlen batch, so
+    # token-parallel ops scale with the total ``B·S`` tokens (attention stays
+    # per-sequence — see model_tracer). Only meaningful when batching (B>1).
+    if prefill_len and decode_batch and decode_batch > 1:
+        result["symbols"]["B·S"] = prefill_len * decode_batch
     if is_moe:
         result["symbols"]["E"] = cfg.get("num_experts", 8)
         result["symbols"]["K"] = cfg.get("num_experts_per_tok", 2)

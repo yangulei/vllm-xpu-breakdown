@@ -964,7 +964,7 @@ function renderGraph() {
   }
 
   const symNames = {
-    'S': 'query_len', 'B': 'batch', 'C': 'context_len', 'S+C': 'kv_len (query+context)',
+    'S': 'query_len', 'B': 'batch', 'B·S': 'batch×query_len', 'C': 'context_len', 'S+C': 'kv_len (query+context)',
     'TP': 'tensor_parallel',
     'H': 'hidden_size', 'n_h': 'num_heads',
     'n_kv': 'num_kv_heads', 'd': 'head_dim', 'I': 'intermediate_size',
@@ -973,7 +973,7 @@ function renderGraph() {
     'I_moe': 'moe_intermediate_size', '2·I_moe': '2×moe_intermediate_size',
     'n_shared': 'n_shared_experts',
   };
-  const order = ['S','B','C','S+C','TP','H','n_h','n_kv','d','I','2·I','QKV','n_h·d','V'];
+  const order = ['S','B','B·S','C','S+C','TP','H','n_h','n_kv','d','I','2·I','QKV','n_h·d','V'];
   for (const sym of order) {
     if (!(sym in symbols)) continue;
     const el = document.createElement('span');

@@ -934,6 +934,55 @@ class TestTracedGraph(unittest.TestCase):
             return g["decode"]["total_memory"]
         self.assertGreater(decode_mem(8192), decode_mem(512))
 
+    def test_prefill_scales_with_batch_subquadratically(self):
+        # Prefill packs ``batch`` sequences of ``S`` tokens: token-parallel ops
+        # (GEMMs/MLP/norms) scale linearly with ``batch·S``, while softmax
+        # attention stays per-sequence (``batch`` blocks of ``S×kv``), so total
+        # prefill FLOPs scale ~linearly with batch — NOT quadratically (which a
+        # naive ``(batch·S)²`` attention model would produce).
+        from breakdown.model_graph import build_model_graph
+        from breakdown.model_info import summarize_config
+        summary = summarize_config(_TINY_LLAMA_CONFIG)
+
+        def prefill(batch):
+            g = build_model_graph(summary, prefill_len=128, decode_batch=batch,
+                                  context_len=4096, raw_config=_TINY_LLAMA_CONFIG)
+            return g["prefill"]["total_flops"], g["symbols"]
+
+        f1, sym1 = prefill(1)
+        f8, sym8 = prefill(8)
+        # Batch raises prefill compute (regression: batch only touched decode).
+        self.assertGreater(f8, f1)
+        ratio = f8 / f1
+        # Linear-ish in batch (8×), and crucially far below the ~64× a quadratic
+        # attention model would give — attention must remain per-sequence.
+        self.assertGreater(ratio, 6.0)
+        self.assertLess(ratio, 12.0)
+        # Batch=1 stays backward-compatible: symbol is "S", no "B·S".
+        self.assertNotIn("B\u00b7S", sym1)
+        # Batch>1 exposes the packed-token symbol for the legend.
+        self.assertEqual(sym8.get("B\u00b7S"), 128 * 8)
+
+    def test_decode_unaffected_by_prefill_len_and_scales_with_batch(self):
+        # Decode is ``B`` single-token queries: it must scale ~linearly with
+        # batch and be independent of prefill_len (regression guard for the
+        # shared phase-metadata after prefill batch-scaling was added).
+        from breakdown.model_graph import build_model_graph
+        from breakdown.model_info import summarize_config
+        summary = summarize_config(_TINY_LLAMA_CONFIG)
+
+        def decode(batch, plen):
+            g = build_model_graph(summary, prefill_len=plen, decode_batch=batch,
+                                  context_len=4096, raw_config=_TINY_LLAMA_CONFIG)
+            return g["decode"]["total_memory"], g["decode"]["total_flops"]
+
+        # Changing prefill_len does not move decode cost.
+        self.assertEqual(decode(1, 128), decode(1, 512))
+        # Decode FLOPs scale linearly with batch (B single-token queries).
+        f1 = decode(1, 128)[1]
+        f4 = decode(4, 128)[1]
+        self.assertAlmostEqual(f4 / f1, 4.0, places=5)
+
     def test_tp_uses_tracer_and_shards_cost(self):
         # TP>1 is handled analytically by the tracer (export at TP=1, divide
         # per-rank cost by op role). Sharded ops (attention, projections) halve

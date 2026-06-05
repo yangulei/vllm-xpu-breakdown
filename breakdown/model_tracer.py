@@ -741,19 +741,38 @@ def build_traced_graph(
         moe_shared_I = 0
 
     phases: dict[str, Any] = {}
-    phase_tokens = {
-        "prefill": (prefill_len or 128),
-        "decode": (decode_batch or 1),
+    prefill_seq = prefill_len or 128
+    batch = decode_batch or 1
+    # Prefill packs ``batch`` sequences of ``prefill_seq`` tokens into one varlen
+    # batch: token-parallel ops (linear/MLP/MoE/norm/embedding) scale with the
+    # total ``batch · prefill_seq`` tokens, while softmax attention stays
+    # per-sequence (``batch`` independent ``prefill_seq × kv`` blocks, NOT one
+    # ``(batch·prefill_seq)²`` block). Decode is ``batch`` single-token queries.
+    phase_meta = {
+        "prefill": {
+            "tokens": prefill_seq * batch,
+            "symbol": "B·S" if batch > 1 else "S",
+            "attn_new": prefill_seq,
+            "attn_seqs": batch,
+        },
+        "decode": {
+            "tokens": batch,
+            "symbol": "B",
+            "attn_new": batch,
+            "attn_seqs": 1,
+        },
     }
-    phase_symbol = {"prefill": "S", "decode": "B"}
-    for phase, tok in phase_tokens.items():
-        sym = phase_symbol[phase]
+    for phase, meta in phase_meta.items():
+        tok = meta["tokens"]
+        sym = meta["symbol"]
         builder = _TreeBuilder(root_name=root_type, root_type=root_type,
                                groups=groups)
         for (path, classes, name, backend, role, in_shapes, out_shape) in collected:
             mem, flops = _cost(name, role, in_shapes, out_shape, tok,
                                dtype_bytes, phase, ctx,
-                               weight_dtype_bytes=w_dtype_bytes)
+                               weight_dtype_bytes=w_dtype_bytes,
+                               attn_new=meta["attn_new"],
+                               attn_seqs=meta["attn_seqs"])
             factor = _tp_shard_factor(path, role, name, classes, tp_size)
             if factor > 1:
                 mem //= factor
@@ -870,7 +889,8 @@ def _render_shape(shape: list, token_symbol: str) -> list:
 
 def _cost(name: str, role: str, in_shapes: list, out_shape: list | None,
           token_value: int, dtype_bytes: int, phase: str,
-          context_len: int, weight_dtype_bytes: int | None = None) -> tuple[int, int]:
+          context_len: int, weight_dtype_bytes: int | None = None,
+          attn_new: int | None = None, attn_seqs: int = 1) -> tuple[int, int]:
     """Estimate memory (bytes touched) + FLOPs from symbolic shapes.
 
     Most ops use a generic input+output byte count. Attention and embedding
@@ -893,7 +913,8 @@ def _cost(name: str, role: str, in_shapes: list, out_shape: list | None,
                                       dtype_bytes)
 
     if role == "attention" or "attention" in n:
-        return _attention_cost(in_shapes, token_value, dtype_bytes,
+        new = attn_new if attn_new is not None else token_value
+        return _attention_cost(in_shapes, new, attn_seqs, dtype_bytes,
                                phase, context_len)
 
     if "embedding" in n:
@@ -943,38 +964,43 @@ def _cost(name: str, role: str, in_shapes: list, out_shape: list | None,
     return mem, flops
 
 
-def _attention_cost(in_shapes: list, token_value: int, dtype_bytes: int,
+def _attention_cost(in_shapes: list, new: int, seqs: int, dtype_bytes: int,
                     phase: str, context_len: int) -> tuple[int, int]:
     """Phase-aware attention cost including the KV-cache read over context.
 
     Unified attention traces identically for prefill and decode, so the cost
     model — not the graph — distinguishes them. Decode is dominated by reading
     the length-``C`` KV cache; the generic input/output count misses this.
+
+    Softmax attention is *per-sequence*: ``new`` is the query length of one
+    sequence (prefill: ``S``; decode: ``1`` token × batch handled via ``new``)
+    and ``seqs`` is the number of independent sequences in the batch. The cost
+    is computed per sequence and multiplied by ``seqs`` — a batch of ``B``
+    prefill sequences costs ``B·(S·kv)``, NOT ``(B·S)²``.
     """
     # q is [T, n_h, d]; k/v are [T, n_kv, d]. Take the 3-D tensor inputs.
     threed = [s for s in in_shapes if len(s) == 3]
     if not threed:
         # Unexpected shape layout — fall back to a plain byte count.
-        mem = sum(_prod(_numeric(s, token_value)) * dtype_bytes
+        mem = sum(_prod(_numeric(s, new)) * dtype_bytes
                   for s in in_shapes)
-        return mem, 0
+        return mem * seqs, 0
     heads = [s[1] for s in threed if isinstance(s[1], int)]
     n_h = max(heads) if heads else 1
     n_kv = min(heads) if heads else 1
     d = next((s[2] for s in threed if isinstance(s[2], int)), 1)
 
-    new = token_value  # query tokens this step (prefill: S, decode: B seqs)
     if phase == "decode":
         kv_len = context_len
     else:
-        kv_len = token_value + context_len  # chunked prefill reads prior C too
+        kv_len = new + context_len  # chunked prefill reads prior C too
 
     q_bytes = new * n_h * d * dtype_bytes          # read Q
     o_bytes = new * n_h * d * dtype_bytes           # write output
     kv_bytes = new * kv_len * n_kv * d * 2 * dtype_bytes  # read K and V cache
-    mem = q_bytes + o_bytes + kv_bytes
-    # QK^T then (softmax)·V, each ~2·(new·kv_len·n_h·d) flops.
-    flops = 2 * (2 * new * kv_len * n_h * d)
+    mem = (q_bytes + o_bytes + kv_bytes) * seqs
+    # QK^T then (softmax)·V, each ~2·(new·kv_len·n_h·d) flops, per sequence.
+    flops = 2 * (2 * new * kv_len * n_h * d) * seqs
     return mem, flops
 
 
