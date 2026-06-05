@@ -5,8 +5,9 @@ Instead of hand-writing a builder per architecture family (see
 ``model_graph.py``), this module derives the op graph from the **real vLLM
 model** via a single ``torch.export`` symbolic trace:
 
-  1. Instantiate the actual vLLM ``nn.Module`` offline on the ``meta`` device
-     (no weights, no HF download) from a model ``config.json``.
+  1. Instantiate the actual vLLM ``nn.Module`` on the ``meta`` device (no
+     weights; HF network access is assumed for configs/custom code) from a
+     model ``config.json``.
   2. ``torch.export`` it once with the token dimension kept symbolic.
   3. Walk the exported graph, grouping ops back onto their owning modules via
      each node's ``nn_module_stack`` metadata, and reading symbolic shapes from
@@ -201,11 +202,51 @@ def _expert_parallel_missing(model_config) -> bool:
     return _ps.model_parallel_is_initialized() and _ps._EP is None
 
 
-def _instantiate_model(raw_config: dict, dtype: str, workdir: str):
+def _stage_remote_code(model_id: str, workdir: str) -> None:
+    """Download a repo's Python modules into ``workdir`` for custom-code models.
+
+    Some recent models (MiMo-V2, Kimi-K2.5, ...) ship an ``auto_map`` in
+    ``config.json`` that points transformers/vLLM at *custom code* modules
+    (``configuration_*.py`` / ``modeling_*.py``). The tracer stages a stripped
+    ``config.json`` into ``workdir`` (to drop quantization, see below) and points
+    vLLM at that local dir, so a *bare* ``auto_map`` reference (no ``repo--``
+    prefix) only resolves if those ``.py`` files are present alongside it. We
+    snapshot just the repository's Python sources (never weights/tokenizers) into
+    ``workdir``, preserving any nested package layout so relative imports resolve.
+
+    This is a security-sensitive step (it stages code that later executes), so
+    callers gate it behind an allow-list — see ``_instantiate_model``.
+    """
+    from huggingface_hub import snapshot_download
+
+    src = snapshot_download(
+        model_id,
+        allow_patterns=["*.py", "**/*.py"],
+    )
+    for root, _dirs, files in os.walk(src):
+        rel = os.path.relpath(root, src)
+        dst_dir = workdir if rel == "." else os.path.join(workdir, rel)
+        os.makedirs(dst_dir, exist_ok=True)
+        for fn in files:
+            if fn.endswith(".py"):
+                shutil.copy(os.path.join(root, fn), os.path.join(dst_dir, fn))
+
+
+def _instantiate_model(raw_config: dict, dtype: str, workdir: str,
+                       model_id: str | None = None,
+                       allow_remote_code: bool = False):
     """Instantiate the real vLLM model on ``meta`` from a config dict.
 
-    Returns ``(model, vllm_config)``. Offline (no weights, no HF download).
+    Returns ``(model, vllm_config)``. Builds on ``meta`` (no weights). HF network
+    access is assumed — the tracer does NOT force ``HF_HUB_OFFLINE``, so configs,
+    processors, and repo-prefixed custom code resolve from the Hub as needed.
     ``workdir`` is a caller-owned temp directory used to stage ``config.json``.
+
+    ``model_id`` + ``allow_remote_code``: when the config carries an
+    ``auto_map`` (custom code), the referenced Python modules are staged from
+    the Hub into ``workdir`` so a bare ``auto_map`` reference resolves next to
+    the stripped local config. Gated behind ``allow_remote_code`` because staged
+    code executes during instantiation.
     """
     from vllm.config import ModelConfig, VllmConfig
     from vllm.config.vllm import set_current_vllm_config
@@ -213,8 +254,11 @@ def _instantiate_model(raw_config: dict, dtype: str, workdir: str):
     from vllm.model_executor.model_loader.utils import initialize_model
     import torch
 
-    os.environ.setdefault("HF_HUB_OFFLINE", "1")
-    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    # Custom-code models need their ``.py`` modules staged so a bare ``auto_map``
+    # resolves against the stripped local config we write below.
+    needs_remote = bool(raw_config.get("auto_map"))
+    if needs_remote and allow_remote_code and model_id:
+        _stage_remote_code(model_id, workdir)
 
     _ensure_distributed()
 
@@ -232,6 +276,11 @@ def _instantiate_model(raw_config: dict, dtype: str, workdir: str):
     model_config = ModelConfig(
         model=workdir, tokenizer=workdir, dtype=_normalize_dtype(dtype), seed=0,
         enforce_eager=True, skip_tokenizer_init=True,
+        # Custom-code models (``auto_map`` in config.json) make transformers/vLLM
+        # demand opt-in code execution even for a structural (meta, no-weights)
+        # build. Only honored when the caller allow-listed the model; the
+        # referenced modules are staged into ``workdir`` above.
+        trust_remote_code=allow_remote_code,
     )
     vllm_config = VllmConfig(model_config=model_config)
     with set_current_vllm_config(vllm_config):
@@ -259,8 +308,8 @@ def _force_meta(model) -> None:
     pass an explicit ``device=`` (e.g. GDN linear attention builds its gate-norm
     with ``device=current_platform.current_device()``), materializing a real
     ``xpu:0`` tensor that defeats the meta context and later raises "Tensor on
-    device xpu:0 is not on the expected device meta!" during export. Tracing is
-    offline (no real weights), so normalizing everything to ``meta`` is correct.
+    device xpu:0 is not on the expected device meta!" during export. The trace
+    uses no real weights, so normalizing everything to ``meta`` is correct.
     """
     import torch
     for module in model.modules():
@@ -548,6 +597,8 @@ def build_traced_graph(
     tp_size: int = 1,
     weight_dtype_bytes: int | None = None,
     extra_children: dict[str, list] | None = None,
+    model_id: str | None = None,
+    allow_remote_code: bool = False,
 ) -> dict:
     """Build prefill/decode ModuleNode trees from a single export trace.
 
@@ -579,7 +630,9 @@ def build_traced_graph(
     with _TRACE_LOCK:
         workdir = tempfile.mkdtemp(prefix="vllm_breakdown_")
         try:
-            model, vllm_config = _instantiate_model(raw_config, dtype, workdir)
+            model, vllm_config = _instantiate_model(
+                raw_config, dtype, workdir,
+                model_id=model_id, allow_remote_code=allow_remote_code)
             ep = _export_model(model, vllm_config)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)

@@ -72,16 +72,27 @@ def _get_text_config(config: dict[str, Any], key: str,
 def _get_vit_config(config: dict[str, Any], key: str) -> Any | None:
     """Extract a vision encoder config value from nested VL model configs.
 
-    VL models store vision config in different places:
-    - Qwen2.5-VL: config["vision_config"]["hidden_size"]
-    - InternVL: config["vision_config"]["hidden_size"]
+    VL models store vision config in different places and under different key
+    names. We accept the canonical key plus common aliases so the analytic
+    vision splice gets real dimensions instead of silently using defaults:
+    - Qwen2.5-VL / Qwen3.5-VL: ``depth`` (layers), ``num_heads`` (heads)
+    - InternVL / generic ViT: ``num_hidden_layers``, ``num_attention_heads``
     - Some models: config["visual"]["hidden_size"]
     """
+    aliases = {
+        "num_hidden_layers": ("num_hidden_layers", "depth", "num_layers"),
+        "num_attention_heads": ("num_attention_heads", "num_heads"),
+        "hidden_size": ("hidden_size", "embed_dim"),
+        "intermediate_size": ("intermediate_size", "ffn_dim"),
+    }
+    candidates = aliases.get(key, (key,))
     for section in ("vision_config", "visual", "visual_config",
                     "vision_tower_config"):
         sub = config.get(section)
-        if isinstance(sub, dict) and key in sub:
-            return sub[key]
+        if isinstance(sub, dict):
+            for cand in candidates:
+                if sub.get(cand) is not None:
+                    return sub[cand]
     return None
 
 

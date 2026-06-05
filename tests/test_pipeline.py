@@ -1253,9 +1253,9 @@ _HIGH_PRIORITY_MODELS = [
     # Gated Delta Net (GDN) linear-attention hybrids (Qwen3.5/3.6). The tracer
     # traces the GDN core as the opaque ``gdn_attention_core_xpu`` op, the
     # full-attention layers as ``unified_attention``, and the gate-norm as real
-    # elementwise ops. NOTE: these are also multimodal (Image-Text-to-Text);
-    # vision-tower splicing for the Qwen3_5 VL family is a separate follow-up, so
-    # the graph here covers the (GDN/MoE) language model.
+    # elementwise ops. These are also multimodal (Image-Text-to-Text): the
+    # Qwen3_5 VL families splice an analytic Qwen-style vision tower + projector
+    # into the prefill graph (DeepStack per-layer injection is not modeled).
     ("Qwen3.5-27B", "Qwen/Qwen3.5-27B", None, "ok", ""),
     ("Qwen3.5-27B-FP8", "Qwen/Qwen3.5-27B-FP8", "fp8", "ok", ""),
     ("Qwen3.5-35B-A3B", "Qwen/Qwen3.5-35B-A3B", None, "ok", ""),
@@ -1264,23 +1264,32 @@ _HIGH_PRIORITY_MODELS = [
     ("Qwen3.6-27B-FP8", "Qwen/Qwen3.6-27B-FP8", "fp8", "ok", ""),
     ("Qwen3.6-35B-A3B", "Qwen/Qwen3.6-35B-A3B", None, "ok", ""),
     ("Qwen3.6-35B-A3B-FP8", "Qwen/Qwen3.6-35B-A3B-FP8", "fp8", "ok", ""),
+    # MoE decoders that trace cleanly once their arch is mapped.
+    ("MiniMax-M2.5", "MiniMaxAI/MiniMax-M2.5", "fp8", "ok", ""),
+    ("MiniMax-M2.7", "MiniMaxAI/MiniMax-M2.7", "fp8", "ok", ""),
+    # Custom-code models: remote ``configuration_*.py`` is staged into the
+    # offline tracer workdir (gated by allow_remote_code).
+    ("MiMo-V2-Flash", "XiaomiMiMo/MiMo-V2-Flash", "fp8", "ok", ""),
+    # MiMo-V2.5/Pro are omni (vision+audio); only the language stack is graphed.
+    ("MiMo-V2.5", "XiaomiMiMo/MiMo-V2.5", "fp8", "ok", ""),
+    ("MiMo-V2.5-Pro", "XiaomiMiMo/MiMo-V2.5-Pro", "fp8", "ok", ""),
     # --- Blocked by external (non-breakdown) issues; documented + skipped ---
     ("DeepSeek-V4", "deepseek-ai/DeepSeek-V4-Pro", None, "blocked",
-     "model code hardcodes torch.cuda.Stream() — fails on no-CUDA XPU"),
+     "vLLM mhc layer requires optional 'tilelang' JIT package (not installed)"),
     ("DeepSeek-V4", "deepseek-ai/DeepSeek-V4-Flash", "fp8", "blocked",
-     "model code hardcodes torch.cuda.Stream() — fails on no-CUDA XPU"),
+     "vLLM mhc layer requires optional 'tilelang' JIT package (not installed)"),
     ("GLM-5.1", "zai-org/GLM-5.1", "fp8", "blocked",
-     "transformers does not recognize model_type 'glm_moe_dsa' (version gap)"),
+     "GLM MoE-DSA indexer accesses a FakeTensor data pointer during "
+     "torch.export — export incompatible"),
     ("Step-3.5-Flash", "stepfun-ai/Step-3.5-Flash", "fp8", "blocked",
-     "torch.export fake-tensor-in-constants (input_layernorm lifted tensor)"),
-    ("MiniMax-M2.5", "MiniMaxAI/MiniMax-M2.5", "fp8", "blocked",
-     "custom configuration_*.py not staged in offline tracer workdir"),
-    ("MiniMax-M2.7", "MiniMaxAI/MiniMax-M2.7", "fp8", "blocked",
-     "custom configuration_*.py not staged in offline tracer workdir"),
-    ("MiMo-V2", "XiaomiMiMo/MiMo-V2-Flash", "fp8", "blocked",
-     "custom configuration_*.py not staged in offline tracer workdir"),
+     "vLLM: 'No Unquantized MoE backend supports the deployment configuration' "
+     "on XPU"),
     ("Kimi-K2.5", "moonshotai/Kimi-K2.5", "int4", "blocked",
-     "meta-tensor .to() during model __init__ (needs to_empty())"),
+     "vLLM KimiK25 vision_tower.to(device) copies a meta tensor during "
+     "__init__ (needs to_empty())"),
+    ("Kimi-K2.6", "moonshotai/Kimi-K2.6", "int4", "blocked",
+     "vLLM KimiK25 vision_tower.to(device) copies a meta tensor during "
+     "__init__ (needs to_empty())"),
 ]
 
 # GDN linear-attention models — the graph must contain the spliced GDN op.
@@ -1292,6 +1301,11 @@ _GDN_MODEL_IDS = frozenset({
 })
 
 _PER_LAYER_LIST_KEYS = ("layer_types", "moe_layer_freq")
+
+# VL families whose analytic vision tower/projector must be spliced into the
+# prefill graph (text-only export captures only the language stack). Kimi-K2.5
+# is a VL+MLA model but is currently blocked in vLLM, so it is not listed here.
+_VL_MODEL_IDS = frozenset(_GDN_MODEL_IDS)
 
 
 def _shrink_config(cfg: dict) -> dict:
@@ -1347,6 +1361,10 @@ class TestHighPriorityModels(unittest.TestCase):
         return build_model_graph(
             summary, prefill_len=128, decode_batch=1, context_len=2048,
             tp_size=1, quantization=quant, raw_config=raw,
+            # Custom-code models (MiMo-V2, Kimi-K2.5, ...) need their remote
+            # modules staged for the tracer; allowed here because these are
+            # explicit, vetted target models.
+            model_id=model_id, allow_remote_code=True,
         )
 
     def test_high_priority_models(self):
@@ -1386,11 +1404,121 @@ class TestHighPriorityModels(unittest.TestCase):
                         "gdn_linear_attention", names,
                         f"{model_id}: GDN linear-attention op missing from graph")
 
+                # VL families must splice an analytic vision tower into prefill.
+                if model_id in _VL_MODEL_IDS:
+                    self.assertEqual(
+                        graph.get("model_type"), "mllm",
+                        f"{model_id}: expected mllm model_type")
+                    roles = {o.get("role", "")
+                             for o in _collect_ops(graph["prefill"])}
+                    self.assertTrue(
+                        any(r.startswith("vit_") or r == "vl_projector"
+                            for r in roles),
+                        f"{model_id}: vision tower/projector not spliced into "
+                        f"the prefill graph")
+
                 # The profiling endpoint serializes the graph to JSON.
                 try:
                     json.dumps(graph)
                 except (TypeError, ValueError) as e:
                     self.fail(f"{model_id}: graph not JSON-serializable: {e!r}")
+
+
+class TestNewArchitectureRouting(unittest.TestCase):
+    """Network-free checks that the new XPU target architectures are mapped and
+    categorized correctly in model_graph's routing tables."""
+
+    def _tables(self):
+        from breakdown import model_graph as mg
+        return mg
+
+    def test_new_archs_mapped(self):
+        mg = self._tables()
+        expected = {
+            "HYV3ForCausalLM": "Hunyuan3",
+            "Step3p5ForCausalLM": "Step3",
+            "MiniMaxM2ForCausalLM": "MiniMax",
+            "MiMoV2FlashForCausalLM": "MiMoV2Flash",
+            "MiMoV2ForCausalLM": "MiMoV2",
+            "Qwen3_5ForConditionalGeneration": "Qwen3_5VL",
+            "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeVL",
+            "KimiK25ForConditionalGeneration": "KimiK25VL",
+        }
+        for arch, family in expected.items():
+            self.assertEqual(
+                mg._ARCH_FAMILY_MAP.get(arch), family,
+                f"{arch} should map to family {family}")
+
+    def test_qwen3_5_vl_is_verified_vl(self):
+        mg = self._tables()
+        for fam in ("Qwen3_5VL", "Qwen3_5MoeVL"):
+            self.assertIn(fam, mg._VL_ARCHS)
+            self.assertIn(fam, mg._TRACER_VERIFIED_VL)
+
+    def test_kimi_is_vl_mla_but_not_verified(self):
+        """Kimi-K2.5 is VL + MLA but blocked in vLLM, so it must NOT be in the
+        verified-VL set (build_model_graph hard-fails fast instead of emitting a
+        graph that silently drops the vision tower)."""
+        mg = self._tables()
+        self.assertIn("KimiK25VL", mg._VL_ARCHS)
+        self.assertIn("KimiK25VL", mg._MLA_ARCHS)
+        self.assertNotIn("KimiK25VL", mg._TRACER_VERIFIED_VL)
+
+
+class TestVitConfigAliases(unittest.TestCase):
+    """``_get_vit_config`` must resolve Qwen-style vision keys (depth/num_heads/
+    embed_dim) as aliases of the canonical HF ViT keys."""
+
+    def test_qwen_style_vision_keys(self):
+        config = {
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "model_type": "qwen3_5",
+            "text_config": {
+                "hidden_size": 4096,
+                "num_hidden_layers": 36,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "intermediate_size": 12288,
+                "vocab_size": 152064,
+            },
+            "vision_config": {
+                "depth": 27,
+                "num_heads": 16,
+                "hidden_size": 1152,
+                "intermediate_size": 4304,
+            },
+        }
+        summary = summarize_config(config)
+        self.assertEqual(summary["vit_num_layers"], 27)
+        self.assertEqual(summary["vit_num_heads"], 16)
+        self.assertEqual(summary["vit_hidden_size"], 1152)
+        self.assertEqual(summary["vit_intermediate_size"], 4304)
+
+    def test_embed_dim_alias(self):
+        config = {
+            "architectures": ["FakeVLForConditionalGeneration"],
+            "model_type": "fake_vl",
+            "text_config": {
+                "hidden_size": 2048,
+                "num_hidden_layers": 24,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 4,
+                "intermediate_size": 8192,
+                "vocab_size": 100000,
+            },
+            "vision_config": {
+                "num_layers": 12,
+                "num_heads": 12,
+                "embed_dim": 768,
+                "ffn_dim": 3072,
+            },
+        }
+        summary = summarize_config(config)
+        self.assertEqual(summary["vit_num_layers"], 12)
+        self.assertEqual(summary["vit_num_heads"], 12)
+        self.assertEqual(summary["vit_hidden_size"], 768)
+        self.assertEqual(summary["vit_intermediate_size"], 3072)
 
 
 if __name__ == "__main__":

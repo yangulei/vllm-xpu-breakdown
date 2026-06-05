@@ -97,82 +97,31 @@ def index():
     return send_from_directory("static", "index.html")
 
 
-# ---- Model Catalog API ----
+# ---- Remote-code allowlist ----
 
-from breakdown.model_catalog import (
-    CATALOG,
-    catalog_summary,
-    get_model,
-    get_models_by_type,
-    get_vllm_models,
-)
+# Model IDs that ship custom code (``auto_map`` in config.json) and therefore
+# require staging+executing remote Python to trace. Allow it only for these
+# vetted target models, or when explicitly opted in via env. This keeps
+# arbitrary user-supplied HF IDs from silently executing remote code.
+_ALLOWED_REMOTE_CODE_MODELS: frozenset[str] = frozenset({
+    "moonshotai/Kimi-K2.5",
+    "moonshotai/Kimi-K2.6",
+    "XiaomiMiMo/MiMo-V2-Flash",
+    "XiaomiMiMo/MiMo-V2.5",
+    "XiaomiMiMo/MiMo-V2.5-Pro",
+})
 
 
-@app.route("/api/catalog")
-def get_catalog():
-    """Return the full model catalog, optionally filtered.
+def _remote_code_allowed(model_id: str) -> bool:
+    """Whether remote (custom) code may be staged+executed for ``model_id``.
 
-    Query params:
-        type   – filter by model type (LLM, MLLM, T2I, T2V, Audio, etc.)
-        priority – filter by priority (H, M, L)
-        vllm   – if "true", only show vLLM-compatible models
+    True for vetted target models, or when ``BREAKDOWN_ALLOW_REMOTE_CODE`` is
+    set. Models without an ``auto_map`` ignore this flag entirely.
     """
-    model_type = request.args.get("type")
-    priority = request.args.get("priority")
-    vllm_only = request.args.get("vllm", "").lower() == "true"
-
-    if vllm_only:
-        models = get_vllm_models()
-    elif model_type:
-        models = get_models_by_type(model_type)
-    else:
-        models = list(CATALOG)
-
-    if priority:
-        models = [m for m in models if m.priority == priority]
-
-    return jsonify({
-        "ok": True,
-        "models": [
-            {
-                "name": m.name,
-                "hf_id": m.hf_id,
-                "model_type": m.model_type,
-                "precision": m.precision,
-                "owner": m.owner,
-                "focus": m.focus,
-                "priority": m.priority,
-                "in_cri_plan": m.in_cri_plan,
-                "status": m.status,
-                "vllm_supported": m.vllm_supported,
-            }
-            for m in models
-        ],
-        "summary": catalog_summary(),
-    })
-
-
-@app.route("/api/catalog/<name>")
-def get_catalog_model(name: str):
-    """Return details for a specific catalog model by name."""
-    model = get_model(name)
-    if not model:
-        return jsonify({"ok": False, "error": f"Model '{name}' not found in catalog"}), 404
-    return jsonify({
-        "ok": True,
-        "model": {
-            "name": model.name,
-            "hf_id": model.hf_id,
-            "model_type": model.model_type,
-            "precision": model.precision,
-            "owner": model.owner,
-            "focus": model.focus,
-            "priority": model.priority,
-            "in_cri_plan": model.in_cri_plan,
-            "status": model.status,
-            "vllm_supported": model.vllm_supported,
-        },
-    })
+    if os.environ.get("BREAKDOWN_ALLOW_REMOTE_CODE", "").lower() in (
+            "1", "true", "yes"):
+        return True
+    return model_id in _ALLOWED_REMOTE_CODE_MODELS
 
 
 # ---- Model API ----
@@ -226,7 +175,9 @@ def get_model_graph(model_id: str):
                                   context_len=context_len,
                                   tp_size=tp_size,
                                   quantization=quantization,
-                                  raw_config=config)
+                                  raw_config=config,
+                                  model_id=model_id,
+                                  allow_remote_code=_remote_code_allowed(model_id))
         min_layers = min_profile_layers(summary)
         return jsonify({
             "ok": True, "graph": graph, "summary": summary,
@@ -448,7 +399,9 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
                                       context_len=max_model_len,
                                       tp_size=tp_size,
                                       quantization=quantization,
-                                      raw_config=config)
+                                      raw_config=config,
+                                      model_id=model_id,
+                                      allow_remote_code=_remote_code_allowed(model_id))
             # Try module-path-based annotation first (more precise)
             module_ops = parse_trace_with_modules(rank_files[0])
             if module_ops:
@@ -1795,6 +1748,8 @@ def export_shape_matrix():
         summary, prefill_len=1, decode_batch=1, context_len=1,
         tp_size=tp_sizes[0], quantization=quantization,
         raw_config=config,
+        model_id=model_id,
+        allow_remote_code=_remote_code_allowed(model_id),
     )
     test_tree = test_graph.get("prefill") or test_graph.get("decode")
     test_ops_count = 0
@@ -1847,6 +1802,8 @@ def export_shape_matrix():
             tp_size=cfg["tp_size"],
             quantization=quantization,
             raw_config=config,
+            model_id=model_id,
+            allow_remote_code=_remote_code_allowed(model_id),
         )
         graph_cfg = graph.get("config", {})
         symbols = graph.get("symbols", {})

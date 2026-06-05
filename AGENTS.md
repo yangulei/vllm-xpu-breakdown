@@ -22,7 +22,6 @@ app.py                    — Flask web server (API + static serving + exports)
 run_profile.py            — CLI profiling entry point
 chat.py                   — Interactive chat with profiling
 breakdown/
-  model_catalog.py        — Registry of 65+ target models with metadata
   model_graph.py          — Static model graph builder (core engine)
   model_info.py           — HuggingFace config fetcher and summarizer
   analyzer.py             — Op analysis (shapes, memory, FLOPs, AI)
@@ -36,7 +35,6 @@ static/
   index.html              — Single-page web UI (HTML + CSS + JS)
 scripts/
   run_profile.sh          — Shell wrapper for profiling
-  run_catalog_models.sh   — Batch static analysis for catalog models
   compare_modes.sh        — Compare eager vs compile modes
 tests/
   test_pipeline.py              — Unit tests (requires torch)
@@ -132,15 +130,6 @@ Exports a flat Excel table sweeping across configurations:
 - Symbolic Shape column keeps S/B/C/TP symbolic, resolves model constants to numbers
 - Row limit guard (`_MAX_MATRIX_ROWS = 50000`) prevents excessive generation
 
-### Model Catalog (`model_catalog.py`)
-
-Registry of target models with:
-- HuggingFace IDs, precision targets, model type
-- Owner, focus area, priority, CRI plan status
-- `vllm_supported` flag (False for diffusion/video models)
-
-Categories: LLM, MLLM, T2I, T2V, Audio, Embedding/Reranker, Segmentation, MTP
-
 ### Op Classification (`classifier.py`)
 
 Classifies ops by name prefix/pattern to backends. Priority order:
@@ -160,10 +149,35 @@ Classifies ops by name prefix/pattern to backends. Priority order:
 
 ## Adding a New Model
 
-1. Add entry to `breakdown/model_catalog.py` in the appropriate category list
-2. If the architecture is new, add mapping in `_ARCH_FAMILY_MAP` in `model_graph.py`
-3. If the attention/MLP pattern is novel, add a new builder function
-4. Test with: `python -c "from breakdown.model_graph import build_model_graph; ..."`
+1. If the architecture is new, add mapping in `_ARCH_FAMILY_MAP` in `model_graph.py`
+2. If the attention/MLP pattern is novel, add a new builder function
+3. For VL families, add to `_VL_ARCHS` and — only after verifying the text-only
+   export contains no vision ops — to `_TRACER_VERIFIED_VL`; otherwise
+   `build_model_graph` hard-fails to avoid silently dropping the vision tower
+4. For custom-code models, add the HF id to `_ALLOWED_REMOTE_CODE_MODELS` in
+   `app.py` (see below)
+5. Test with: `python -c "from breakdown.model_graph import build_model_graph; ..."`
+
+### Custom-code (remote-code) models
+
+Some models (e.g. `XiaomiMiMo/MiMo-V2-Flash`, `moonshotai/Kimi-K2.5`) ship their
+config/model classes as `auto_map` remote code rather than in `transformers`.
+The tracer assumes HF network access (it does **not** force `HF_HUB_OFFLINE`),
+but it points vLLM at a stripped local `config.json` (quantization removed), so a
+*bare* `auto_map` reference only resolves if the referenced
+`configuration_*.py` / `modeling_*.py` sit next to it. `model_tracer._stage_remote_code`
+downloads just the `*.py` files via `snapshot_download(..., allow_patterns=["*.py", "**/*.py"])`
+into the tracer workdir for that reason.
+
+This is gated for security: `build_model_graph(..., allow_remote_code=...)`
+threads through to the tracer, and `app.py`'s `_remote_code_allowed(model_id)`
+only enables it for HF ids in the `_ALLOWED_REMOTE_CODE_MODELS` constant or when
+`BREAKDOWN_ALLOW_REMOTE_CODE=1` is set. So a new custom-code model must be added
+to that allowlist to be profiled through the web app. Models blocked by external
+vLLM/env issues (e.g. DeepSeek-V4 needs `tilelang`, Step-3.5-Flash has no XPU
+unquantized-MoE backend, Kimi-K2.5 does a meta-tensor `.to()` in `__init__`,
+GLM-5.1 dereferences a FakeTensor data pointer during export) are documented in
+the high-priority test matrix (`tests/test_pipeline.py`) with a reason.
 
 ## Adding a New Op/Kernel
 
@@ -177,8 +191,6 @@ Classifies ops by name prefix/pattern to backends. Priority order:
 |----------|--------|-------------|
 | `/api/model/<hf_id>` | GET | Fetch and summarize HF model config |
 | `/api/model/<hf_id>/graph` | GET | Build static model graph |
-| `/api/catalog` | GET | List models with `?type=`, `?priority=`, `?vllm=true` filters |
-| `/api/catalog/<name>` | GET | Get single catalog model details |
 | `/api/profile/start` | POST | Start async profiling |
 | `/api/profile/status` | GET | Poll profiling status |
 | `/api/profile/trace` | GET | Download raw trace file |
@@ -198,6 +210,12 @@ Classifies ops by name prefix/pattern to backends. Priority order:
 - Shape strings contain `/TP` always (even when TP=1) — resolve via `symbols["TP"]`
 - MLA models (DeepSeek-V2/V3/V4, GLM-MoE-DSA) are supported on XPU — do not
   re-add the removed profiling guard that rejected them
+- Custom-code models need their remote `*.py` staged AND `allow_remote_code` set
+  (HF id in `_ALLOWED_REMOTE_CODE_MODELS` or `BREAKDOWN_ALLOW_REMOTE_CODE=1`); a
+  missing allowlist entry silently disables staging and the trace fails
+- VL families must be in `_TRACER_VERIFIED_VL` (not just `_VL_ARCHS`) or
+  `build_model_graph` hard-fails — verify the text-only export has zero vision
+  ops before promoting a family
 
 ## Updating Documentation
 

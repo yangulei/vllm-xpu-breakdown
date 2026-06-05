@@ -74,7 +74,6 @@ Flask web app (`app.py`) + static SPA (`static/index.html`) backed by a `breakdo
 |----------|--------|-------------|
 | `/api/model/<hf_id>` | GET | Fetch and summarize HF model config |
 | `/api/model/<hf_id>/graph` | GET | Build static model graph |
-| `/api/catalog` | GET | List catalog models (filters: `?type=`, `?priority=`, `?vllm=true`) |
 | `/api/profile/start` | POST | Start async profiling |
 | `/api/profile/status` | GET | Poll profiling status |
 | `/api/profile/trace` | GET | Download raw trace file |

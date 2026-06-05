@@ -183,25 +183,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
   .model-input-row { flex-direction: column; }
   .controls-row { flex-direction: column; align-items: flex-start; }
   .stats-grid { grid-template-columns: repeat(2, 1fr); }
-}
-
-/* Catalog */
-#catalog-table td { font-size: 12px; padding: 6px 12px; }
-#catalog-table .cat-name { font-weight: 600; cursor: pointer; color: var(--accent); }
-#catalog-table .cat-name:hover { text-decoration: underline; }
-.priority-badge { display: inline-block; padding: 1px 8px; border-radius: 10px;
-                  font-size: 10px; font-weight: 600; }
-.priority-badge.H { background: #ffcdd2; color: #b71c1c; }
-.priority-badge.M { background: #fff9c4; color: #f57f17; }
-.priority-badge.L { background: #e8f5e9; color: #2e7d32; }
-.type-badge { display: inline-block; padding: 1px 8px; border-radius: 10px;
-              font-size: 10px; font-weight: 500; }
-.type-badge.LLM { background: #e3f2fd; color: #0d47a1; }
-.type-badge.MLLM { background: #f3e5f5; color: #6a1b9a; }
-.type-badge.T2I, .type-badge.T2V { background: #fce4ec; color: #880e4f; }
-.type-badge.Audio { background: #e0f7fa; color: #006064; }
-.type-badge.Embedding { background: #fff3e0; color: #e65100; }
-</style>
+}</style>
 </head>
 <body>
 
@@ -247,52 +229,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
       <div id="model-title" style="font-size:16px;font-weight:600;margin-bottom:4px"></div>
       <div class="model-tags" id="model-tags"></div>
       <div class="model-props" id="model-props"></div>
-    </div>
-  </div>
-
-  <!-- Model Catalog Browser -->
-  <div class="card" id="catalog-card">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-      <h2 style="margin-bottom:0">Model Catalog</h2>
-      <button class="btn btn-secondary" onclick="toggleCatalog()" id="catalog-toggle-btn"
-              style="font-size:12px;padding:4px 12px">▼ Show</button>
-    </div>
-    <div id="catalog-content" style="display:none">
-      <div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center">
-        <span style="font-size:12px;color:var(--text2);font-weight:500">Filter:</span>
-        <div class="filter-pills" id="catalog-type-filters">
-          <span class="pill active" onclick="filterCatalog('all',this)">All</span>
-          <span class="pill" onclick="filterCatalog('LLM',this)">LLM</span>
-          <span class="pill" onclick="filterCatalog('MLLM',this)">MLLM</span>
-          <span class="pill" onclick="filterCatalog('T2I',this)">T2I</span>
-          <span class="pill" onclick="filterCatalog('T2V',this)">T2V</span>
-          <span class="pill" onclick="filterCatalog('Audio',this)">Audio</span>
-          <span class="pill" onclick="filterCatalog('Embedding',this)">Embed</span>
-        </div>
-        <label style="font-size:12px;display:flex;align-items:center;gap:4px;margin-left:12px">
-          <input type="checkbox" id="catalog-vllm-filter" onchange="refreshCatalog()"> vLLM only
-        </label>
-        <label style="font-size:12px;display:flex;align-items:center;gap:4px">
-          <input type="checkbox" id="catalog-priority-filter" onchange="refreshCatalog()"> High priority
-        </label>
-      </div>
-      <div id="catalog-summary" style="font-size:12px;color:var(--text2);margin-bottom:10px"></div>
-      <div style="overflow-x:auto;max-height:400px;overflow-y:auto">
-        <table class="ops-table" id="catalog-table">
-          <thead>
-            <tr>
-              <th>Model</th>
-              <th>Type</th>
-              <th>Precision</th>
-              <th>Priority</th>
-              <th>CRI Plan</th>
-              <th>vLLM</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody id="catalog-tbody"></tbody>
-        </table>
-      </div>
     </div>
   </div>
 
@@ -1434,81 +1370,6 @@ async function downloadShapeMatrix() {
   } finally {
     btn.disabled = false;
   }
-}
-
-// ---- Model Catalog ----
-let catalogData = null;
-let catalogFilter = 'all';
-
-function toggleCatalog() {
-  const content = document.getElementById('catalog-content');
-  const btn = document.getElementById('catalog-toggle-btn');
-  if (content.style.display === 'none') {
-    content.style.display = 'block';
-    btn.textContent = '▲ Hide';
-    if (!catalogData) refreshCatalog();
-  } else {
-    content.style.display = 'none';
-    btn.textContent = '▼ Show';
-  }
-}
-
-async function refreshCatalog() {
-  const vllmOnly = document.getElementById('catalog-vllm-filter').checked;
-  const highPriority = document.getElementById('catalog-priority-filter').checked;
-  let url = '/api/catalog?';
-  if (vllmOnly) url += 'vllm=true&';
-  if (highPriority) url += 'priority=H&';
-  if (catalogFilter !== 'all') url += 'type=' + catalogFilter;
-  try {
-    const resp = await fetch(url);
-    const data = await resp.json();
-    if (data.ok) {
-      catalogData = data;
-      renderCatalog(data.models);
-      const s = data.summary;
-      document.getElementById('catalog-summary').textContent =
-        `${s.total} models: ${s.by_type.LLM || 0} LLM, ${s.by_type.MLLM || 0} MLLM, ` +
-        `${s.by_type.T2I || 0} T2I, ${s.by_type.T2V || 0} T2V, ${s.by_type.Audio || 0} Audio, ` +
-        `${s.by_type['Embedding / Reranker'] || 0} Embedding — ` +
-        `${s.vllm_supported} vLLM-compatible`;
-    }
-  } catch (e) {
-    document.getElementById('catalog-summary').textContent = 'Error loading catalog: ' + e.message;
-  }
-}
-
-function filterCatalog(type, el) {
-  catalogFilter = type;
-  document.querySelectorAll('#catalog-type-filters .pill').forEach(p => p.classList.remove('active'));
-  el.classList.add('active');
-  refreshCatalog();
-}
-
-function renderCatalog(models) {
-  const tbody = document.getElementById('catalog-tbody');
-  tbody.innerHTML = '';
-  for (const m of models) {
-    const tr = document.createElement('tr');
-    const hfLink = m.hf_id ? `<span class="cat-name" onclick="selectCatalogModel('${m.hf_id}')">${m.name}</span>` :
-                              `<span style="font-weight:600">${m.name}</span>`;
-    const typeClass = m.model_type.replace(/[^a-zA-Z]/g, '').replace('EmbeddingReranker', 'Embedding');
-    tr.innerHTML =
-      `<td>${hfLink}</td>` +
-      `<td><span class="type-badge ${typeClass}">${m.model_type}</span></td>` +
-      `<td style="font-size:11px">${m.precision}</td>` +
-      `<td>${m.priority ? '<span class="priority-badge ' + m.priority + '">' + m.priority + '</span>' : '—'}</td>` +
-      `<td style="font-size:11px">${m.in_cri_plan || '—'}</td>` +
-      `<td>${m.vllm_supported ? '✅' : '—'}</td>` +
-      `<td>${m.hf_id ? '<button class="btn btn-secondary" style="font-size:10px;padding:2px 8px" ' +
-        'onclick="selectCatalogModel(\'' + m.hf_id + '\')">Select</button>' : ''}</td>`;
-    tbody.appendChild(tr);
-  }
-}
-
-function selectCatalogModel(hfId) {
-  document.getElementById('model-input').value = hfId;
-  loadConfig();
 }
 
 // ---- Init ----

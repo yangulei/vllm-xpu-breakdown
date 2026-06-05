@@ -563,12 +563,20 @@ _ARCH_FAMILY_MAP: dict[str, str] = {
     # --- MoE models ---
     "MixtralForCausalLM": "Mixtral",
     "HunYuanMoEV1ForCausalLM": "Hunyuan",
+    "HYV3ForCausalLM": "Hunyuan3",          # Tencent Hunyuan v3 (MoE)
     "MiniMaxM1ForCausalLM": "MiniMax",
+    "MiniMaxM2ForCausalLM": "MiniMax",      # MiniMax-M2 (MoE)
+    "Step3p5ForCausalLM": "Step3",          # StepFun Step-3.5 (sliding/full MoE)
+    "MiMoV2FlashForCausalLM": "MiMoV2Flash",  # Xiaomi MiMo-V2 Flash (chunked MoE)
+    "MiMoV2ForCausalLM": "MiMoV2",          # Xiaomi MiMo-V2 (omni: vision+audio)
     # --- Vision-Language (VL) models ---
     "Qwen2_5_VLForConditionalGeneration": "Qwen2VL",
     "Qwen2VLForConditionalGeneration": "Qwen2VL",
     "Qwen3VLForConditionalGeneration": "Qwen3VL",
     "Qwen3OmniForConditionalGeneration": "Qwen3VL",
+    "Qwen3_5ForConditionalGeneration": "Qwen3_5VL",       # Qwen3.5/3.6 dense VL
+    "Qwen3_5MoeForConditionalGeneration": "Qwen3_5MoeVL",  # Qwen3.5/3.6 MoE VL
+    "KimiK25ForConditionalGeneration": "KimiK25VL",        # Kimi-K2.5 (VL + MLA)
     "InternVLChatModel": "InternVL",
     # --- Embedding / Reranker ---
     "XLMRobertaModel": "RoBERTa",
@@ -587,19 +595,29 @@ _ARCH_FAMILY_MAP: dict[str, str] = {
 }
 
 # Architectures that have QK normalization
-_HAS_QK_NORM = {"Qwen3", "Qwen3Moe", "DeepSeekV2", "DeepSeekV3", "DeepSeekV4", "GLM4", "GLM5MoE"}
+_HAS_QK_NORM = {"Qwen3", "Qwen3Moe", "Qwen3_5VL", "Qwen3_5MoeVL",
+                "DeepSeekV2", "DeepSeekV3", "DeepSeekV4", "GLM4", "GLM5MoE",
+                "KimiK25VL"}
 
 # Architectures that use Multi-head Latent Attention (MLA)
-_MLA_ARCHS = {"DeepSeekV2", "DeepSeekV3", "DeepSeekV4", "GLM5MoE"}
+_MLA_ARCHS = {"DeepSeekV2", "DeepSeekV3", "DeepSeekV4", "GLM5MoE", "KimiK25VL"}
 
 # Vision-language architecture families
-_VL_ARCHS = {"Qwen2VL", "Qwen3VL", "InternVL"}
+_VL_ARCHS = {"Qwen2VL", "Qwen3VL", "InternVL", "Qwen3_5VL", "Qwen3_5MoeVL",
+             "KimiK25VL"}
 
 # VL families whose multimodal cost decomposes cleanly into "vision encoder +
 # projector + ordinary decoder prefill", verified to export text-only with NO
 # vision/fusion ops in the trace. Only these use the torch.export tracer (with
-# an analytic vision splice); other VL families stay on the static builder.
-_TRACER_VERIFIED_VL = {"Qwen2VL"}
+# an analytic vision splice); other VL families hard-fail (no static fallback).
+#
+# Qwen3_5VL / Qwen3_5MoeVL ship a standard Qwen-style ViT (the analytic splice
+# models it like Qwen2-VL). Their DeepStack visual-feature injection adds a few
+# per-layer residual adds that are NOT separately modeled — the same
+# simplification already applied to the analytic vision tower. KimiK25VL is
+# deliberately excluded: its vision tower trips a meta-tensor copy during build
+# and its projector-only vision_config has no standard ViT dims to splice.
+_TRACER_VERIFIED_VL = {"Qwen2VL", "Qwen3_5VL", "Qwen3_5MoeVL"}
 
 # Encoder-only architecture families
 _ENCODER_ARCHS = {"RoBERTa", "BERT"}
@@ -671,6 +689,8 @@ def build_model_graph(
     tp_size: int = 1,
     quantization: str | None = None,
     raw_config: dict | None = None,
+    model_id: str | None = None,
+    allow_remote_code: bool = False,
 ) -> dict:
     """Build static model graph from model summary (from model_info.py).
 
@@ -961,6 +981,7 @@ def build_model_graph(
             prefill_len, decode_batch, context_len, tp_size=tp_size,
             weight_dtype_bytes=cfg.get("weight_dtype_bytes"),
             extra_children=extra_children,
+            model_id=model_id, allow_remote_code=allow_remote_code,
         )
     except Exception as e:
         raise RuntimeError(
