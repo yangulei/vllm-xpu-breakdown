@@ -48,7 +48,6 @@ Then open `http://localhost:8080` in your browser.
   - Memory estimation, FLOPs, and arithmetic intensity
   - Sortable and filterable by backend
 - Backend distribution chart
-- Model catalog with 65+ models across LLM, MLLM, T2I, T2V, Audio, Embedding
 
 ## CLI (Quick One-Shot)
 
@@ -109,7 +108,6 @@ app.py                  Web server (Flask) — model config, profiling, exports,
 run_profile.py          CLI entry point — standalone profiling + reports
 static/index.html       Interactive frontend (SPA, vanilla JS)
 breakdown/
-  model_catalog.py      Registry of 65+ target models with metadata
   model_graph.py        Static model graph builder (core engine)
   model_info.py         HuggingFace model config fetching & summarization
   analyzer.py           Shape symbolization, memory/FLOPs estimation, layer merging

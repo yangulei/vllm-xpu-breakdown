@@ -22,7 +22,6 @@ app.py                    — Flask web server (API + static serving + exports)
 run_profile.py            — CLI profiling entry point
 chat.py                   — Interactive chat with profiling
 breakdown/
-  model_catalog.py        — Registry of 65+ target models with metadata
   model_graph.py          — Static model graph builder (core engine)
   model_info.py           — HuggingFace config fetcher and summarizer
   analyzer.py             — Op analysis (shapes, memory, FLOPs, AI)
@@ -36,7 +35,6 @@ static/
   index.html              — Single-page web UI (HTML + CSS + JS)
 scripts/
   run_profile.sh          — Shell wrapper for profiling
-  run_catalog_models.sh   — Batch static analysis for catalog models
   compare_modes.sh        — Compare eager vs compile modes
 tests/
   test_pipeline.py              — Unit tests (requires torch)
@@ -126,15 +124,6 @@ Exports a flat Excel table sweeping across configurations:
 - Symbolic Shape column keeps S/B/C/TP symbolic, resolves model constants to numbers
 - Row limit guard (`_MAX_MATRIX_ROWS = 50000`) prevents excessive generation
 
-### Model Catalog (`model_catalog.py`)
-
-Registry of target models with:
-- HuggingFace IDs, precision targets, model type
-- Owner, focus area, priority, CRI plan status
-- `vllm_supported` flag (False for diffusion/video models)
-
-Categories: LLM, MLLM, T2I, T2V, Audio, Embedding/Reranker, Segmentation, MTP
-
 ### Op Classification (`classifier.py`)
 
 Classifies ops by name prefix/pattern to backends. Priority order:
@@ -154,10 +143,9 @@ Classifies ops by name prefix/pattern to backends. Priority order:
 
 ## Adding a New Model
 
-1. Add entry to `breakdown/model_catalog.py` in the appropriate category list
-2. If the architecture is new, add mapping in `_ARCH_FAMILY_MAP` in `model_graph.py`
-3. If the attention/MLP pattern is novel, add a new builder function
-4. Test with: `python -c "from breakdown.model_graph import build_model_graph; ..."`
+1. If the architecture is new, add mapping in `_ARCH_FAMILY_MAP` in `model_graph.py`
+2. If the attention/MLP pattern is novel, add a new builder function
+3. Test with: `python -c "from breakdown.model_graph import build_model_graph; ..."`
 
 ## Adding a New Op/Kernel
 
@@ -171,8 +159,6 @@ Classifies ops by name prefix/pattern to backends. Priority order:
 |----------|--------|-------------|
 | `/api/model/<hf_id>` | GET | Fetch and summarize HF model config |
 | `/api/model/<hf_id>/graph` | GET | Build static model graph |
-| `/api/catalog` | GET | List models with `?type=`, `?priority=`, `?vllm=true` filters |
-| `/api/catalog/<name>` | GET | Get single catalog model details |
 | `/api/profile/start` | POST | Start async profiling |
 | `/api/profile/status` | GET | Poll profiling status |
 | `/api/profile/trace` | GET | Download raw trace file |
