@@ -395,6 +395,7 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             "mode": mode,
             "batch_size": batch_size,
             "max_model_len": max_model_len,
+            "max_tokens": max_tokens,
             "tp_size": tp_size,
             "quantization": quantization,
             "summary": summary,
@@ -533,18 +534,27 @@ def download_trace():
     if not trace_path or not os.path.isfile(trace_path):
         return jsonify({"ok": False, "error": "Trace file not found"}), 404
 
-    # Build a descriptive filename:
-    # vllm_trace_{model}_{mode}_bs{batch}_ctx{ctx}_tp{tp}_layers{n}.json.gz
+    # Build a descriptive filename. A profiling run captures both the prefill
+    # (prompt) and decode (generation) phases in one trace, so label it
+    # "prefill+decode". Encode the engine max_model_len as "maxlen" (it is the
+    # KV budget, not the processed context length — labeling it "ctx" was
+    # misleading) and the generated token count as "gen".
+    # vllm_trace_{model}_{mode}_prefill+decode_bs{bs}_maxlen{n}_gen{n}_tp{tp}_{n}layers.json.gz
     model_short = result["model_id"].replace("/", "_")
     mode = result.get("mode", "eager")
     bs = result.get("batch_size", 1)
-    ctx = result.get("max_model_len", "")
+    maxlen = result.get("max_model_len", "")
+    gen = result.get("max_tokens", "")
     tp = result.get("tp_size", 1) or 1
     quant = result.get("quantization")
     layers = result.get("profiled_layers", "all")
     ext = ".json.gz" if trace_path.endswith(".gz") else ".json"
     quant_part = f"_{quant}" if quant else ""
-    download_name = f"vllm_trace_{model_short}_{mode}_bs{bs}_ctx{ctx}_tp{tp}{quant_part}_{layers}layers{ext}"
+    gen_part = f"_gen{gen}" if gen else ""
+    download_name = (
+        f"vllm_trace_{model_short}_{mode}_prefill+decode_bs{bs}"
+        f"_maxlen{maxlen}{gen_part}_tp{tp}{quant_part}_{layers}layers{ext}"
+    )
 
     return send_file(
         trace_path,
@@ -1238,16 +1248,21 @@ def export_excel():
     model_name = data.get("model_id", "breakdown").replace("/", "_")
     mode = data.get("mode", "eager")
     bs = data.get("batch_size", "")
-    ctx = data.get("max_model_len", "")
+    maxlen = data.get("max_model_len", "")
+    gen = data.get("max_tokens", "")
     tp = data.get("tp_size", "")
     quant = data.get("quantization")
 
-    # Build descriptive filename encoding profile settings
-    parts = [f"vllm_xpu_breakdown_{model_name}_{mode}"]
+    # Build descriptive filename encoding profile settings. The profiled run
+    # covers both phases, so tag it "prefill+decode"; max_model_len is the KV
+    # budget (labeled "maxlen", not "ctx").
+    parts = [f"vllm_xpu_breakdown_{model_name}_{mode}_prefill+decode"]
     if bs:
         parts.append(f"bs{bs}")
-    if ctx:
-        parts.append(f"ctx{ctx}")
+    if maxlen:
+        parts.append(f"maxlen{maxlen}")
+    if gen:
+        parts.append(f"gen{gen}")
     if tp and int(tp) > 1:
         parts.append(f"tp{tp}")
     if quant:
