@@ -543,7 +543,10 @@ async function runStatic() {
   const tpSize = parseInt(document.getElementById('tp-size-select').value);
   const queryLen = parseInt(document.getElementById('query-len').value) || 2048;
   const batchSize = parseInt(document.getElementById('batch-size').value) || 1;
-  const contextLen = parseInt(document.getElementById('context-len').value) || 4096;
+  // context_len=0 is valid (pure prefill, no prior context). Only fall back to
+  // the default when the field is empty/invalid — don't treat 0 as falsy.
+  const ctxRaw = parseInt(document.getElementById('context-len').value);
+  const contextLen = Number.isFinite(ctxRaw) ? ctxRaw : 4096;
   const quant = document.getElementById('quant-select').value;
 
   try {
