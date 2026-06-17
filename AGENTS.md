@@ -178,6 +178,19 @@ Classifies ops by name prefix/pattern to backends. Priority order:
 - Shape strings contain `/TP` always (even when TP=1) — resolve via `symbols["TP"]`
 - MLA models (DeepSeek-V2/V3/V4, GLM-MoE-DSA) are supported on XPU — do not
   re-add the removed profiling guard that rejected them
+- Some VL models (e.g. MiniMax-M3, `MiniMaxM3SparseForConditionalGeneration`)
+  nest language-model params under `text_config` and vision params under
+  `vision_config`. `summarize_config` reads text params via a `text_config`
+  fallback, derives `first_k_dense_replace` from the leading zeros of a
+  per-layer `moe_layer_freq` list, and maps `dense_intermediate_size` → dense
+  MLP / `intermediate_size` → MoE experts. M3 uses standard GQA (not MLA).
+- MiniMax-M3 sparse attention (DeepSeek-style "lightning indexer") IS modeled:
+  `_build_attention_ops(..., sparse=True)` adds an `indexer_proj` (aten::mm),
+  `indexer_k_quant_and_cache`, `top_k_per_row_prefill`/`top_k_per_row_decode`,
+  and `merge_attn_states` (all registered vllm-xpu-kernels). Only the MoE layers
+  are sparse — the dense prefix layers keep full attention, matching
+  `sparse_attention_freq` (= the dense/MoE split). The MoE layer builder passes
+  `sparse=cfg.get("sparse_attention")`.
 
 ## Updating Documentation
 

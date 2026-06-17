@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import functools
 import io
 import json
 import os
@@ -159,11 +160,29 @@ def get_model_graph(model_id: str):
 
 # ---- Profile API ----
 
+
+def _set_num_hidden_layers(hf_config, n: int):
+    """Set the decoder layer count where it actually lives in the HF config.
+
+    Module-level (picklable) so it can be passed as a ``hf_overrides`` callable
+    to vLLM, which pickles the config when spawning the EngineCore subprocess.
+    Some multimodal models (e.g. MiniMax-M3) nest ``num_hidden_layers`` under
+    ``text_config``; a top-level override is ignored there.
+    """
+    text_cfg = getattr(hf_config, "text_config", None)
+    if text_cfg is not None and hasattr(text_cfg, "num_hidden_layers"):
+        text_cfg.num_hidden_layers = n
+    else:
+        hf_config.num_hidden_layers = n
+    return hf_config
+
+
 def _run_profile(model_id: str, mode: str, max_model_len: int,
                  batch_size: int, max_tokens: int, prompt: str,
                  num_profile_layers: int | None = None,
                  tp_size: int = 1,
-                 quantization: str | None = None):
+                 quantization: str | None = None,
+                 gpu_memory_utilization: float | None = None):
     """Run profiling in a background thread using vLLM's native profiler.
 
     On XPU hardware, vLLM automatically selects XPUWorker which uses
@@ -178,6 +197,9 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             one trace file per rank; we parse all and aggregate timing.
         quantization: quantization method (e.g. "fp8", "gptq", "awq").
             Passed as --quantization to vLLM.
+        gpu_memory_utilization: fraction of device memory vLLM may use. Lower
+            it (e.g. 0.8) when vLLM's init footprint leaves too little headroom
+            for the default (0.92) on small-VRAM cards. None keeps vLLM default.
     """
     global _profile_state
     try:
@@ -225,15 +247,43 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
         # weight values, and dummy avoids KeyError when layers are reduced.
         engine_kwargs["load_format"] = "dummy"
 
+        # Optionally cap device memory usage (leaves headroom for vLLM's init
+        # footprint on small-VRAM cards; None keeps vLLM's default).
+        if gpu_memory_utilization is not None:
+            engine_kwargs["gpu_memory_utilization"] = gpu_memory_utilization
+
+        # Vision-language models: disable multimodal memory profiling so the run
+        # captures the language-model ops on a text prompt. This avoids vLLM's
+        # dummy image/video profiling path through the vision tower (which the
+        # static graph already covers) and keeps the profile focused on the LLM.
+        if summary.get("vit_hidden_size"):
+            engine_kwargs["limit_mm_per_prompt"] = {"image": 0, "video": 0}
+
+        # Sparse-attention models (e.g. MiniMax-M3) select fixed-size KV blocks
+        # via the lightning indexer, so the KV-cache block size must match the
+        # sparse block size; otherwise vLLM cannot reconcile a common kernel
+        # block size across the sparse/full attention backends.
+        sparse_block = summary.get("sparse_block_size")
+        if sparse_block:
+            engine_kwargs["block_size"] = int(sparse_block)
+
         # Quantization method
         if quantization:
             engine_kwargs["quantization"] = quantization
 
         # Override layer count for reduced-layer profiling.
         if profiled_layers < actual_layers:
-            engine_kwargs["hf_overrides"] = {
-                "num_hidden_layers": profiled_layers,
-            }
+            # Some multimodal models (e.g. MiniMax-M3) nest the decoder layer
+            # count under ``text_config``. A top-level ``num_hidden_layers``
+            # override is silently ignored there, so the full model is built
+            # and exhausts device memory (UR_RESULT_ERROR_DEVICE_LOST). Pass a
+            # callable override (vLLM applies callables in place, preserving the
+            # rest of the config) that sets the count where it actually lives.
+            # Must be a module-level partial so it pickles for the spawned
+            # EngineCore subprocess.
+            engine_kwargs["hf_overrides"] = functools.partial(
+                _set_num_hidden_layers, n=profiled_layers
+            )
 
         # Set compile / eager mode
         if mode == "compile":
@@ -414,6 +464,7 @@ def start_profile():
     num_profile_layers = data.get("num_profile_layers")  # None = all layers
     tp_size = data.get("tensor_parallel_size", 1)
     quantization = data.get("quantization")  # None = no quantization
+    gpu_memory_utilization = data.get("gpu_memory_utilization")  # None = vLLM default
 
     with _profile_lock:
         _profile_state = {
@@ -433,7 +484,7 @@ def start_profile():
     thread = threading.Thread(
         target=_run_profile,
         args=(model_id, mode, max_model_len, batch_size, max_tokens, prompt,
-              num_profile_layers, tp_size, quantization),
+              num_profile_layers, tp_size, quantization, gpu_memory_utilization),
         daemon=True,
     )
     thread.start()

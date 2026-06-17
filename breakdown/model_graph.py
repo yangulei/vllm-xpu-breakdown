@@ -136,9 +136,16 @@ def _softmax_flops(tokens: int, seq_len: int, n_heads: int) -> int:
 # ===================================================================
 
 def _build_attention_ops(
-    cfg: dict, phase: str, tokens: str, seq: str
+    cfg: dict, phase: str, tokens: str, seq: str, sparse: bool = False
 ) -> list[OpNode]:
-    """Build ops for attention module."""
+    """Build ops for attention module.
+
+    When ``sparse`` is True, model DeepSeek-style sparse attention (the
+    "lightning indexer" + top-k block selection used by MiniMax-M3): a small
+    index projection, index-key quant/cache, a per-row top-k block selector,
+    and a merge over the selected sparse attention states. The first few layers
+    of M3 use full attention (``sparse`` False); the rest are sparse.
+    """
     H = cfg["hidden_size"]
     n_h = cfg["_tp_num_heads"]
     n_kv = cfg["_tp_num_kv_heads"]
@@ -194,6 +201,48 @@ def _build_attention_ops(
         phase=phase,
     ))
 
+    # Sparse-attention "lightning indexer" (DeepSeek-style, MiniMax-M3):
+    # a small index projection scores KV blocks, then a per-row top-k selector
+    # picks the blocks each query attends to. Runs before the attention kernel.
+    if sparse:
+        n_idx = cfg.get("sparse_num_index_heads") or 4
+        idx_d = cfg.get("sparse_index_dim") or 128
+        idx_out = n_idx * idx_d
+        # Index Q/K projection (H → n_idx·idx_d)
+        ops.append(OpNode(
+            name="aten::mm", role="indexer_proj",
+            backend="torch-xpu-ops",
+            input_shapes=[[tokens, "H"], ["H", "n_idx·idx_d"]],
+            output_shape=[tokens, "n_idx·idx_d"],
+            memory_bytes=_mm_mem(T, H, idx_out, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
+            flops=_mm_flops(T, H, idx_out) if isinstance(T, int) else 0,
+            phase=phase,
+        ))
+        # Index-key FP8 quant + cache write
+        ops.append(OpNode(
+            name="indexer_k_quant_and_cache", role="indexer_cache",
+            backend="vllm-xpu-kernels",
+            input_shapes=[[tokens, "idx_d"]],
+            output_shape=[],
+            memory_bytes=(T * idx_d) if isinstance(T, int) else 0,
+            flops=0,
+            phase=phase,
+        ))
+        # Per-row top-k block selection (separate prefill/decode kernels)
+        topk_name = (
+            "top_k_per_row_prefill" if phase == "prefill"
+            else "top_k_per_row_decode"
+        )
+        ops.append(OpNode(
+            name=topk_name, role="indexer_topk",
+            backend="vllm-xpu-kernels",
+            input_shapes=[[tokens, "n_idx", seq]],
+            output_shape=[tokens, "topk_blk"],
+            memory_bytes=0,
+            flops=(T * n_idx * S) if isinstance(T, int) and isinstance(S, int) else 0,
+            phase=phase,
+        ))
+
     # Attention kernel
     attn_backend = "vllm-xpu-kernels"
     if phase == "prefill":
@@ -215,6 +264,18 @@ def _build_attention_ops(
             memory_bytes=0,
             flops=0,
             phase="decode",
+        ))
+
+    # Sparse attention merges partial states across selected KV blocks.
+    if sparse:
+        ops.append(OpNode(
+            name="merge_attn_states", role="attention_merge",
+            backend="vllm-xpu-kernels",
+            input_shapes=[[tokens, nh_sym, "d"]],
+            output_shape=[tokens, nh_sym, "d"],
+            memory_bytes=(T * n_h * d * dtype_bytes) if isinstance(T, int) else 0,
+            flops=0,
+            phase=phase,
         ))
 
     # KV cache store
@@ -378,8 +439,12 @@ def _build_moe_layer(
         ops=[_build_norm_op(cfg, "input_layernorm", tokens, phase)],
     )
 
-    # Attention (same as dense)
-    attn_ops = _build_attention_ops(cfg, phase, tokens, seq)
+    # Attention (same as dense) — sparse "lightning indexer" attention when the
+    # model enables it (MiniMax-M3: dense prefix layers use full attention, MoE
+    # layers use sparse attention).
+    attn_ops = _build_attention_ops(
+        cfg, phase, tokens, seq, sparse=cfg.get("sparse_attention", False)
+    )
     attention = ModuleNode(
         name="self_attn", path="model.layers.*.self_attn",
         module_type=f"{arch_family}Attention", ops=attn_ops,
@@ -1196,6 +1261,7 @@ _ARCH_FAMILY_MAP: dict[str, str] = {
     "MixtralForCausalLM": "Mixtral",
     "HunYuanMoEV1ForCausalLM": "Hunyuan",
     "MiniMaxM1ForCausalLM": "MiniMax",
+    "MiniMaxM3SparseForConditionalGeneration": "MiniMaxM3",
     # --- Vision-Language (VL) models ---
     "Qwen2_5_VLForConditionalGeneration": "Qwen2VL",
     "Qwen2VLForConditionalGeneration": "Qwen2VL",
@@ -1219,13 +1285,13 @@ _ARCH_FAMILY_MAP: dict[str, str] = {
 }
 
 # Architectures that have QK normalization
-_HAS_QK_NORM = {"Qwen3", "Qwen3Moe", "DeepSeekV2", "DeepSeekV3", "DeepSeekV4", "GLM4", "GLM5MoE"}
+_HAS_QK_NORM = {"Qwen3", "Qwen3Moe", "DeepSeekV2", "DeepSeekV3", "DeepSeekV4", "GLM4", "GLM5MoE", "MiniMaxM3"}
 
 # Architectures that use Multi-head Latent Attention (MLA)
 _MLA_ARCHS = {"DeepSeekV2", "DeepSeekV3", "DeepSeekV4", "GLM5MoE"}
 
 # Vision-language architecture families
-_VL_ARCHS = {"Qwen2VL", "Qwen3VL", "InternVL"}
+_VL_ARCHS = {"Qwen2VL", "Qwen3VL", "InternVL", "MiniMaxM3"}
 
 # Encoder-only architecture families
 _ENCODER_ARCHS = {"RoBERTa", "BERT"}
@@ -1408,6 +1474,16 @@ def build_model_graph(
         cfg["o_lora_rank"] = model_summary.get("o_lora_rank") or 0
         cfg["o_groups"] = model_summary.get("o_groups") or 1
 
+    # Sparse-attention config (DeepSeek-style lightning indexer) — MiniMax-M3.
+    # When enabled, MoE layers run sparse attention (the dense prefix layers
+    # keep full attention).
+    if model_summary.get("sparse_attention"):
+        cfg["sparse_attention"] = True
+        cfg["sparse_index_dim"] = model_summary.get("sparse_index_dim") or 128
+        cfg["sparse_num_index_heads"] = model_summary.get("sparse_num_index_heads") or 4
+        cfg["sparse_topk_blocks"] = model_summary.get("sparse_topk_blocks") or 16
+        cfg["sparse_block_size"] = model_summary.get("sparse_block_size") or 128
+
     # VL-specific config
     if is_vl:
         cfg["vit_hidden_size"] = model_summary.get("vit_hidden_size", 1024)
@@ -1495,6 +1571,15 @@ def build_model_graph(
             result["symbols"]["2·I_moe"] = 2 * moe_I
         if cfg.get("n_shared_experts", 0) > 0:
             result["symbols"]["n_shared"] = cfg["n_shared_experts"]
+
+    # Sparse-attention (lightning indexer) symbols — MiniMax-M3
+    if cfg.get("sparse_attention"):
+        idx_d = cfg["sparse_index_dim"]
+        n_idx = cfg["sparse_num_index_heads"]
+        result["symbols"]["idx_d"] = idx_d
+        result["symbols"]["n_idx"] = n_idx
+        result["symbols"]["n_idx·idx_d"] = n_idx * idx_d
+        result["symbols"]["topk_blk"] = cfg["sparse_topk_blocks"]
 
     # MLA-specific symbols
     if is_mla:

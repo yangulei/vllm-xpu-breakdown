@@ -19,7 +19,11 @@ and encoder/embedding models are supported for both static analysis and
 profiling. **MLA (Multi-head Latent Attention) models** (DeepSeek-V2/V3/V4,
 GLM-MoE-DSA) are now supported on XPU too — dense MLA routes to the
 `TRITON_MLA` backend and DeepSeek sparse attention routes to the
-`XPU_MLA_SPARSE` backend in vLLM-XPU. Diffusion (T2I/T2V) models support
+`XPU_MLA_SPARSE` backend in vLLM-XPU. **MiniMax-M3** (vision-language MoE
+with sparse attention) is supported on XPU as well — its nested
+`text_config`/`vision_config` layout, per-layer dense/MoE split, shared
+experts, and DeepSeek-style sparse attention (lightning indexer + top-k block
+selection) are modeled in the static graph. Diffusion (T2I/T2V) models support
 static analysis only (not vLLM-served).
 
 ## Web UI (Recommended)

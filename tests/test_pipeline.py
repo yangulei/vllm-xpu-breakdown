@@ -878,5 +878,157 @@ class TestMLAModelGraph(unittest.TestCase):
                     )
 
 
+# MiniMax-M3 is a vision-language MoE model with sparse attention. vLLM-XPU now
+# supports it, so the static graph builder must handle its nested ``text_config``
+# layout (text params under text_config, vision under vision_config), the
+# per-layer ``moe_layer_freq`` dense/MoE split, and the separate dense vs. MoE
+# intermediate sizes. M3 uses standard GQA (not MLA); the sparse indexer is not
+# modeled as separate ops (same simplification as GLM5MoE DSA).
+_MINIMAX_M3_CONFIG = {
+    "architectures": ["MiniMaxM3SparseForConditionalGeneration"],
+    "model_type": "minimax_m3_vl",
+    "torch_dtype": "bfloat16",
+    "projector_hidden_act": "gelu",
+    "vision_feature_layer": -1,
+    "text_config": {
+        "hidden_size": 6144,
+        "intermediate_size": 3072,
+        "dense_intermediate_size": 12288,
+        "shared_intermediate_size": 3072,
+        "num_hidden_layers": 60,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 4,
+        "head_dim": 128,
+        "vocab_size": 200064,
+        "use_qk_norm": True,
+        "num_local_experts": 128,
+        "num_experts_per_tok": 4,
+        "n_shared_experts": 1,
+        # First 3 layers dense (leading zeros), remainder MoE.
+        "moe_layer_freq": [0, 0, 0] + [1] * 57,
+        "sparse_attention_config": {
+            "use_sparse_attention": True,
+            "sparse_index_dim": 128,
+            "sparse_num_index_heads": 4,
+            "sparse_topk_blocks": 16,
+            "sparse_block_size": 128,
+        },
+    },
+    "vision_config": {
+        "hidden_size": 1280,
+        "num_attention_heads": 16,
+        "num_hidden_layers": 32,
+        "intermediate_size": 5120,
+        "patch_size": 14,
+        "image_size": 2016,
+    },
+}
+
+
+class TestMiniMaxM3ModelGraph(unittest.TestCase):
+    """MiniMax-M3 (VL + MoE + sparse attention) is supported on XPU — the static
+    graph must build from its nested text_config/vision_config layout and route
+    every op to an XPU backend."""
+
+    def _build(self, config: dict) -> dict:
+        from breakdown.model_graph import build_model_graph
+        from breakdown.model_info import summarize_config
+
+        summary = summarize_config(config)
+        return build_model_graph(
+            summary, prefill_len=128, decode_batch=1, context_len=2048
+        )
+
+    def test_summary_reads_nested_text_config(self):
+        from breakdown.model_info import summarize_config
+
+        summary = summarize_config(_MINIMAX_M3_CONFIG)
+        self.assertEqual(summary["hidden_size"], 6144)
+        self.assertEqual(summary["num_layers"], 60)
+        self.assertEqual(summary["num_heads"], 64)
+        self.assertEqual(summary["num_kv_heads"], 4)
+        self.assertTrue(summary["is_moe"])
+        self.assertEqual(summary["num_experts"], 128)
+        self.assertEqual(summary["num_experts_per_tok"], 4)
+        self.assertEqual(summary["n_shared_experts"], 1)
+        # dense MLP uses dense_intermediate_size; experts use intermediate_size
+        self.assertEqual(summary["intermediate_size"], 12288)
+        self.assertEqual(summary["moe_intermediate_size"], 3072)
+        # leading zeros of moe_layer_freq → dense prefix
+        self.assertEqual(summary["first_k_dense_replace"], 3)
+        # vision encoder dimensions resolved from vision_config
+        self.assertEqual(summary["vit_hidden_size"], 1280)
+        self.assertEqual(summary["vit_num_layers"], 32)
+
+    def test_graph_builds(self):
+        graph = self._build(_MINIMAX_M3_CONFIG)
+        self.assertEqual(graph["family"], "MiniMaxM3")
+        self.assertEqual(graph["model_type"], "mllm")
+        self.assertIsNotNone(graph["prefill"])
+        self.assertIsNotNone(graph["decode"])
+
+    def test_hybrid_dense_moe_split(self):
+        graph = self._build(_MINIMAX_M3_CONFIG)
+        types = {
+            ch["module_type"]: ch.get("repeat_count")
+            for ch in graph["prefill"]["children"]
+        }
+        self.assertEqual(types.get("MiniMaxM3DenseLayer"), 3)
+        self.assertEqual(types.get("MiniMaxM3MoELayer"), 57)
+
+    def test_vision_encoder_and_shared_experts_present(self):
+        graph = self._build(_MINIMAX_M3_CONFIG)
+        roles = {o.get("role") for o in _collect_ops(graph["prefill"])}
+        self.assertTrue(any(r and r.startswith("vit") for r in roles),
+                        "vision encoder ops missing")
+        self.assertIn("vl_projector", roles)
+        self.assertTrue(any(r and "shared_expert" in r for r in roles),
+                        "shared expert ops missing")
+        self.assertIn("q_norm", roles)  # use_qk_norm=True
+
+    def test_sparse_attention_indexer_in_moe_layers(self):
+        # MoE (sparse) layers carry the lightning indexer + top-k + merge ops;
+        # the dense prefix layers keep full attention (no indexer).
+        graph = self._build(_MINIMAX_M3_CONFIG)
+
+        def _attn_names(layer_type, phase):
+            for ch in graph[phase]["children"]:
+                if ch["module_type"] == layer_type:
+                    for sub in ch["children"]:
+                        if sub["name"] == "self_attn":
+                            return {o["name"] for o in sub["ops"]}
+            return set()
+
+        for phase, topk in (("prefill", "top_k_per_row_prefill"),
+                            ("decode", "top_k_per_row_decode")):
+            moe_names = _attn_names("MiniMaxM3MoELayer", phase)
+            self.assertIn("indexer_k_quant_and_cache", moe_names)
+            self.assertIn(topk, moe_names)
+            self.assertIn("merge_attn_states", moe_names)
+            self.assertTrue(
+                any(o.get("role") == "indexer_proj"
+                    for ch in graph[phase]["children"]
+                    if ch["module_type"] == "MiniMaxM3MoELayer"
+                    for sub in ch["children"] if sub["name"] == "self_attn"
+                    for o in sub["ops"]),
+                "indexer projection missing in sparse attention",
+            )
+            # Dense prefix layers must NOT have indexer/top-k ops.
+            dense_names = _attn_names("MiniMaxM3DenseLayer", phase)
+            self.assertNotIn(topk, dense_names)
+            self.assertNotIn("indexer_k_quant_and_cache", dense_names)
+
+    def test_ops_use_xpu_backends(self):
+        graph = self._build(_MINIMAX_M3_CONFIG)
+        for phase in ("prefill", "decode"):
+            for op in _collect_ops(graph[phase]):
+                self.assertIn(
+                    op["backend"],
+                    _XPU_SUPPORTED_BACKENDS,
+                    f"MiniMax-M3 {phase} op {op['name']} fell back to "
+                    f"{op['backend']}",
+                )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
