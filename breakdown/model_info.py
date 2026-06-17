@@ -9,6 +9,30 @@ from pathlib import Path
 from typing import Any
 
 
+def _normalize_layerwise_value(value: Any) -> Any:
+    """Collapse per-layer config lists to a representative scalar when possible.
+
+    Static graph generation assumes one configuration per repeated layer block.
+    Some model configs encode MoE settings as one value per layer. If all
+    entries are identical, treat them as a scalar. Otherwise, fall back to the
+    first non-null entry so graph building can proceed with a representative
+    layer configuration.
+    """
+    if not isinstance(value, list):
+        return value
+    if not value:
+        return None
+
+    normalized = [_normalize_layerwise_value(item) for item in value]
+    first = normalized[0]
+    if all(item == first for item in normalized):
+        return first
+    for item in normalized:
+        if item is not None:
+            return item
+    return None
+
+
 def fetch_model_config(model_id: str) -> dict[str, Any]:
     """Fetch config.json from HuggingFace Hub.
 
@@ -85,9 +109,17 @@ def summarize_config(config: dict[str, Any]) -> dict[str, Any]:
         or config.get("n_routed_experts")
     )
     is_moe = num_experts is not None and num_experts > 1
-    num_experts_per_tok = (
+    num_experts_per_tok = _normalize_layerwise_value(
         config.get("num_experts_per_tok")
-        or config.get("n_group_top_k", config.get("top_k"))
+        or config.get("n_group_top_k")
+        or config.get("top_k")
+        or config.get("moe_topk")
+    )
+    moe_intermediate_size = _normalize_layerwise_value(
+        config.get("moe_intermediate_size")
+    )
+    n_shared_experts = _normalize_layerwise_value(
+        config.get("n_shared_experts", config.get("num_shared_expert", 0))
     )
 
     # Quantization config
@@ -120,9 +152,9 @@ def summarize_config(config: dict[str, Any]) -> dict[str, Any]:
         # Qwen-style: decoder_sparse_step (1 = all MoE, 2 = alternating)
         "decoder_sparse_step": config.get("decoder_sparse_step", 0),
         # MoE intermediate size (may differ from dense intermediate_size)
-        "moe_intermediate_size": config.get("moe_intermediate_size"),
+        "moe_intermediate_size": moe_intermediate_size,
         # Shared experts
-        "n_shared_experts": config.get("n_shared_experts", 0),
+        "n_shared_experts": n_shared_experts,
         # MLA (Multi-head Latent Attention) — DeepSeek-V2/V3/V4
         "kv_lora_rank": config.get("kv_lora_rank"),
         "q_lora_rank": config.get("q_lora_rank"),

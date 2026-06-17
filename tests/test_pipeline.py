@@ -38,6 +38,7 @@ from breakdown.classifier import Backend, classify_op
 from breakdown.model_info import fetch_model_config, get_dim_symbols, summarize_config
 from breakdown.profiler import _is_overhead_event
 from breakdown.trace_parser import parse_trace_file
+from breakdown.model_graph import build_model_graph
 
 
 # ---- Qwen3-4B-Instruct-2507 model constants ----
@@ -53,6 +54,23 @@ QWEN3_4B_EXPECTED = {
     "vocab_size": 151936,
     "is_moe": False,
     "dtype": "bfloat16",
+}
+
+HUNYUAN_MOE_LIST_CONFIG = {
+    "architectures": ["HunYuanMoEV1ForCausalLM"],
+    "model_type": "hunyuan_v1_moe",
+    "hidden_size": 4096,
+    "num_hidden_layers": 32,
+    "num_attention_heads": 32,
+    "num_key_value_heads": 8,
+    "head_dim": 128,
+    "intermediate_size": 3072,
+    "vocab_size": 128167,
+    "torch_dtype": "bfloat16",
+    "num_experts": 64,
+    "moe_intermediate_size": [3072] * 32,
+    "moe_topk": [8] * 32,
+    "num_shared_expert": [1] * 32,
 }
 
 # Path to real trace file from profiling run (if available)
@@ -143,6 +161,27 @@ class TestModelInfo(unittest.TestCase):
         self.assertEqual(dim_symbols[151936], "V")
         self.assertIn(32, dim_symbols)     # n_h
         self.assertIn(8, dim_symbols)      # n_kv
+
+    def test_summarize_config_normalizes_layerwise_moe_lists(self):
+        summary = summarize_config(HUNYUAN_MOE_LIST_CONFIG)
+
+        self.assertEqual(summary["moe_intermediate_size"], 3072)
+        self.assertEqual(summary["num_experts_per_tok"], 8)
+        self.assertEqual(summary["n_shared_experts"], 1)
+
+    def test_build_model_graph_accepts_layerwise_moe_lists(self):
+        summary = summarize_config(HUNYUAN_MOE_LIST_CONFIG)
+
+        graph = build_model_graph(
+            summary,
+            prefill_len=128,
+            decode_batch=1,
+            context_len=4096,
+            tp_size=1,
+        )
+
+        self.assertIn("prefill", graph)
+        self.assertIn("decode", graph)
 
 
 # ===================================================================
