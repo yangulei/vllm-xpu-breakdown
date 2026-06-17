@@ -297,28 +297,40 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
 
         sampling_params = SamplingParams(max_tokens=max_tokens)
 
-        # Use chat() if model supports it, else fall back to generate()
+        # Use chat() if model supports it, else fall back to generate().
+        conversation = [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt},
+        ]
+        conversations = [conversation] * batch_size
+        prompts = [prompt] * batch_size
+
+        # First warmup pass also detects chat-template support.
         try:
-            conversation = [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": prompt},
-            ]
-            conversations = [conversation] * batch_size
-            # Test that chat template works
             llm.chat(conversations, sampling_params, use_tqdm=False)
             use_chat = True
         except Exception:
             # Model may not have a chat template — use raw generate
-            prompts = [prompt] * batch_size
             llm.generate(prompts, sampling_params, use_tqdm=False)
             use_chat = False
 
+        def _run_inference():
+            if use_chat:
+                llm.chat(conversations, sampling_params, use_tqdm=False)
+            else:
+                llm.generate(prompts, sampling_params, use_tqdm=False)
+
+        # Warm up before profiling. Warmup primes Triton JIT compilation /
+        # kernel autotuning so the profiled trace reflects steady-state timing,
+        # not one-time compilation overhead (important for fused/sparse-kernel
+        # models such as MiniMax-M3). The detection pass above is warmup #1;
+        # run 2 more for 3 warmups total.
+        for _ in range(2):
+            _run_inference()
+
         # --- Profiled run ---
         llm.start_profile()
-        if use_chat:
-            llm.chat(conversations, sampling_params, use_tqdm=False)
-        else:
-            llm.generate(prompts, sampling_params, use_tqdm=False)
+        _run_inference()
         llm.stop_profile()
 
         # --- Parse trace files ---
