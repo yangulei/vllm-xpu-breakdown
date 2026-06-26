@@ -184,12 +184,21 @@ Classifies ops by name prefix/pattern to backends. Priority order:
   fallback, derives `first_k_dense_replace` from the leading zeros of a
   per-layer `moe_layer_freq` list, and maps `dense_intermediate_size` → dense
   MLP / `intermediate_size` → MoE experts. M3 uses standard GQA (not MLA).
-- MiniMax-M3 sparse attention (DeepSeek-style "lightning indexer") IS modeled:
-  `_build_attention_ops(..., sparse=True)` adds an `indexer_proj` (aten::mm),
-  `indexer_k_quant_and_cache`, `top_k_per_row_prefill`/`top_k_per_row_decode`,
-  and `merge_attn_states` (all registered vllm-xpu-kernels). Only the MoE layers
-  are sparse — the dense prefix layers keep full attention, matching
-  `sparse_attention_freq` (= the dense/MoE split). The MoE layer builder passes
+- MiniMax-M3 sparse attention is modeled to match the **actual XPU dispatch**
+  (not the DeepSeek/CUDA indexer ops). `_build_attention_ops(..., sparse=True)`
+  emits: a fused `fused_minimax_m3_qknorm_rope_kv_insert` vllm-xpu-kernels op
+  (replaces the dense q_norm/k_norm/rotary/reshape_and_cache — it also writes the
+  K/V and index-key caches), the Triton lightning-indexer score
+  (`minimax_m3_index_score` prefill / `minimax_m3_index_decode` decode), a Triton
+  `minimax_m3_index_topk` (prefill only; decode fuses top-k into the score
+  kernel), and the Triton block-sparse attention itself
+  (`minimax_m3_sparse_attn` prefill / `minimax_m3_sparse_attn_decode` decode —
+  the decode kernel merges its split-K partials internally, so there is no
+  separate `merge_attn_states`). The index Q/K projection is fused into
+  `qkv_proj`, so it is not a separate matmul. On XPU the flash/MSA sparse path is
+  CUDA-SM100-only, so sparse attention always runs Triton — do NOT model it as
+  `flash_attn_varlen_fwd`. Only the MoE layers are sparse; the dense prefix
+  layers keep full attention. The MoE layer builder passes
   `sparse=cfg.get("sparse_attention")`.
 
 ## Updating Documentation

@@ -631,10 +631,17 @@ async function startProfile() {
   const modelId = document.getElementById('model-input').value.trim();
   if (!modelId) { alert('Enter a model ID first'); return; }
 
+  // max_model_len must cover the full sequence the engine sees: the prefill
+  // query tokens plus any prior context (KV) tokens. "Query Len" + "Context Len"
+  // (e.g. 2048 + 2048 = 4096), not just the context length.
+  const profQueryLen = parseInt(document.getElementById('query-len').value) || 2048;
+  const profCtxLen = parseInt(document.getElementById('context-len').value);
+  const profMaxLen = profQueryLen + (Number.isFinite(profCtxLen) ? profCtxLen : 4096);
+
   const body = {
     model_id: modelId,
     mode: document.getElementById('mode-select').value,
-    max_model_len: parseInt(document.getElementById('context-len').value) || 4096,
+    max_model_len: profMaxLen,
     batch_size: parseInt(document.getElementById('batch-size').value) || 1,
     max_tokens: 128,
     num_profile_layers: (() => {

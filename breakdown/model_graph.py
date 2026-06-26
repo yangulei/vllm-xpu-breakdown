@@ -176,78 +176,95 @@ def _build_attention_ops(
         phase=phase,
     ))
 
-    # Q/K norms (Qwen3-specific)
-    if cfg.get("has_qk_norm"):
-        for role, sym in [("q_norm", nh_sym), ("k_norm", nkv_sym)]:
-            n = n_h if role == "q_norm" else n_kv
-            ops.append(OpNode(
-                name="rms_norm", role=role,
-                backend="vllm-xpu-kernels",
-                input_shapes=[[tokens, sym, "d"]],
-                output_shape=[tokens, sym, "d"],
-                memory_bytes=_norm_mem(T * n, d, dtype_bytes) if isinstance(T, int) else 0,
-                flops=_norm_flops(T * n, d) if isinstance(T, int) else 0,
-                phase=phase,
-            ))
+    # Q/K norms + rotary embedding. MiniMax-M3 sparse layers fuse per-head
+    # Gemma QK-norm, partial NeoX RoPE, the main K/V cache insert, and the
+    # index-key cache insert into a single vllm-xpu-kernels custom op
+    # (fused_minimax_m3_qknorm_rope_kv_insert), so the separate norm/rotary/
+    # cache_store ops below are emitted only for the dense (full-attention) path.
+    if sparse:
+        ops.append(OpNode(
+            name="fused_minimax_m3_qknorm_rope_kv_insert", role="qknorm_rope_kv",
+            backend="vllm-xpu-kernels",
+            input_shapes=[[tokens, qkv_sym]],
+            output_shape=[tokens, nhd_sym],
+            memory_bytes=(T * qkv_size * dtype_bytes) if isinstance(T, int) else 0,
+            flops=(T * (n_h + n_kv) * d * 6) if isinstance(T, int) else 0,
+            phase=phase,
+        ))
+    else:
+        # Q/K norms (Qwen3-specific)
+        if cfg.get("has_qk_norm"):
+            for role, sym in [("q_norm", nh_sym), ("k_norm", nkv_sym)]:
+                n = n_h if role == "q_norm" else n_kv
+                ops.append(OpNode(
+                    name="rms_norm", role=role,
+                    backend="vllm-xpu-kernels",
+                    input_shapes=[[tokens, sym, "d"]],
+                    output_shape=[tokens, sym, "d"],
+                    memory_bytes=_norm_mem(T * n, d, dtype_bytes) if isinstance(T, int) else 0,
+                    flops=_norm_flops(T * n, d) if isinstance(T, int) else 0,
+                    phase=phase,
+                ))
 
-    # Rotary embedding
-    ops.append(OpNode(
-        name="rotary_embedding", role="rotary_emb",
-        backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, nh_sym, "d"], [tokens, nkv_sym, "d"]],
-        output_shape=[tokens, nh_sym, "d"],
-        memory_bytes=(T * (n_h + n_kv) * d * dtype_bytes * 3) if isinstance(T, int) else 0,
-        flops=(T * (n_h + n_kv) * d * 6) if isinstance(T, int) else 0,
-        phase=phase,
-    ))
+        # Rotary embedding
+        ops.append(OpNode(
+            name="rotary_embedding", role="rotary_emb",
+            backend="vllm-xpu-kernels",
+            input_shapes=[[tokens, nh_sym, "d"], [tokens, nkv_sym, "d"]],
+            output_shape=[tokens, nh_sym, "d"],
+            memory_bytes=(T * (n_h + n_kv) * d * dtype_bytes * 3) if isinstance(T, int) else 0,
+            flops=(T * (n_h + n_kv) * d * 6) if isinstance(T, int) else 0,
+            phase=phase,
+        ))
 
-    # Sparse-attention "lightning indexer" (DeepSeek-style, MiniMax-M3):
-    # a small index projection scores KV blocks, then a per-row top-k selector
-    # picks the blocks each query attends to. Runs before the attention kernel.
+    # Sparse-attention "lightning indexer" (DeepSeek-style, MiniMax-M3). On XPU
+    # these are the model's own Triton kernels (minimax_m3_index_*), not the
+    # DeepSeek vllm-xpu-kernels indexer ops. The index Q/K projection is fused
+    # into qkv_proj above, and the index-key cache write is fused into
+    # fused_minimax_m3_qknorm_rope_kv_insert, so neither appears as a separate
+    # op here.
     if sparse:
         n_idx = cfg.get("sparse_num_index_heads") or 4
         idx_d = cfg.get("sparse_index_dim") or 128
-        idx_out = n_idx * idx_d
-        # Index Q/K projection (H → n_idx·idx_d)
-        ops.append(OpNode(
-            name="aten::mm", role="indexer_proj",
-            backend="torch-xpu-ops",
-            input_shapes=[[tokens, "H"], ["H", "n_idx·idx_d"]],
-            output_shape=[tokens, "n_idx·idx_d"],
-            memory_bytes=_mm_mem(T, H, idx_out, dtype_bytes, w_bytes) if isinstance(T, int) else 0,
-            flops=_mm_flops(T, H, idx_out) if isinstance(T, int) else 0,
-            phase=phase,
-        ))
-        # Index-key FP8 quant + cache write
-        ops.append(OpNode(
-            name="indexer_k_quant_and_cache", role="indexer_cache",
-            backend="vllm-xpu-kernels",
-            input_shapes=[[tokens, "idx_d"]],
-            output_shape=[],
-            memory_bytes=(T * idx_d) if isinstance(T, int) else 0,
-            flops=0,
-            phase=phase,
-        ))
-        # Per-row top-k block selection (separate prefill/decode kernels)
-        topk_name = (
-            "top_k_per_row_prefill" if phase == "prefill"
-            else "top_k_per_row_decode"
+        # Indexer score over the cached index keys (prefill vs decode kernels).
+        score_name = (
+            "minimax_m3_index_score" if phase == "prefill"
+            else "minimax_m3_index_decode"
         )
         ops.append(OpNode(
-            name=topk_name, role="indexer_topk",
-            backend="vllm-xpu-kernels",
-            input_shapes=[[tokens, "n_idx", seq]],
-            output_shape=[tokens, "topk_blk"],
+            name=score_name, role="indexer_score",
+            backend="triton",
+            input_shapes=[[tokens, "n_idx", "idx_d"], [seq, "idx_d"]],
+            output_shape=[tokens, "n_idx", seq],
             memory_bytes=0,
-            flops=(T * n_idx * S) if isinstance(T, int) and isinstance(S, int) else 0,
+            flops=(T * n_idx * idx_d * S * 2) if isinstance(T, int) and isinstance(S, int) else 0,
             phase=phase,
         ))
+        # Per-row top-k block selection. Prefill runs a dedicated Triton kernel;
+        # decode fuses top-k selection into minimax_m3_index_decode above.
+        if phase == "prefill":
+            ops.append(OpNode(
+                name="minimax_m3_index_topk", role="indexer_topk",
+                backend="triton",
+                input_shapes=[[tokens, "n_idx", seq]],
+                output_shape=[tokens, "topk_blk"],
+                memory_bytes=0,
+                flops=(T * n_idx * S) if isinstance(T, int) and isinstance(S, int) else 0,
+                phase=phase,
+            ))
 
-    # Attention kernel
-    attn_backend = "vllm-xpu-kernels"
+    # Attention kernel. Dense layers use the vllm-xpu-kernels flash/paged
+    # attention; sparse (MiniMax-M3) layers attend only to the indexer-selected
+    # blocks via the model's Triton block-sparse kernels (the Triton decode
+    # kernel merges its split-K partials internally, so there is no separate
+    # merge_attn_states op).
     if phase == "prefill":
+        if sparse:
+            attn_name, attn_backend = "minimax_m3_sparse_attn", "triton"
+        else:
+            attn_name, attn_backend = "flash_attn_varlen_fwd", "vllm-xpu-kernels"
         ops.append(OpNode(
-            name="flash_attn_varlen_fwd", role="attention",
+            name=attn_name, role="attention",
             backend=attn_backend,
             input_shapes=[[tokens, nh_sym, "d"], [seq, nkv_sym, "d"], [seq, nkv_sym, "d"]],
             output_shape=[tokens, nh_sym, "d"],
@@ -256,8 +273,12 @@ def _build_attention_ops(
             phase="prefill",
         ))
     else:
+        if sparse:
+            attn_name, attn_backend = "minimax_m3_sparse_attn_decode", "triton"
+        else:
+            attn_name, attn_backend = "paged_attention", "vllm-xpu-kernels"
         ops.append(OpNode(
-            name="paged_attention", role="attention",
+            name=attn_name, role="attention",
             backend=attn_backend,
             input_shapes=[[tokens, nh_sym, "d"], [seq, nkv_sym, "d"]],
             output_shape=[tokens, nh_sym, "d"],
@@ -266,28 +287,18 @@ def _build_attention_ops(
             phase="decode",
         ))
 
-    # Sparse attention merges partial states across selected KV blocks.
-    if sparse:
+    # KV cache store. Sparse (M3) layers already wrote K/V inside the fused
+    # qknorm/rope/insert kernel above, so only the dense path stores here.
+    if not sparse:
         ops.append(OpNode(
-            name="merge_attn_states", role="attention_merge",
+            name="reshape_and_cache_flash", role="cache_store",
             backend="vllm-xpu-kernels",
-            input_shapes=[[tokens, nh_sym, "d"]],
-            output_shape=[tokens, nh_sym, "d"],
-            memory_bytes=(T * n_h * d * dtype_bytes) if isinstance(T, int) else 0,
+            input_shapes=[[tokens, nkv_sym, "d"], [tokens, nkv_sym, "d"]],
+            output_shape=[],
+            memory_bytes=(T * n_kv * d * dtype_bytes * 2) if isinstance(T, int) else 0,
             flops=0,
             phase=phase,
         ))
-
-    # KV cache store
-    ops.append(OpNode(
-        name="reshape_and_cache_flash", role="cache_store",
-        backend="vllm-xpu-kernels",
-        input_shapes=[[tokens, nkv_sym, "d"], [tokens, nkv_sym, "d"]],
-        output_shape=[],
-        memory_bytes=(T * n_kv * d * dtype_bytes * 2) if isinstance(T, int) else 0,
-        flops=0,
-        phase=phase,
-    ))
 
     # Output projection
     ops.append(OpNode(

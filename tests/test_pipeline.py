@@ -987,8 +987,11 @@ class TestMiniMaxM3ModelGraph(unittest.TestCase):
         self.assertIn("q_norm", roles)  # use_qk_norm=True
 
     def test_sparse_attention_indexer_in_moe_layers(self):
-        # MoE (sparse) layers carry the lightning indexer + top-k + merge ops;
-        # the dense prefix layers keep full attention (no indexer).
+        # MoE (sparse) layers carry the lightning indexer + top-k + Triton
+        # block-sparse attention; the dense prefix layers keep full attention
+        # (no indexer). On XPU M3 dispatches to its own Triton kernels
+        # (minimax_m3_*) and a fused vllm-xpu-kernels qknorm/rope/insert op,
+        # not the DeepSeek indexer ops or flash_attn_varlen_fwd.
         graph = self._build(_MINIMAX_M3_CONFIG)
 
         def _attn_names(layer_type, phase):
@@ -999,24 +1002,31 @@ class TestMiniMaxM3ModelGraph(unittest.TestCase):
                             return {o["name"] for o in sub["ops"]}
             return set()
 
-        for phase, topk in (("prefill", "top_k_per_row_prefill"),
-                            ("decode", "top_k_per_row_decode")):
+        for phase, attn, score in (
+            ("prefill", "minimax_m3_sparse_attn", "minimax_m3_index_score"),
+            ("decode", "minimax_m3_sparse_attn_decode", "minimax_m3_index_decode"),
+        ):
             moe_names = _attn_names("MiniMaxM3MoELayer", phase)
-            self.assertIn("indexer_k_quant_and_cache", moe_names)
-            self.assertIn(topk, moe_names)
-            self.assertIn("merge_attn_states", moe_names)
-            self.assertTrue(
-                any(o.get("role") == "indexer_proj"
-                    for ch in graph[phase]["children"]
-                    if ch["module_type"] == "MiniMaxM3MoELayer"
-                    for sub in ch["children"] if sub["name"] == "self_attn"
-                    for o in sub["ops"]),
-                "indexer projection missing in sparse attention",
-            )
-            # Dense prefix layers must NOT have indexer/top-k ops.
+            # Fused qknorm/rope/kv-insert custom op replaces norm/rotary/cache.
+            self.assertIn("fused_minimax_m3_qknorm_rope_kv_insert", moe_names)
+            # Triton lightning-indexer score + the Triton block-sparse attention.
+            self.assertIn(score, moe_names)
+            self.assertIn(attn, moe_names)
+            # The sparse path must NOT fall back to dense flash/paged attention.
+            self.assertNotIn("flash_attn_varlen_fwd", moe_names)
+            self.assertNotIn("paged_attention", moe_names)
+            # Prefill runs a dedicated top-k kernel; decode fuses it into score.
+            if phase == "prefill":
+                self.assertIn("minimax_m3_index_topk", moe_names)
+            # Dense prefix layers keep full attention, no indexer.
             dense_names = _attn_names("MiniMaxM3DenseLayer", phase)
-            self.assertNotIn(topk, dense_names)
-            self.assertNotIn("indexer_k_quant_and_cache", dense_names)
+            self.assertNotIn("minimax_m3_index_score", dense_names)
+            self.assertNotIn("minimax_m3_index_decode", dense_names)
+            self.assertNotIn("fused_minimax_m3_qknorm_rope_kv_insert", dense_names)
+            dense_attn = (
+                "flash_attn_varlen_fwd" if phase == "prefill" else "paged_attention"
+            )
+            self.assertIn(dense_attn, dense_names)
 
     def test_ops_use_xpu_backends(self):
         graph = self._build(_MINIMAX_M3_CONFIG)

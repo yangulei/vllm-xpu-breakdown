@@ -43,6 +43,7 @@ _C_OPS: set[str] = {
     "top_k_per_row_decode",
     "xpu_memcpy_sync",
     "merge_attn_states",
+    "fused_minimax_m3_qknorm_rope_kv_insert",
 }
 
 # csrc/torch_bindings.cpp  (CONCAT(TORCH_EXTENSION_NAME, _cache_ops))
