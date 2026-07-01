@@ -210,6 +210,17 @@ class TestClassifier(unittest.TestCase):
         backend, _ = classify_op("_xpu_C::flash_attn_varlen_func")
         self.assertEqual(backend, Backend.VLLM_XPU_KERNELS)
 
+    def test_vllm_namespace_dispatch_ops(self):
+        # vLLM registered dispatch ops (attention core, kv-cache, MoE, sampler)
+        # run vllm-xpu-kernels on XPU.
+        for name in ("vllm::unified_attention_with_output",
+                     "vllm::unified_kv_cache_update",
+                     "vllm::moe_forward_shared",
+                     "vllm::xpu_topk_topp_sampler"):
+            backend, _ = classify_op(name, device_type="xpu",
+                                     device_time_us=10.0)
+            self.assertEqual(backend, Backend.VLLM_XPU_KERNELS, name)
+
     def test_triton_prefix(self):
         backend, _ = classify_op("triton_flash_attn_fwd")
         self.assertEqual(backend, Backend.TRITON)
@@ -1176,6 +1187,73 @@ class TestGraphFromTrace(unittest.TestCase):
             self.assertFalse(g["has_timing"])
         finally:
             os.unlink(path)
+
+    def test_orphan_triton_kernel_surfaced_on_module(self):
+        # A Triton-compiled kernel launches straight from Python with no cpu_op
+        # wrapper (e.g. an RMSNorm). It must still surface as a ``triton::`` op on
+        # its enclosing module, attributed by launch-site containment.
+        from breakdown.graph_from_trace import build_graph_from_trace
+        tid = 7
+        events = [
+            {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
+             "ts": 0, "dur": 100, "name": "nn.Module: TinyForCausalLM_0"},
+            {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
+             "ts": 1, "dur": 98, "name": "nn.Module: TinyModel_0"},
+            {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
+             "ts": 10, "dur": 30, "name": "nn.Module: TinyDecoderLayer_0"},
+            # A real matmul with a cpu_op + kernel (so a phase/token dim exists).
+            {"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+             "ts": 11, "dur": 8, "name": "aten::linear",
+             "args": {"External id": 1, "Input Dims": [[8, 16], [48, 16]],
+                      "Input type": ["c10::BFloat16", "c10::BFloat16"]}},
+            {"ph": "X", "cat": "xpu_runtime", "tid": tid, "pid": tid,
+             "ts": 12, "dur": 0.1, "name": "urEnqueueKernelLaunch",
+             "args": {"correlation": 1, "External id": 1}},
+            {"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+             "ts": 2000, "dur": 5.0, "name": "gemm_xpu_kernel",
+             "args": {"correlation": 1}},
+            # An orphan Triton norm kernel: only a runtime launch (inside the
+            # decoder-layer module) + device kernel, NO cpu_op.
+            {"ph": "X", "cat": "xpu_runtime", "tid": tid, "pid": tid,
+             "ts": 30, "dur": 0.1, "name": "urEnqueueKernelLaunch",
+             "args": {"correlation": 2, "External id": 999}},
+            {"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+             "ts": 3000, "dur": 4.0, "name": "_rms_norm_kernel",
+             "args": {"correlation": 2}},
+        ]
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"traceEvents": events}, f)
+            path = f.name
+        try:
+            g = build_graph_from_trace(path, self.SUMMARY, tp_size=1,
+                                       batch_size=1)
+        finally:
+            os.unlink(path)
+        model = g["prefill"]["children"][0]
+        layer = next(c for c in model["children"]
+                     if c["module_type"] == "TinyDecoderLayer")
+        norm_op = next(o for o in layer["ops"]
+                       if o["name"] == "triton::_rms_norm_kernel")
+        self.assertEqual(norm_op["backend"], "triton")
+        self.assertAlmostEqual(norm_op["device_time_us"], 4.0, places=3)
+
+    def test_layer_extrapolation_to_config_count(self):
+        # Reduced-layer profiling captures 2 decoder layers; the config says the
+        # model has 5. The unprofiled layers fold into the last decoder group.
+        from breakdown.graph_from_trace import build_graph_from_trace
+        summary = dict(self.SUMMARY, num_layers=5)
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(_synthetic_trace([8]), f)
+            path = f.name
+        try:
+            g = build_graph_from_trace(path, summary, tp_size=1, batch_size=1)
+        finally:
+            os.unlink(path)
+        model = g["prefill"]["children"][0]
+        layers = [c for c in model["children"]
+                  if c["module_type"] == "TinyDecoderLayer"]
+        self.assertEqual(sum(c["repeat_count"] for c in layers), 5)
+        self.assertEqual(layers[-1]["repeat_count"], 5)
 
 
 if __name__ == "__main__":

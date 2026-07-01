@@ -179,8 +179,11 @@ def classify_op(name: str, device_type: str = "",
         cat = get_op_category(stripped) or "vllm-xpu-kernels"
         return Backend.VLLM_XPU_KERNELS, cat
 
-    # Also check full name patterns for vllm custom ops
-    for prefix in ("_C::", "_C_cache_ops::", "_moe_C::", "_xpu_C::"):
+    # Also check full name patterns for vllm custom ops. The ``vllm::``
+    # namespace holds vLLM's registered dispatch ops (unified_attention_with_output,
+    # unified_kv_cache_update, moe_forward_shared, xpu_topk_topp_sampler ...) which
+    # run vllm-xpu-kernels on XPU.
+    for prefix in ("_C::", "_C_cache_ops::", "_moe_C::", "_xpu_C::", "vllm::"):
         if name.startswith(prefix):
             cat = get_op_category(stripped) or "vllm-xpu-kernels"
             return Backend.VLLM_XPU_KERNELS, cat

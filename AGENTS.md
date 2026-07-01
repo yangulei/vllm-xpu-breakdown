@@ -216,6 +216,34 @@ Classifies ops by name prefix/pattern to backends. Priority order:
 
 ## Common Pitfalls
 
+- **Device time is attributed by launch-site containment, not `External id`.**
+  `graph_from_trace.py` links each device `kernel` to its host launch call
+  (`kernel.correlation → xpu_runtime`, the "flow arrow") and attributes it to the
+  deepest module/op interval containing the launch timestamp on the worker
+  thread. This is deliberate: under `torch.compile` the `External id` bookkeeping
+  points norm/indexer/sparse-attention kernels at compiled-region/plumbing
+  cpu_ops (leaking their time), whereas launch-site containment is stable across
+  eager and compiled passes. Do NOT revert to `External id` mapping
+  (`_build_device_time_map` was replaced by `_collect_kernel_launches` +
+  `_attribute_kernels`).
+- **Triton kernels with no `cpu_op` surface as synthetic `triton::<kernel>` ops.**
+  Kernels launched straight from Python via `triton.jit` (Gemma RMSNorm,
+  MiniMax-M3 lightning indexer, block-sparse attention) never emit an
+  `aten`/`_C` cpu_op. `_attribute_kernels` adds them as `triton::`-prefixed ops
+  on their enclosing module (classified as `triton`). Real ops (`aten::mm`,
+  `c10d::allreduce_`, `vllm::unified_attention_with_output`) get the kernel time
+  added to themselves instead.
+- **`vllm::` namespace ops classify as vllm-xpu-kernels.** `classify_op` maps the
+  `vllm::` prefix (dispatch ops: `unified_attention_with_output`,
+  `unified_kv_cache_update`, `moe_forward_shared`, `xpu_topk_topp_sampler`)
+  alongside `_C::`/`_C_cache_ops::`/`_moe_C::`/`_xpu_C::`. Without this, dense
+  attention showed as `framework`.
+- **Reduced-layer profiling is extrapolated to the true layer count.**
+  `_extrapolate_decoder_layers` folds unprofiled layers into the *last*
+  `*DecoderLayer` sibling group (the MoE body for dense-prefix MoE models), so a
+  1-MoE-layer reduced trace of MiniMax-M3 reads `x57`. Totals are recomputed via
+  `_recompute_totals`. Triggers only when `summary["num_layers"]` exceeds the
+  profiled decoder-layer count.
 - `model_graph.py` is ~1600 lines — use `view_range` to read targeted sections
 - `app.py` is ~1700 lines — use `view_range` to read targeted sections
 - **Profiling reconstructs the graph from the trace** (`graph_from_trace.py`) —

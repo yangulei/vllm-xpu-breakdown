@@ -14,9 +14,14 @@ What the trace gives us (captured with ``with_stack=True`` and
   (``DecoderLayer → Attention → QKVParallelLinear`` ...).
 * ``cpu_op`` events carrying ``Input Dims`` (shapes), ``Input type`` (dtypes) and
   an ``External id``.
-* ``kernel`` / ``gpu_memcpy`` events whose device time is attributed back to the
-  launching ``cpu_op`` via ``kernel.correlation → xpu_runtime.correlation →
-  xpu_runtime.External id → cpu_op.External id``.
+* ``kernel`` / ``gpu_memcpy`` events whose device time is attributed to the
+  module/op that launched them, by **launch-site containment**: each kernel is
+  linked to its host launch call (``kernel.correlation → xpu_runtime`` — the
+  "flow arrow" in the trace viewer), whose timestamp falls inside the enclosing
+  module/op interval on the worker thread. This is robust to ``torch.compile``:
+  Triton-compiled kernels (RMSNorm, lightning indexer, block-sparse attention)
+  that never emit an ``aten``/``_C`` ``cpu_op`` surface as ``triton::`` ops on
+  their module, and fused/eager kernels are handled identically.
 
 The output dict matches the serialized shape produced by
 ``model_graph.build_model_graph`` (``prefill`` / ``decode`` trees, ``symbols``,
@@ -98,33 +103,37 @@ def _first_dtype(args: dict) -> str:
     return ""
 
 
-def _build_device_time_map(events: list[dict]) -> dict[int, float]:
-    """Map ``cpu_op External id → total device (kernel) microseconds``.
+def _collect_kernel_launches(events: list[dict], worker_tid: Any
+                             ) -> list[tuple[float, str, float]]:
+    """Collect every device kernel as ``(host_launch_ts, name, device_us)``.
 
-    Kernels don't always carry the cpu_op's External id directly, so resolve
-    through the runtime correlation table:
-    ``kernel.correlation → xpu_runtime.External id``.
+    Each device ``kernel``/``gpu_memcpy`` event is linked to the host-side
+    launch call that issued it (the "flow arrow" you see in the trace viewer)
+    via the correlation id: ``kernel.correlation → xpu_runtime.correlation``.
+    The runtime launch event carries a timestamp on the worker thread, which is
+    exactly where the launch sits inside the module/op nesting tree. Attributing
+    kernels by this *launch site* (rather than by ``External id`` bookkeeping) is
+    robust to ``torch.compile`` — fused/compiled regions and eager kernels are
+    handled identically, because both physically launch from within the module
+    that owns them.
     """
-    corr_to_ext: dict[int, int] = {}
+    corr_to_rt: dict[int, dict] = {}
     for evt in events:
         if evt.get("cat") in ("xpu_runtime", "cuda_runtime"):
-            a = evt.get("args", {})
-            corr = a.get("correlation")
-            ext = a.get("External id")
-            if corr is not None and ext is not None:
-                corr_to_ext[corr] = ext
+            corr = evt.get("args", {}).get("correlation")
+            if corr is not None:
+                corr_to_rt[corr] = evt
 
-    ext_to_dev: dict[int, float] = {}
+    launches: list[tuple[float, str, float]] = []
     for evt in events:
         if evt.get("cat") not in _KERNEL_CATEGORIES:
             continue
-        a = evt.get("args", {})
-        dur = evt.get("dur", 0) or 0
-        ext = corr_to_ext.get(a.get("correlation"), a.get("External id"))
-        if ext is None:
+        rt = corr_to_rt.get(evt.get("args", {}).get("correlation"))
+        if rt is None or rt.get("tid") != worker_tid:
             continue
-        ext_to_dev[ext] = ext_to_dev.get(ext, 0.0) + dur
-    return ext_to_dev
+        launches.append((rt.get("ts", 0), evt.get("name", ""),
+                         evt.get("dur", 0) or 0))
+    return launches
 
 
 # ===================================================================
@@ -151,8 +160,84 @@ class _Raw:
         self.sub_dev = 0.0        # device us of this node + all descendants
 
 
-def _build_raw_forest(events: list[dict], ext_to_dev: dict[int, float]
-                      ) -> list[_Raw]:
+def _deepest_at(roots: list[_Raw], ts: float) -> _Raw | None:
+    """Deepest node (module or op) in the forest whose interval contains ``ts``.
+
+    Siblings in the forest never overlap (they were built by strict time
+    containment), so descending into the first child that contains ``ts`` finds
+    the tightest enclosing node — the physical launch site of a kernel.
+    """
+    node: _Raw | None = None
+    level = roots
+    while True:
+        nxt = None
+        for c in level:
+            if c.ts <= ts < c.end:
+                nxt = c
+                break
+        if nxt is None:
+            break
+        node = nxt
+        level = nxt.children
+    return node
+
+
+def _enclosing_module(node: _Raw, module_of: dict[int, _Raw]) -> _Raw | None:
+    """Walk up from ``node`` to the nearest ancestor module (inclusive)."""
+    cur: _Raw | None = node
+    while cur is not None:
+        if cur.kind == "module":
+            return cur
+        cur = module_of.get(id(cur))
+    return None
+
+
+def _attribute_kernels(roots: list[_Raw],
+                       launches: list[tuple[float, str, float]]) -> None:
+    """Attribute every device kernel to its host launch site.
+
+    * If the launch sits inside a real (non-plumbing) op — ``aten::mm``,
+      ``c10d::allreduce_``, ``vllm::unified_attention_with_output`` ... — the
+      kernel's device time is added to that op.
+    * If it sits directly in a module (or only inside tensor-plumbing ops), the
+      kernel is surfaced as a synthetic ``triton::<kernel>`` op on the enclosing
+      module. This is how Triton-compiled kernels (RMSNorm, the lightning
+      indexer, block-sparse attention) — which never emit an ``aten``/``_C``
+      ``cpu_op`` — become visible.
+    """
+    # Parent map (child id → parent) for walking up to the enclosing module.
+    parent: dict[int, _Raw] = {}
+    stack = list(roots)
+    while stack:
+        n = stack.pop()
+        for c in n.children:
+            parent[id(c)] = n
+            stack.append(c)
+
+    # Accumulate synthetic op device time per (module, kernel-name) so repeated
+    # launches across forward passes collapse into one op node per module.
+    synth: dict[tuple[int, str], _Raw] = {}
+    for ts, name, dur in launches:
+        node = _deepest_at(roots, ts)
+        if node is None:
+            continue
+        if node.kind == "op" and node.label not in _PLUMBING_OPS:
+            node.self_dev += dur
+            continue
+        mod = _enclosing_module(node, parent)
+        if mod is None:
+            continue
+        key = (id(mod), name)
+        op = synth.get(key)
+        if op is None:
+            op = _Raw("op", "triton::" + name, ts, 0.0)
+            synth[key] = op
+            mod.children.append(op)
+            parent[id(op)] = mod
+        op.self_dev += dur
+
+
+def _build_raw_forest(events: list[dict]) -> list[_Raw]:
     """Build the module/op nesting forest for the busiest worker thread."""
     cpu_ops = [e for e in events if e.get("cat") == "cpu_op"
                and e.get("ph") == "X"]
@@ -184,7 +269,6 @@ def _build_raw_forest(events: list[dict], ext_to_dev: dict[int, float]
             n.ext = a.get("External id")
             n.shapes = _parse_input_dims(a)
             n.dtype = _first_dtype(a)
-            n.self_dev = ext_to_dev.get(n.ext, 0.0) if n.ext is not None else 0.0
             nodes.append(n)
 
     if not nodes:
@@ -205,6 +289,7 @@ def _build_raw_forest(events: list[dict], ext_to_dev: dict[int, float]
             roots.append(n)
         stack.append(n)
 
+    _attribute_kernels(roots, _collect_kernel_launches(events, worker_tid))
     _compute_sub_dev(roots)
     return roots
 
@@ -717,6 +802,61 @@ def _build_symbol_tables(summary: dict, tp_size: int
 # Public entry point
 # ===================================================================
 
+def _recompute_totals(node: dict) -> None:
+    """Post-order recompute of a node's aggregate totals from its ops and
+    children (each child folded ``total × repeat_count``). Used after the layer
+    repeat counts are rescaled by extrapolation."""
+    dev = sum(o["device_time_us"] for o in node["ops"])
+    cpu = sum(o["cpu_time_us"] for o in node["ops"])
+    mem = sum(o["memory_bytes"] for o in node["ops"])
+    flops = sum(o["flops"] for o in node["ops"])
+    for c in node["children"]:
+        _recompute_totals(c)
+        rep = c["repeat_count"]
+        dev += c["total_device_time_us"] * rep
+        cpu += c["total_cpu_time_us"] * rep
+        mem += c["total_memory"] * rep
+        flops += c["total_flops"] * rep
+    node["total_device_time_us"] = round(dev, 2)
+    node["total_cpu_time_us"] = round(cpu, 2)
+    node["total_memory"] = mem
+    node["total_flops"] = flops
+    node["total_ai"] = round(flops / mem, 2) if mem > 0 else 0
+
+
+def _extrapolate_decoder_layers(tree: dict, num_layers: int | None) -> None:
+    """Rescale decoder-layer repeat counts to the model's true layer count.
+
+    When profiling ran with a reduced ``num_hidden_layers`` (to fit memory), the
+    trace only contains a handful of decoder layers. The dense prefix is captured
+    in full, but the repeated (MoE) body is under-represented. We add the missing
+    layers to the *last* decoder-layer group — which, for dense-prefix MoE models
+    (DeepSeek, MiniMax-M3, Qwen-MoE), is the MoE layer that repeats for the rest
+    of the network. Totals are recomputed afterwards so parents stay consistent.
+    """
+    if not num_layers:
+        return
+
+    def find_layer_siblings(node: dict) -> list[dict] | None:
+        layers = [c for c in node["children"]
+                  if "DecoderLayer" in c["module_type"]]
+        if layers:
+            return layers
+        for c in node["children"]:
+            found = find_layer_siblings(c)
+            if found is not None:
+                return found
+        return None
+
+    layers = find_layer_siblings(tree)
+    if not layers:
+        return
+    profiled = sum(c["repeat_count"] for c in layers)
+    if num_layers > profiled:
+        layers[-1]["repeat_count"] += num_layers - profiled
+        _recompute_totals(tree)
+
+
 def build_graph_from_trace(
     trace_path: str,
     summary: dict | None = None,
@@ -749,8 +889,7 @@ def build_graph_from_trace(
                 "config": {}, "has_timing": False,
                 "error": "empty trace"}
 
-    ext_to_dev = _build_device_time_map(events)
-    roots = _build_raw_forest(events, ext_to_dev)
+    roots = _build_raw_forest(events)
     if not roots:
         return {"prefill": None, "decode": None, "symbols": {},
                 "config": {}, "has_timing": False,
@@ -770,6 +909,14 @@ def build_graph_from_trace(
         prefill_passes, n_pre, val_to_sym, dtype_bytes, "S", prefill_tokens)
     decode_tree = _build_phase_tree(
         decode_passes, n_dec, val_to_sym, dtype_bytes, "B", decode_tokens)
+
+    # Reduced-layer profiling (app.py caps num_hidden_layers to save memory)
+    # captures only a few decoder layers. Extrapolate the repeat counts back to
+    # the model's true layer count so the tree reads e.g. ``x57`` MoE layers.
+    num_layers = summary.get("num_layers")
+    for tree in (prefill_tree, decode_tree):
+        if tree:
+            _extrapolate_decoder_layers(tree, num_layers)
 
     if prefill_tokens:
         sym_to_val["S"] = prefill_tokens
