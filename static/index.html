@@ -253,6 +253,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
       </div>
       <div style="display:flex;gap:8px;align-self:flex-end">
         <button class="btn btn-primary" id="profile-btn" onclick="startProfile()">▶ Profile</button>
+        <button class="btn btn-secondary" id="upload-trace-btn" onclick="document.getElementById('trace-upload').click()">⬆ Upload Trace</button>
+        <input type="file" id="trace-upload" accept=".json,.gz,.json.gz" multiple
+               style="display:none" onchange="uploadTrace(this.files)">
       </div>
     </div>
   </div>
@@ -554,16 +557,7 @@ async function pollStatus() {
       const rr = await fetch('/api/profile/result');
       const rd = await rr.json();
       if (rd.ok) {
-        // Show download button if trace available
-        document.getElementById('download-trace-btn').style.display =
-          rd.data.has_trace ? '' : 'none';
-        // Show the reconstructed graph if available
-        if (rd.data.graph) {
-          GRAPH_DATA = rd.data.graph;
-          document.getElementById('graph-section').classList.add('visible');
-          updateGraphSubtitle();
-          renderGraph();
-        }
+        applyProfileResult(rd.data);
       }
     } else if (data.status === 'error') {
       clearInterval(pollTimer);
@@ -572,6 +566,57 @@ async function pollStatus() {
     }
   } catch(e) {
     // ignore transient errors
+  }
+}
+
+function applyProfileResult(data) {
+  // Show download button if trace available
+  document.getElementById('download-trace-btn').style.display =
+    data.has_trace ? '' : 'none';
+  // Show the reconstructed graph if available
+  if (data.graph) {
+    GRAPH_DATA = data.graph;
+    document.getElementById('graph-section').classList.add('visible');
+    updateGraphSubtitle();
+    renderGraph();
+  }
+}
+
+async function uploadTrace(fileList) {
+  const files = Array.from(fileList || []);
+  if (!files.length) return;
+  document.getElementById('trace-upload').value = '';  // allow re-selecting same file
+
+  const fd = new FormData();
+  files.forEach(f => fd.append('trace', f));
+  const modelId = document.getElementById('model-input').value.trim();
+  if (modelId) fd.append('model_id', modelId);
+  fd.append('mode', document.getElementById('mode-select').value);
+  fd.append('batch_size', parseInt(document.getElementById('batch-size').value) || 1);
+  fd.append('tensor_parallel_size', parseInt(document.getElementById('tp-size-select').value) || 1);
+  const q = document.getElementById('quant-select').value;
+  fd.append('quantization', (q === 'auto' || q === 'none') ? '' : q);
+
+  document.getElementById('profile-btn').disabled = true;
+  document.getElementById('upload-trace-btn').disabled = true;
+  showStatus('running', `Reconstructing model graph from ${files.length} trace file(s)...`);
+
+  try {
+    const resp = await fetch('/api/profile/upload', { method: 'POST', body: fd });
+    const data = await resp.json();
+    if (!data.ok) {
+      showStatus('error', data.error || 'Upload failed');
+      return;
+    }
+    showStatus('hide');
+    const rr = await fetch('/api/profile/result');
+    const rd = await rr.json();
+    if (rd.ok) applyProfileResult(rd.data);
+  } catch(e) {
+    showStatus('error', 'Upload failed: ' + e.message);
+  } finally {
+    document.getElementById('profile-btn').disabled = false;
+    document.getElementById('upload-trace-btn').disabled = false;
   }
 }
 

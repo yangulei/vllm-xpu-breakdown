@@ -145,6 +145,115 @@ def _set_num_hidden_layers(hf_config, n: int):
     return hf_config
 
 
+def _build_result_from_traces(
+    rank_files: list[str],
+    *,
+    model_id: str,
+    summary: dict,
+    dim_symbols: dict,
+    tp_size: int,
+    batch_size: int,
+    mode: str = "eager",
+    max_model_len: int | None = None,
+    max_tokens: int | None = None,
+    quantization: str | None = None,
+    profiled_layers: int | None = None,
+    actual_layers: int | None = None,
+    layer_scale: float = 1.0,
+    trace_file: str | None = None,
+) -> dict:
+    """Parse one or more trace files and build the profile result dict.
+
+    Shared by the live profiler (``_run_profile``) and the trace-upload
+    endpoint so both paths reconstruct the model graph and op breakdown the
+    same way. ``rank_files`` is rank-0 first; with TP>1 the remaining ranks are
+    used only to average device time.
+    """
+    from breakdown.trace_parser import parse_trace_file
+
+    op_dicts = parse_trace_file(rank_files[0])
+
+    # If multi-rank, average device times across ranks
+    if tp_size > 1 and len(rank_files) > 1:
+        for extra_file in rank_files[1:]:
+            extra_ops = parse_trace_file(extra_file)
+            extra_timing = {
+                (o["name"], o.get("input_shapes", "")): o.get("device_time_us", 0)
+                for o in extra_ops
+            }
+            for op in op_dicts:
+                key = (op["name"], op.get("input_shapes", ""))
+                op["device_time_us"] = (
+                    op.get("device_time_us", 0) + extra_timing.get(key, 0)
+                )
+        for op in op_dicts:
+            op["device_time_us"] = op.get("device_time_us", 0) / tp_size
+
+    if not op_dicts:
+        raise RuntimeError(
+            f"No ops found in trace file {rank_files[0]}. "
+            "The trace may not contain any captured events."
+        )
+
+    analyzed = analyze_ops(
+        op_dicts,
+        dim_symbols=dim_symbols,
+        batch_size=batch_size,
+        seq_len=None,
+        model_dtype=summary.get("dtype", "bfloat16"),
+        num_layers=summary.get("num_layers"),
+    )
+
+    backend_totals: dict[str, dict] = {}
+    total_dev = sum(o.device_time_us for o in analyzed)
+    for b in Backend:
+        ops = [o for o in analyzed if o.backend == b.value]
+        dev = sum(o.device_time_us for o in ops)
+        backend_totals[b.value] = {
+            "device_time_us": dev,
+            "pct": round(dev / total_dev * 100, 1) if total_dev > 0 else 0,
+            "num_ops": len(ops),
+            "num_calls": sum(o.call_count for o in ops),
+        }
+
+    profile_result = {
+        "model_id": model_id,
+        "mode": mode,
+        "batch_size": batch_size,
+        "max_model_len": max_model_len,
+        "max_tokens": max_tokens,
+        "tp_size": tp_size,
+        "quantization": quantization,
+        "summary": summary,
+        "total_device_time_us": total_dev,
+        "total_cpu_time_us": sum(o.cpu_time_us for o in analyzed),
+        "backends": backend_totals,
+        "ops": [o.to_dict() for o in analyzed],
+        "profiled_layers": profiled_layers,
+        "actual_layers": actual_layers,
+        "layer_scale": layer_scale,
+        "trace_file": trace_file if trace_file is not None else rank_files[0],
+    }
+
+    # Reconstruct the model graph directly from the profiler trace.
+    try:
+        graph = build_graph_from_trace(
+            rank_files[0],
+            summary=summary,
+            tp_size=tp_size,
+            batch_size=batch_size,
+            quantization=quantization,
+        )
+        graph["profiled_layers"] = profiled_layers
+        graph["actual_layers"] = actual_layers
+        graph["layer_scale"] = layer_scale
+        profile_result["graph"] = graph
+    except Exception:
+        pass  # Graph reconstruction is best-effort
+
+    return profile_result
+
+
 def _run_profile(model_id: str, mode: str, max_model_len: int,
                  batch_size: int, max_tokens: int, prompt: str,
                  num_profile_layers: int | None = None,
@@ -172,8 +281,6 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
     global _profile_state
     try:
         from vllm import LLM, SamplingParams
-
-        from breakdown.trace_parser import parse_trace_file
 
         # Fetch model config for analysis
         try:
@@ -320,98 +427,22 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
         # With TP>1, take the tp_size most recent files (one per rank).
         # Parse rank-0 (most recent) for ops; average timing across all ranks.
         rank_files = trace_files[:tp_size]
-        op_dicts = parse_trace_file(rank_files[0])
 
-        # If multi-rank, average device times across ranks
-        if tp_size > 1 and len(rank_files) > 1:
-            # Build timing map from additional ranks and average
-            for extra_file in rank_files[1:]:
-                extra_ops = parse_trace_file(extra_file)
-                extra_timing = {
-                    (o["name"], o.get("input_shapes", "")): o.get("device_time_us", 0)
-                    for o in extra_ops
-                }
-                for op in op_dicts:
-                    key = (op["name"], op.get("input_shapes", ""))
-                    extra_t = extra_timing.get(key, 0)
-                    op["device_time_us"] = (
-                        op.get("device_time_us", 0) + extra_t
-                    )
-            # Average across ranks
-            for op in op_dicts:
-                op["device_time_us"] = op.get("device_time_us", 0) / tp_size
-
-        if not op_dicts:
-            raise RuntimeError(
-                f"No ops found in trace file {trace_files[0]}. "
-                "The worker may not have captured any events."
-            )
-
-        # Analyze
-        analyzed = analyze_ops(
-            op_dicts,
+        profile_result = _build_result_from_traces(
+            rank_files,
+            model_id=model_id,
+            summary=summary,
             dim_symbols=dim_symbols,
+            tp_size=tp_size,
             batch_size=batch_size,
-            seq_len=None,
-            model_dtype=summary.get("dtype", "bfloat16"),
-            num_layers=summary.get("num_layers"),
+            mode=mode,
+            max_model_len=max_model_len,
+            max_tokens=max_tokens,
+            quantization=quantization,
+            profiled_layers=profiled_layers,
+            actual_layers=actual_layers,
+            layer_scale=layer_scale,
         )
-
-        # Build result
-        backend_totals: dict[str, dict] = {}
-        total_dev = sum(o.device_time_us for o in analyzed)
-        for b in Backend:
-            ops = [o for o in analyzed if o.backend == b.value]
-            dev = sum(o.device_time_us for o in ops)
-            backend_totals[b.value] = {
-                "device_time_us": dev,
-                "pct": round(dev / total_dev * 100, 1) if total_dev > 0 else 0,
-                "num_ops": len(ops),
-                "num_calls": sum(o.call_count for o in ops),
-            }
-
-        profile_result = {
-            "model_id": model_id,
-            "mode": mode,
-            "batch_size": batch_size,
-            "max_model_len": max_model_len,
-            "max_tokens": max_tokens,
-            "tp_size": tp_size,
-            "quantization": quantization,
-            "summary": summary,
-            "total_device_time_us": total_dev,
-            "total_cpu_time_us": sum(o.cpu_time_us for o in analyzed),
-            "backends": backend_totals,
-            "ops": [o.to_dict() for o in analyzed],
-            # Layer scaling info for 1-layer profiling
-            "profiled_layers": profiled_layers,
-            "actual_layers": actual_layers,
-            "layer_scale": layer_scale,
-            # Trace file path for download
-            "trace_file": rank_files[0],
-        }
-
-        # Reconstruct the model graph directly from the profiler trace.
-        # The trace (captured with with_stack + record_shapes) is the ground
-        # truth for what actually executed, so the tree tracks whatever vLLM /
-        # the backends dispatched — no dependency on a hand-maintained static
-        # graph that drifts as vLLM evolves.
-        try:
-            graph = build_graph_from_trace(
-                rank_files[0],
-                summary=summary,
-                tp_size=tp_size,
-                batch_size=batch_size,
-                quantization=quantization,
-            )
-            # Carry layer-scaling metadata so the UI can extrapolate reduced-layer
-            # profiles the same way it does for the flat op list.
-            graph["profiled_layers"] = profiled_layers
-            graph["actual_layers"] = actual_layers
-            graph["layer_scale"] = layer_scale
-            profile_result["graph"] = graph
-        except Exception:
-            pass  # Graph reconstruction is best-effort
 
         with _profile_lock:
             _profile_state["status"] = "done"
@@ -474,6 +505,114 @@ def start_profile():
     thread.start()
 
     return jsonify({"ok": True, "status": "running"})
+
+
+@app.route("/api/profile/upload", methods=["POST"])
+def upload_profile():
+    """Reconstruct the model graph and op breakdown from uploaded trace(s).
+
+    Accepts a multipart form with one or more ``trace`` files (a torch profiler
+    Chrome trace, ``.json`` or ``.json.gz``; with TP>1 upload one file per rank,
+    rank-0 first) plus optional form fields:
+
+      - ``model_id``: HF id used to fetch config for shape symbols / summary
+      - ``tensor_parallel_size`` / ``tp_size``: ranks represented by the uploads
+      - ``batch_size``, ``quantization``, ``mode``
+      - ``num_profile_layers`` / ``actual_layers``: for reduced-layer scaling
+
+    Parsing is fast, so this runs synchronously and stores the result in the
+    shared profile state so ``/api/profile/result`` and ``/api/profile/trace``
+    work exactly as they do for a live profiling run.
+    """
+    global _profile_state
+
+    with _profile_lock:
+        if _profile_state["status"] == "running":
+            return jsonify({"ok": False, "error": "Profiling already in progress"}), 409
+
+    files = request.files.getlist("trace")
+    files = [f for f in files if f and f.filename]
+    if not files:
+        return jsonify({"ok": False, "error": "No trace file uploaded"}), 400
+
+    form = request.form
+    model_id = (form.get("model_id") or "").strip()
+    mode = form.get("mode", "eager")
+    tp_size = int(form.get("tensor_parallel_size") or form.get("tp_size") or 1)
+    batch_size = int(form.get("batch_size") or 1)
+    quantization = form.get("quantization") or None
+    if quantization in ("", "auto", "none"):
+        quantization = None
+
+    # Persist uploads under output/traces so the trace-download endpoint works.
+    from werkzeug.utils import secure_filename
+    trace_dir = os.path.abspath("output/traces")
+    os.makedirs(trace_dir, exist_ok=True)
+    saved: list[str] = []
+    for f in files:
+        name = secure_filename(f.filename) or "uploaded_trace.json"
+        dest = os.path.join(trace_dir, name)
+        f.save(dest)
+        saved.append(dest)
+
+    # Fetch model config for shape symbols / summary (best-effort).
+    try:
+        summary = summarize_config(fetch_model_config(model_id)) if model_id else {}
+        dim_symbols = get_dim_symbols(summary) if summary else {}
+    except Exception:
+        summary = {}
+        dim_symbols = {}
+
+    actual_layers = form.get("actual_layers") or summary.get("num_layers")
+    actual_layers = int(actual_layers) if actual_layers else None
+    profiled_layers = form.get("num_profile_layers") or actual_layers
+    profiled_layers = int(profiled_layers) if profiled_layers else None
+    layer_scale = (
+        actual_layers / profiled_layers
+        if actual_layers and profiled_layers else 1.0
+    )
+
+    with _profile_lock:
+        _profile_state = {
+            "status": "running",
+            "result": None,
+            "error": None,
+            "model_id": model_id,
+            "settings": {
+                "mode": mode,
+                "batch_size": batch_size,
+                "tp_size": tp_size,
+                "quantization": quantization,
+                "uploaded": True,
+            },
+        }
+
+    try:
+        result = _build_result_from_traces(
+            saved[:tp_size] if len(saved) >= tp_size else saved,
+            model_id=model_id,
+            summary=summary,
+            dim_symbols=dim_symbols,
+            tp_size=tp_size,
+            batch_size=batch_size,
+            mode=mode,
+            quantization=quantization,
+            profiled_layers=profiled_layers,
+            actual_layers=actual_layers,
+            layer_scale=layer_scale,
+        )
+        with _profile_lock:
+            _profile_state["status"] = "done"
+            _profile_state["result"] = result
+            _profile_state["error"] = None
+    except Exception:
+        err = traceback.format_exc()
+        with _profile_lock:
+            _profile_state["status"] = "error"
+            _profile_state["error"] = err
+        return jsonify({"ok": False, "error": err}), 500
+
+    return jsonify({"ok": True, "status": "done"})
 
 
 @app.route("/api/profile/status")

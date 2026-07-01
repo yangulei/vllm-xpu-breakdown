@@ -207,11 +207,10 @@ Classifies ops by name prefix/pattern to backends. Priority order:
 | `/api/model/<hf_id>` | GET | Fetch/summarize HF model config (+ `min_profile_layers`) |
 | `/api/cached-models` | GET | List previously loaded model IDs |
 | `/api/profile` | POST | Start async profiling run |
+| `/api/profile/upload` | POST | Reconstruct graph + op breakdown from uploaded trace file(s) |
 | `/api/profile/status` | GET | Poll profiling status |
 | `/api/profile/result` | GET | Fetch profiling result (ops + reconstructed graph) |
 | `/api/profile/trace` | GET | Download raw trace file |
-| `/api/demo` | GET | Mock profiling data for UI development |
-| `/api/export/excel` | POST | Export profiled breakdown to Excel |
 | `/api/export/shape-matrix` | POST | Export config-driven multi-config shape sweep to Excel |
 
 ## Common Pitfalls

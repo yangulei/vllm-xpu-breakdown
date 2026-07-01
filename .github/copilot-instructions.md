@@ -74,8 +74,8 @@ Flask web app (`app.py`) + static SPA (`static/index.html`) backed by a `breakdo
 |----------|--------|-------------|
 | `/api/model/<hf_id>` | GET | Fetch/summarize HF model config (+ `min_profile_layers`) |
 | `/api/profile` | POST | Start async profiling |
+| `/api/profile/upload` | POST | Reconstruct graph + op breakdown from uploaded trace file(s) |
 | `/api/profile/status` | GET | Poll profiling status |
 | `/api/profile/result` | GET | Fetch profiling result (ops + reconstructed graph) |
 | `/api/profile/trace` | GET | Download raw trace file |
-| `/api/export/excel` | POST | Export profiled breakdown to Excel |
 | `/api/export/shape-matrix` | POST | Export config-driven shape sweep to Excel |
