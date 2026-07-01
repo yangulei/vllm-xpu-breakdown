@@ -121,47 +121,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 .sym-dim { font-family: 'SF Mono', SFMono-Regular, monospace; color: var(--accent);
            font-weight: 600; }
 
-/* Results */
-#results { display: none; }
-#results.visible { display: block; }
-
-.stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-              gap: 12px; margin-bottom: 20px; }
-.stat-card { background: var(--card); border: 1px solid var(--border); border-radius: 8px;
-             padding: 14px 18px; }
-.stat-card .val { font-size: 22px; font-weight: 700; }
-.stat-card .lbl { font-size: 12px; color: var(--text2); }
-
-/* Backend chart */
-.backend-bars { margin-top: 12px; }
-.bbar-row { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
-.bbar-label { width: 140px; font-size: 13px; font-weight: 500; text-align: right; }
-.bbar-track { flex: 1; height: 24px; background: #f0f0f0; border-radius: 4px; overflow: hidden;
-              position: relative; }
-.bbar-fill { height: 100%; border-radius: 4px; transition: width 0.5s ease; display: flex;
-             align-items: center; padding-left: 8px; font-size: 11px; color: #fff; font-weight: 600; }
-.bbar-pct { width: 50px; font-size: 13px; font-weight: 600; }
-
-/* Table */
-.table-controls { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
-.search-input { padding: 8px 14px; border: 1px solid var(--border); border-radius: 6px;
-                font-size: 14px; width: 260px; }
-.filter-pills { display: flex; gap: 6px; flex-wrap: wrap; }
-.pill { padding: 4px 12px; border-radius: 14px; font-size: 12px; cursor: pointer;
-        border: 1px solid var(--border); background: #fff; transition: all 0.2s; }
-.pill.active { background: var(--text); color: #fff; border-color: var(--text); }
-.pill:hover:not(.active) { background: #f0f0f0; }
-
-.ops-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-.ops-table th { background: #fafafa; text-align: left; padding: 10px 12px; font-weight: 600;
-                border-bottom: 2px solid var(--border); cursor: pointer; user-select: none;
-                white-space: nowrap; position: sticky; top: 0; z-index: 1; }
-.ops-table th:hover { background: #f0f0f0; }
-.ops-table th .sort-arrow { font-size: 10px; margin-left: 4px; color: #999; }
-.ops-table td { padding: 8px 12px; border-bottom: 1px solid #f0f0f0; vertical-align: middle; }
-.ops-table tr:hover td { background: #f8fafc; }
-.ops-table .mono { font-family: 'SF Mono', Monaco, 'Cascadia Code', monospace; font-size: 12px; }
-
+/* Backend badges (used in the model-graph tree) */
 .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px;
          font-weight: 600; color: #fff; white-space: nowrap; }
 .badge.vllm-xpu-kernels { background: var(--green); }
@@ -170,20 +130,11 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 .badge.cpu { background: var(--grey); }
 .badge.framework { background: var(--lgrey); }
 
-.layer-count { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 11px;
-               font-weight: 600; background: #e8f0fe; color: #1565c0; margin-left: 4px; }
-
-.bar-cell { display: flex; align-items: center; gap: 6px; }
-.mini-bar { height: 14px; border-radius: 3px; min-width: 2px; }
-
-.table-wrapper { overflow-x: auto; max-height: 70vh; overflow-y: auto; }
-
 /* Responsive */
 @media (max-width: 768px) {
   .container { padding: 12px; }
   .model-input-row { flex-direction: column; }
   .controls-row { flex-direction: column; align-items: flex-start; }
-  .stats-grid { grid-template-columns: repeat(2, 1fr); }
 }
 
 </style>
@@ -302,7 +253,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
       </div>
       <div style="display:flex;gap:8px;align-self:flex-end">
         <button class="btn btn-primary" id="profile-btn" onclick="startProfile()">▶ Profile</button>
-        <button class="btn btn-secondary" onclick="loadDemo()">Load Demo</button>
       </div>
     </div>
   </div>
@@ -334,52 +284,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
       </p>
       <div class="symbol-legend" id="symbol-legend"></div>
       <div id="graph-tree"></div>
-    </div>
-  </div>
-
-  <!-- Results (from profiling) -->
-  <div id="results">
-    <div class="stats-grid" id="stats-grid"></div>
-
-    <div class="card">
-      <h2>Backend Distribution</h2>
-      <div class="backend-bars" id="backend-bars"></div>
-    </div>
-
-    <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
-        <h2 style="margin-bottom:0">Operations</h2>
-        <button class="btn btn-secondary" onclick="exportExcel()" title="Export to Excel with formulas">
-          📥 Export Excel
-        </button>
-      </div>
-      <div class="table-controls">
-        <input type="text" class="search-input" id="table-search"
-               placeholder="Search op name..." oninput="filterTable()">
-        <div class="filter-pills" id="filter-pills">
-          <span class="pill active" data-backend="all" onclick="setFilter(this)">All</span>
-        </div>
-      </div>
-      <div class="table-wrapper">
-        <table class="ops-table" id="ops-table">
-          <thead>
-            <tr>
-              <th onclick="sortTable('name')">Op Name <span class="sort-arrow">⇅</span></th>
-              <th onclick="sortTable('backend')">Backend <span class="sort-arrow">⇅</span></th>
-              <th onclick="sortTable('input_shapes')">Shape</th>
-              <th>Shape (concrete)</th>
-              <th onclick="sortTable('layer_count')" style="text-align:center">×Layers <span class="sort-arrow">⇅</span></th>
-              <th onclick="sortTable('call_count')" style="text-align:right">Calls <span class="sort-arrow">⇅</span></th>
-              <th onclick="sortTable('device_time_us')" style="text-align:right">Device Time <span class="sort-arrow">⇅</span></th>
-              <th onclick="sortTable('pct')" style="text-align:right">% Time <span class="sort-arrow">⇅</span></th>
-              <th onclick="sortTable('memory_bytes')" style="text-align:right">Memory <span class="sort-arrow">⇅</span></th>
-              <th onclick="sortTable('flops')" style="text-align:right">FLOPs <span class="sort-arrow">⇅</span></th>
-              <th onclick="sortTable('arithmetic_intensity')" style="text-align:right">AI <span class="sort-arrow">⇅</span></th>
-            </tr>
-          </thead>
-          <tbody id="ops-tbody"></tbody>
-        </table>
-      </div>
     </div>
   </div>
 
@@ -470,21 +374,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 
 <script>
 // ---- State ----
-let DATA = null;
 let GRAPH_DATA = null;         // profiled graph reconstructed from the trace
 let currentPhase = 'prefill';
-let currentSort = { key: 'device_time_us', asc: false };
-let currentFilter = 'all';
-let searchText = '';
 let modelSummary = null;
-
-const COLORS = {
-  'vllm-xpu-kernels': '#2e7d32',
-  'triton':           '#1565c0',
-  'torch-xpu-ops':    '#e65100',
-  'cpu':              '#757575',
-  'framework':        '#bdbdbd'
-};
 
 // ---- Formatting ----
 function fmtTime(us) {
@@ -509,23 +401,6 @@ function fmtFlops(f) {
   if (f >= 1e6) return (f/1e6).toFixed(1) + ' MFLOP';
   if (f >= 1e3) return (f/1e3).toFixed(1) + ' KFLOP';
   return f + ' FLOP';
-}
-
-function fmtAI(ai) {
-  if (!ai || ai === 0) return '—';
-  return ai.toFixed(1);
-}
-
-function fmtShape(shapes) {
-  if (!shapes || shapes.length === 0) return '—';
-  return shapes.map(s => '[' + s.join(', ') + ']').join(' × ');
-}
-
-function fmtShapeConcrete(op) {
-  const rawShapes = op.input_shapes_raw;
-  if (!rawShapes || rawShapes.length === 0) return '—';
-  const dtype = op.dtype ? op.dtype.replace('bfloat16', 'bf16').replace('float16', 'fp16').replace('float32', 'fp32').replace('float8', 'fp8') : '';
-  return rawShapes.map(s => '[' + s.join(', ') + (dtype ? ', ' + dtype : '') + ']').join(' × ');
 }
 
 // ---- Model Config ----
@@ -679,7 +554,6 @@ async function pollStatus() {
       const rr = await fetch('/api/profile/result');
       const rd = await rr.json();
       if (rd.ok) {
-        renderResults(rd.data);
         // Show download button if trace available
         document.getElementById('download-trace-btn').style.display =
           rd.data.has_trace ? '' : 'none';
@@ -701,28 +575,6 @@ async function pollStatus() {
   }
 }
 
-async function loadDemo() {
-  showStatus('running', 'Loading demo data...');
-  try {
-    const resp = await fetch('/api/demo');
-    const data = await resp.json();
-    showStatus('hide');
-    if (data.ok) {
-      if (data.data.summary) {
-        modelSummary = data.data.summary;
-        showModelSummary(data.data.model_id, data.data.summary);
-        document.getElementById('model-input').value = data.data.model_id;
-        const autoOpt = document.querySelector('#quant-select option[value="auto"]');
-        const mq = data.data.summary.quant_method;
-        autoOpt.textContent = mq ? `${mq.toUpperCase()} (default)` : 'None (default)';
-      }
-      renderResults(data.data);
-    }
-  } catch(e) {
-    showStatus('error', 'Failed to load demo: ' + e.message);
-  }
-}
-
 function showStatus(type, msg) {
   const el = document.getElementById('status-banner');
   el.className = 'status-banner';
@@ -730,139 +582,6 @@ function showStatus(type, msg) {
   el.classList.add(type);
   el.style.display = type === 'running' ? 'flex' : 'block';
   document.getElementById('status-text').textContent = msg || '';
-}
-
-// ---- Render Results ----
-function renderResults(data) {
-  DATA = data;
-  document.getElementById('results').classList.add('visible');
-
-  // Stats
-  const grid = document.getElementById('stats-grid');
-  grid.innerHTML = '';
-  const addStat = (val, label) => {
-    grid.innerHTML += `<div class="stat-card"><div class="val">${val}</div><div class="lbl">${label}</div></div>`;
-  };
-
-  const ls = data.layer_scale || 1;
-  const scaledTotal = data.total_device_time_us * ls;
-  addStat(fmtTime(scaledTotal), ls > 1 ? `Est. Total Device Time (×${ls})` : 'Total Device Time');
-  addStat(fmtTime(data.total_cpu_time_us * ls), ls > 1 ? `Est. Total CPU Time (×${ls})` : 'Total CPU Time');
-  addStat(data.ops.length, 'Unique Ops');
-  addStat(data.mode, 'Mode');
-  if (data.batch_size) addStat(data.batch_size, 'Batch Size');
-  if (data.max_model_len) addStat(data.max_model_len, 'Context Len');
-  if (data.tp_size && data.tp_size > 1) addStat(data.tp_size, 'TP Size');
-  if (data.quantization) addStat(data.quantization, 'Quantization');
-  if (data.profiled_layers && data.actual_layers && data.profiled_layers !== data.actual_layers) {
-    addStat(`${data.profiled_layers} → ${data.actual_layers}`, 'Layers (profiled → actual)');
-  }
-
-  // Backend bars
-  const bars = document.getElementById('backend-bars');
-  bars.innerHTML = '';
-  const maxDev = Math.max(...Object.values(data.backends).map(b => b.device_time_us), 1);
-  for (const [name, b] of Object.entries(data.backends)) {
-    if (b.num_ops === 0) continue;
-    const pct = b.pct || 0;
-    const w = (b.device_time_us / maxDev * 100);
-    bars.innerHTML += `
-      <div class="bbar-row">
-        <div class="bbar-label">${name}</div>
-        <div class="bbar-track">
-          <div class="bbar-fill" style="width:${w}%;background:${COLORS[name]||'#999'}">
-            ${pct > 5 ? fmtTime(b.device_time_us) : ''}
-          </div>
-        </div>
-        <div class="bbar-pct">${pct}%</div>
-      </div>`;
-  }
-
-  // Filter pills
-  const pills = document.getElementById('filter-pills');
-  pills.innerHTML = '<span class="pill active" data-backend="all" onclick="setFilter(this)">All</span>';
-  for (const [name, b] of Object.entries(data.backends)) {
-    if (b.num_ops === 0) continue;
-    pills.innerHTML += `<span class="pill" data-backend="${name}" onclick="setFilter(this)"
-      style="border-color:${COLORS[name]||'#999'}">${name} (${b.num_ops})</span>`;
-  }
-
-  renderTable();
-}
-
-// ---- Table ----
-function renderTable() {
-  if (!DATA) return;
-  let ops = DATA.ops;
-  const totalDev = DATA.total_device_time_us || 1;
-
-  // Filter
-  if (currentFilter !== 'all') ops = ops.filter(o => o.backend === currentFilter);
-  if (searchText) ops = ops.filter(o => o.name.toLowerCase().includes(searchText));
-
-  // Sort
-  ops = [...ops].sort((a, b) => {
-    let va = a[currentSort.key], vb = b[currentSort.key];
-    if (currentSort.key === 'pct') {
-      va = a.device_time_us; vb = b.device_time_us;
-    }
-    if (currentSort.key === 'input_shapes') {
-      va = JSON.stringify(a.input_shapes); vb = JSON.stringify(b.input_shapes);
-    }
-    if (typeof va === 'string') { va = va.toLowerCase(); vb = (vb||'').toLowerCase(); }
-    if (va < vb) return currentSort.asc ? -1 : 1;
-    if (va > vb) return currentSort.asc ? 1 : -1;
-    return 0;
-  });
-
-  const tbody = document.getElementById('ops-tbody');
-  tbody.innerHTML = '';
-
-  for (const op of ops) {
-    const pct = (op.device_time_us / totalDev * 100);
-    const barW = Math.max(pct, 0.3);
-    const color = COLORS[op.backend] || '#999';
-    const badgeCls = op.backend.replace(/[^a-z-]/g, '');
-
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td class="mono">${escHtml(op.name)}</td>
-      <td><span class="badge ${badgeCls}">${op.backend}</span></td>
-      <td class="mono" style="font-size:11px">${fmtShape(op.input_shapes)}</td>
-      <td class="mono" style="font-size:11px;color:#666">${fmtShapeConcrete(op)}</td>
-      <td style="text-align:center">${op.layer_count > 1
-          ? '<span class="layer-count">×' + op.layer_count + '</span>' : '—'}</td>
-      <td style="text-align:right">${op.call_count}</td>
-      <td style="text-align:right">${fmtTime(op.device_time_us)}</td>
-      <td style="text-align:right">
-        <div class="bar-cell" style="justify-content:flex-end">
-          <span class="mini-bar" style="width:${barW}%;max-width:80px;background:${color}"></span>
-          ${pct.toFixed(1)}%
-        </div>
-      </td>
-      <td style="text-align:right">${fmtBytes(op.memory_bytes)}</td>
-      <td style="text-align:right">${fmtFlops(op.flops)}</td>
-      <td style="text-align:right">${fmtAI(op.arithmetic_intensity)}</td>`;
-    tbody.appendChild(tr);
-  }
-}
-
-function sortTable(key) {
-  if (currentSort.key === key) currentSort.asc = !currentSort.asc;
-  else { currentSort.key = key; currentSort.asc = false; }
-  renderTable();
-}
-
-function setFilter(el) {
-  document.querySelectorAll('.pill').forEach(p => p.classList.remove('active'));
-  el.classList.add('active');
-  currentFilter = el.dataset.backend;
-  renderTable();
-}
-
-function filterTable() {
-  searchText = document.getElementById('table-search').value.toLowerCase();
-  renderTable();
 }
 
 function escHtml(s) {
@@ -894,8 +613,8 @@ function setPhase(el) {
 
 function updateGraphSubtitle() {
   const subtitle = document.getElementById('graph-subtitle');
-  const ls = DATA?.layer_scale || 1;
-  const lsNote = ls > 1 ? ` <strong>1-layer profiled → ×${DATA.actual_layers} extrapolated</strong> for decoder layers.` : '';
+  const ls = GRAPH_DATA?.layer_scale || 1;
+  const lsNote = ls > 1 ? ` <strong>1-layer profiled → ×${GRAPH_DATA.actual_layers} extrapolated</strong> for decoder layers.` : '';
   subtitle.innerHTML = 'Profiled run — model structure reconstructed from the trace (actual dispatched ops &amp; per-call device time).' + lsNote;
 }
 
@@ -1230,34 +949,6 @@ function buildTreeNode(node, isRoot, hasTiming) {
   }
 
   return div;
-}
-
-// ---- Export Excel ----
-async function exportExcel() {
-  if (!DATA) return alert('No data to export. Run a profile first.');
-  try {
-    // Include graph data and current phase for hierarchy export
-    const payload = Object.assign({}, DATA);
-    if (GRAPH_DATA) {
-      payload.graph = GRAPH_DATA;
-      payload.phase = currentPhase;
-    }
-    const resp = await fetch('/api/export/excel', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    if (!resp.ok) { alert('Export failed: ' + resp.statusText); return; }
-    const blob = await resp.blob();
-    const cd = resp.headers.get('Content-Disposition') || '';
-    const match = cd.match(/filename="?([^"]+)"?/);
-    const filename = match ? match[1] : 'vllm_xpu_breakdown.xlsx';
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = filename;
-    a.click();
-    URL.revokeObjectURL(a.href);
-  } catch (e) { alert('Export error: ' + e.message); }
 }
 
 function downloadTrace() {
