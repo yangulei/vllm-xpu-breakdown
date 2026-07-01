@@ -82,6 +82,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 .tab-btn.active::after { content: ''; position: absolute; bottom: -2px; left: 0; right: 0;
                           height: 2px; background: var(--accent); }
 .tab-btn:hover { color: var(--accent); }
+.tab-content.hidden { display: none; }
 
 /* Model Graph */
 #graph-section { display: none; }
@@ -234,6 +235,15 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
     </div>
   </div>
 
+  <!-- Tabs -->
+  <div class="tab-bar">
+    <button class="tab-btn active" id="tab-btn-graph" onclick="switchTab('graph')">Model Graph</button>
+    <button class="tab-btn" id="tab-btn-matrix" onclick="switchTab('matrix')">Shape Matrix</button>
+  </div>
+
+  <!-- Tab: Model Graph (profiling) -->
+  <div id="tab-graph" class="tab-content">
+
   <!-- Profile Controls -->
   <div class="card">
     <h2>Profile Settings</h2>
@@ -310,8 +320,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
         <div style="display:flex;align-items:center;gap:12px">
           <h2 style="margin-bottom:0">Model Graph — Op Dispatch by Module</h2>
           <div style="display:flex;gap:4px;align-items:center">
-            <button class="btn btn-secondary" id="export-shape-matrix-btn" onclick="toggleShapeMatrixPanel()"
-                    style="font-size:11px;padding:3px 10px;display:none">📊 Shape Matrix</button>
             <button class="btn btn-secondary" id="download-trace-btn" onclick="downloadTrace()"
                     style="font-size:11px;padding:3px 10px;display:none">⬇ Download Trace</button>
           </div>
@@ -322,75 +330,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
         </div>
       </div>
       <p style="font-size:12px;color:#888;margin-bottom:12px" id="graph-subtitle">
-        Run a profile to reconstruct the model graph from the trace, or use 📊 Shape Matrix to export a config-driven shape sweep.
+        Run a profile to reconstruct the model graph from the trace. See the <strong>Shape Matrix</strong> tab for a config-driven shape sweep export.
       </p>
-      <!-- Shape Matrix Export Panel -->
-      <div id="shape-matrix-panel" style="display:none;background:#f8f9fa;border:1px solid #e0e0e0;border-radius:8px;padding:16px;margin-bottom:16px">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
-          <h3 style="font-size:14px;font-weight:600;margin:0">📊 Shape Matrix Export</h3>
-          <button class="btn btn-secondary" onclick="toggleShapeMatrixPanel()" style="font-size:11px;padding:2px 8px">✕ Close</button>
-        </div>
-        <p style="font-size:12px;color:#666;margin-bottom:12px">
-          Export a flat table of op shapes/dtypes for the current model across all combinations of
-          sequence length, context length, batch size, and TP size. Use Excel filters to select configurations.
-        </p>
-
-        <!-- TP Sizes (shared) -->
-        <div style="margin-bottom:12px">
-          <label style="font-size:12px;font-weight:600;display:block;margin-bottom:4px">TP Sizes (comma-separated)</label>
-          <input id="sm-tp-sizes" type="text" value="1, 2, 4, 8"
-                 style="width:240px;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace">
-        </div>
-
-        <!-- Prefill / Decode side by side -->
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:14px">
-          <!-- Prefill settings -->
-          <fieldset style="border:1px solid #ddd;border-radius:6px;padding:12px;margin:0">
-            <legend style="font-size:12px;font-weight:600;padding:0 6px">Prefill (chunked prefill)</legend>
-            <div style="margin-bottom:8px">
-              <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Sequence Lengths</label>
-              <input id="sm-prefill-seq-lens" type="text" value="128, 256, 512, 1024, 2048, 4096, 8192"
-                     style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace">
-            </div>
-            <div style="margin-bottom:8px">
-              <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Context Lengths</label>
-              <input id="sm-prefill-ctx-lens" type="text" value="0, 8192"
-                     style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace">
-            </div>
-            <div>
-              <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Batch Sizes</label>
-              <input id="sm-prefill-batch-sizes" type="text" value="1"
-                     style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace">
-            </div>
-          </fieldset>
-          <!-- Decode settings -->
-          <fieldset style="border:1px solid #ddd;border-radius:6px;padding:12px;margin:0">
-            <legend style="font-size:12px;font-weight:600;padding:0 6px">Decode</legend>
-            <div style="margin-bottom:8px">
-              <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Sequence Length</label>
-              <input id="sm-decode-seq-len" type="text" value="1" disabled
-                     style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace;background:#eee">
-            </div>
-            <div style="margin-bottom:8px">
-              <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Context Lengths</label>
-              <input id="sm-decode-ctx-lens" type="text" value="8192"
-                     style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace">
-            </div>
-            <div>
-              <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Batch Sizes</label>
-              <input id="sm-decode-batch-sizes" type="text" value="1, 2, 4, 8, 16, 32, 64, 128"
-                     style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace">
-            </div>
-          </fieldset>
-        </div>
-
-        <div style="display:flex;gap:12px;align-items:center">
-          <button class="btn btn-primary" id="sm-download-btn" onclick="downloadShapeMatrix()" style="font-size:13px;padding:8px 20px">
-            📥 Download Shape Matrix
-          </button>
-          <span id="sm-status" style="font-size:12px;color:#666"></span>
-        </div>
-      </div>
       <div class="symbol-legend" id="symbol-legend"></div>
       <div id="graph-tree"></div>
     </div>
@@ -438,6 +379,90 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
           </thead>
           <tbody id="ops-tbody"></tbody>
         </table>
+      </div>
+    </div>
+  </div>
+
+  </div><!-- /tab-graph -->
+
+  <!-- Tab: Shape Matrix -->
+  <div id="tab-matrix" class="tab-content hidden">
+    <div class="card">
+      <h2>📊 Shape Matrix Export</h2>
+      <p style="font-size:12px;color:#666;margin-bottom:16px">
+        Export a flat table of op shapes/dtypes for the loaded model across all combinations of
+        sequence length, context length, batch size, and TP size. Use Excel filters to select configurations.
+        This is a config-driven sweep — no profiling run required.
+      </p>
+
+      <div class="controls-row" style="margin-bottom:16px">
+        <div class="control-group">
+          <label>Quantization</label>
+          <select id="sm-quant">
+            <option value="auto" selected>None (default)</option>
+            <option value="none">None (BF16)</option>
+            <option value="fp8">FP8</option>
+            <option value="gptq">GPTQ</option>
+            <option value="awq">AWQ</option>
+            <option value="squeezellm">SqueezeLLM</option>
+            <option value="marlin">Marlin</option>
+            <option value="gptq_marlin">GPTQ-Marlin</option>
+            <option value="awq_marlin">AWQ-Marlin</option>
+            <option value="bitsandbytes">BitsAndBytes</option>
+            <option value="gguf">GGUF</option>
+          </select>
+        </div>
+        <div class="control-group">
+          <label>TP Sizes (comma-separated)</label>
+          <input id="sm-tp-sizes" type="text" value="1, 2, 4, 8"
+                 style="font-family:monospace">
+        </div>
+      </div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
+        <fieldset style="border:1px solid #ddd;border-radius:6px;padding:12px;margin:0">
+          <legend style="font-size:12px;font-weight:600;padding:0 6px">Prefill (chunked prefill)</legend>
+          <div style="margin-bottom:8px">
+            <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Sequence Lengths</label>
+            <input id="sm-prefill-seq-lens" type="text" value="128, 256, 512, 1024, 2048, 4096, 8192"
+                   style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace">
+          </div>
+          <div style="margin-bottom:8px">
+            <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Context Lengths</label>
+            <input id="sm-prefill-ctx-lens" type="text" value="0, 8192"
+                   style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace">
+          </div>
+          <div>
+            <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Batch Sizes</label>
+            <input id="sm-prefill-batch-sizes" type="text" value="1"
+                   style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace">
+          </div>
+        </fieldset>
+        <fieldset style="border:1px solid #ddd;border-radius:6px;padding:12px;margin:0">
+          <legend style="font-size:12px;font-weight:600;padding:0 6px">Decode</legend>
+          <div style="margin-bottom:8px">
+            <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Sequence Length</label>
+            <input id="sm-decode-seq-len" type="text" value="1" disabled
+                   style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace;background:#eee">
+          </div>
+          <div style="margin-bottom:8px">
+            <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Context Lengths</label>
+            <input id="sm-decode-ctx-lens" type="text" value="8192"
+                   style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace">
+          </div>
+          <div>
+            <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Batch Sizes</label>
+            <input id="sm-decode-batch-sizes" type="text" value="1, 2, 4, 8, 16, 32, 64, 128"
+                   style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace">
+          </div>
+        </fieldset>
+      </div>
+
+      <div style="display:flex;gap:12px;align-items:center">
+        <button class="btn btn-primary" id="sm-download-btn" onclick="downloadShapeMatrix()" style="font-size:13px;padding:8px 20px">
+          📥 Download Shape Matrix
+        </button>
+        <span id="sm-status" style="font-size:12px;color:#666"></span>
       </div>
     </div>
   </div>
@@ -516,13 +541,13 @@ async function loadConfig() {
     modelSummary = data.summary;
     showModelSummary(modelId, data.summary);
 
-    // Update quant dropdown default label
-    const autoOpt = document.querySelector('#quant-select option[value="auto"]');
+    // Update quant dropdown default labels (profile + shape-matrix tabs)
     const mq = data.summary.quant_method;
-    autoOpt.textContent = mq ? `${mq.toUpperCase()} (default)` : 'None (default)';
+    const autoLabel = mq ? `${mq.toUpperCase()} (default)` : 'None (default)';
+    document.querySelector('#quant-select option[value="auto"]').textContent = autoLabel;
+    const smAuto = document.querySelector('#sm-quant option[value="auto"]');
+    if (smAuto) smAuto.textContent = autoLabel;
 
-    // Enable the shape-matrix export for this model
-    document.getElementById('export-shape-matrix-btn').style.display = 'inline-block';
     document.getElementById('graph-section').classList.add('visible');
 
     // Update layers dropdown with min_profile_layers info
@@ -1239,16 +1264,16 @@ function downloadTrace() {
   window.location.href = '/api/profile/trace';
 }
 
-// ---- Shape Matrix Export ----
-function toggleShapeMatrixPanel() {
-  const panel = document.getElementById('shape-matrix-panel');
-  if (panel.style.display === 'none') {
-    panel.style.display = 'block';
-  } else {
-    panel.style.display = 'none';
-  }
+// ---- Tabs ----
+function switchTab(name) {
+  const isGraph = name === 'graph';
+  document.getElementById('tab-graph').classList.toggle('hidden', !isGraph);
+  document.getElementById('tab-matrix').classList.toggle('hidden', isGraph);
+  document.getElementById('tab-btn-graph').classList.toggle('active', isGraph);
+  document.getElementById('tab-btn-matrix').classList.toggle('active', !isGraph);
 }
 
+// ---- Shape Matrix Export ----
 async function downloadShapeMatrix() {
   const btn = document.getElementById('sm-download-btn');
   const status = document.getElementById('sm-status');
@@ -1275,7 +1300,7 @@ async function downloadShapeMatrix() {
   const decodeBatchSizes = document.getElementById('sm-decode-batch-sizes').value.trim()
     .split(',').map(s => parseInt(s.trim())).filter(n => n > 0);
 
-  const quant = document.getElementById('quant-select').value || 'auto';
+  const quant = document.getElementById('sm-quant').value || 'auto';
 
   const payload = {
     model_id: modelId,
