@@ -29,9 +29,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from breakdown.analyzer import AnalyzedOp, analyze_ops
 from breakdown.classifier import Backend, classify_op
+from breakdown.graph_from_trace import build_graph_from_trace
 from breakdown.model_graph import (
-    annotate_graph_from_modules,
-    annotate_graph_timing,
     build_model_graph,
     min_profile_layers,
 )
@@ -117,42 +116,11 @@ def get_model_config(model_id: str):
         # Cache on success
         _save_config_cache(model_id, config)
         summary = summarize_config(config)
-        return jsonify({"ok": True, "config": config, "summary": summary})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 400
-
-
-@app.route("/api/model/<path:model_id>/graph")
-def get_model_graph(model_id: str):
-    """Build static model graph (no profiling needed)."""
-    try:
-        config = _load_cached_config(model_id)
-        if config is None:
-            config = fetch_model_config(model_id)
-            _save_config_cache(model_id, config)
-        summary = summarize_config(config)
-
-        prefill_len = request.args.get("prefill_len", 128, type=int)
-        decode_batch = request.args.get("decode_batch", 1, type=int)
-        context_len = request.args.get("context_len", 4096, type=int)
-        tp_size = request.args.get("tp_size", 1, type=int)
-        quantization = request.args.get("quantization", None, type=str)
-        # "auto" = use model's built-in quant config; "none" = force no quantization
-        if quantization == "auto":
-            quantization = None  # let build_model_graph read from model summary
-        elif quantization == "none":
-            quantization = "none"  # explicit override to disable quant
-
-        graph = build_model_graph(summary,
-                                  prefill_len=prefill_len,
-                                  decode_batch=decode_batch,
-                                  context_len=context_len,
-                                  tp_size=tp_size,
-                                  quantization=quantization)
-        min_layers = min_profile_layers(summary)
         return jsonify({
-            "ok": True, "graph": graph, "summary": summary,
-            "min_profile_layers": min_layers,
+            "ok": True,
+            "config": config,
+            "summary": summary,
+            "min_profile_layers": min_profile_layers(summary),
         })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400
@@ -205,7 +173,7 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
     try:
         from vllm import LLM, SamplingParams
 
-        from breakdown.trace_parser import parse_trace_file, parse_trace_with_modules
+        from breakdown.trace_parser import parse_trace_file
 
         # Fetch model config for analysis
         try:
@@ -423,24 +391,27 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             "trace_file": rank_files[0],
         }
 
-        # Build annotated graph — same tree view with timing overlaid
-        # Use actual_layers in the graph so repeat_count is correct
+        # Reconstruct the model graph directly from the profiler trace.
+        # The trace (captured with with_stack + record_shapes) is the ground
+        # truth for what actually executed, so the tree tracks whatever vLLM /
+        # the backends dispatched — no dependency on a hand-maintained static
+        # graph that drifts as vLLM evolves.
         try:
-            graph = build_model_graph(summary, prefill_len=128,
-                                      decode_batch=batch_size,
-                                      context_len=max_model_len,
-                                      tp_size=tp_size,
-                                      quantization=quantization)
-            # Try module-path-based annotation first (more precise)
-            module_ops = parse_trace_with_modules(rank_files[0])
-            if module_ops:
-                annotate_graph_from_modules(graph, module_ops)
-            else:
-                # Fall back to name+shape matching
-                annotate_graph_timing(graph, op_dicts)
+            graph = build_graph_from_trace(
+                rank_files[0],
+                summary=summary,
+                tp_size=tp_size,
+                batch_size=batch_size,
+                quantization=quantization,
+            )
+            # Carry layer-scaling metadata so the UI can extrapolate reduced-layer
+            # profiles the same way it does for the flat op list.
+            graph["profiled_layers"] = profiled_layers
+            graph["actual_layers"] = actual_layers
+            graph["layer_scale"] = layer_scale
             profile_result["graph"] = graph
         except Exception:
-            pass  # Graph annotation is best-effort
+            pass  # Graph reconstruction is best-effort
 
         with _profile_lock:
             _profile_state["status"] = "done"
@@ -1277,208 +1248,6 @@ def export_excel():
         parts.append(f"gen{gen}")
     if tp and int(tp) > 1:
         parts.append(f"tp{tp}")
-    if quant:
-        parts.append(quant)
-    filename = "_".join(parts) + ".xlsx"
-
-    return Response(
-        buf.getvalue(),
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
-
-
-@app.route("/api/export/static-graph", methods=["POST"])
-def export_static_graph():
-    """Export the static model graph breakdown to Excel (no profiling needed)."""
-    from openpyxl import Workbook
-    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-    from openpyxl.utils import get_column_letter
-
-    data = request.json
-    if not data or "graph" not in data:
-        return jsonify({"ok": False, "error": "No graph data to export"}), 400
-
-    graph_data = data["graph"]
-    summary = data.get("summary", {})
-    model_id = data.get("model_id", "unknown")
-    phase = data.get("phase", "prefill")
-
-    wb = Workbook()
-
-    title_font = Font(bold=True, size=14)
-    header_font = Font(bold=True, size=11, color="FFFFFF")
-    header_fill = PatternFill(start_color="1A1A2E", end_color="1A1A2E",
-                              fill_type="solid")
-    thin_border = Border(
-        bottom=Side(style="thin", color="E0E0E0"),
-    )
-
-    # ---- Sheet 1: Summary ----
-    ws_sum = wb.active
-    ws_sum.title = "Summary"
-
-    ws_sum["A1"] = "vLLM-XPU Static Model Graph Breakdown"
-    ws_sum["A1"].font = title_font
-    ws_sum["A2"] = f"Model: {model_id}"
-    ws_sum["A3"] = f"Phase: {phase}"
-
-    graph_cfg = graph_data.get("config", {})
-    tp_size = graph_cfg.get("tp_size", 1)
-    quant = graph_cfg.get("quantization")
-    ws_sum["A4"] = (
-        f"Prefill Len: {graph_cfg.get('prefill_len', 'N/A')} | "
-        f"Decode Batch: {graph_cfg.get('decode_batch', 'N/A')} | "
-        f"Context Len: {graph_cfg.get('context_len', 'N/A')} | "
-        f"TP: {tp_size}"
-        + (f" | Quant: {quant}" if quant else "")
-    )
-
-    # Write model config
-    row = 6
-    if summary:
-        ws_sum.cell(row, 1, "Model Configuration").font = Font(bold=True, size=12)
-        row += 1
-        ws_sum.cell(row, 1, "architecture").font = Font(bold=True)
-        ws_sum.cell(row, 2, str(summary.get("architecture", "")))
-        row += 1
-
-        for key in _SUMMARY_CONFIG_KEYS:
-            if key in summary:
-                ws_sum.cell(row, 1, key).font = Font(bold=True)
-                val = summary[key]
-                if isinstance(val, (int, float)):
-                    ws_sum.cell(row, 2, val)
-                else:
-                    ws_sum.cell(row, 2, str(val))
-                row += 1
-
-        ws_sum.cell(row, 1, "dtype").font = Font(bold=True)
-        ws_sum.cell(row, 2, str(summary.get("dtype", "bfloat16")))
-        row += 1
-        ws_sum.cell(row, 1, "is_moe").font = Font(bold=True)
-        ws_sum.cell(row, 2, str(summary.get("is_moe", False)))
-        row += 1
-
-    # Write symbols
-    symbols = graph_data.get("symbols", {})
-    if symbols:
-        row += 1
-        ws_sum.cell(row, 1, "Dimension Symbols").font = Font(bold=True, size=12)
-        row += 1
-        for sym, val in symbols.items():
-            ws_sum.cell(row, 1, sym).font = Font(bold=True)
-            ws_sum.cell(row, 2, val)
-            row += 1
-
-    ws_sum.column_dimensions["A"].width = 28
-    ws_sum.column_dimensions["B"].width = 20
-
-    # ---- Sheet 2: Model Hierarchy ----
-    tree = graph_data.get(phase) or graph_data.get("prefill")
-    if tree:
-        ws_hier = wb.create_sheet("Model Hierarchy")
-
-        hier_headers = ["Module", "Path", "Type", "×Repeat",
-                        "Memory (bytes)", "FLOPs", "AI",
-                        "Op Role", "Op Name", "Op Backend", "Op Shape"]
-        for col, hdr in enumerate(hier_headers, 1):
-            c = ws_hier.cell(1, col, hdr)
-            c.font = header_font
-            c.fill = header_fill
-            c.alignment = Alignment(horizontal="center")
-
-        flat_nodes = _flatten_graph_nodes(tree)
-        hier_row = 2
-        indent_fill = PatternFill(start_color="F5F5F5", end_color="F5F5F5",
-                                  fill_type="solid")
-        module_font = Font(bold=True)
-
-        for node_info in flat_nodes:
-            depth = node_info["depth"]
-            indent = "  " * depth
-
-            # Module header row
-            ws_hier.cell(hier_row, 1, indent + node_info["name"])
-            ws_hier.cell(hier_row, 1).font = module_font
-            ws_hier.cell(hier_row, 2, node_info["path"])
-            ws_hier.cell(hier_row, 3, node_info["module_type"])
-            repeat = node_info["repeat_count"]
-            if repeat > 1:
-                ws_hier.cell(hier_row, 4, repeat)
-            ws_hier.cell(hier_row, 5, node_info["total_memory"])
-            ws_hier.cell(hier_row, 6, node_info["total_flops"])
-            ai = node_info["total_ai"]
-            if ai:
-                ws_hier.cell(hier_row, 7, ai)
-                ws_hier.cell(hier_row, 7).number_format = '0.00'
-
-            for col in range(1, len(hier_headers) + 1):
-                ws_hier.cell(hier_row, col).fill = indent_fill
-                ws_hier.cell(hier_row, col).border = thin_border
-
-            hier_row += 1
-
-            # Op rows under this module
-            for op in node_info["ops"]:
-                op_role = op.get("role", "")
-                ws_hier.cell(hier_row, 8, op_role)
-                op_name = op.get("name", "")
-                ws_hier.cell(hier_row, 9, op_name)
-                ws_hier.cell(hier_row, 10, op.get("backend", ""))
-
-                # Show concrete op shapes with per-tensor dtype
-                op_shapes = op.get("input_shapes", [])
-                if op_shapes:
-                    concrete_shapes = []
-                    for shape_idx, shape in enumerate(op_shapes):
-                        if isinstance(shape, list):
-                            tensor_dtype = _get_tensor_dtype(
-                                shape_idx, op_role, graph_cfg
-                            )
-                            parts = []
-                            for dim in shape:
-                                if isinstance(dim, str) and dim in symbols:
-                                    parts.append(str(symbols[dim]))
-                                elif isinstance(dim, int):
-                                    parts.append(str(dim))
-                                else:
-                                    parts.append(str(dim))
-                            if tensor_dtype:
-                                parts.append(tensor_dtype)
-                            concrete_shapes.append(
-                                "[" + ", ".join(parts) + "]"
-                            )
-                        else:
-                            concrete_shapes.append(str(shape))
-                    ws_hier.cell(
-                        hier_row, 11, " × ".join(concrete_shapes)
-                    )
-                else:
-                    ws_hier.cell(hier_row, 11, "—")
-
-                op_indent = "  " * (depth + 1)
-                ws_hier.cell(hier_row, 1, op_indent + "↳ " + op_role)
-                for col in range(1, len(hier_headers) + 1):
-                    ws_hier.cell(hier_row, col).border = thin_border
-                hier_row += 1
-
-        # Column widths
-        hier_col_widths = [35, 35, 25, 8, 15, 15, 10, 18, 35, 18, 55]
-        for i, w in enumerate(hier_col_widths, 1):
-            ws_hier.column_dimensions[get_column_letter(i)].width = w
-
-        ws_hier.freeze_panes = "A2"
-
-    # Write to buffer
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-
-    model_name = model_id.replace("/", "_")
-    parts = [f"vllm_xpu_static_graph_{model_name}_{phase}"]
-    if tp_size > 1:
-        parts.append(f"tp{tp_size}")
     if quant:
         parts.append(quant)
     filename = "_".join(parts) + ".xlsx"

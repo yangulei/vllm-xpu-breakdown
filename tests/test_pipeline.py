@@ -1040,5 +1040,143 @@ class TestMiniMaxM3ModelGraph(unittest.TestCase):
                 )
 
 
+# ===================================================================
+# Profile-first graph reconstruction (build_graph_from_trace)
+# ===================================================================
+
+
+def _synthetic_trace(steps):
+    """Build a minimal chrome-trace dict for reconstruction tests.
+
+    ``steps`` is a list of ``tokens`` (int); each produces one model forward
+    with an embedding + two identical decoder layers (each a linear op). Kernel
+    device time is linked to each cpu_op through the correlation → runtime →
+    External id chain, exactly like real XPU traces.
+    """
+    events = []
+    ext = [0]
+    corr = [0]
+    tid = 7
+
+    def kernel_for(ext_id, ts, dur):
+        corr[0] += 1
+        c = corr[0]
+        events.append({"ph": "X", "cat": "xpu_runtime", "tid": tid, "pid": tid,
+                       "ts": ts, "dur": 0.1, "name": "urEnqueueKernelLaunch",
+                       "args": {"correlation": c, "External id": ext_id}})
+        events.append({"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+                       "ts": ts + 1000, "dur": dur, "name": "gemm_xpu_kernel",
+                       "args": {"correlation": c}})
+
+    def op(name, ts, dur, shapes, kdur):
+        ext[0] += 1
+        e = ext[0]
+        events.append({"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+                       "ts": ts, "dur": dur, "name": name,
+                       "args": {"External id": e, "Input Dims": shapes,
+                                "Input type": ["c10::BFloat16", "c10::BFloat16"]}})
+        if kdur:
+            kernel_for(e, ts, kdur)
+
+    def module(cls, ts, dur):
+        events.append({"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
+                       "ts": ts, "dur": dur, "name": f"nn.Module: {cls}"})
+
+    t = 0.0
+    for si, tokens in enumerate(steps):
+        base = t
+        module(f"TinyForCausalLM_{si}", base, 100)
+        module(f"TinyModel_{si}", base + 1, 98)
+        module(f"VocabParallelEmbedding_{si}", base + 2, 4)
+        op("aten::embedding", base + 3, 2, [[32000, 16], [tokens]], 0)
+        for li in range(2):
+            lts = base + 10 + li * 40
+            module(f"TinyDecoderLayer_{li}", lts, 38)
+            module(f"TinyAttention_{li}", lts + 1, 16)
+            op("aten::linear", lts + 2, 8,
+               [[tokens, 16], [48, 16]], 5.0)  # qkv proj → kernel 5us
+            module(f"TinyMLP_{li}", lts + 20, 16)
+            op("aten::linear", lts + 21, 8,
+               [[tokens, 16], [64, 16]], 7.0)  # mlp → kernel 7us
+        t = base + 120
+    return {"traceEvents": events}
+
+
+class TestGraphFromTrace(unittest.TestCase):
+    """Reconstruct a model graph directly from a profiler trace."""
+
+    SUMMARY = {
+        "architecture": "TinyForCausalLM", "hidden_size": 16, "num_heads": 3,
+        "num_kv_heads": 3, "head_dim": 16, "intermediate_size": 64,
+        "vocab_size": 32000, "num_layers": 2, "dtype": "bfloat16",
+    }
+
+    def _build(self, steps):
+        from breakdown.graph_from_trace import build_graph_from_trace
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(_synthetic_trace(steps), f)
+            path = f.name
+        try:
+            return build_graph_from_trace(path, self.SUMMARY,
+                                          tp_size=1, batch_size=1)
+        finally:
+            os.unlink(path)
+
+    def test_reconstructs_prefill_and_decode(self):
+        g = self._build([8, 1, 1])  # 1 prefill (8 tokens) + 2 decode (1 token)
+        self.assertIsNotNone(g["prefill"])
+        self.assertIsNotNone(g["decode"])
+        self.assertTrue(g["has_timing"])
+        self.assertEqual(g["timing_method"], "trace_reconstruction")
+
+    def test_phase_token_symbols(self):
+        g = self._build([8, 1, 1])
+        self.assertEqual(g["symbols"]["S"], 8)   # prefill token dim
+        self.assertEqual(g["symbols"]["B"], 1)   # decode token dim
+
+    def test_repeated_layers_collapsed(self):
+        g = self._build([8])
+        # Model → embed + collapsed decoder layer (×2) + (no final norm here)
+        model = g["prefill"]["children"][0]
+        layer_nodes = [c for c in model["children"]
+                       if c["module_type"] == "TinyDecoderLayer"]
+        self.assertEqual(len(layer_nodes), 1)
+        self.assertEqual(layer_nodes[0]["repeat_count"], 2)
+
+    def test_device_time_attributed_via_correlation(self):
+        g = self._build([8])
+        model = g["prefill"]["children"][0]
+        layer = next(c for c in model["children"]
+                     if c["module_type"] == "TinyDecoderLayer")
+        attn = next(c for c in layer["children"]
+                    if c["module_type"] == "TinyAttention")
+        linear = next(o for o in attn["ops"] if o["name"] == "aten::linear")
+        self.assertAlmostEqual(linear["device_time_us"], 5.0, places=3)
+
+    def test_shapes_symbolized(self):
+        g = self._build([8])
+        model = g["prefill"]["children"][0]
+        layer = next(c for c in model["children"]
+                     if c["module_type"] == "TinyDecoderLayer")
+        attn = next(c for c in layer["children"]
+                    if c["module_type"] == "TinyAttention")
+        linear = next(o for o in attn["ops"] if o["name"] == "aten::linear")
+        # First input row dim → "S", hidden dim → "H"
+        self.assertEqual(linear["input_shapes"][0], ["S", "H"])
+
+    def test_empty_trace(self):
+        from breakdown.graph_from_trace import build_graph_from_trace
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"traceEvents": []}, f)
+            path = f.name
+        try:
+            g = build_graph_from_trace(path, self.SUMMARY)
+            self.assertIsNone(g["prefill"])
+            self.assertIsNone(g["decode"])
+            self.assertFalse(g["has_timing"])
+        finally:
+            os.unlink(path)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

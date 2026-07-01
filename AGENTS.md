@@ -11,9 +11,23 @@ This is a profiling and static-analysis tool for vLLM inference on Intel XPU (GP
 - **cpu** — CPU fallbacks
 - **framework** — Tensor reshaping, profiler overhead
 
-The tool has two modes:
-1. **Static analysis** — Builds a model op graph from HuggingFace config without GPU
-2. **Dynamic profiling** — Runs actual inference via vLLM and parses torch profiler traces
+The tool's in-app **Model Graph is always reconstructed from a profiling run**;
+there is no interactive static-graph view.
+1. **Dynamic profiling (profile-first)** — Runs actual inference via vLLM on
+   Intel XPU, then **reconstructs the model graph directly from the torch
+   profiler trace** (nn.Module call stack + `Input Dims` shapes + kernel device
+   time via the correlation→runtime→External-id chain). The reconstructed tree
+   reflects what actually executed, so it tracks whatever vLLM/the backends
+   dispatched instead of relying on a hand-maintained static graph.
+2. **Config-driven shape sweep** — `build_model_graph` (from the HuggingFace
+   config) still powers the **Shape Matrix Excel export**
+   (`/api/export/shape-matrix`), a sweep across seq/context/batch/TP. It is no
+   longer exposed as an interactive graph endpoint.
+
+> **Environment assumption:** the profiling path assumes torch-xpu and vLLM are
+> installed and an Intel XPU is available. (`model_graph.py`/`model_info.py`
+> happen to be import-light, but supporting a torch-free CPU-only install is no
+> longer a design goal.)
 
 ## Project Structure
 
@@ -22,12 +36,14 @@ app.py                    — Flask web server (API + static serving + exports)
 run_profile.py            — CLI profiling entry point
 chat.py                   — Interactive chat with profiling
 breakdown/
-  model_graph.py          — Static model graph builder (core engine)
+  model_graph.py          — Static (config-driven) model graph builder
+  graph_from_trace.py     — Profile-first graph reconstruction from a trace
   model_info.py           — HuggingFace config fetcher and summarizer
   analyzer.py             — Op analysis (shapes, memory, FLOPs, AI)
   classifier.py           — Op → backend classification
   registry.py             — Known vllm-xpu-kernels ops list
-  trace_parser.py         — Chrome trace JSON parser
+  trace_parser.py         — Chrome trace JSON parser + module/role helpers
+  trace_common.py         — Torch-free trace helpers (overhead-event filtering)
   profiler.py             — vLLM profiler integration
   report.py               — Text/CSV/JSON report generation
   visualize.py            — Plotting utilities
@@ -49,7 +65,7 @@ tests/
 # Install dependencies
 pip install -r requirements.txt
 
-# Run web UI (no GPU needed for static analysis)
+# Run web UI (static analysis works without loading model weights)
 python app.py --port 8080
 
 # Run CLI profiling (requires Intel XPU + vLLM)
@@ -73,7 +89,8 @@ pytest tests/ -v
 
 ### Model Graph Builder (`model_graph.py`)
 
-The core engine for static analysis. Key concepts:
+The config-driven shape builder. It powers the **Shape Matrix Excel export**
+(no longer an interactive graph view). Key concepts:
 
 - **`_ARCH_FAMILY_MAP`** — Maps HuggingFace `architectures` field to family names (35+ entries). This determines which graph builder is used.
 - **Architecture category sets** — `_MLA_ARCHS`, `_VL_ARCHS`, `_ENCODER_ARCHS`, `_DIFFUSION_ARCHS` control routing in `build_model_graph()`.
@@ -97,6 +114,36 @@ Architecture-specific builders:
 > (`TRITON_MLA` for dense MLA, `XPU_MLA_SPARSE` for DeepSeek sparse attention),
 > so that block was removed. Do not re-add an MLA architecture guard in the
 > profiling path. See `TestMLAModelGraph` in `tests/test_pipeline.py`.
+
+### Profile-First Graph Reconstruction (`graph_from_trace.py`)
+
+The profiling flow no longer overlays timing onto the static graph. Instead
+`build_graph_from_trace(trace_path, summary, tp_size, batch_size, quantization)`
+reconstructs the module/op tree straight from the torch profiler trace and
+returns the same serialized shape (`{prefill, decode, symbols, config,
+has_timing, timing_*, source}`) as `build_model_graph`, so the frontend renders
+it unchanged. How it works:
+
+- **Module tree** — `nn.Module: <Cls>_<idx>` python_function events nest by
+  time-containment (sort by `(ts asc, end desc)`, pop a stack while the top ends
+  before the current node).
+- **Op shapes** — taken from each `cpu_op`'s `Input Dims` / `Input type`, then
+  symbolized (`_symbolize`) against the model config so dims show as `S`, `B`,
+  `C`, `H`, `/TP`, etc.
+- **Device time** — kernels link to their launching `cpu_op` via
+  `kernel.correlation → runtime.correlation→External id → cpu_op.External id`;
+  kernel durations are summed per op (`self_dev`) and rolled up post-order
+  (`sub_dev`).
+- **Phase split** — `_partition_steps` groups module roots into inference steps
+  (main model class starts each step; trailing LogitsProcessor/Sampler attach to
+  it), classified prefill vs decode by the pass's max matmul token dim.
+- **Repeat collapse** — adjacent structurally-identical sibling layers merge into
+  one node with `repeat_count`, timing averaged. Dense vs MoE layers have
+  different structural signatures so they stay as separate runs.
+
+The old `annotate_graph_timing` / `annotate_graph_from_modules` /
+`parse_trace_with_modules` paths were **removed**. Do not reintroduce a
+static-overlay step in the profiling worker.
 
 ### Symbolic Shape System
 
@@ -137,7 +184,7 @@ Classifies ops by name prefix/pattern to backends. Priority order:
 
 - **License header** — All Python files start with `# SPDX-License-Identifier: Apache-2.0`
 - **Type annotations** — Use `from __future__ import annotations` and modern syntax (`dict[str, Any]`, `list[int] | None`)
-- **No external ML dependencies for static analysis** — `model_graph.py` and `model_info.py` must work without PyTorch/vLLM installed
+- **Environment** — Assume torch-xpu and vLLM are installed and an Intel XPU is available. `model_graph.py`/`model_info.py` remain import-light (they don't pull in torch/vLLM at import time), which keeps static analysis fast, but supporting a torch-free CPU-only install is no longer a design requirement.
 - **Symbolic shapes** — Op shapes use string symbols (`"H"`, `"S"`, `"n_h·d/TP"`) with `/TP` for TP-divided dims
 - **TP-awareness** — All graph builders accept `tp_size`; shapes always show `/TP` for split dimensions; `cfg["_tp_*"]` keys hold divided values for numeric calculations
 
@@ -157,19 +204,26 @@ Classifies ops by name prefix/pattern to backends. Priority order:
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/model/<hf_id>` | GET | Fetch and summarize HF model config |
-| `/api/model/<hf_id>/graph` | GET | Build static model graph |
-| `/api/profile/start` | POST | Start async profiling |
+| `/api/model/<hf_id>` | GET | Fetch/summarize HF model config (+ `min_profile_layers`) |
+| `/api/cached-models` | GET | List previously loaded model IDs |
+| `/api/profile` | POST | Start async profiling run |
 | `/api/profile/status` | GET | Poll profiling status |
+| `/api/profile/result` | GET | Fetch profiling result (ops + reconstructed graph) |
 | `/api/profile/trace` | GET | Download raw trace file |
-| `/api/export/shape-matrix` | POST | Export multi-config shape sweep to Excel |
+| `/api/demo` | GET | Mock profiling data for UI development |
 | `/api/export/excel` | POST | Export profiled breakdown to Excel |
-| `/api/export/static-graph` | POST | Export static graph breakdown to Excel |
+| `/api/export/shape-matrix` | POST | Export config-driven multi-config shape sweep to Excel |
 
 ## Common Pitfalls
 
 - `model_graph.py` is ~1600 lines — use `view_range` to read targeted sections
-- `app.py` is ~1900 lines — use `view_range` to read targeted sections
+- `app.py` is ~1700 lines — use `view_range` to read targeted sections
+- **Profiling reconstructs the graph from the trace** (`graph_from_trace.py`) —
+  it does NOT overlay timing onto a static graph. The `annotate_graph_*` and
+  `parse_trace_with_modules` helpers were removed; don't reintroduce them. There
+  is **no interactive static-graph endpoint** (`/api/model/<id>/graph` and
+  `/api/export/static-graph` were removed) — `build_model_graph` is only reached
+  through the Shape Matrix export.
 - The `_ARCH_FAMILY_MAP` keys must exactly match HuggingFace `architectures[0]` values
 - Encoder models return `decode: None` (no autoregressive decode phase)
 - Diffusion models return `prefill: None, decode: None` with a `note` field
