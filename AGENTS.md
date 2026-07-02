@@ -174,9 +174,14 @@ those names onto the accurate profile-based tree instead of rebuilding it.
 - **`ref_tree_from_llm(llm)`** — extracts the tree from the *live* vLLM model
   during profiling (via `LLM.apply_model`, falling back to attribute traversal).
   Cheap: the model is already loaded. This is the primary path.
-- **`ref_tree_from_config(...)`** — `meta`-device instantiation fallback for the
-  offline / trace-upload path (env-gated by `VLLM_XPU_BREAKDOWN_META_NAMES=1`,
-  remote code by `VLLM_XPU_BREAKDOWN_TRUST_REMOTE_CODE=1`). Heavy + network.
+- **`ref_tree_from_config(...)`** — `meta`-device instantiation fallback
+  (env-gated by `VLLM_XPU_BREAKDOWN_META_NAMES=1`, remote code by
+  `VLLM_XPU_BREAKDOWN_TRUST_REMOTE_CODE=1`). Heavy + network. Used by the
+  trace-upload path **and** as a live-path fallback: if `ref_tree_from_llm`
+  returns `None` during profiling, `_run_profile` retries with
+  `ref_tree_from_config` when `META_NAMES=1`. The whole naming path logs its
+  outcome (`vllm_xpu_breakdown` logger) — a "reference tree available but no
+  names landed" warning means alignment (not acquisition) failed.
 - **Alignment** — `graph_from_trace._apply_ref_names` walks the *raw* module
   forest against the reference tree, matching children greedily by
   `(class, order)` (reusing a matched representative when the trace has more
@@ -279,7 +284,18 @@ Classifies ops by name prefix/pattern to backends. Priority order:
   via `outputs[0].num_cached_tokens >= ctx_aligned` — a miss recomputes the whole
   context (`S = context+query`) and is surfaced as `cache_hit_note`. `start_profile`
   bumps `max_model_len` to `context+query+max_tokens`. When `query_len` is absent
-  (uploads/legacy clients) the old chat/text-prompt path still runs.
+  (uploads/legacy clients) the old chat/text-prompt path still runs. The
+  **block-aligned** context length (`ctx_aligned`) is threaded into
+  `build_graph_from_trace(..., context_len=...)`, which registers `C =
+  context_len` and `S+C = context+query` in the symbol legend. **Paged attention
+  never records the context as a tensor dim** — the op's key/value inputs only
+  carry the *new* `[S, n_kv, d]` tokens (verified: `unified_attention_with_output`
+  =`[[S,n_h,d],[S,n_kv,d],[S,n_kv,d],[S,n_h,d],…]`), the cached context lives in
+  the block cache / seqlen metadata. So `C` can't be *symbolized* from the trace;
+  instead `_annotate_attention_kv` **rewrites the attention key/value rows from
+  `S` to `S+C`** (query/output rows stay `S`) so the prefill graph shows the
+  query attending `context+query` keys. Without threading `context_len`, KV rows
+  stay `S` and the context is invisible.
 - **Main model class is picked by subtree size, not device time.** The
   `LogitsProcessor`'s `lm_head` matmul (`V`-wide, once per decode step) can
   out-weigh the whole model forward, so selecting the main class by `sub_dev`

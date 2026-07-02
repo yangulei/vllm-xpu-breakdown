@@ -15,6 +15,7 @@ import argparse
 import functools
 import io
 import json
+import logging
 import os
 import sys
 import threading
@@ -38,6 +39,12 @@ from breakdown.model_info import fetch_model_config, get_dim_symbols, summarize_
 from breakdown.registry import ALL_VLLM_XPU_OPS
 
 app = Flask(__name__, static_folder="static")
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("vllm_xpu_breakdown")
 
 # ---- Config Cache ----
 # Persists successfully loaded model configs to disk so they appear as suggestions.
@@ -191,6 +198,26 @@ def _get_vocab_size(llm, summary: dict, default: int = 32000) -> int:
     return int(vs) if vs and vs > 512 else default
 
 
+def _collect_node_names(node: dict | None) -> set[str]:
+    """Set of all display ``name`` values in a graph tree (for diagnostics)."""
+    if not node:
+        return set()
+    out = {node.get("name", "")}
+    for c in node.get("children", []):
+        out |= _collect_node_names(c)
+    return out
+
+
+def _collect_module_types(node: dict | None) -> set[str]:
+    """Set of all ``module_type`` (class) values in a graph tree."""
+    if not node:
+        return set()
+    out = {node.get("module_type", "")}
+    for c in node.get("children", []):
+        out |= _collect_module_types(c)
+    return out
+
+
 def _build_result_from_traces(
     rank_files: list[str],
     *,
@@ -208,6 +235,8 @@ def _build_result_from_traces(
     layer_scale: float = 1.0,
     trace_file: str | None = None,
     ref_module_tree: dict | None = None,
+    query_len: int | None = None,
+    context_len: int | None = None,
 ) -> dict:
     """Parse one or more trace files and build the profile result dict.
 
@@ -291,13 +320,31 @@ def _build_result_from_traces(
             batch_size=batch_size,
             quantization=quantization,
             ref_module_tree=ref_module_tree,
+            query_len=query_len,
+            context_len=context_len,
         )
         graph["profiled_layers"] = profiled_layers
         graph["actual_layers"] = actual_layers
         graph["layer_scale"] = layer_scale
         profile_result["graph"] = graph
+        if ref_module_tree:
+            names = _collect_node_names(graph.get("prefill")
+                                        or graph.get("decode"))
+            recovered = names & {"q_norm", "k_norm", "input_layernorm",
+                                 "post_attention_layernorm"}
+            if recovered:
+                logger.info("Module-name recovery applied to graph: %s",
+                            ", ".join(sorted(recovered)))
+            else:
+                logger.warning(
+                    "Module-name recovery: reference tree was available but no "
+                    "attribute names landed on the graph (structural alignment "
+                    "found no match). Trace module classes seen: %s",
+                    ", ".join(sorted(_collect_module_types(
+                        graph.get("prefill") or graph.get("decode")))[:20]),
+                )
     except Exception:
-        pass  # Graph reconstruction is best-effort
+        logger.warning("Graph reconstruction failed", exc_info=True)
 
     return profile_result
 
@@ -346,6 +393,7 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             summary = summarize_config(config)
             dim_symbols = get_dim_symbols(summary)
         except Exception:
+            config = {}
             summary = {}
             dim_symbols = {}
 
@@ -408,6 +456,11 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
         query_len = int(query_len) if query_len else 0
         context_len = int(context_len) if context_len else 0
         use_token_prompts = query_len > 0
+        # The context length actually served from the prefix cache, floored to a
+        # whole number of KV blocks (set below once the block size is known). The
+        # graph reconstruction symbolizes this value as ``C`` so attention KV
+        # dims read ``C`` / ``S+C`` instead of a bare number.
+        profiled_context_len = 0
 
         # Enable Automatic Prefix Caching so the context prefix computed in the
         # warm pass is reused (not recomputed) during the profiled run.
@@ -455,6 +508,7 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             # entire context prefix is cacheable (a trailing partial block would
             # be recomputed and shift the profiled prefill token count).
             ctx_aligned = (context_len // block_size) * block_size
+            profiled_context_len = ctx_aligned
             ctx_ids = _make_token_ids(ctx_aligned, vocab_size, seed=0)
 
             def _full_prompt(query_seed: int) -> "TokensPrompt":
@@ -542,7 +596,46 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             from breakdown.module_naming import ref_tree_from_llm
             ref_module_tree = ref_tree_from_llm(llm)
         except Exception:
+            logger.warning("ref_tree_from_llm raised; module names disabled",
+                           exc_info=True)
             ref_module_tree = None
+
+        if ref_module_tree:
+            logger.info(
+                "Module-name recovery: got reference tree from live model "
+                "(root=%s, %d top-level children)",
+                ref_module_tree.get("cls"),
+                len(ref_module_tree.get("children", [])),
+            )
+        else:
+            logger.warning(
+                "Module-name recovery: could NOT read module names from the "
+                "live model (ref_tree_from_llm returned None). q_norm/k_norm and "
+                "other attribute names will fall back to class heuristics."
+            )
+            # Fallback: the offline meta-device path, gated by the same env var
+            # the docs advertise. Heavy (re-instantiates on meta) but lets naming
+            # work when the live-model traversal fails.
+            if os.environ.get("VLLM_XPU_BREAKDOWN_META_NAMES") == "1" and config:
+                try:
+                    from breakdown.module_naming import ref_tree_from_config
+                    ref_module_tree = ref_tree_from_config(
+                        config,
+                        dtype=summary.get("dtype", "bfloat16"),
+                        model_id=model_id,
+                        allow_remote_code=(
+                            os.environ.get(
+                                "VLLM_XPU_BREAKDOWN_TRUST_REMOTE_CODE") == "1"),
+                    )
+                    if ref_module_tree:
+                        logger.info(
+                            "Module-name recovery: recovered names via "
+                            "meta-device fallback (VLLM_XPU_BREAKDOWN_META_NAMES=1)."
+                        )
+                except Exception:
+                    logger.warning("ref_tree_from_config fallback failed",
+                                   exc_info=True)
+                    ref_module_tree = None
 
         # --- Parse trace files ---
         # With TP>1, vLLM produces one trace file per rank.
@@ -579,6 +672,8 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             actual_layers=actual_layers,
             layer_scale=layer_scale,
             ref_module_tree=ref_module_tree,
+            query_len=query_len or None,
+            context_len=profiled_context_len or None,
         )
 
         profile_result["query_len"] = query_len or None

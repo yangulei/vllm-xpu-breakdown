@@ -24,8 +24,11 @@ have no torch/vLLM dependency so they are unit-testable on any host.
 """
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
+
+logger = logging.getLogger("vllm_xpu_breakdown")
 
 # ===================================================================
 # Reference module-name tree (pure — torch-free)
@@ -316,6 +319,8 @@ def ref_tree_from_llm(llm: Any) -> dict | None:
                                   and first and isinstance(first[0], tuple)) \
                     else results  # some versions return the list directly
         except Exception:
+            logger.warning("ref_tree_from_llm: apply_model path failed",
+                           exc_info=True)
             items = None
     if not items:
         model = _get_model_direct(llm)
@@ -323,12 +328,23 @@ def ref_tree_from_llm(llm: Any) -> dict | None:
             try:
                 items = named_modules_from_model(model)
             except Exception:
+                logger.warning("ref_tree_from_llm: direct traversal failed",
+                               exc_info=True)
                 items = None
+        else:
+            logger.warning(
+                "ref_tree_from_llm: apply_model yielded nothing and no direct "
+                "model path matched (vLLM engine layout unrecognized).")
     if not items:
         return None
     try:
-        return build_ref_tree(list(items))
+        tree = build_ref_tree(list(items))
+        if tree:
+            logger.info("ref_tree_from_llm: read %d named modules (root=%s)",
+                        len(items), tree.get("cls"))
+        return tree
     except Exception:
+        logger.warning("ref_tree_from_llm: build_ref_tree failed", exc_info=True)
         return None
 
 
