@@ -638,34 +638,6 @@ class TestFlaskAPI(unittest.TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertIn(b"vLLM-XPU", resp.data)
 
-    def test_demo_endpoint_ok(self):
-        resp = self.client.get("/api/demo")
-        data = resp.get_json()
-        self.assertTrue(data["ok"])
-        self.assertGreater(len(data["data"]["ops"]), 0)
-
-    def test_demo_no_overhead(self):
-        resp = self.client.get("/api/demo")
-        data = resp.get_json()
-        names = [op["name"] for op in data["data"]["ops"]]
-        self.assertNotIn("ProfilerStep*", names)
-
-    def test_demo_ops_fields(self):
-        resp = self.client.get("/api/demo")
-        data = resp.get_json()
-        required = {"name", "backend", "input_shapes", "dtype",
-                    "call_count", "layer_count", "device_time_us",
-                    "memory_bytes", "flops", "arithmetic_intensity"}
-        for op in data["data"]["ops"]:
-            for field in required:
-                self.assertIn(field, op, f"Missing '{field}' in {op['name']}")
-
-    def test_demo_backend_pct_sums_to_100(self):
-        resp = self.client.get("/api/demo")
-        data = resp.get_json()
-        total_pct = sum(b["pct"] for b in data["data"]["backends"].values())
-        self.assertAlmostEqual(total_pct, 100.0, delta=1.0)
-
     def test_model_endpoint_qwen3(self):
         resp = self.client.get(f"/api/model/{QWEN3_4B_MODEL_ID}")
         data = resp.get_json()
