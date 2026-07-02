@@ -217,8 +217,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
         <input type="number" id="context-len" value="2048" min="1" step="128">
       </div>
       <div class="control-group">
-        <label>Batch Size</label>
-        <input type="number" id="batch-size" value="1" min="1" max="512">
+        <label>Prefill Batch</label>
+        <input type="number" id="prefill-batch-size" value="1" min="1" max="512"
+               title="Concurrent sequences for the prefill phase (real serving is usually 1)">
+      </div>
+      <div class="control-group">
+        <label>Decode Batch</label>
+        <input type="number" id="decode-batch-size" value="32" min="1" max="512"
+               title="Concurrent sequences for the decode phase (often 32/64/128). If it differs from Prefill Batch, profiling runs two passes and merges them.">
       </div>
       <div class="control-group">
         <label>Layers</label>
@@ -505,11 +511,16 @@ async function startProfile() {
   const profCtxLen = parseInt(document.getElementById('context-len').value);
   const profMaxLen = profQueryLen + (Number.isFinite(profCtxLen) ? profCtxLen : 4096);
 
+  const prefillBatch = parseInt(document.getElementById('prefill-batch-size').value) || 1;
+  const decodeBatch = parseInt(document.getElementById('decode-batch-size').value) || 1;
+
   const body = {
     model_id: modelId,
     mode: document.getElementById('mode-select').value,
     max_model_len: profMaxLen,
-    batch_size: parseInt(document.getElementById('batch-size').value) || 1,
+    batch_size: prefillBatch,
+    prefill_batch_size: prefillBatch,
+    decode_batch_size: decodeBatch,
     max_tokens: 128,
     query_len: profQueryLen,
     context_len: Number.isFinite(profCtxLen) ? profCtxLen : 0,
@@ -612,7 +623,7 @@ async function uploadTrace(fileList) {
   const modelId = document.getElementById('model-input').value.trim();
   if (modelId) fd.append('model_id', modelId);
   fd.append('mode', document.getElementById('mode-select').value);
-  fd.append('batch_size', parseInt(document.getElementById('batch-size').value) || 1);
+  fd.append('batch_size', parseInt(document.getElementById('decode-batch-size').value) || 1);
   fd.append('tensor_parallel_size', parseInt(document.getElementById('tp-size-select').value) || 1);
   const q = document.getElementById('quant-select').value;
   fd.append('quantization', (q === 'auto' || q === 'none') ? '' : q);
@@ -661,17 +672,8 @@ function setPhase(el) {
   el.classList.add('active');
   currentPhase = el.dataset.phase;
 
-  // Update control defaults for the phase
-  if (currentPhase === 'prefill') {
-    document.getElementById('query-len').value = 2048;
-    document.getElementById('context-len').value = 2048;
-    document.getElementById('batch-size').value = 1;
-  } else {
-    document.getElementById('query-len').value = 1;
-    document.getElementById('context-len').value = 4096;
-    document.getElementById('batch-size').value = 128;
-  }
-
+  // A single profile run now reconstructs both phases (prefill from the prefill
+  // batch, decode from the decode batch), so switching phase only re-renders.
   // Re-render the graph for the selected phase
   renderGraph();
 }

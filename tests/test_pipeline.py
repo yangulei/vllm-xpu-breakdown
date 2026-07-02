@@ -717,9 +717,9 @@ class TestQueryContextProfiling(unittest.TestCase):
         args = captured["args"]
         # signature: (model_id, mode, max_model_len, batch_size, max_tokens,
         #  prompt, num_profile_layers, tp_size, quantization, gpu_mem,
-        #  query_len, context_len)
-        self.assertEqual(args[-2], 2048)     # query_len
-        self.assertEqual(args[-1], 2048)     # context_len
+        #  query_len, context_len, prefill_batch_size, decode_batch_size)
+        self.assertEqual(args[-4], 2048)     # query_len
+        self.assertEqual(args[-3], 2048)     # context_len
         max_model_len = args[2]
         # must be bumped to cover context + query + decode budget
         self.assertGreaterEqual(max_model_len, 2048 + 2048 + 128)
@@ -1845,3 +1845,86 @@ class TestPhasePartition(unittest.TestCase):
         self.assertIsNotNone(g["decode"])
         self.assertEqual(g["symbols"].get("S"), 8)
         self.assertEqual(g["symbols"].get("B"), 1)
+
+    def _build_steps(self, step_tokens, batch_size):
+        """Build a trace of engine steps with explicit per-step token dims."""
+        from breakdown import graph_from_trace as G  # noqa: F401
+        events = []
+        ext = [0]
+        corr = [0]
+        tid = 7
+        midx = [0]
+        clock = [0]
+
+        def kern(e, ts, dur):
+            corr[0] += 1
+            events.append({"ph": "X", "cat": "xpu_runtime", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": 0.1, "name": "l",
+                           "args": {"correlation": corr[0], "External id": e}})
+            events.append({"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+                           "ts": ts + 100000, "dur": dur, "name": "g",
+                           "args": {"correlation": corr[0]}})
+
+        def op(name, ts, dur, shapes, kdur):
+            ext[0] += 1
+            events.append({"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+                           "ts": ts, "dur": dur, "name": name,
+                           "args": {"External id": ext[0], "Input Dims": shapes,
+                                    "Input type": ["c10::BFloat16"]}})
+            if kdur:
+                kern(ext[0], ts, kdur)
+
+        def mod(cls, ts, dur):
+            events.append({"ph": "X", "cat": "python_function", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": dur,
+                           "name": f"nn.Module: {cls}_{midx[0]}"})
+            midx[0] += 1
+
+        def step(tokens):
+            t0 = clock[0]
+            mod("LlamaForCausalLM", t0, 200)
+            mod("LlamaDecoderLayer", t0 + 1, 190)
+            op("aten::mm", t0 + 2, 4, [[tokens, 16], [16, 16]], 2.0)
+            t1 = t0 + 210
+            mod("LogitsProcessor", t1, 30)
+            op("aten::mm", t1 + 1, 20, [[tokens, 16], [16, 32000]], 1.0)
+            clock[0] = t1 + 40
+
+        for tk in step_tokens:
+            step(tk)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            json.dump({"traceEvents": events}, f)
+            path = f.name
+        summary = {"architecture": "LlamaForCausalLM", "hidden_size": 16,
+                   "num_heads": 1, "num_kv_heads": 1, "head_dim": 16,
+                   "intermediate_size": 16, "vocab_size": 32000,
+                   "num_layers": 1, "dtype": "bfloat16"}
+        try:
+            from breakdown import graph_from_trace as G
+            return G.build_graph_from_trace(path, summary, tp_size=1,
+                                            batch_size=batch_size)
+        finally:
+            os.unlink(path)
+
+    def test_decode_pass_batch_rows_not_misclassified(self):
+        # Two-pass decode pass: query_len=1 means each sequence's single new
+        # token is prefilled *individually* (1-row microsteps), while the batched
+        # decode steps have batch_size rows. A "max-token = prefill" rule would
+        # wrongly tag the batch-row decode steps as prefill and report B = 7.
+        # token dim > batch_size is the correct discriminator: all steps here are
+        # decode, and B must equal the batch (8).
+        g = self._build_steps(step_tokens=[1, 1, 8, 8, 8, 7], batch_size=8)
+        self.assertIsNone(g["prefill"])           # nothing exceeds batch_size
+        self.assertIsNotNone(g["decode"])
+        self.assertEqual(g["symbols"].get("B"), 8)
+
+    def test_prefill_step_above_batch_is_prefill(self):
+        # A genuine multi-token prefill (128 rows) alongside batch-row decode
+        # steps (batch=8): the 128-row step is prefill (S=128), decode B=8.
+        g = self._build_steps(step_tokens=[128, 8, 8, 8], batch_size=8)
+        self.assertIsNotNone(g["prefill"])
+        self.assertIsNotNone(g["decode"])
+        self.assertEqual(g["symbols"].get("S"), 128)
+        self.assertEqual(g["symbols"].get("B"), 8)

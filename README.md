@@ -83,6 +83,11 @@ python run_profile.py --model Qwen/Qwen3-4B-Instruct-2507 --max-model-len 32768
 python run_profile.py --model meta-llama/Llama-3.2-1B-Instruct \
     --prompt "Explain quantum computing" \
     --max-tokens 512 --batch-size 4
+
+# Separate prefill / decode batch sizes (mirrors real serving: prefill ~1,
+# decode 32/64/128). Runs two passes → output/prefill and output/decode.
+python run_profile.py --model meta-llama/Llama-3.2-1B-Instruct \
+    --prefill-batch-size 1 --decode-batch-size 32
 ```
 
 All standard vLLM `EngineArgs` (e.g., `--model`, `--max-model-len`, `--dtype`) are passed through.

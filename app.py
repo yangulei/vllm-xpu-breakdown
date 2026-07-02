@@ -19,6 +19,7 @@ import logging
 import os
 import sys
 import threading
+import time
 import traceback
 from dataclasses import asdict
 from pathlib import Path
@@ -379,6 +380,47 @@ def _build_result_from_traces(
     return profile_result
 
 
+def _merge_two_pass_result(pre: dict, dec: dict,
+                           prefill_bs: int, decode_bs: int) -> dict:
+    """Splice a prefill-batch pass and a decode-batch pass into one result.
+
+    Real serving decouples the phases: prefill typically runs ~1 sequence at a
+    time while decode batches many concurrent sequences. A single
+    ``llm.generate`` call cannot express that (it prefills and decodes the same
+    batch), so we profile two passes and merge them here:
+
+    - ``pre`` — full result from a pass run at ``prefill_bs`` (its **prefill**
+      phase is the faithful one; ``S`` = query_len).
+    - ``dec`` — full result from a pass run at ``decode_bs`` (its **decode**
+      phase is faithful; ``B`` = decode_bs).
+
+    The merged result keeps the decode pass as the base (its op breakdown
+    reflects the steady-state, throughput-bound decode batch) and overlays the
+    prefill pass's prefill graph tree, so the reconstructed graph shows
+    prefill@``prefill_bs`` together with decode@``decode_bs``.
+    """
+    result = dict(dec)
+    result["batch_size"] = decode_bs
+    result["prefill_batch_size"] = prefill_bs
+    result["decode_batch_size"] = decode_bs
+    result["two_pass"] = True
+
+    gpre = pre.get("graph") or {}
+    gdec = dec.get("graph") or {}
+    graph = dict(gdec)
+    graph["prefill"] = gpre.get("prefill")
+    # Symbols: the decode pass supplies ``B`` (decode batch); the prefill pass
+    # supplies the prefill token dims ``S`` / ``S+C`` / ``C``.
+    sym = dict(gdec.get("symbols") or {})
+    presym = gpre.get("symbols") or {}
+    for k in ("S", "S+C", "C"):
+        if k in presym:
+            sym[k] = presym[k]
+    graph["symbols"] = sym
+    result["graph"] = graph
+    return result
+
+
 def _run_profile(model_id: str, mode: str, max_model_len: int,
                  batch_size: int, max_tokens: int, prompt: str,
                  num_profile_layers: int | None = None,
@@ -386,7 +428,9 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
                  quantization: str | None = None,
                  gpu_memory_utilization: float | None = None,
                  query_len: int | None = None,
-                 context_len: int | None = None):
+                 context_len: int | None = None,
+                 prefill_batch_size: int | None = None,
+                 decode_batch_size: int | None = None):
     """Run profiling in a background thread using vLLM's native profiler.
 
     On XPU hardware, vLLM automatically selects XPUWorker which uses
@@ -412,6 +456,15 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             the profiled run, so the profiled prefill computes only ``query_len``
             new tokens while attention still reads the full ``context_len+query_len``
             KV. Rounded down to a KV block boundary so the whole context caches.
+        prefill_batch_size: number of concurrent sequences for the **prefill**
+            phase (typically 1 in real serving). When it differs from
+            ``decode_batch_size`` the run is profiled in two passes — a prefill
+            pass at this batch and a decode pass at ``decode_batch_size`` — and
+            the two phase graphs are merged. ``None`` falls back to
+            ``batch_size`` (single pass, legacy behaviour).
+        decode_batch_size: number of concurrent sequences for the **decode**
+            phase (often 32/64/128). See ``prefill_batch_size``. ``None`` falls
+            back to ``batch_size``.
     """
     global _profile_state
     try:
@@ -525,98 +578,145 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
 
         llm = LLM(**engine_kwargs)
 
-        sampling_params = SamplingParams(max_tokens=max_tokens)
+        # ignore_eos keeps every sequence alive for the full decode budget so
+        # the profiled decode step reflects the requested batch (a sequence
+        # hitting EOS early would shrink the observed decode concurrency ``B``).
+        sampling_params = SamplingParams(max_tokens=max_tokens, ignore_eos=True)
 
-        cache_hit_note = None
+        # Resolve the per-phase batch sizes. When prefill and decode batches
+        # differ we profile two passes (real serving prefills ~1 sequence while
+        # decoding many); otherwise a single pass reproduces legacy behaviour.
+        pf_batch = int(prefill_batch_size) if prefill_batch_size else int(batch_size)
+        dc_batch = int(decode_batch_size) if decode_batch_size else int(batch_size)
+        two_pass = pf_batch != dc_batch
 
         if use_token_prompts:
-            # --- Exact-length token prompts (honours Query Len / Context Len) ---
             block_size = _get_block_size(llm)
             vocab_size = _get_vocab_size(llm, summary)
-
-            # Round the context down to a whole number of KV blocks so the
-            # entire context prefix is cacheable (a trailing partial block would
-            # be recomputed and shift the profiled prefill token count).
+            # Round the context down to a whole number of KV blocks so the entire
+            # context prefix is cacheable (a trailing partial block would be
+            # recomputed and shift the profiled prefill token count).
             ctx_aligned = (context_len // block_size) * block_size
             profiled_context_len = ctx_aligned
             ctx_ids = _make_token_ids(ctx_aligned, vocab_size, seed=0)
-
-            def _full_prompt(query_seed: int) -> "TokensPrompt":
-                q = _make_token_ids(query_len, vocab_size, seed=query_seed)
-                return TokensPrompt(prompt_token_ids=ctx_ids + q)
-
-            # Distinct query per batch item (shared context prefix) so every
-            # sequence genuinely prefills its own ``query_len`` tokens instead of
-            # cache-hitting a sibling. Profiled seeds differ from warmup seeds so
-            # the profiled queries are never served from a warmed cache.
-            def _batch(base_seed: int) -> list["TokensPrompt"]:
-                return [_full_prompt(base_seed + b) for b in range(batch_size)]
-
-            # Warm the prefix cache: compute the shared context once, un-profiled,
-            # so the profiled run reads it from cache instead of recomputing it.
-            if ctx_ids:
-                llm.generate(
-                    [TokensPrompt(prompt_token_ids=ctx_ids)],
-                    SamplingParams(max_tokens=1), use_tqdm=False,
-                )
-
-            # Warm kernels on the real prefix-cached-prefill + decode shapes.
-            for w in range(2):
-                llm.generate(_batch(1000 * (w + 1)), sampling_params, use_tqdm=False)
-
-            profiled_prompts = _batch(900000)
-
-            # --- Profiled run ---
-            llm.start_profile()
-            outputs = llm.generate(profiled_prompts, sampling_params, use_tqdm=False)
-            llm.stop_profile()
-
-            # Verify the context was served from cache. A miss means the profiled
-            # prefill recomputed the whole context (S = context+query), so record
-            # a note rather than silently reporting the wrong shape.
-            if context_len > 0 and outputs:
-                cached = getattr(outputs[0], "num_cached_tokens", None)
-                if cached is not None and cached < ctx_aligned:
-                    cache_hit_note = (
-                        f"Prefix cache hit only {cached}/{ctx_aligned} context "
-                        "tokens; profiled prefill may include context recompute."
-                    )
         else:
-            # --- Legacy text-prompt path (Query/Context Len not specified) ---
-            conversation = [
-                {"role": "system", "content": "You are a helpful assistant."},
-                {"role": "user", "content": prompt},
-            ]
-            conversations = [conversation] * batch_size
-            prompts = [prompt] * batch_size
+            ctx_aligned = 0
+            ctx_ids = []
 
-            # First warmup pass also detects chat-template support.
-            try:
-                llm.chat(conversations, sampling_params, use_tqdm=False)
-                use_chat = True
-            except Exception:
-                # Model may not have a chat template — use raw generate
-                llm.generate(prompts, sampling_params, use_tqdm=False)
-                use_chat = False
+        def _list_trace_files() -> set:
+            return {os.path.join(trace_dir, f) for f in os.listdir(trace_dir)
+                    if f.endswith(".json") or f.endswith(".json.gz")}
 
-            def _run_inference():
-                if use_chat:
+        def _profiled_pass(pass_batch: int, pass_query_len: int):
+            """Warm + run one profiled generate at the given batch/query size.
+
+            Returns ``(rank_files, cache_hit_note)``: the trace file(s) newly
+            written by this pass (newest first, capped to ``tp_size``) and an
+            optional prefix-cache-miss note.
+            """
+            note = None
+            if use_token_prompts:
+                def _full_prompt(query_seed: int) -> "TokensPrompt":
+                    q = _make_token_ids(pass_query_len, vocab_size, seed=query_seed)
+                    return TokensPrompt(prompt_token_ids=ctx_ids + q)
+
+                # Distinct query per batch item (shared context prefix) so every
+                # sequence genuinely prefills its own tokens instead of
+                # cache-hitting a sibling; profiled seeds differ from warmup
+                # seeds so the profiled queries are never served from cache.
+                def _batch(base_seed: int) -> list["TokensPrompt"]:
+                    return [_full_prompt(base_seed + b) for b in range(pass_batch)]
+
+                # Warm the shared prefix cache once (un-profiled) so the profiled
+                # run reads the context from cache instead of recomputing it.
+                if ctx_ids:
+                    llm.generate(
+                        [TokensPrompt(prompt_token_ids=ctx_ids)],
+                        SamplingParams(max_tokens=1), use_tqdm=False,
+                    )
+                for w in range(2):
+                    llm.generate(_batch(1000 * (w + 1)), sampling_params,
+                                 use_tqdm=False)
+                profiled_prompts = _batch(900000)
+
+                before = _list_trace_files()
+                llm.start_profile()
+                outputs = llm.generate(profiled_prompts, sampling_params,
+                                       use_tqdm=False)
+                llm.stop_profile()
+
+                # Verify the context was served from cache. A miss means the
+                # profiled prefill recomputed the whole context (S = context +
+                # query), so record a note rather than silently misreporting.
+                if context_len > 0 and outputs:
+                    cached = getattr(outputs[0], "num_cached_tokens", None)
+                    if cached is not None and cached < ctx_aligned:
+                        note = (
+                            f"Prefix cache hit only {cached}/{ctx_aligned} "
+                            "context tokens; profiled prefill may include "
+                            "context recompute."
+                        )
+            else:
+                # --- Legacy text-prompt path (Query/Context Len unspecified) ---
+                conversation = [
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": prompt},
+                ]
+                conversations = [conversation] * pass_batch
+                prompts = [prompt] * pass_batch
+
+                # First warmup pass also detects chat-template support.
+                try:
                     llm.chat(conversations, sampling_params, use_tqdm=False)
-                else:
+                    use_chat = True
+                except Exception:
                     llm.generate(prompts, sampling_params, use_tqdm=False)
+                    use_chat = False
 
-            # Warm up before profiling. Warmup primes Triton JIT compilation /
-            # kernel autotuning so the profiled trace reflects steady-state
-            # timing, not one-time compilation overhead (important for
-            # fused/sparse-kernel models such as MiniMax-M3). The detection pass
-            # above is warmup #1; run 2 more for 3 warmups total.
-            for _ in range(2):
+                def _run_inference():
+                    if use_chat:
+                        llm.chat(conversations, sampling_params, use_tqdm=False)
+                    else:
+                        llm.generate(prompts, sampling_params, use_tqdm=False)
+
+                # Warmup primes Triton JIT / autotuning so the profiled trace
+                # reflects steady-state timing. Detection pass above is warmup
+                # #1; run 2 more for 3 total.
+                for _ in range(2):
+                    _run_inference()
+
+                before = _list_trace_files()
+                llm.start_profile()
                 _run_inference()
+                llm.stop_profile()
 
-            # --- Profiled run ---
-            llm.start_profile()
-            _run_inference()
-            llm.stop_profile()
+            # torch's profiler writes the trace on stop_profile; wait briefly for
+            # the new file(s) to appear, then return them (newest first).
+            new_files: list[str] = []
+            for _ in range(20):
+                new_files = sorted(_list_trace_files() - before,
+                                   key=os.path.getmtime, reverse=True)
+                if len(new_files) >= tp_size:
+                    break
+                time.sleep(0.5)
+            if not new_files:
+                new_files = sorted(_list_trace_files(),
+                                   key=os.path.getmtime, reverse=True)
+            return new_files[:tp_size], note
+
+        # --- Run the profiled pass(es) ---
+        if two_pass:
+            # Prefill pass: batch = prefill_batch, real query_len (keeps its
+            # prefill phase). Decode pass: batch = decode_batch, query_len forced
+            # to 1 so decode is 1 new token/seq (matches real decode and avoids
+            # OOM from prefilling decode_batch x query_len tokens) — keeps its
+            # decode phase.
+            pre_files, note_pre = _profiled_pass(pf_batch, query_len)
+            dec_query = 1 if use_token_prompts else 0
+            dec_files, note_dec = _profiled_pass(dc_batch, dec_query)
+            cache_hit_note = note_pre or note_dec
+        else:
+            single_files, cache_hit_note = _profiled_pass(dc_batch, query_len)
 
         # Capture the real module hierarchy (attribute names like q_norm/k_norm)
         # from the loaded model while it is still alive, to enrich the
@@ -663,44 +763,42 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
                                    exc_info=True)
                     ref_module_tree = None
 
-        # --- Parse trace files ---
-        # With TP>1, vLLM produces one trace file per rank.
-        # We parse rank-0 trace as the canonical ops (all ranks have the
-        # same op sequence with identical per-rank shapes).
-        trace_files = sorted(
-            [os.path.join(trace_dir, f) for f in os.listdir(trace_dir)
-             if f.endswith(".json") or f.endswith(".json.gz")],
-            key=os.path.getmtime, reverse=True,
-        )
-
-        if not trace_files:
-            raise RuntimeError(
-                f"No trace files found in {trace_dir}. "
-                "Profiling may have failed in the worker process."
+        # --- Parse trace files & build the result ---
+        # With TP>1, vLLM produces one trace file per rank; each pass's
+        # ``_profiled_pass`` already returned that pass's rank-0-first files.
+        def _build(files: list[str], bsz: int, qlen: int | None) -> dict:
+            if not files:
+                raise RuntimeError(
+                    f"No trace files found in {trace_dir}. "
+                    "Profiling may have failed in the worker process."
+                )
+            return _build_result_from_traces(
+                files,
+                model_id=model_id,
+                summary=summary,
+                dim_symbols=dim_symbols,
+                tp_size=tp_size,
+                batch_size=bsz,
+                mode=mode,
+                max_model_len=max_model_len,
+                max_tokens=max_tokens,
+                quantization=quantization,
+                profiled_layers=profiled_layers,
+                actual_layers=actual_layers,
+                layer_scale=layer_scale,
+                ref_module_tree=ref_module_tree,
+                query_len=qlen,
+                context_len=profiled_context_len or None,
             )
 
-        # With TP>1, take the tp_size most recent files (one per rank).
-        # Parse rank-0 (most recent) for ops; average timing across all ranks.
-        rank_files = trace_files[:tp_size]
-
-        profile_result = _build_result_from_traces(
-            rank_files,
-            model_id=model_id,
-            summary=summary,
-            dim_symbols=dim_symbols,
-            tp_size=tp_size,
-            batch_size=batch_size,
-            mode=mode,
-            max_model_len=max_model_len,
-            max_tokens=max_tokens,
-            quantization=quantization,
-            profiled_layers=profiled_layers,
-            actual_layers=actual_layers,
-            layer_scale=layer_scale,
-            ref_module_tree=ref_module_tree,
-            query_len=query_len or None,
-            context_len=profiled_context_len or None,
-        )
+        if two_pass:
+            res_pre = _build(pre_files, pf_batch, query_len or None)
+            res_dec = _build(dec_files, dc_batch,
+                             1 if use_token_prompts else None)
+            profile_result = _merge_two_pass_result(
+                res_pre, res_dec, pf_batch, dc_batch)
+        else:
+            profile_result = _build(single_files, dc_batch, query_len or None)
 
         profile_result["query_len"] = query_len or None
         profile_result["context_len"] = context_len or None
@@ -751,6 +849,11 @@ def start_profile():
     gpu_memory_utilization = data.get("gpu_memory_utilization")  # None = vLLM default
     query_len = data.get("query_len")  # new prefill tokens (None = legacy prompt)
     context_len = data.get("context_len")  # cached prefix tokens (None/0 = none)
+    # Per-phase batch sizes. When they differ, profiling runs two passes
+    # (prefill@prefill_batch_size + decode@decode_batch_size) and merges them.
+    # Absent → fall back to the single ``batch_size`` (legacy single pass).
+    prefill_batch_size = data.get("prefill_batch_size")
+    decode_batch_size = data.get("decode_batch_size")
 
     # The engine must fit the whole sequence it will ever see: cached context +
     # new query tokens + the decode tokens we generate. The frontend sizes
@@ -769,6 +872,8 @@ def start_profile():
             "settings": {
                 "mode": mode,
                 "batch_size": batch_size,
+                "prefill_batch_size": prefill_batch_size,
+                "decode_batch_size": decode_batch_size,
                 "max_model_len": max_model_len,
                 "tp_size": tp_size,
                 "quantization": quantization,
@@ -781,7 +886,7 @@ def start_profile():
         target=_run_profile,
         args=(model_id, mode, max_model_len, batch_size, max_tokens, prompt,
               num_profile_layers, tp_size, quantization, gpu_memory_utilization,
-              query_len, context_len),
+              query_len, context_len, prefill_batch_size, decode_batch_size),
         daemon=True,
     )
     thread.start()

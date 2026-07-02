@@ -294,6 +294,35 @@ Classifies ops by name prefix/pattern to backends. Priority order:
   `S` to `S+C`** (query/output rows stay `S`) so the prefill graph shows the
   query attending `context+query` keys. Without threading `context_len`, KV rows
   stay `S` and the context is invisible.
+- **Separate prefill / decode batch sizes are two profiled passes merged.** Real
+  serving prefills ~1 sequence while decode batches 32/64/128, but a single
+  `llm.generate` prefills and decodes the *same* batch (so `S` and `B` couple to
+  one `batch_size`). When `prefill_batch_size != decode_batch_size`, `_run_profile`
+  runs **two** profiled passes reusing the one loaded `LLM`: a **prefill pass** at
+  `prefill_batch` with the real `query_len` (keep its `prefill` tree, `S`=query_len)
+  and a **decode pass** at `decode_batch` with `query_len` forced to **1** (decode
+  = 1 new token/seq; also avoids OOM from prefilling `decode_batch × query_len`)
+  (keep its `decode` tree, `B`=decode_batch). `_merge_two_pass_result` splices them:
+  decode pass is the base (its op/backend breakdown is the steady-state one), the
+  prefill pass's `graph.prefill` is overlaid, and symbols are combined (`S`/`S+C`/`C`
+  from prefill, `B` from decode). Each `_profiled_pass` snapshots `trace_dir` before
+  its `start_profile` and returns only the file(s) it wrote, so the two passes'
+  traces don't cross-contaminate. Equal batches (or only legacy `batch_size`) → a
+  single pass, identical to before. Frontend sends `prefill_batch_size` /
+  `decode_batch_size`; `setPhase` no longer rewrites the inputs since one run now
+  yields both phases. See `tests/test_two_pass_merge.py`.
+- **Phase classification is `token_dim > batch_size`, not "max-token step = prefill".**
+  `graph_from_trace._classify_steps` labels a step **prefill** iff its forward
+  processes *more than one token per running sequence* (`token > batch_size`); a
+  **decode** step advances each running sequence by one token, so its token dim is
+  `num_running_seqs` (≤ `batch_size`). The old rule (largest-token step = prefill)
+  breaks the two-pass **decode pass**: with `query_len=1` and prefix caching, vLLM
+  prefills each sequence's single new token *individually* (a **1-row** op) while
+  decode runs the whole batch (**`batch_size`-row** ops) — so the decode steps have
+  *more* rows than the prefill microsteps, and "max = prefill" would invert the
+  phases and report `B = batch_size − 1` (a ramp step). Comparing to `batch_size`
+  also classifies each chunk of a chunked prefill correctly. Verified end-to-end on
+  XPU (Qwen3-4B): prefill@1 → `S=query_len`, decode@8 → `B=8`.
 - **Main model class is picked by subtree size, not device time.** The
   `LogitsProcessor`'s `lm_head` matmul (`V`-wide, once per decode step) can
   out-weigh the whole model forward, so selecting the main class by `sub_dev`

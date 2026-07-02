@@ -462,26 +462,33 @@ def _classify_steps(roots: list[_Raw], batch_size: int
                     ) -> tuple[list[_Raw], list[_Raw], int, int]:
     """Split all module roots into prefill and decode by their step's phase.
 
+    A **decode** step advances every running sequence by one token, so its
+    forward processes ``num_running_seqs`` tokens — at most ``batch_size`` (fewer
+    while the batch ramps up/down). A **prefill** step ingests a multi-token
+    prompt, so its forward processes *more* than one token per running sequence.
+    A step is therefore prefill iff its token dim exceeds ``batch_size``.
+
+    This is deliberately compared against ``batch_size`` rather than picking the
+    largest-token step as prefill: in a two-pass profile the decode pass drives
+    a full ``batch_size``-wide decode while its own (prefix-cached) prompts
+    prefill only one new token each — i.e. the decode steps have *more* rows than
+    the prefill microsteps, so a "max token == prefill" rule would invert the
+    phases. Comparing to ``batch_size`` also classifies each chunk of a chunked
+    prefill correctly.
+
     Returns ``(prefill_roots, decode_roots, n_prefill_steps, n_decode_steps)``.
     """
     steps, _ = _partition_steps(roots)
     if not steps:
         return [], [], 0, 0
 
-    main_tokens = [s["token"] for s in steps if s["main"] is not None]
-    max_tok = max(main_tokens) if main_tokens else 0
-    min_tok = min(main_tokens) if main_tokens else 0
+    threshold = max(int(batch_size), 1)
 
     prefill: list[_Raw] = []
     decode: list[_Raw] = []
     n_pre = n_dec = 0
     for s in steps:
-        tok = s["token"]
-        if max_tok == min_tok:
-            # Only one kind of step captured — decide against the batch size.
-            is_prefill = max_tok > max(batch_size, 1)
-        else:
-            is_prefill = tok == max_tok
+        is_prefill = s["token"] > threshold
         if is_prefill:
             prefill.extend(s["roots"])
             n_pre += 1

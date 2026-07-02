@@ -74,6 +74,18 @@ def create_parser() -> argparse.ArgumentParser:
         "--batch-size", type=int, default=1,
         help="Number of concurrent requests (default: 1)",
     )
+    prompt_group.add_argument(
+        "--prefill-batch-size", type=int, default=None,
+        help="Concurrent sequences for the prefill phase (real serving is "
+             "usually 1). If it differs from --decode-batch-size, two profiled "
+             "passes are run and written to <output>/prefill and "
+             "<output>/decode. Defaults to --batch-size.",
+    )
+    prompt_group.add_argument(
+        "--decode-batch-size", type=int, default=None,
+        help="Concurrent sequences for the decode phase (often 32/64/128). "
+             "See --prefill-batch-size. Defaults to --batch-size.",
+    )
 
     return parser
 
@@ -97,69 +109,81 @@ def main():
     EngineArgs.add_cli_args(engine_parser)
     engine_args_parsed = vars(engine_parser.parse_args(vllm_args))
 
-    config = ProfileConfig(
-        output_dir=args.output_dir,
-        warmup_steps=args.warmup_steps,
-        active_steps=args.active_steps,
-        top_n=args.top_n,
-        profile_memory=args.profile_memory,
-    )
-
-    os.makedirs(config.output_dir, exist_ok=True)
+    os.makedirs(args.output_dir, exist_ok=True)
 
     # Build the LLM instance
     print(f"[breakdown] Loading model: {engine_args_parsed.get('model', 'default')}...")
     llm = LLM(**engine_args_parsed)
 
-    # Prepare prompts
+    # Prepare the shared conversation template.
     conversation = [
         {"role": "system", "content": "You are a helpful assistant."},
         {"role": "user", "content": args.prompt},
     ]
-    conversations = [conversation] * args.batch_size
-
     sampling_params = SamplingParams(max_tokens=args.max_tokens)
 
-    total_steps = config.warmup_steps + config.active_steps
-    print(f"[breakdown] Running {total_steps} steps "
-          f"({config.warmup_steps} warmup + {config.active_steps} profiled)...")
+    def _profile_batch(batch_size: int, output_dir: str):
+        """Profile one run at ``batch_size`` and write reports to ``output_dir``."""
+        config = ProfileConfig(
+            output_dir=output_dir,
+            warmup_steps=args.warmup_steps,
+            active_steps=args.active_steps,
+            top_n=args.top_n,
+            profile_memory=args.profile_memory,
+        )
+        os.makedirs(config.output_dir, exist_ok=True)
+        conversations = [conversation] * batch_size
 
-    # Profile the inference
-    with profile_context(config) as prof:
-        for step in range(total_steps):
-            phase = "warmup" if step < config.warmup_steps else "profile"
-            print(f"[breakdown] Step {step + 1}/{total_steps} ({phase})")
-            llm.chat(conversations, sampling_params, use_tqdm=False)
-            prof.step()
+        total_steps = config.warmup_steps + config.active_steps
+        print(f"[breakdown] Running {total_steps} steps at batch={batch_size} "
+              f"({config.warmup_steps} warmup + {config.active_steps} profiled)...")
 
-    print("[breakdown] Profiling complete. Generating reports...")
+        with profile_context(config) as prof:
+            for step in range(total_steps):
+                phase = "warmup" if step < config.warmup_steps else "profile"
+                print(f"[breakdown] Step {step + 1}/{total_steps} ({phase})")
+                llm.chat(conversations, sampling_params, use_tqdm=False)
+                prof.step()
 
-    # Parse and classify
-    result = parse_events(prof, config)
+        print("[breakdown] Profiling complete. Generating reports...")
+        result = parse_events(prof, config)
 
-    # Console report
-    report_text = print_summary(result, top_n=config.top_n)
-    report_path = os.path.join(config.output_dir, "report.txt")
-    with open(report_path, "w") as f:
-        f.write(report_text)
+        report_text = print_summary(result, top_n=config.top_n)
+        report_path = os.path.join(config.output_dir, "report.txt")
+        with open(report_path, "w") as f:
+            f.write(report_text)
 
-    # CSV + JSON
-    csv_path = export_csv(result, config.output_dir)
-    json_path = export_json(result, config.output_dir)
-    print(f"[breakdown] CSV:  {csv_path}")
-    print(f"[breakdown] JSON: {json_path}")
+        csv_path = export_csv(result, config.output_dir)
+        json_path = export_json(result, config.output_dir)
+        print(f"[breakdown] CSV:  {csv_path}")
+        print(f"[breakdown] JSON: {json_path}")
 
-    # HTML
-    if not args.no_html:
-        html_path = generate_html(result, config.output_dir)
-        print(f"[breakdown] HTML: {html_path}")
+        if not args.no_html:
+            html_path = generate_html(result, config.output_dir)
+            print(f"[breakdown] HTML: {html_path}")
 
-    if not args.no_trace:
-        trace_path = os.path.join(config.output_dir, "trace.json")
-        if os.path.exists(trace_path):
-            print(f"[breakdown] Chrome trace: {trace_path}")
+        if not args.no_trace:
+            trace_path = os.path.join(config.output_dir, "trace.json")
+            if os.path.exists(trace_path):
+                print(f"[breakdown] Chrome trace: {trace_path}")
 
-    print(f"[breakdown] All reports written to {config.output_dir}/")
+        print(f"[breakdown] Reports written to {config.output_dir}/")
+
+    # Resolve per-phase batch sizes. When they differ, real serving decouples
+    # the phases (prefill ~1 sequence, decode many), so profile two passes into
+    # separate report directories; otherwise a single run at --batch-size.
+    pf = args.prefill_batch_size or args.batch_size
+    dc = args.decode_batch_size or args.batch_size
+
+    if pf != dc:
+        print(f"[breakdown] Two-pass profiling: prefill batch={pf}, "
+              f"decode batch={dc}")
+        _profile_batch(pf, os.path.join(args.output_dir, "prefill"))
+        _profile_batch(dc, os.path.join(args.output_dir, "decode"))
+    else:
+        _profile_batch(pf, args.output_dir)
+
+    print(f"[breakdown] All reports written to {args.output_dir}/")
 
 
 if __name__ == "__main__":
