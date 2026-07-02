@@ -352,15 +352,13 @@ def ref_tree_from_config(
     raw_config: dict,
     dtype: str = "bfloat16",
     model_id: str | None = None,
-    allow_remote_code: bool = False,
 ) -> dict | None:
     """Build a reference tree by instantiating the model on ``meta`` (no weights).
 
     Fallback for the offline / trace-upload path where no live ``LLM`` exists.
     Reuses the ``torch_export`` idea of a weightless ``meta``-device build purely
-    to read ``named_modules()``. Heavy and network-dependent, so callers gate it
-    (see ``VLLM_XPU_BREAKDOWN_META_NAMES`` in ``app.py``). Returns ``None`` on any
-    failure.
+    to read ``named_modules()``. Heavy and network-dependent. Returns ``None`` on
+    any failure.
     """
     import tempfile
 
@@ -406,7 +404,7 @@ def ref_tree_from_config(
         model_config = ModelConfig(
             model=workdir, tokenizer=workdir, dtype=_normalize_dtype(dtype),
             seed=0, enforce_eager=True, skip_tokenizer_init=True,
-            trust_remote_code=allow_remote_code,
+            trust_remote_code=True,
         )
         vllm_config = VllmConfig(model_config=model_config)
         with set_current_vllm_config(vllm_config):

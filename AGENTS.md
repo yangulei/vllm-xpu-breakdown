@@ -175,12 +175,10 @@ those names onto the accurate profile-based tree instead of rebuilding it.
   during profiling (via `LLM.apply_model`, falling back to attribute traversal).
   Cheap: the model is already loaded. This is the primary path.
 - **`ref_tree_from_config(...)`** — `meta`-device instantiation fallback
-  (env-gated by `VLLM_XPU_BREAKDOWN_META_NAMES=1`, remote code by
-  `VLLM_XPU_BREAKDOWN_TRUST_REMOTE_CODE=1`). Heavy + network. Used by the
-  trace-upload path **and** as a live-path fallback: if `ref_tree_from_llm`
-  returns `None` during profiling, `_run_profile` retries with
-  `ref_tree_from_config` when `META_NAMES=1`. The whole naming path logs its
-  outcome (`vllm_xpu_breakdown` logger) — a "reference tree available but no
+  (always trusts remote code). Heavy + network. Used by the trace-upload path **and** as a live-path fallback: if
+  `ref_tree_from_llm` returns `None` during profiling, `_run_profile` retries
+  with `ref_tree_from_config`. The whole naming path logs its outcome
+  (`vllm_xpu_breakdown` logger) — a "reference tree available but no
   names landed" warning means alignment (not acquisition) failed.
 - **Alignment** — `graph_from_trace._apply_ref_names` walks the *raw* module
   forest against the reference tree, matching children greedily by

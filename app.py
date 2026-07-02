@@ -643,24 +643,20 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
                 "live model (ref_tree_from_llm returned None). q_norm/k_norm and "
                 "other attribute names will fall back to class heuristics."
             )
-            # Fallback: the offline meta-device path, gated by the same env var
-            # the docs advertise. Heavy (re-instantiates on meta) but lets naming
-            # work when the live-model traversal fails.
-            if os.environ.get("VLLM_XPU_BREAKDOWN_META_NAMES") == "1" and config:
+            # Fallback: the offline meta-device path. Heavy (re-instantiates on
+            # meta) but lets naming work when the live-model traversal fails.
+            if config:
                 try:
                     from breakdown.module_naming import ref_tree_from_config
                     ref_module_tree = ref_tree_from_config(
                         config,
                         dtype=summary.get("dtype", "bfloat16"),
                         model_id=model_id,
-                        allow_remote_code=(
-                            os.environ.get(
-                                "VLLM_XPU_BREAKDOWN_TRUST_REMOTE_CODE") == "1"),
                     )
                     if ref_module_tree:
                         logger.info(
                             "Module-name recovery: recovered names via "
-                            "meta-device fallback (VLLM_XPU_BREAKDOWN_META_NAMES=1)."
+                            "meta-device fallback."
                         )
                 except Exception:
                     logger.warning("ref_tree_from_config fallback failed",
@@ -873,20 +869,17 @@ def upload_profile():
             },
         }
 
-    # Optional: reconstruct real module attribute names by instantiating the
-    # model on ``meta`` (no weights). Heavy + network-dependent, so it is
-    # opt-in via env var. Without it, uploaded traces keep heuristic names.
+    # Reconstruct real module attribute names by instantiating the model on
+    # ``meta`` (no weights). Heavy + network-dependent. Without a recovered
+    # tree, uploaded traces keep heuristic names.
     ref_module_tree = None
-    if model_id and os.environ.get("VLLM_XPU_BREAKDOWN_META_NAMES") == "1":
+    if model_id:
         try:
             from breakdown.module_naming import ref_tree_from_config
             ref_module_tree = ref_tree_from_config(
                 fetch_model_config(model_id),
                 dtype=summary.get("dtype", "bfloat16"),
                 model_id=model_id,
-                allow_remote_code=(
-                    os.environ.get("VLLM_XPU_BREAKDOWN_TRUST_REMOTE_CODE") == "1"
-                ),
             )
         except Exception:
             ref_module_tree = None
