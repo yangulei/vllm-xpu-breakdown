@@ -35,7 +35,7 @@ def print_summary(result: ClassificationResult, top_n: int = 30) -> str:
     lines: list[str] = []
     lines.append("")
     lines.append("=" * 80)
-    lines.append("  vLLM-XPU Ops/Kernels Breakdown Report")
+    lines.append("  vLLM Ops/Kernels Breakdown Report")
     lines.append("=" * 80)
     lines.append("")
 

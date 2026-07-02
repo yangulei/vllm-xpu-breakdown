@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>vLLM-XPU Ops/Kernels Breakdown</title>
+<title>vLLM Ops/Kernels Breakdown</title>
 <style>
 :root {
   --bg: #f8f9fa; --card: #fff; --border: #e0e0e0;
@@ -125,8 +125,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px;
          font-weight: 600; color: #fff; white-space: nowrap; }
 .badge.vllm-xpu-kernels { background: var(--green); }
+.badge.vllm-cuda-kernels { background: #558b2f; }
 .badge.triton { background: var(--blue); }
 .badge.torch-xpu-ops { background: var(--orange); }
+.badge.torch-cuda-ops { background: #c2185b; }
 .badge.cpu { background: var(--grey); }
 .badge.framework { background: var(--lgrey); }
 
@@ -142,8 +144,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 <body>
 
 <div class="header">
-  <h1>vLLM-XPU Ops/Kernels Breakdown</h1>
-  <p>Profile and visualize op dispatch across vllm-xpu-kernels, torch-xpu-ops, and Triton</p>
+  <h1>vLLM Ops/Kernels Breakdown</h1>
+  <p>Profile and visualize op dispatch across vllm-kernels, torch-ops, and Triton (CUDA &amp; XPU)</p>
 </div>
 
 <div class="container">

@@ -1,6 +1,7 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
-# Profile a vLLM inference run on Intel XPU and generate breakdown reports.
+# Profile a vLLM inference run on Intel XPU or NVIDIA CUDA and generate
+# breakdown reports.
 #
 # Usage:
 #   ./scripts/run_profile.sh --model Qwen/Qwen3-4B --max-model-len 32768
@@ -15,12 +16,12 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
 cd "$PROJECT_DIR"
 
-# Source oneAPI if available
+# Source oneAPI if available (Intel XPU)
 if [ -f /opt/intel/oneapi/setvars.sh ]; then
     source /opt/intel/oneapi/setvars.sh > /dev/null 2>&1 || true
 fi
 
-echo "=== vLLM-XPU Ops/Kernels Breakdown ==="
+echo "=== vLLM Ops/Kernels Breakdown ==="
 echo "Working directory: $PROJECT_DIR"
 echo "Arguments: $@"
 echo ""

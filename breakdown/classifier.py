@@ -16,6 +16,8 @@ class Backend(str, Enum):
     TORCH_XPU_OPS = "torch-xpu-ops"
     CPU = "cpu"
     FRAMEWORK = "framework"
+    VLLM_CUDA_KERNELS = "vllm-cuda-kernels"
+    TORCH_CUDA_OPS = "torch-cuda-ops"
 
 
 # Op name prefixes/substrings that indicate Triton-compiled kernels
@@ -165,7 +167,7 @@ def classify_op(name: str, device_type: str = "",
 
     Args:
         name: Op name from profiler (e.g. "aten::mm", "rms_norm")
-        device_type: Device type string (e.g. "xpu", "cpu")
+        device_type: Device type string (e.g. "xpu", "cuda", "cpu")
         self_device_time_us: Self device time (excludes children)
         device_time_us: Total device time (includes children)
 
@@ -173,20 +175,29 @@ def classify_op(name: str, device_type: str = "",
     """
     stripped = _strip_namespace(name)
     has_device_time = self_device_time_us > 0 or device_time_us > 0
+    is_xpu = device_type in ("xpu", "XPU")
+    is_cuda = device_type in ("cuda", "CUDA")
 
-    # 1. Check against vllm-xpu-kernels registry
+    # 1. Check against vllm custom-kernels registry (shared ops like rms_norm
+    #    exist on both CUDA and XPU builds of vLLM)
     if stripped in ALL_VLLM_XPU_OPS:
-        cat = get_op_category(stripped) or "vllm-xpu-kernels"
+        cat = get_op_category(stripped) or "vllm-kernels"
+        if is_cuda:
+            return Backend.VLLM_CUDA_KERNELS, cat.replace("xpu", "cuda")
         return Backend.VLLM_XPU_KERNELS, cat
 
-    # Also check full name patterns for vllm custom ops. The ``vllm::``
-    # namespace holds vLLM's registered dispatch ops (unified_attention_with_output,
-    # unified_kv_cache_update, moe_forward_shared, xpu_topk_topp_sampler ...) which
-    # run vllm-xpu-kernels on XPU.
+    # Also check full name patterns for vllm custom ops
     for prefix in ("_C::", "_C_cache_ops::", "_moe_C::", "_xpu_C::", "vllm::"):
         if name.startswith(prefix):
-            cat = get_op_category(stripped) or "vllm-xpu-kernels"
+            cat = get_op_category(stripped) or "vllm-kernels"
+            if is_cuda:
+                return Backend.VLLM_CUDA_KERNELS, cat.replace("xpu", "cuda")
             return Backend.VLLM_XPU_KERNELS, cat
+
+    # 1b. CUDA-specific vllm kernel namespace
+    if name.startswith("_cuda_C::"):
+        cat = get_op_category(stripped) or "vllm-cuda-kernels"
+        return Backend.VLLM_CUDA_KERNELS, cat
 
     # 2. Check for Triton kernels
     for indicator in _TRITON_INDICATORS:
@@ -198,15 +209,19 @@ def classify_op(name: str, device_type: str = "",
         if name.startswith(prefix):
             return Backend.FRAMEWORK, "framework-overhead"
 
-    # 4. ATen compute ops on XPU → torch-xpu-ops
+    # 4. ATen compute ops on accelerator → torch-{cuda,xpu}-ops
     if name in _ATEN_COMPUTE_OPS or stripped in _ATEN_COMPUTE_OPS:
-        if device_type in ("xpu", "XPU") or has_device_time:
+        if is_cuda:
+            return Backend.TORCH_CUDA_OPS, "aten-cuda"
+        elif is_xpu or has_device_time:
             return Backend.TORCH_XPU_OPS, "aten-xpu"
         else:
             return Backend.CPU, "aten-cpu"
 
-    # 5. Any aten:: op with XPU device time → torch-xpu-ops
+    # 5. Any aten:: op with device time → torch-{cuda,xpu}-ops
     if name.startswith("aten::") and has_device_time:
+        if is_cuda:
+            return Backend.TORCH_CUDA_OPS, "aten-cuda"
         return Backend.TORCH_XPU_OPS, "aten-xpu"
 
     # 6. Any aten:: op without device time → framework

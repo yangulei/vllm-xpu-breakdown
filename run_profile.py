@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """
-vLLM-XPU Ops/Kernels Breakdown — main entry point.
+vLLM Ops/Kernels Breakdown — main entry point.
 
-Profiles a vLLM inference run on Intel XPU and generates dispatch
-breakdown reports showing which ops go to vllm-xpu-kernels,
-torch-xpu-ops, or Triton.
+Profiles a vLLM inference run on XPU or CUDA and generates dispatch
+breakdown reports showing which ops go to vllm-kernels, torch-ops, or Triton.
 
 Usage:
     python run_profile.py --model <model> [--max-model-len N] [--output-dir DIR]
@@ -25,7 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Profile vLLM inference on XPU and generate ops breakdown.",
+        description="Profile vLLM inference on XPU/CUDA and generate ops breakdown.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 

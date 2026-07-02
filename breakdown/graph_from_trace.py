@@ -38,10 +38,11 @@ from typing import Any
 from .analyzer import DTYPE_BYTES, dtype_size, estimate_flops, estimate_memory
 from .classifier import classify_op
 from .trace_common import _is_overhead_event
-from .trace_parser import _infer_role, _strip_instance_idx
+from .trace_parser import _infer_device_from_trace, _infer_role, _strip_instance_idx
 
 # Chrome-trace categories that carry device (GPU/XPU) kernel time.
-_KERNEL_CATEGORIES = {"kernel", "gpu_memcpy", "xpu_op", "gpu_op"}
+_KERNEL_CATEGORIES = {"kernel", "gpu_memcpy", "xpu_op", "gpu_op", "cuda_op",
+                      "cuda_runtime", "gpu_kernel"}
 
 # Ops that are pure tensor plumbing — kept out of the reconstructed op lists to
 # avoid drowning the real compute ops. They carry no device time anyway.
@@ -116,6 +117,12 @@ def _collect_kernel_launches(events: list[dict], worker_tid: Any
     robust to ``torch.compile`` — fused/compiled regions and eager kernels are
     handled identically, because both physically launch from within the module
     that owns them.
+
+    Fallback: when a kernel has no matching runtime event on the worker thread
+    (common for flash attention kernels launched via custom CUDA graphs or
+    internal streams), we fall back to matching via ``External id`` — the kernel's
+    ``External id`` links back to the CPU op that issued it, whose timestamp
+    provides the launch site.
     """
     corr_to_rt: dict[int, dict] = {}
     for evt in events:
@@ -124,15 +131,30 @@ def _collect_kernel_launches(events: list[dict], worker_tid: Any
             if corr is not None:
                 corr_to_rt[corr] = evt
 
+    # Build External-id → CPU op timestamp map for fallback attribution
+    ext_to_ts: dict[int, float] = {}
+    for evt in events:
+        if evt.get("cat") == "cpu_op" and evt.get("tid") == worker_tid:
+            ext = evt.get("args", {}).get("External id")
+            if ext is not None:
+                ext_to_ts[ext] = evt.get("ts", 0)
+
     launches: list[tuple[float, str, float]] = []
     for evt in events:
         if evt.get("cat") not in _KERNEL_CATEGORIES:
             continue
-        rt = corr_to_rt.get(evt.get("args", {}).get("correlation"))
-        if rt is None or rt.get("tid") != worker_tid:
-            continue
-        launches.append((rt.get("ts", 0), evt.get("name", ""),
-                         evt.get("dur", 0) or 0))
+        args = evt.get("args", {})
+        corr = args.get("correlation")
+        rt = corr_to_rt.get(corr) if corr is not None else None
+        if rt is not None and rt.get("tid") == worker_tid:
+            launches.append((rt.get("ts", 0), evt.get("name", ""),
+                             evt.get("dur", 0) or 0))
+        else:
+            # Fallback: use External id to find the issuing CPU op's timestamp
+            ext = args.get("External id")
+            if ext is not None and ext in ext_to_ts:
+                launches.append((ext_to_ts[ext], evt.get("name", ""),
+                                 evt.get("dur", 0) or 0))
     return launches
 
 
@@ -537,6 +559,7 @@ def _finalize_node(
     dtype_bytes: int,
     token_symbol: str,
     token_val: int,
+    device_type: str = "cuda",
 ) -> dict:
     """Turn a merged module description into the serialized display dict."""
     n_forward = merged["n_forward"]
@@ -561,7 +584,7 @@ def _finalize_node(
         flops = estimate_flops(raw.label, shapes)
         backend, category = classify_op(
             raw.label,
-            device_type="xpu" if dev > 0 else "",
+            device_type=device_type if dev > 0 else "",
             self_device_time_us=dev,
             device_time_us=dev,
         )
@@ -606,6 +629,7 @@ def _finalize_node(
             dtype_bytes=dtype_bytes,
             token_symbol=token_symbol,
             token_val=token_val,
+            device_type=device_type,
         )
         raw_children.append(child)
 
@@ -699,7 +723,8 @@ def _collapse_repeats(children: list[dict]) -> list[dict]:
 
 def _build_phase_tree(roots: list[_Raw], n_steps: int,
                       symbols_val: dict[int, str], dtype_bytes: int,
-                      token_symbol: str, token_val: int) -> dict | None:
+                      token_symbol: str, token_val: int,
+                      device_type: str = "cuda") -> dict | None:
     """Build one phase tree from all module roots assigned to that phase.
 
     Roots of the same class (the model, the logits processor, the sampler ...)
@@ -731,6 +756,7 @@ def _build_phase_tree(roots: list[_Raw], n_steps: int,
             dtype_bytes=dtype_bytes,
             token_symbol=token_symbol,
             token_val=token_val,
+            device_type=device_type,
         ))
 
     if len(finalized) == 1:
@@ -974,6 +1000,9 @@ def build_graph_from_trace(
     prefill_passes, decode_passes, n_pre, n_dec = _classify_steps(
         roots, batch_size)
 
+    # Infer accelerator type from the trace events
+    device_type = _infer_device_from_trace(events)
+
     dtype = summary.get("dtype", "bfloat16")
     dtype_bytes = dtype_size(dtype)
     val_to_sym, sym_to_val = _build_symbol_tables(summary, tp_size)
@@ -982,9 +1011,11 @@ def build_graph_from_trace(
     decode_tokens = max((_pass_token_dim(p) for p in decode_passes), default=0)
 
     prefill_tree = _build_phase_tree(
-        prefill_passes, n_pre, val_to_sym, dtype_bytes, "S", prefill_tokens)
+        prefill_passes, n_pre, val_to_sym, dtype_bytes, "S", prefill_tokens,
+        device_type=device_type)
     decode_tree = _build_phase_tree(
-        decode_passes, n_dec, val_to_sym, dtype_bytes, "B", decode_tokens)
+        decode_passes, n_dec, val_to_sym, dtype_bytes, "B", decode_tokens,
+        device_type=device_type)
 
     # Reduced-layer profiling (app.py caps num_hidden_layers to save memory)
     # captures only a few decoder layers. Extrapolate the repeat counts back to

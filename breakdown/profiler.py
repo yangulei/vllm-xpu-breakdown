@@ -22,6 +22,7 @@ class ProfileConfig:
     # Activities to trace
     trace_xpu: bool = True
     trace_cpu: bool = True
+    trace_cuda: bool = True
     # Profiler options
     record_shapes: bool = True
     with_stack: bool = True
@@ -34,28 +35,37 @@ class ProfileConfig:
     top_n: int = 30
 
 
+def _detect_device() -> str:
+    """Return 'cuda', 'xpu', or 'cpu' based on available accelerator."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
+    return "cpu"
+
+
 def _get_activities(config: ProfileConfig) -> list[ProfilerActivity]:
     acts = []
     if config.trace_cpu:
         acts.append(ProfilerActivity.CPU)
-    if config.trace_xpu:
-        try:
+    device = _detect_device()
+    if device == "cuda" and config.trace_cuda:
+        if hasattr(ProfilerActivity, "CUDA"):
+            acts.append(ProfilerActivity.CUDA)
+    elif device == "xpu" and config.trace_xpu:
+        if hasattr(ProfilerActivity, "XPU"):
             acts.append(ProfilerActivity.XPU)
-        except AttributeError:
-            try:
-                acts.append(ProfilerActivity.CUDA)
-            except AttributeError:
-                pass
     return acts
 
 
 def _sync_device():
-    """Synchronize XPU/CUDA device to ensure all async work is captured."""
+    """Synchronize the active accelerator to ensure all async work is captured."""
     try:
-        if hasattr(torch, "xpu") and torch.xpu.is_available():
-            torch.xpu.synchronize()
-        elif torch.cuda.is_available():
+        device = _detect_device()
+        if device == "cuda":
             torch.cuda.synchronize()
+        elif device == "xpu":
+            torch.xpu.synchronize()
     except Exception:
         pass
 
@@ -172,7 +182,15 @@ def parse_events(prof: profile, config: ProfileConfig | None = None,
         # Determine device type from the event
         device_type = ""
         if hasattr(evt, "device_type"):
-            device_type = str(evt.device_type)
+            dt = str(evt.device_type).lower()
+            if "cuda" in dt:
+                device_type = "cuda"
+            elif "xpu" in dt:
+                device_type = "xpu"
+            elif "cpu" in dt:
+                device_type = "cpu"
+            else:
+                device_type = dt
 
         # Use self device time and total device time for classification
         self_device = getattr(evt, "self_device_time_total", device_time)

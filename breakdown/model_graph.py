@@ -1373,6 +1373,7 @@ def build_model_graph(
     context_len: int | None = None,
     tp_size: int = 1,
     quantization: str | None = None,
+    device: str | None = None,
 ) -> dict:
     """Build static model graph from model summary (from model_info.py).
 
@@ -1385,6 +1386,10 @@ def build_model_graph(
         tp_size: tensor parallel size (splits heads, intermediate, vocab)
         quantization: quantization method (e.g. "fp8", "gptq", "awq").
             Affects weight dtype_bytes and adds dequant ops to the graph.
+        device: target accelerator — "cuda" or "xpu". When "cuda", the XPU
+            backend labels used internally are localized to their CUDA
+            equivalents (vllm-cuda-kernels, torch-cuda-ops). ``None`` keeps the
+            original XPU labels for backward compatibility.
 
     Returns:
         Dict with "prefill" and "decode" trees, plus metadata.
@@ -1399,11 +1404,14 @@ def build_model_graph(
 
     # Encoder-only models have a different graph structure
     if is_encoder:
-        return _build_encoder_graph(model_summary, family, prefill_len, tp_size)
+        return _localize_backends(
+            _build_encoder_graph(model_summary, family, prefill_len, tp_size),
+            device)
 
     # Diffusion models: return a placeholder noting static analysis is limited
     if is_diffusion:
-        return _build_diffusion_placeholder(model_summary, family)
+        return _localize_backends(
+            _build_diffusion_placeholder(model_summary, family), device)
 
     # Full (un-split) dimensions from config.json
     full_num_heads = model_summary.get("num_heads") or 1
@@ -1632,7 +1640,7 @@ def build_model_graph(
         _compute_totals(root)
         result[phase] = root.to_dict()
 
-    return result
+    return _localize_backends(result, device)
 
 
 def _build_full_model(
@@ -1875,3 +1883,40 @@ def _resolve_dim(d: Any, symbols: dict) -> Any:
         return int(s)
     except (ValueError, TypeError):
         return s
+
+
+# ===================================================================
+# Backend localization (XPU → CUDA)
+# ===================================================================
+
+# Map of XPU backend labels → CUDA equivalents.
+_XPU_TO_CUDA_BACKEND = {
+    "vllm-xpu-kernels": "vllm-cuda-kernels",
+    "torch-xpu-ops": "torch-cuda-ops",
+    # triton / cpu / framework stay the same
+}
+
+
+def _localize_backends(result: dict, device: str | None) -> dict:
+    """If *device* is ``"cuda"``, rewrite every op's backend label in the
+    serialized prefill/decode trees from XPU → CUDA equivalents.
+
+    This is a post-processing pass so the 60+ backend assignments inside the
+    graph builders stay in their canonical (XPU) form — only the output is
+    translated.
+    """
+    if device != "cuda":
+        return result
+
+    def _walk(node: dict) -> None:
+        for op in node.get("ops", []) or []:
+            old = op.get("backend", "")
+            op["backend"] = _XPU_TO_CUDA_BACKEND.get(old, old)
+        for child in node.get("children", []) or []:
+            _walk(child)
+
+    for phase in ("prefill", "decode"):
+        tree = result.get(phase)
+        if isinstance(tree, dict):
+            _walk(tree)
+    return result

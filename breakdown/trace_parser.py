@@ -19,7 +19,35 @@ from .trace_common import _is_overhead_event
 
 # Chrome trace event categories that contain real ops
 _OP_CATEGORIES = {"cpu_op", "user_annotation"}
-_KERNEL_CATEGORIES = {"kernel", "gpu_memcpy", "xpu_op", "gpu_op"}
+_KERNEL_CATEGORIES = {"kernel", "gpu_memcpy", "xpu_op", "gpu_op", "cuda_op",
+                      "cuda_runtime", "gpu_kernel"}
+
+
+# Backends that represent real accelerator compute
+_COMPUTE_BACKENDS = frozenset({
+    "vllm-xpu-kernels", "vllm-cuda-kernels",
+    "torch-xpu-ops", "torch-cuda-ops",
+    "triton",
+})
+
+
+def _infer_device_from_trace(events: list[dict]) -> str:
+    """Infer accelerator type from trace events.
+
+    Looks at kernel event categories: ``xpu_op`` → xpu, everything else → cuda.
+    Falls back to runtime detection.
+    """
+    for evt in events:
+        cat = evt.get("cat", "")
+        if cat == "xpu_op":
+            return "xpu"
+        if cat in ("cuda_runtime", "cuda_op"):
+            return "cuda"
+    # Fallback: if there are GPU kernels, assume cuda (the common case).
+    for evt in events:
+        if evt.get("cat", "") in ("kernel", "gpu_op", "gpu_memcpy", "gpu_kernel"):
+            return "cuda"
+    return ""
 
 
 def parse_trace_file(path: str) -> list[dict]:
@@ -111,12 +139,16 @@ def parse_trace_file(path: str) -> list[dict]:
     # Strategy: match kernel names to their parent CPU ops
     _attribute_device_time(op_agg, kernel_events, kernel_time_by_name)
 
+    # Infer the accelerator from trace events
+    device_type = _infer_device_from_trace(kernel_events) or _infer_device_from_trace(cpu_ops)
+
     # Classify each aggregated op
     result = []
     for key, op in op_agg.items():
+        dt = device_type if op["device_time_us"] > 0 else ""
         backend, category = classify_op(
             op["name"],
-            device_type="xpu" if op["device_time_us"] > 0 else "",
+            device_type=dt,
             self_device_time_us=0,
             device_time_us=op["device_time_us"],
         )
@@ -153,13 +185,17 @@ def _attribute_device_time(op_agg: dict[tuple, dict],
     total_kernel_time = sum(e.get("dur", 0) for e in kernel_events)
 
     if not kernel_events or not op_agg:
-        # If no kernels but we have CPU ops with known XPU dispatch,
+        # If no kernels but we have CPU ops with known compute dispatch,
         # use cpu_time as a rough proxy for device time
         for key, op in op_agg.items():
             name = op["name"]
-            backend, _ = classify_op(name, device_type="xpu",
+            # Try both cuda and xpu; whichever is the active backend
+            backend, _ = classify_op(name, device_type="cuda",
                                      self_device_time_us=1)
-            if backend.value in ("vllm-xpu-kernels", "torch-xpu-ops", "triton"):
+            if backend.value not in _COMPUTE_BACKENDS:
+                backend, _ = classify_op(name, device_type="xpu",
+                                         self_device_time_us=1)
+            if backend.value in _COMPUTE_BACKENDS:
                 # Use CPU time as proxy when no kernel events available
                 op["device_time_us"] = op["cpu_time_us"]
         return
@@ -177,9 +213,12 @@ def _attribute_device_time(op_agg: dict[tuple, dict],
     compute_ops = {}
     total_compute_cpu = 0
     for key, op in op_agg.items():
-        backend, _ = classify_op(op["name"], device_type="xpu",
+        backend, _ = classify_op(op["name"], device_type="cuda",
                                  self_device_time_us=1)
-        if backend.value in ("vllm-xpu-kernels", "torch-xpu-ops", "triton"):
+        if backend.value not in _COMPUTE_BACKENDS:
+            backend, _ = classify_op(op["name"], device_type="xpu",
+                                     self_device_time_us=1)
+        if backend.value in _COMPUTE_BACKENDS:
             compute_ops[key] = op
             total_compute_cpu += op["cpu_time_us"]
 
