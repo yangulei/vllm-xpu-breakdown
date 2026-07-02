@@ -943,6 +943,64 @@ def _extrapolate_decoder_layers(tree: dict, num_layers: int | None) -> None:
         _recompute_totals(tree)
 
 
+_ATTENTION_OP_NAMES = frozenset({
+    "vllm::unified_attention_with_output",
+    "vllm::unified_attention",
+})
+
+
+def _is_attention_op(op: dict) -> bool:
+    name = op.get("name", "")
+    if name in _ATTENTION_OP_NAMES:
+        return True
+    low = name.lower()
+    return ("attention" in low or "flash_attn" in low
+            or op.get("role") == "attention")
+
+
+def _annotate_attention_kv(node: dict, n_kv: int | None) -> None:
+    """Rewrite attention key/value row lengths from ``S`` to ``S+C``.
+
+    Paged/prefix-cached attention only records the *new* tokens as the op's
+    key/value inputs (``[S, n_kv, d]``); the cached context never appears as a
+    tensor dim. To make the attended context visible, the key/value input rows
+    (and the KV-shaped inputs generally) have their leading ``S`` replaced with
+    the symbolic full KV length ``S+C``. Query/output rows (``[S, n_h, d]``) are
+    left untouched — there are still ``S`` query positions producing ``S``
+    outputs. Key/value rows are identified by their second dim being the KV-head
+    count (GQA); when heads are indistinguishable (MHA) the canonical vLLM
+    ``[query, key, value, output]`` argument order (inputs 1 and 2) is used.
+    """
+    for op in node.get("ops", []):
+        if not _is_attention_op(op):
+            continue
+        shapes = op.get("input_shapes") or []
+        kv_by_heads = False
+        if n_kv:
+            for i, row in enumerate(shapes):
+                if (isinstance(row, list) and len(row) >= 2
+                        and row[0] == "S" and _dim_is(row[1], n_kv)):
+                    row[0] = "S+C"
+                    kv_by_heads = True
+        if not kv_by_heads:
+            # Fall back to vLLM arg order: inputs[1] = key, inputs[2] = value.
+            for i in (1, 2):
+                if (i < len(shapes) and isinstance(shapes[i], list)
+                        and shapes[i] and shapes[i][0] == "S"):
+                    shapes[i][0] = "S+C"
+    for child in node.get("children", []):
+        _annotate_attention_kv(child, n_kv)
+
+
+def _dim_is(sym: Any, value: int) -> bool:
+    """True if a (possibly symbolic) shape entry equals the integer ``value``."""
+    if isinstance(sym, int):
+        return sym == value
+    # Symbolic head-count dims render as "n_kv" / "n_kv/TP"; treat any n_kv label
+    # as the KV-head dimension.
+    return isinstance(sym, str) and sym.split("/")[0] in ("n_kv", "n_h·d_kv")
+
+
 def build_graph_from_trace(
     trace_path: str,
     summary: dict | None = None,
@@ -950,6 +1008,8 @@ def build_graph_from_trace(
     batch_size: int = 1,
     quantization: str | None = None,
     ref_module_tree: dict | None = None,
+    query_len: int | None = None,
+    context_len: int | None = None,
 ) -> dict:
     """Reconstruct a model graph purely from a torch profiler trace.
 
@@ -967,6 +1027,10 @@ def build_graph_from_trace(
             names (``q_norm``/``k_norm``, ``input_layernorm``, ...) onto the
             trace-reconstructed module nodes. When omitted, nodes keep their
             class-name-derived heuristic labels.
+        query_len: number of new prefill tokens (``S``); currently informational.
+        context_len: prefix-cached context length (already floored to a KV-block
+            boundary). Added to the symbol legend as ``C`` and, combined with the
+            prefill token count, as ``S+C`` so attention KV dims symbolize.
 
     Returns:
         Dict with ``prefill`` / ``decode`` trees (either may be ``None``),
@@ -1010,6 +1074,19 @@ def build_graph_from_trace(
     prefill_tokens = max((_pass_token_dim(p) for p in prefill_passes), default=0)
     decode_tokens = max((_pass_token_dim(p) for p in decode_passes), default=0)
 
+    # Symbolize the prefix-cached context length as ``C`` (and the full attended
+    # KV length ``context+query`` as ``S+C``) so attention KV dims read
+    # ``C`` / ``S+C`` instead of a bare number. ``context_len`` is already floored
+    # to a KV-block boundary by the caller. Assigned directly (not setdefault) so
+    # the context dim wins over any coincidental config-value collision.
+    ctx = int(context_len) if context_len else 0
+    if ctx > 0:
+        val_to_sym[ctx] = "C"
+        sym_to_val["C"] = ctx
+        if prefill_tokens:
+            val_to_sym[ctx + prefill_tokens] = "S+C"
+            sym_to_val["S+C"] = ctx + prefill_tokens
+
     prefill_tree = _build_phase_tree(
         prefill_passes, n_pre, val_to_sym, dtype_bytes, "S", prefill_tokens,
         device_type=device_type)
@@ -1024,6 +1101,16 @@ def build_graph_from_trace(
     for tree in (prefill_tree, decode_tree):
         if tree:
             _extrapolate_decoder_layers(tree, num_layers)
+
+    # Surface the prefix-cached context in attention. Paged attention records
+    # only the *new* tokens in the op's key/value inputs ([S, n_kv, d]); the
+    # context length lives in the block cache / seqlen metadata, never as a
+    # tensor dim, so it can't be symbolized from the trace. When a context was
+    # served from the prefix cache, rewrite the attention key/value rows to the
+    # full attended KV length ``S+C`` so the graph shows the query attending
+    # ``context+query`` keys (the query/output rows stay ``S``).
+    if ctx > 0 and prefill_tokens and prefill_tree:
+        _annotate_attention_kv(prefill_tree, n_kv=summary.get("num_kv_heads"))
 
     if prefill_tokens:
         sym_to_val["S"] = prefill_tokens

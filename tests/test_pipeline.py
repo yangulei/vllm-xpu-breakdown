@@ -1258,6 +1258,132 @@ class TestGraphFromTrace(unittest.TestCase):
         # First input row dim → "S", hidden dim → "H"
         self.assertEqual(linear["input_shapes"][0], ["S", "H"])
 
+    def test_context_len_symbolized_as_C(self):
+        # When a prefix-cached prefill is profiled, the context length (and the
+        # full attended KV length context+query) must symbolize as C / S+C.
+        from breakdown.graph_from_trace import build_graph_from_trace
+        events, ext, corr, tid, midx = [], [0], [0], 7, [0]
+
+        def kern(e, ts, dur):
+            corr[0] += 1
+            events.append({"ph": "X", "cat": "xpu_runtime", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": 0.1, "name": "l",
+                           "args": {"correlation": corr[0], "External id": e}})
+            events.append({"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+                           "ts": ts + 1000, "dur": dur, "name": "g",
+                           "args": {"correlation": corr[0]}})
+
+        def op(name, ts, dur, shapes, kdur):
+            ext[0] += 1
+            events.append({"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+                           "ts": ts, "dur": dur, "name": name,
+                           "args": {"External id": ext[0], "Input Dims": shapes,
+                                    "Input type": ["c10::BFloat16"]}})
+            if kdur:
+                kern(ext[0], ts, kdur)
+
+        def mod(cls, ts, dur):
+            events.append({"ph": "X", "cat": "python_function", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": dur,
+                           "name": f"nn.Module: {cls}_{midx[0]}"})
+            midx[0] += 1
+
+        mod("TinyForCausalLM", 0, 400)
+        mod("TinyAttention", 5, 80)
+        op("aten::mm", 6, 4, [[8, 16], [16, 48]], 5.0)  # 8 query tokens => S
+        # attention: context dim 64 => C, total kv 72 => S+C
+        op("vllm::unified_attention_with_output", 10, 4,
+           [[8, 48], [64, 16], [72, 16]], 3.0)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"traceEvents": events}, f)
+            path = f.name
+        try:
+            g = build_graph_from_trace(path, self.SUMMARY, tp_size=1,
+                                       batch_size=1, query_len=8, context_len=64)
+        finally:
+            os.unlink(path)
+
+        self.assertEqual(g["symbols"]["C"], 64)
+        self.assertEqual(g["symbols"]["S+C"], 72)
+
+        def _find_attn(node):
+            for o in node.get("ops", []):
+                if "unified_attention" in o["name"]:
+                    return o
+            for c in node.get("children", []):
+                r = _find_attn(c)
+                if r:
+                    return r
+            return None
+
+        attn_op = _find_attn(g["prefill"])
+        self.assertIsNotNone(attn_op)
+        self.assertIn(["C", "H"], attn_op["input_shapes"])
+        self.assertIn(["S+C", "H"], attn_op["input_shapes"])
+
+    def test_paged_attention_kv_rows_get_S_plus_C(self):
+        # Real paged/prefix-cached attention records ONLY the new tokens in its
+        # key/value inputs ([S, n_kv, d]); the context length is never a tensor
+        # dim. With a context, key/value rows must be rewritten to the full
+        # attended KV length S+C while query/output rows stay S.
+        from breakdown.graph_from_trace import build_graph_from_trace
+        events, ext, corr, tid, midx = [], [0], [0], 7, [0]
+
+        def op(name, ts, dur, shapes):
+            ext[0] += 1
+            events.append({"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+                           "ts": ts, "dur": dur, "name": name,
+                           "args": {"External id": ext[0], "Input Dims": shapes,
+                                    "Input type": ["c10::BFloat16"]}})
+
+        def mod(cls, ts, dur):
+            events.append({"ph": "X", "cat": "python_function", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": dur,
+                           "name": f"nn.Module: {cls}_{midx[0]}"})
+            midx[0] += 1
+
+        # summary: n_h=3, n_kv=1 (GQA so heads distinguish q from k/v), d=16.
+        summary = {"architecture": "TinyForCausalLM", "hidden_size": 48,
+                   "num_heads": 3, "num_kv_heads": 1, "head_dim": 16,
+                   "intermediate_size": 64, "vocab_size": 32000,
+                   "num_layers": 1, "dtype": "bfloat16"}
+        mod("TinyForCausalLM", 0, 400)
+        mod("TinyAttention", 5, 80)
+        op("aten::mm", 6, 4, [[8, 48], [48, 80]])  # 8 query tokens => S
+        # q [8,3,16], k [8,1,16], v [8,1,16], out [8,3,16] — all leading dim 8=S
+        op("vllm::unified_attention_with_output", 10, 4,
+           [[8, 3, 16], [8, 1, 16], [8, 1, 16], [8, 3, 16], []])
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"traceEvents": events}, f)
+            path = f.name
+        try:
+            g = build_graph_from_trace(path, summary, tp_size=1, batch_size=1,
+                                       query_len=8, context_len=64)
+        finally:
+            os.unlink(path)
+
+        def _find_attn(node):
+            for o in node.get("ops", []):
+                if "unified_attention" in o["name"]:
+                    return o
+            for c in node.get("children", []):
+                r = _find_attn(c)
+                if r:
+                    return r
+            return None
+
+        attn = _find_attn(g["prefill"])
+        self.assertIsNotNone(attn)
+        shapes = attn["input_shapes"]
+        # query + output rows stay S; key + value rows become S+C.
+        self.assertEqual(shapes[0][0], "S")       # query
+        self.assertEqual(shapes[1][0], "S+C")     # key
+        self.assertEqual(shapes[2][0], "S+C")     # value
+        self.assertEqual(shapes[3][0], "S")       # output
+        self.assertEqual(g["symbols"]["S+C"], 72)
+
     def test_empty_trace(self):
         from breakdown.graph_from_trace import build_graph_from_trace
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
