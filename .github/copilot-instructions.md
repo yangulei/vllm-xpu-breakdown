@@ -46,6 +46,8 @@ Flask web app (`app.py`) + static SPA (`static/index.html`) backed by a `breakdo
 
 **Two subtle invariants (don't regress):** (1) `_partition_steps` picks the main model class by **largest module subtree** (`_subtree_module_count`), NOT device time — the `LogitsProcessor` `lm_head` matmul can dominate `sub_dev`, which previously mis-selected it, dropped the prefill phase (`prefill: None`) and made both phases identical. (2) The frontend (`applyProfileResult`) auto-selects a phase that has a reconstructed tree so the graph shows immediately.
 
+**Query Len / Context Len profiling (Method 1 / APC):** `_run_profile` builds exact-length synthetic token prompts (`_make_token_ids`) instead of a fixed text prompt. `query_len` = new prefill tokens (`S`); `context_len` (floored to `block_size`) is pre-computed in an un-profiled warm pass and served from the prefix cache (`enable_prefix_caching=True`) during the profiled run, so the profiled prefill sees `S` new tokens attending to a `context_len`-token KV. Warm the context prefix alone first, warm kernels with distinct query seeds, and profile with yet another seed (`900000+b`) so profiled queries are never cache-hit; each batch item gets a distinct query over a shared context. A cache miss (`outputs[0].num_cached_tokens < ctx_aligned`) is surfaced as `cache_hit_note`. `start_profile` bumps `max_model_len` to `context+query+max_tokens`. Absent `query_len` → legacy text-prompt path.
+
 **Backend classification priority:** vllm-xpu-kernels (exact match from registry) > triton (name patterns) > torch-xpu-ops (aten:: on XPU) > cpu > framework
 
 ## Key Conventions

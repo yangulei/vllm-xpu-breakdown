@@ -22,6 +22,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -676,6 +677,80 @@ class TestFlaskAPI(unittest.TestCase):
     def test_model_endpoint_invalid(self):
         resp = self.client.get("/api/model/nonexistent/model-xyz-999")
         self.assertNotEqual(resp.status_code, 200)
+
+
+# ===================================================================
+# Query/Context Len profiling (Method 1: APC prefix)
+# ===================================================================
+
+class TestQueryContextProfiling(unittest.TestCase):
+    """Wiring for the Query Len / Context Len prefix-cache profiling knobs."""
+
+    def test_make_token_ids_deterministic_and_valid(self):
+        from app import _make_token_ids
+        a = _make_token_ids(48, 32000, seed=0)
+        b = _make_token_ids(48, 32000, seed=0)
+        c = _make_token_ids(48, 32000, seed=7)
+        self.assertEqual(a, b)               # same seed -> identical prefix
+        self.assertNotEqual(a, c)            # different seed -> different query
+        self.assertEqual(len(a), 48)
+        self.assertTrue(all(256 <= x < 32000 - 256 for x in a))
+        self.assertEqual(_make_token_ids(0, 32000, 0), [])
+
+    def test_get_block_size_and_vocab_fallbacks(self):
+        from app import _get_block_size, _get_vocab_size
+
+        class _CC:
+            block_size = 64
+
+        class _Cfg:
+            cache_config = _CC()
+
+        class _Eng:
+            vllm_config = _Cfg()
+
+        class _LLM:
+            llm_engine = _Eng()
+
+        self.assertEqual(_get_block_size(_LLM()), 64)
+        self.assertEqual(_get_block_size(object(), default=16), 16)
+        self.assertEqual(_get_vocab_size(object(), {"vocab_size": 40000}), 40000)
+        self.assertEqual(_get_vocab_size(object(), {}, default=32000), 32000)
+
+    def test_start_profile_passes_query_context_and_bumps_maxlen(self):
+        import app as app_module
+        captured = {}
+
+        def _fake_thread(target=None, args=(), daemon=None):
+            captured["args"] = args
+
+            class _T:
+                def start(self_inner):
+                    pass
+            return _T()
+
+        client = app_module.app.test_client()
+        with patch.object(app_module.threading, "Thread", _fake_thread), \
+                patch.object(app_module, "_profile_state",
+                             {"status": "idle", "result": None, "error": None,
+                              "model_id": None}):
+            resp = client.post("/api/profile", json={
+                "model_id": "Qwen/Qwen3-4B-Instruct-2507",
+                "query_len": 2048,
+                "context_len": 2048,
+                "max_model_len": 4096,   # query+context, no decode headroom
+                "max_tokens": 128,
+            })
+        self.assertTrue(resp.get_json()["ok"])
+        args = captured["args"]
+        # signature: (model_id, mode, max_model_len, batch_size, max_tokens,
+        #  prompt, num_profile_layers, tp_size, quantization, gpu_mem,
+        #  query_len, context_len)
+        self.assertEqual(args[-2], 2048)     # query_len
+        self.assertEqual(args[-1], 2048)     # context_len
+        max_model_len = args[2]
+        # must be bumped to cover context + query + decode budget
+        self.assertGreaterEqual(max_model_len, 2048 + 2048 + 128)
 
 
 # ===================================================================

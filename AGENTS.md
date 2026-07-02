@@ -264,6 +264,35 @@ Classifies ops by name prefix/pattern to backends. Priority order:
 
 ## Common Pitfalls
 
+- **Query Len / Context Len drive a real prefix-cached prefill (Method 1 / APC).**
+  Profiling no longer runs a fixed text prompt. `_run_profile` builds
+  exact-length synthetic token prompts (`_make_token_ids`): `query_len` new
+  tokens form the profiled prefill (`S`), and `context_len` (rounded **down** to
+  a KV `block_size` boundary) is pre-computed in an **un-profiled warm pass** and
+  served from the prefix cache (`enable_prefix_caching=True`) during the profiled
+  run. So the profiled prefill computes only `query_len` tokens while attention
+  still reads the full `context_len+query_len` KV. Key invariants: (1) warm the
+  **context prefix alone**, then warm kernels with **distinct** query seeds per
+  pass, and give the **profiled** run yet another seed set (`900000+b`) so its
+  queries are never cache-hit; (2) the context prefix is shared across the batch
+  (one warm pass) but each batch item gets a distinct query; (3) verify the hit
+  via `outputs[0].num_cached_tokens >= ctx_aligned` — a miss recomputes the whole
+  context (`S = context+query`) and is surfaced as `cache_hit_note`. `start_profile`
+  bumps `max_model_len` to `context+query+max_tokens`. When `query_len` is absent
+  (uploads/legacy clients) the old chat/text-prompt path still runs.
+- **Main model class is picked by subtree size, not device time.** The
+  `LogitsProcessor`'s `lm_head` matmul (`V`-wide, once per decode step) can
+  out-weigh the whole model forward, so selecting the main class by `sub_dev`
+  wrongly picked `LogitsProcessor` — making every step a 1-token pass, so the
+  prefill phase disappeared (`prefill: None`, blank graph until you click Decode)
+  and prefill/decode looked identical. `_partition_steps` now uses
+  `_subtree_module_count`. Do NOT revert to a device-time heuristic.
+- **Module-name alignment must unwrap `*Model` levels absent from the trace.**
+  vLLM nests the decoder stack under an inner `*Model` module whose `forward`
+  usually emits no trace module event, so the trace nests it directly under
+  `*ForCausalLM`. `module_naming._effective_ref_children` flattens reference
+  levels whose class isn't among a node's actual trace-child classes; without it,
+  child matching stalls at the missing level and `q_norm`/`k_norm` stay `norm`.
 - **Device time is attributed by launch-site containment, not `External id`.**
   `graph_from_trace.py` links each device `kernel` to its host launch call
   (`kernel.correlation → xpu_runtime`, the "flow arrow") and attributes it to the

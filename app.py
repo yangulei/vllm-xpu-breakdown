@@ -145,6 +145,52 @@ def _set_num_hidden_layers(hf_config, n: int):
     return hf_config
 
 
+def _make_token_ids(n: int, vocab_size: int, seed: int) -> list[int]:
+    """Deterministically build ``n`` valid, non-special token ids.
+
+    Ids are drawn from a safe interior range of the vocabulary (avoiding the
+    low ids that are typically special/control tokens) using a cheap hash of the
+    position and ``seed``. Two calls with the same ``(n, vocab_size, seed)``
+    yield the identical sequence, which is what lets the prefix-cache warm pass
+    and the profiled pass share an exact-match context prefix.
+    """
+    if n <= 0:
+        return []
+    lo = 256
+    hi = max(lo + 1, vocab_size - 256)
+    span = hi - lo
+    return [lo + ((i * 2654435761 + seed * 40503 + 12345) % span) for i in range(n)]
+
+
+def _get_block_size(llm, default: int = 16) -> int:
+    """Read the KV-cache block size from a constructed vLLM engine (robust)."""
+    engine = getattr(llm, "llm_engine", None)
+    for attr in ("vllm_config", "engine_config", "model_config"):
+        cfg = getattr(engine, attr, None)
+        cc = getattr(cfg, "cache_config", None)
+        bs = getattr(cc, "block_size", None)
+        if bs:
+            return int(bs)
+    cc = getattr(engine, "cache_config", None)
+    bs = getattr(cc, "block_size", None)
+    if bs:
+        return int(bs)
+    return default
+
+
+def _get_vocab_size(llm, summary: dict, default: int = 32000) -> int:
+    """Best-effort tokenizer vocabulary size for synthetic-prompt generation."""
+    try:
+        tok = llm.get_tokenizer()
+        vs = getattr(tok, "vocab_size", None) or len(tok)
+        if vs and vs > 512:
+            return int(vs)
+    except Exception:
+        pass
+    vs = summary.get("vocab_size")
+    return int(vs) if vs and vs > 512 else default
+
+
 def _build_result_from_traces(
     rank_files: list[str],
     *,
@@ -261,7 +307,9 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
                  num_profile_layers: int | None = None,
                  tp_size: int = 1,
                  quantization: str | None = None,
-                 gpu_memory_utilization: float | None = None):
+                 gpu_memory_utilization: float | None = None,
+                 query_len: int | None = None,
+                 context_len: int | None = None):
     """Run profiling in a background thread using vLLM's native profiler.
 
     On XPU hardware, vLLM automatically selects XPUWorker which uses
@@ -279,10 +327,18 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
         gpu_memory_utilization: fraction of device memory vLLM may use. Lower
             it (e.g. 0.8) when vLLM's init footprint leaves too little headroom
             for the default (0.92) on small-VRAM cards. None keeps vLLM default.
+        query_len: number of *new* prompt tokens the profiled prefill computes
+            (the "Query Len"). Drives the prefill token dimension ``S``.
+        context_len: number of prior context tokens the query attends to (the
+            "Context Len"). When >0, those tokens are pre-computed in an
+            un-profiled warm pass and served from the prefix cache (APC) during
+            the profiled run, so the profiled prefill computes only ``query_len``
+            new tokens while attention still reads the full ``context_len+query_len``
+            KV. Rounded down to a KV block boundary so the whole context caches.
     """
     global _profile_state
     try:
-        from vllm import LLM, SamplingParams
+        from vllm import LLM, SamplingParams, TokensPrompt
 
         # Fetch model config for analysis
         try:
@@ -344,6 +400,20 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
         if sparse_block:
             engine_kwargs["block_size"] = int(sparse_block)
 
+        # Normalize the query/context sizing knobs. ``query_len`` sets the
+        # number of new prompt tokens the profiled prefill computes; when
+        # ``context_len`` > 0 we serve that many prior tokens from the prefix
+        # cache so the profiled prefill sees ``S = query_len`` new tokens
+        # attending to a ``context_len``-token KV context.
+        query_len = int(query_len) if query_len else 0
+        context_len = int(context_len) if context_len else 0
+        use_token_prompts = query_len > 0
+
+        # Enable Automatic Prefix Caching so the context prefix computed in the
+        # warm pass is reused (not recomputed) during the profiled run.
+        if context_len > 0:
+            engine_kwargs["enable_prefix_caching"] = True
+
         # Quantization method
         if quantization:
             engine_kwargs["quantization"] = quantization
@@ -374,41 +444,105 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
 
         sampling_params = SamplingParams(max_tokens=max_tokens)
 
-        # Use chat() if model supports it, else fall back to generate().
-        conversation = [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": prompt},
-        ]
-        conversations = [conversation] * batch_size
-        prompts = [prompt] * batch_size
+        cache_hit_note = None
 
-        # First warmup pass also detects chat-template support.
-        try:
-            llm.chat(conversations, sampling_params, use_tqdm=False)
-            use_chat = True
-        except Exception:
-            # Model may not have a chat template — use raw generate
-            llm.generate(prompts, sampling_params, use_tqdm=False)
-            use_chat = False
+        if use_token_prompts:
+            # --- Exact-length token prompts (honours Query Len / Context Len) ---
+            block_size = _get_block_size(llm)
+            vocab_size = _get_vocab_size(llm, summary)
 
-        def _run_inference():
-            if use_chat:
+            # Round the context down to a whole number of KV blocks so the
+            # entire context prefix is cacheable (a trailing partial block would
+            # be recomputed and shift the profiled prefill token count).
+            ctx_aligned = (context_len // block_size) * block_size
+            ctx_ids = _make_token_ids(ctx_aligned, vocab_size, seed=0)
+
+            def _full_prompt(query_seed: int) -> "TokensPrompt":
+                q = _make_token_ids(query_len, vocab_size, seed=query_seed)
+                return TokensPrompt(prompt_token_ids=ctx_ids + q)
+
+            # Distinct query per batch item (shared context prefix) so every
+            # sequence genuinely prefills its own ``query_len`` tokens instead of
+            # cache-hitting a sibling. Profiled seeds differ from warmup seeds so
+            # the profiled queries are never served from a warmed cache.
+            def _batch(base_seed: int) -> list["TokensPrompt"]:
+                return [_full_prompt(base_seed + b) for b in range(batch_size)]
+
+            # Warm the prefix cache: compute the shared context once, un-profiled,
+            # so the profiled run reads it from cache instead of recomputing it.
+            if ctx_ids:
+                llm.generate(
+                    [TokensPrompt(prompt_token_ids=ctx_ids)],
+                    SamplingParams(max_tokens=1), use_tqdm=False,
+                )
+
+            # Warm kernels on the real prefix-cached-prefill + decode shapes.
+            for w in range(2):
+                llm.generate(_batch(1000 * (w + 1)), sampling_params, use_tqdm=False)
+
+            profiled_prompts = _batch(900000)
+
+            # --- Profiled run ---
+            llm.start_profile()
+            outputs = llm.generate(profiled_prompts, sampling_params, use_tqdm=False)
+            llm.stop_profile()
+
+            # Verify the context was served from cache. A miss means the profiled
+            # prefill recomputed the whole context (S = context+query), so record
+            # a note rather than silently reporting the wrong shape.
+            if context_len > 0 and outputs:
+                cached = getattr(outputs[0], "num_cached_tokens", None)
+                if cached is not None and cached < ctx_aligned:
+                    cache_hit_note = (
+                        f"Prefix cache hit only {cached}/{ctx_aligned} context "
+                        "tokens; profiled prefill may include context recompute."
+                    )
+        else:
+            # --- Legacy text-prompt path (Query/Context Len not specified) ---
+            conversation = [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt},
+            ]
+            conversations = [conversation] * batch_size
+            prompts = [prompt] * batch_size
+
+            # First warmup pass also detects chat-template support.
+            try:
                 llm.chat(conversations, sampling_params, use_tqdm=False)
-            else:
+                use_chat = True
+            except Exception:
+                # Model may not have a chat template — use raw generate
                 llm.generate(prompts, sampling_params, use_tqdm=False)
+                use_chat = False
 
-        # Warm up before profiling. Warmup primes Triton JIT compilation /
-        # kernel autotuning so the profiled trace reflects steady-state timing,
-        # not one-time compilation overhead (important for fused/sparse-kernel
-        # models such as MiniMax-M3). The detection pass above is warmup #1;
-        # run 2 more for 3 warmups total.
-        for _ in range(2):
+            def _run_inference():
+                if use_chat:
+                    llm.chat(conversations, sampling_params, use_tqdm=False)
+                else:
+                    llm.generate(prompts, sampling_params, use_tqdm=False)
+
+            # Warm up before profiling. Warmup primes Triton JIT compilation /
+            # kernel autotuning so the profiled trace reflects steady-state
+            # timing, not one-time compilation overhead (important for
+            # fused/sparse-kernel models such as MiniMax-M3). The detection pass
+            # above is warmup #1; run 2 more for 3 warmups total.
+            for _ in range(2):
+                _run_inference()
+
+            # --- Profiled run ---
+            llm.start_profile()
             _run_inference()
+            llm.stop_profile()
 
-        # --- Profiled run ---
-        llm.start_profile()
-        _run_inference()
-        llm.stop_profile()
+        # Capture the real module hierarchy (attribute names like q_norm/k_norm)
+        # from the loaded model while it is still alive, to enrich the
+        # trace-reconstructed graph with structural names.
+        ref_module_tree = None
+        try:
+            from breakdown.module_naming import ref_tree_from_llm
+            ref_module_tree = ref_tree_from_llm(llm)
+        except Exception:
+            ref_module_tree = None
 
         # --- Parse trace files ---
         # With TP>1, vLLM produces one trace file per rank.
@@ -444,7 +578,13 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             profiled_layers=profiled_layers,
             actual_layers=actual_layers,
             layer_scale=layer_scale,
+            ref_module_tree=ref_module_tree,
         )
+
+        profile_result["query_len"] = query_len or None
+        profile_result["context_len"] = context_len or None
+        if cache_hit_note:
+            profile_result["cache_hit_note"] = cache_hit_note
 
         with _profile_lock:
             _profile_state["status"] = "done"
@@ -482,6 +622,16 @@ def start_profile():
     tp_size = data.get("tensor_parallel_size", 1)
     quantization = data.get("quantization")  # None = no quantization
     gpu_memory_utilization = data.get("gpu_memory_utilization")  # None = vLLM default
+    query_len = data.get("query_len")  # new prefill tokens (None = legacy prompt)
+    context_len = data.get("context_len")  # cached prefix tokens (None/0 = none)
+
+    # The engine must fit the whole sequence it will ever see: cached context +
+    # new query tokens + the decode tokens we generate. The frontend sizes
+    # max_model_len from Query+Context; bump it to also cover the decode budget.
+    if query_len:
+        needed = int(query_len) + int(context_len or 0) + int(max_tokens) + 16
+        if needed > int(max_model_len):
+            max_model_len = needed
 
     with _profile_lock:
         _profile_state = {
@@ -495,13 +645,16 @@ def start_profile():
                 "max_model_len": max_model_len,
                 "tp_size": tp_size,
                 "quantization": quantization,
+                "query_len": query_len,
+                "context_len": context_len,
             },
         }
 
     thread = threading.Thread(
         target=_run_profile,
         args=(model_id, mode, max_model_len, batch_size, max_tokens, prompt,
-              num_profile_layers, tp_size, quantization, gpu_memory_utilization),
+              num_profile_layers, tp_size, quantization, gpu_memory_utilization,
+              query_len, context_len),
         daemon=True,
     )
     thread.start()
