@@ -161,6 +161,7 @@ def _build_result_from_traces(
     actual_layers: int | None = None,
     layer_scale: float = 1.0,
     trace_file: str | None = None,
+    ref_module_tree: dict | None = None,
 ) -> dict:
     """Parse one or more trace files and build the profile result dict.
 
@@ -243,6 +244,7 @@ def _build_result_from_traces(
             tp_size=tp_size,
             batch_size=batch_size,
             quantization=quantization,
+            ref_module_tree=ref_module_tree,
         )
         graph["profiled_layers"] = profiled_layers
         graph["actual_layers"] = actual_layers
@@ -587,6 +589,24 @@ def upload_profile():
             },
         }
 
+    # Optional: reconstruct real module attribute names by instantiating the
+    # model on ``meta`` (no weights). Heavy + network-dependent, so it is
+    # opt-in via env var. Without it, uploaded traces keep heuristic names.
+    ref_module_tree = None
+    if model_id and os.environ.get("VLLM_XPU_BREAKDOWN_META_NAMES") == "1":
+        try:
+            from breakdown.module_naming import ref_tree_from_config
+            ref_module_tree = ref_tree_from_config(
+                fetch_model_config(model_id),
+                dtype=summary.get("dtype", "bfloat16"),
+                model_id=model_id,
+                allow_remote_code=(
+                    os.environ.get("VLLM_XPU_BREAKDOWN_TRUST_REMOTE_CODE") == "1"
+                ),
+            )
+        except Exception:
+            ref_module_tree = None
+
     try:
         result = _build_result_from_traces(
             saved[:tp_size] if len(saved) >= tp_size else saved,
@@ -600,6 +620,7 @@ def upload_profile():
             profiled_layers=profiled_layers,
             actual_layers=actual_layers,
             layer_scale=layer_scale,
+            ref_module_tree=ref_module_tree,
         )
         with _profile_lock:
             _profile_state["status"] = "done"

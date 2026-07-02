@@ -38,6 +38,7 @@ chat.py                   — Interactive chat with profiling
 breakdown/
   model_graph.py          — Static (config-driven) model graph builder
   graph_from_trace.py     — Profile-first graph reconstruction from a trace
+  module_naming.py        — Recover real module attribute names (q_norm/k_norm)
   model_info.py           — HuggingFace config fetcher and summarizer
   analyzer.py             — Op analysis (shapes, memory, FLOPs, AI)
   classifier.py           — Op → backend classification
@@ -136,14 +137,62 @@ it unchanged. How it works:
   (`sub_dev`).
 - **Phase split** — `_partition_steps` groups module roots into inference steps
   (main model class starts each step; trailing LogitsProcessor/Sampler attach to
-  it), classified prefill vs decode by the pass's max matmul token dim.
+  it), classified prefill vs decode by the pass's max matmul token dim. The
+  **main model class is chosen by largest module subtree**, NOT by device time:
+  the `lm_head` vocab projection inside `LogitsProcessor` (a `V`-wide matmul run
+  once per decode step) can outweigh the entire model forward, which previously
+  mis-selected `LogitsProcessor` as the main class — collapsing every step to a
+  1-token pass so the prefill phase vanished (`prefill: None`) and both phases
+  looked identical. Do NOT revert `_partition_steps` to a `sub_dev`-max heuristic
+  (see `_subtree_module_count` + `TestPhasePartition`).
 - **Repeat collapse** — adjacent structurally-identical sibling layers merge into
   one node with `repeat_count`, timing averaged. Dense vs MoE layers have
-  different structural signatures so they stay as separate runs.
+  different structural signatures so they stay as separate runs. The structural
+  signature includes the node's (recovered) `name`, so distinctly-named siblings
+  (`q_norm`/`k_norm`) are kept apart while genuinely-repeated layers still merge.
 
 The old `annotate_graph_timing` / `annotate_graph_from_modules` /
 `parse_trace_with_modules` paths were **removed**. Do not reintroduce a
 static-overlay step in the profiling worker.
+
+### Module Attribute Naming (`module_naming.py`)
+
+The profiler only labels module events with their **class** (`nn.Module:
+<Cls>_<idx>`), so sibling modules of the same class (Qwen3 `q_norm`/`k_norm`,
+both `RMSNorm`; `input_layernorm`/`post_attention_layernorm`; ...) are
+indistinguishable and fall back to a class-heuristic name. `module_naming.py`
+ports the *idea* from the (retired) `torch_export` branch — derive the real
+attribute name of every module from the model's `named_modules()` — and overlays
+those names onto the accurate profile-based tree instead of rebuilding it.
+
+- **`build_ref_tree(named_modules)`** — pure/torch-free. Builds a reference tree
+  of `{attr, cls, children, is_group, group_size}` from
+  `[(qualified_name, class_name), ...]`. Indexed `ModuleList` containers are
+  *inlined* (their `forward` is never called, so they emit no module event) and
+  consecutive numeric entries of the same class collapse into one `is_group`
+  representative — mirroring the trace's layer collapse.
+- **`ref_tree_from_llm(llm)`** — extracts the tree from the *live* vLLM model
+  during profiling (via `LLM.apply_model`, falling back to attribute traversal).
+  Cheap: the model is already loaded. This is the primary path.
+- **`ref_tree_from_config(...)`** — `meta`-device instantiation fallback for the
+  offline / trace-upload path (env-gated by `VLLM_XPU_BREAKDOWN_META_NAMES=1`,
+  remote code by `VLLM_XPU_BREAKDOWN_TRUST_REMOTE_CODE=1`). Heavy + network.
+- **Alignment** — `graph_from_trace._apply_ref_names` walks the *raw* module
+  forest against the reference tree, matching children greedily by
+  `(class, order)` (reusing a matched representative when the trace has more
+  same-class siblings than the collapsed reference, e.g. dense + MoE layer
+  groups). It **unwraps reference levels absent from the trace**
+  (`module_naming._effective_ref_children`): vLLM nests the decoder stack under
+  an inner `*Model` module (`*ForCausalLM → *Model → [embed, layers, norm]`)
+  whose `forward` often emits **no** trace module event, so the trace nests the
+  stack directly under `*ForCausalLM`. Without the unwrap, child-class matching
+  stalls at that missing level and every submodule keeps its class-heuristic name
+  (`q_norm`/`k_norm` → `norm`). Applied **before** finalization/collapse so
+  recovered names feed the structural signature.
+  `build_graph_from_trace(..., ref_module_tree=...)` opts in; without a ref tree
+  the class-heuristic names are used (backward compatible). The assumption:
+  sibling modules **of the same class** execute in their registration/definition
+  order (holds for q_norm-before-k_norm, the layer norms, etc.).
 
 ### Symbolic Shape System
 

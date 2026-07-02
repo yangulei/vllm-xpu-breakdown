@@ -124,6 +124,31 @@ def _get_real_trace_file() -> str | None:
     return sorted(files, key=os.path.getmtime, reverse=True)[0]
 
 
+def _find_multilayer_trace(num_layers: int, scan_limit: int = 12):
+    """Find the newest trace whose per-layer ops repeat across ``num_layers``.
+
+    Returns ``(path, parsed_ops)`` for the first (newest) trace that looks like a
+    full-model run — some op is called a positive multiple of ``num_layers`` — or
+    ``(None, None)`` if none of the newest ``scan_limit`` traces qualify (e.g.
+    only reduced-layer profiling traces are present). Selection is based on the
+    raw aggregated call count so it stays independent of the analyzer's own
+    layer-detection logic under test.
+    """
+    if not os.path.isdir(_TRACE_DIR):
+        return None, None
+    files = [os.path.join(_TRACE_DIR, f) for f in os.listdir(_TRACE_DIR)
+             if f.endswith(".json") or f.endswith(".json.gz")]
+    for path in sorted(files, key=os.path.getmtime, reverse=True)[:scan_limit]:
+        try:
+            ops = parse_trace_file(path)
+        except Exception:
+            continue
+        if any(o.get("count", 1) >= num_layers
+               and o.get("count", 1) % num_layers == 0 for o in ops):
+            return path, ops
+    return None, None
+
+
 # ===================================================================
 # Model Info Tests
 # ===================================================================
@@ -691,7 +716,18 @@ class TestRealTrace(unittest.TestCase):
                        "Should have cache ops")
 
     def test_full_pipeline_produces_analyzed_ops(self):
-        ops = parse_trace_file(self.trace_file)
+        # Layer merging only applies to full-model traces, where each per-layer
+        # op repeats once per layer. Reduced-layer profiling traces
+        # (``num_profile_layers`` < ``num_layers``) legitimately contain no
+        # multi-layer ops, so pick a genuinely multi-layer trace here — the
+        # shared ``output/traces/`` dir may hold either kind. Selection uses the
+        # raw per-op call count (a signal independent of the ``layer_count``
+        # field the analyzer computes), so an analyzer regression that fails to
+        # detect layer repetition still fails this test rather than skipping it.
+        trace_file, ops = _find_multilayer_trace(num_layers=36)
+        if not trace_file:
+            self.skipTest("No full-model (multi-layer) trace available")
+
         analyzed = analyze_ops(ops, dim_symbols=self.dim_symbols,
                                batch_size=1, seq_len=None,
                                model_dtype="bfloat16", num_layers=36)
@@ -1256,5 +1292,383 @@ class TestGraphFromTrace(unittest.TestCase):
         self.assertEqual(layers[-1]["repeat_count"], 5)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+class TestModuleNaming(unittest.TestCase):
+    """Recover real module attribute names (q_norm/k_norm, ...) for the graph."""
+
+    # named_modules() of a tiny Qwen3-style model: two RMSNorm siblings in
+    # attention (q_norm/k_norm) plus per-layer norms, and a ModuleList of layers.
+    NAMED_MODULES = [
+        ("", "Qwen3ForCausalLM"),
+        ("model", "Qwen3Model"),
+        ("model.embed_tokens", "VocabParallelEmbedding"),
+        ("model.layers", "ModuleList"),
+        ("model.layers.0", "Qwen3DecoderLayer"),
+        ("model.layers.0.self_attn", "Qwen3Attention"),
+        ("model.layers.0.self_attn.qkv_proj", "QKVParallelLinear"),
+        ("model.layers.0.self_attn.o_proj", "RowParallelLinear"),
+        ("model.layers.0.self_attn.q_norm", "RMSNorm"),
+        ("model.layers.0.self_attn.k_norm", "RMSNorm"),
+        ("model.layers.0.mlp", "Qwen3MLP"),
+        ("model.layers.0.input_layernorm", "RMSNorm"),
+        ("model.layers.0.post_attention_layernorm", "RMSNorm"),
+        ("model.layers.1", "Qwen3DecoderLayer"),
+        ("model.layers.1.self_attn", "Qwen3Attention"),
+        ("model.layers.1.self_attn.qkv_proj", "QKVParallelLinear"),
+        ("model.layers.1.self_attn.o_proj", "RowParallelLinear"),
+        ("model.layers.1.self_attn.q_norm", "RMSNorm"),
+        ("model.layers.1.self_attn.k_norm", "RMSNorm"),
+        ("model.layers.1.mlp", "Qwen3MLP"),
+        ("model.layers.1.input_layernorm", "RMSNorm"),
+        ("model.layers.1.post_attention_layernorm", "RMSNorm"),
+        ("model.norm", "RMSNorm"),
+        ("lm_head", "ParallelLMHead"),
+    ]
+
+    def _ref(self):
+        from breakdown.module_naming import build_ref_tree
+        return build_ref_tree(self.NAMED_MODULES)
+
+    def test_build_ref_tree_inlines_modulelist(self):
+        ref = self._ref()
+        self.assertEqual(ref["cls"], "Qwen3ForCausalLM")
+        model = next(c for c in ref["children"] if c["cls"] == "Qwen3Model")
+        # ModuleList "layers" is inlined + collapsed into ONE representative.
+        layers = [c for c in model["children"]
+                  if c["cls"] == "Qwen3DecoderLayer"]
+        self.assertEqual(len(layers), 1)
+        self.assertTrue(layers[0]["is_group"])
+        self.assertEqual(layers[0]["group_size"], 2)
+        self.assertEqual(layers[0]["attr"], "layers")
+
+    def test_build_ref_tree_preserves_sibling_norm_names(self):
+        ref = self._ref()
+        model = next(c for c in ref["children"] if c["cls"] == "Qwen3Model")
+        layer = next(c for c in model["children"]
+                     if c["cls"] == "Qwen3DecoderLayer")
+        attn = next(c for c in layer["children"] if c["cls"] == "Qwen3Attention")
+        norms = [c["attr"] for c in attn["children"] if c["cls"] == "RMSNorm"]
+        self.assertEqual(norms, ["q_norm", "k_norm"])
+
+    def _trace_tree(self):
+        # A trace-reconstructed tree: module_type is the class only; the two
+        # attention norms + two layer norms are indistinguishable siblings.
+        def mod(mt, children=None):
+            return {"name": mt, "module_type": mt, "repeat_count": 1,
+                    "ops": [], "children": children or []}
+        attn = mod("Qwen3Attention", [
+            mod("RMSNorm"),  # q_norm (executes first)
+            mod("RMSNorm"),  # k_norm
+        ])
+        layer = mod("Qwen3DecoderLayer", [
+            mod("RMSNorm"),   # input_layernorm
+            attn,
+            mod("RMSNorm"),   # post_attention_layernorm
+            mod("Qwen3MLP"),
+        ])
+        layer["repeat_count"] = 2
+        model = mod("Qwen3Model", [
+            mod("VocabParallelEmbedding"),
+            layer,
+            mod("RMSNorm"),  # final norm
+        ])
+        return mod("Qwen3ForCausalLM", [model])
+
+    def test_enrich_assigns_attribute_names(self):
+        from breakdown.module_naming import enrich_graph_names
+        tree = self._trace_tree()
+        enrich_graph_names({"prefill": tree, "decode": None}, self._ref())
+
+        model = tree["children"][0]
+        self.assertEqual(model["name"], "model")
+        layer = next(c for c in model["children"]
+                     if c["module_type"] == "Qwen3DecoderLayer")
+        self.assertEqual(layer["name"], "decoder_layer")
+        names = {c["module_type"]: c["name"] for c in layer["children"]}
+        # Sibling RMSNorms disambiguated by execution/definition order.
+        layer_norms = [c["name"] for c in layer["children"]
+                       if c["module_type"] == "RMSNorm"]
+        self.assertEqual(layer_norms,
+                         ["input_layernorm", "post_attention_layernorm"])
+        self.assertEqual(names["Qwen3Attention"], "self_attn")
+        self.assertEqual(names["Qwen3MLP"], "mlp")
+
+        attn = next(c for c in layer["children"]
+                    if c["module_type"] == "Qwen3Attention")
+        attn_norms = [c["name"] for c in attn["children"]
+                      if c["module_type"] == "RMSNorm"]
+        self.assertEqual(attn_norms, ["q_norm", "k_norm"])
+
+    def test_enrich_handles_step_wrapper(self):
+        # Multi-root phase trees are wrapped in a synthetic InferenceStep node.
+        from breakdown.module_naming import enrich_graph_names
+        inner = self._trace_tree()
+        wrapper = {"name": "step", "module_type": "InferenceStep",
+                   "repeat_count": 1, "ops": [], "children": [inner]}
+        enrich_graph_names({"prefill": wrapper, "decode": None}, self._ref())
+        self.assertEqual(inner["children"][0]["name"], "model")
+
+    def test_enrich_noop_without_ref(self):
+        from breakdown.module_naming import enrich_graph_names
+        tree = self._trace_tree()
+        enrich_graph_names({"prefill": tree, "decode": None}, None)
+        # Names unchanged (still class-name placeholders).
+        self.assertEqual(tree["children"][0]["name"], "Qwen3Model")
+
+    def test_empty_named_modules(self):
+        from breakdown.module_naming import build_ref_tree
+        self.assertIsNone(build_ref_tree([]))
+
+    def test_end_to_end_distinguishes_qnorm_knorm(self):
+        # Full reconstruction: two structurally-identical RMSNorm siblings in
+        # attention would collapse into one "norm ×2" node, but with the ref
+        # tree they must stay separate q_norm / k_norm nodes.
+        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.module_naming import build_ref_tree
+
+        events = []
+        ext = [0]
+        corr = [0]
+        tid = 7
+        midx = [0]
+
+        def kern(e, ts, dur):
+            corr[0] += 1
+            events.append({"ph": "X", "cat": "xpu_runtime", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": 0.1, "name": "l",
+                           "args": {"correlation": corr[0], "External id": e}})
+            events.append({"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+                           "ts": ts + 1000, "dur": dur, "name": "g",
+                           "args": {"correlation": corr[0]}})
+
+        def op(name, ts, dur, shapes, kdur):
+            ext[0] += 1
+            events.append({"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+                           "ts": ts, "dur": dur, "name": name,
+                           "args": {"External id": ext[0], "Input Dims": shapes,
+                                    "Input type": ["c10::BFloat16"]}})
+            if kdur:
+                kern(ext[0], ts, kdur)
+
+        def mod(cls, ts, dur):
+            events.append({"ph": "X", "cat": "python_function", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": dur,
+                           "name": f"nn.Module: {cls}_{midx[0]}"})
+            midx[0] += 1
+
+        mod("Qwen3ForCausalLM", 0, 400)
+        mod("Qwen3Model", 1, 398)
+        mod("VocabParallelEmbedding", 2, 2)
+        op("aten::embedding", 2, 1, [[32000, 16], [8]], 0)
+        for li in range(2):
+            b = 10 + li * 180
+            mod("Qwen3DecoderLayer", b, 178)
+            mod("RMSNorm", b + 1, 2)
+            op("aten::rms_norm", b + 1, 1, [[8, 16]], 1.0)
+            mod("Qwen3Attention", b + 5, 80)
+            op("aten::linear", b + 6, 4, [[8, 16], [48, 16]], 5.0)
+            mod("RMSNorm", b + 12, 2)   # q_norm
+            op("aten::rms_norm", b + 12, 1, [[8, 16]], 1.0)
+            mod("RMSNorm", b + 15, 2)   # k_norm
+            op("aten::rms_norm", b + 15, 1, [[8, 16]], 1.0)
+            mod("RMSNorm", b + 90, 2)   # post_attention_layernorm
+            op("aten::rms_norm", b + 90, 1, [[8, 16]], 1.0)
+            mod("Qwen3MLP", b + 95, 20)
+            op("aten::linear", b + 96, 4, [[8, 16], [64, 16]], 7.0)
+
+        ref = build_ref_tree(self.NAMED_MODULES)
+        summary = {"architecture": "Qwen3ForCausalLM", "hidden_size": 16,
+                   "num_heads": 3, "num_kv_heads": 3, "head_dim": 16,
+                   "intermediate_size": 64, "vocab_size": 32000,
+                   "num_layers": 2, "dtype": "bfloat16"}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"traceEvents": events}, f)
+            path = f.name
+        try:
+            g = build_graph_from_trace(path, summary, tp_size=1, batch_size=1,
+                                       ref_module_tree=ref)
+        finally:
+            os.unlink(path)
+
+        self.assertTrue(g["has_module_names"])
+        model = g["prefill"]["children"][0]
+        self.assertEqual(model["name"], "model")
+        layer = next(c for c in model["children"]
+                     if c["module_type"] == "Qwen3DecoderLayer")
+        self.assertEqual(layer["name"], "decoder_layer")
+        self.assertEqual(layer["repeat_count"], 2)  # layers still collapse
+        attn = next(c for c in layer["children"]
+                    if c["module_type"] == "Qwen3Attention")
+        norm_names = [c["name"] for c in attn["children"]
+                      if c["module_type"] == "RMSNorm"]
+        self.assertEqual(norm_names, ["q_norm", "k_norm"])
+        # Each stays a single instance — NOT collapsed into "norm ×2".
+        self.assertTrue(all(c["repeat_count"] == 1 for c in attn["children"]
+                            if c["module_type"] == "RMSNorm"))
+
+    def test_names_recovered_when_inner_model_level_absent(self):
+        # Real vLLM traces often DON'T emit a module event for the inner
+        # ``*Model`` wrapper — the decoder stack nests directly under
+        # ``*ForCausalLM``. The reference tree still has that level, so alignment
+        # must transparently unwrap it. Without the unwrap, child matching stalls
+        # at the top and q_norm/k_norm stay "norm".
+        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.module_naming import build_ref_tree
+
+        events = []
+        ext = [0]
+        corr = [0]
+        tid = 7
+        midx = [0]
+
+        def kern(e, ts, dur):
+            corr[0] += 1
+            events.append({"ph": "X", "cat": "xpu_runtime", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": 0.1, "name": "l",
+                           "args": {"correlation": corr[0], "External id": e}})
+            events.append({"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+                           "ts": ts + 1000, "dur": dur, "name": "g",
+                           "args": {"correlation": corr[0]}})
+
+        def op(name, ts, dur, shapes, kdur):
+            ext[0] += 1
+            events.append({"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+                           "ts": ts, "dur": dur, "name": name,
+                           "args": {"External id": ext[0], "Input Dims": shapes,
+                                    "Input type": ["c10::BFloat16"]}})
+            if kdur:
+                kern(ext[0], ts, kdur)
+
+        def mod(cls, ts, dur):
+            events.append({"ph": "X", "cat": "python_function", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": dur,
+                           "name": f"nn.Module: {cls}_{midx[0]}"})
+            midx[0] += 1
+
+        # NOTE: no Qwen3Model event — layers nest directly under ForCausalLM.
+        mod("Qwen3ForCausalLM", 0, 400)
+        mod("VocabParallelEmbedding", 2, 2)
+        op("aten::embedding", 2, 1, [[32000, 16], [8]], 0)
+        for li in range(2):
+            b = 10 + li * 180
+            mod("Qwen3DecoderLayer", b, 178)
+            mod("RMSNorm", b + 1, 2)
+            op("aten::rms_norm", b + 1, 1, [[8, 16]], 1.0)
+            mod("Qwen3Attention", b + 5, 80)
+            op("aten::linear", b + 6, 4, [[8, 16], [48, 16]], 5.0)
+            mod("RMSNorm", b + 12, 2)   # q_norm
+            op("aten::rms_norm", b + 12, 1, [[8, 16]], 1.0)
+            mod("RMSNorm", b + 15, 2)   # k_norm
+            op("aten::rms_norm", b + 15, 1, [[8, 16]], 1.0)
+            mod("RMSNorm", b + 90, 2)   # post_attention_layernorm
+            op("aten::rms_norm", b + 90, 1, [[8, 16]], 1.0)
+            mod("Qwen3MLP", b + 95, 20)
+            op("aten::linear", b + 96, 4, [[8, 16], [64, 16]], 7.0)
+
+        ref = build_ref_tree(self.NAMED_MODULES)
+        summary = {"architecture": "Qwen3ForCausalLM", "hidden_size": 16,
+                   "num_heads": 3, "num_kv_heads": 3, "head_dim": 16,
+                   "intermediate_size": 64, "vocab_size": 32000,
+                   "num_layers": 2, "dtype": "bfloat16"}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"traceEvents": events}, f)
+            path = f.name
+        try:
+            g = build_graph_from_trace(path, summary, tp_size=1, batch_size=1,
+                                       ref_module_tree=ref)
+        finally:
+            os.unlink(path)
+
+        self.assertTrue(g["has_module_names"])
+        # ForCausalLM's children were named across the missing model level.
+        root = g["prefill"]
+        self.assertEqual(root["module_type"], "Qwen3ForCausalLM")
+        embed = next(c for c in root["children"]
+                     if c["module_type"] == "VocabParallelEmbedding")
+        self.assertEqual(embed["name"], "embed_tokens")
+        layer = next(c for c in root["children"]
+                     if c["module_type"] == "Qwen3DecoderLayer")
+        self.assertEqual(layer["name"], "decoder_layer")
+        attn = next(c for c in layer["children"]
+                    if c["module_type"] == "Qwen3Attention")
+        norm_names = [c["name"] for c in attn["children"]
+                      if c["module_type"] == "RMSNorm"]
+        self.assertEqual(norm_names, ["q_norm", "k_norm"])
+
+
+class TestPhasePartition(unittest.TestCase):
+    """Prefill/decode step partition + main-model-class detection."""
+
+    def _build(self, prefill_tokens, decode_steps, lm_head_dev):
+        # Each engine step is [Model(deep), LogitsProcessor(shallow), Sampler].
+        # The LogitsProcessor's lm_head matmul is intentionally the most
+        # device-time-heavy op — main-class detection must NOT pick it.
+        from breakdown import graph_from_trace as G
+        events = []
+        ext = [0]
+        corr = [0]
+        tid = 7
+        midx = [0]
+        clock = [0]
+
+        def kern(e, ts, dur):
+            corr[0] += 1
+            events.append({"ph": "X", "cat": "xpu_runtime", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": 0.1, "name": "l",
+                           "args": {"correlation": corr[0], "External id": e}})
+            events.append({"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+                           "ts": ts + 100000, "dur": dur, "name": "g",
+                           "args": {"correlation": corr[0]}})
+
+        def op(name, ts, dur, shapes, kdur):
+            ext[0] += 1
+            events.append({"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+                           "ts": ts, "dur": dur, "name": name,
+                           "args": {"External id": ext[0], "Input Dims": shapes,
+                                    "Input type": ["c10::BFloat16"]}})
+            if kdur:
+                kern(ext[0], ts, kdur)
+
+        def mod(cls, ts, dur):
+            events.append({"ph": "X", "cat": "python_function", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": dur,
+                           "name": f"nn.Module: {cls}_{midx[0]}"})
+            midx[0] += 1
+
+        def step(tokens):
+            t0 = clock[0]
+            mod("LlamaForCausalLM", t0, 200)          # deep model
+            mod("LlamaDecoderLayer", t0 + 1, 190)
+            op("aten::mm", t0 + 2, 4, [[tokens, 16], [16, 16]], 2.0)
+            t1 = t0 + 210
+            mod("LogitsProcessor", t1, 30)            # shallow, huge lm_head op
+            op("aten::mm", t1 + 1, 20, [[tokens, 16], [16, 32000]], lm_head_dev)
+            t2 = t1 + 40
+            mod("Sampler", t2, 10)
+            clock[0] = t2 + 20
+
+        step(prefill_tokens)
+        for _ in range(decode_steps):
+            step(1)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            json.dump({"traceEvents": events}, f)
+            path = f.name
+        try:
+            summary = {"architecture": "LlamaForCausalLM", "hidden_size": 16,
+                       "num_heads": 1, "num_kv_heads": 1, "head_dim": 16,
+                       "intermediate_size": 16, "vocab_size": 32000,
+                       "num_layers": 1, "dtype": "bfloat16"}
+            return G.build_graph_from_trace(path, summary, tp_size=1,
+                                            batch_size=1)
+        finally:
+            os.unlink(path)
+
+    def test_main_class_is_model_not_logits_processor(self):
+        # lm_head op dominates device time, but the model subtree is deeper.
+        g = self._build(prefill_tokens=8, decode_steps=3, lm_head_dev=999.0)
+        # Both phases reconstructed and distinct (prefill S=8, decode B=1).
+        self.assertIsNotNone(g["prefill"])
+        self.assertIsNotNone(g["decode"])
+        self.assertEqual(g["symbols"].get("S"), 8)
+        self.assertEqual(g["symbols"].get("B"), 1)

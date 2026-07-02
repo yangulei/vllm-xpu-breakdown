@@ -144,7 +144,7 @@ class _Raw:
     """A node in the raw trace nesting tree (a module or a leaf op)."""
 
     __slots__ = ("kind", "label", "ts", "end", "dur", "ext", "shapes",
-                 "dtype", "children", "self_dev", "sub_dev")
+                 "dtype", "children", "self_dev", "sub_dev", "attr_name")
 
     def __init__(self, kind: str, label: str, ts: float, dur: float):
         self.kind = kind          # "module" or "op"
@@ -158,6 +158,7 @@ class _Raw:
         self.children: list[_Raw] = []
         self.self_dev = 0.0       # device us launched directly by this op
         self.sub_dev = 0.0        # device us of this node + all descendants
+        self.attr_name = ""       # real module attribute name (q_norm, ...)
 
 
 def _deepest_at(roots: list[_Raw], ts: float) -> _Raw | None:
@@ -334,12 +335,30 @@ def _pass_token_dim(root: _Raw) -> int:
     return best
 
 
+def _subtree_module_count(root: _Raw) -> int:
+    """Number of module nodes in ``root``'s subtree (including itself)."""
+    n = 0
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.kind == "module":
+            n += 1
+        stack.extend(node.children)
+    return n
+
+
 def _partition_steps(roots: list[_Raw]) -> tuple[list[dict], str]:
     """Group top-level module roots into inference steps.
 
     A step is one iteration of the engine: the main model forward followed by
     its post-processing roots (``LogitsProcessor``, ``Sampler`` ...). The main
-    model class is the module-root class that accounts for the most device time.
+    model class is the module-root class with the largest module subtree — the
+    full model forward is structurally deep (decoder layers, attention, MLP, ...)
+    while post-processing roots (``LogitsProcessor``, ``Sampler``) are shallow.
+    Device time is *not* used to pick the main class: the ``lm_head`` vocab
+    projection inside ``LogitsProcessor`` (``V``-wide matmul, run once per decode
+    step) can outweigh the whole model forward, which previously mis-selected
+    ``LogitsProcessor`` as the main class and collapsed the prefill pass.
 
     Returns ``(steps, main_class)`` where each step is
     ``{"main": _Raw|None, "roots": [_Raw, ...], "token": int}``.
@@ -349,11 +368,12 @@ def _partition_steps(roots: list[_Raw]) -> tuple[list[dict], str]:
     if not module_roots:
         return [], ""
 
-    dev_by_class: dict[str, float] = {}
+    size_by_class: dict[str, int] = {}
     for r in module_roots:
         norm = _strip_instance_idx(r.label)
-        dev_by_class[norm] = dev_by_class.get(norm, 0.0) + r.sub_dev
-    main_class = max(dev_by_class, key=dev_by_class.get)
+        size_by_class[norm] = max(size_by_class.get(norm, 0),
+                                  _subtree_module_count(r))
+    main_class = max(size_by_class, key=size_by_class.get)
 
     steps: list[dict] = []
     cur: dict | None = None
@@ -414,6 +434,43 @@ def _module_children(node: _Raw) -> list[_Raw]:
     return [c for c in node.children if c.kind == "module"]
 
 
+def _apply_ref_names(roots: list[_Raw], ref_tree: dict) -> None:
+    """Overlay real module attribute names onto the raw module forest.
+
+    Uses the reference module-name tree (from ``module_naming.build_ref_tree``,
+    derived from the live model's ``named_modules()``) to assign each raw module
+    node its attribute name — ``q_norm``/``k_norm``, ``input_layernorm``,
+    ``self_attn``, ... — by matching children on ``(class, order)``. Applied on
+    the *raw* forest before finalization so the recovered names also feed the
+    structural signature, keeping distinctly-named siblings (q_norm vs k_norm)
+    from collapsing while genuinely-repeated layers still merge.
+    """
+    from .module_naming import (_display_name, _effective_ref_children,
+                                _find_ref_desc, _match_ref)
+
+    def align(raw_node: _Raw, rnode: dict) -> None:
+        raw_node.attr_name = _display_name(rnode)
+        raw_mod_children = _module_children(raw_node)
+        present = {_strip_instance_idx(cm.label) for cm in raw_mod_children}
+        rchildren = _effective_ref_children(rnode, present)
+        used = [False] * len(rchildren)
+        for cm in raw_mod_children:
+            j = _match_ref(rchildren, used, _strip_instance_idx(cm.label))
+            if j is not None:
+                used[j] = True
+                align(cm, rchildren[j])
+
+    root_cls = ref_tree.get("cls")
+    for root in roots:
+        rc = _strip_instance_idx(root.label)
+        if rc == root_cls:
+            align(root, ref_tree)
+        else:
+            r = _find_ref_desc(ref_tree, rc)
+            if r is not None:
+                align(root, r)
+
+
 def _direct_ops(node: _Raw) -> list[_Raw]:
     """Op children that belong to this module (not nested in a child module)."""
     return [c for c in node.children if c.kind == "op"
@@ -462,6 +519,7 @@ def _merge_modules(instances: list[_Raw], n_forward: int) -> dict:
 
     return {
         "module_type": _strip_instance_idx(base.label),
+        "attr_name": base.attr_name,
         "op_groups": op_groups,
         "op_order": op_order,
         "child_groups": child_groups,
@@ -483,6 +541,7 @@ def _finalize_node(
     """Turn a merged module description into the serialized display dict."""
     n_forward = merged["n_forward"]
     module_path = _split_path_types(path)
+    display_name = merged.get("attr_name") or name
 
     ops_out: list[dict] = []
     node_dev = 0.0
@@ -540,7 +599,7 @@ def _finalize_node(
         child_merged = _merge_modules(insts, n_forward)
         child = _finalize_node(
             child_merged,
-            name=_module_display_name(norm),
+            name=child_merged.get("attr_name") or _module_display_name(norm),
             path=path + "/" + norm,
             repeat_count=1,
             symbols_val=symbols_val,
@@ -562,7 +621,7 @@ def _finalize_node(
 
     ai = (node_flops / node_mem) if node_mem > 0 else 0
     return {
-        "name": name,
+        "name": display_name,
         "path": path,
         "module_type": merged["module_type"],
         "repeat_count": repeat_count,
@@ -580,6 +639,7 @@ def _struct_sig(node: dict) -> tuple:
     """Structural signature (ignores timing) for detecting repeated siblings."""
     return (
         node["module_type"],
+        node.get("name"),
         node["repeat_count"],
         tuple((o["name"], o["role"],
                tuple(tuple(s) for s in o["input_shapes"]))
@@ -863,6 +923,7 @@ def build_graph_from_trace(
     tp_size: int = 1,
     batch_size: int = 1,
     quantization: str | None = None,
+    ref_module_tree: dict | None = None,
 ) -> dict:
     """Reconstruct a model graph purely from a torch profiler trace.
 
@@ -875,6 +936,11 @@ def build_graph_from_trace(
         tp_size: tensor-parallel size the trace was captured at (per-rank shapes).
         batch_size: request batch size, used for prefill/decode disambiguation.
         quantization: quant method, surfaced in ``config`` for the UI's dtype hints.
+        ref_module_tree: optional reference module-name tree (from
+            ``module_naming.build_ref_tree``) used to overlay real attribute
+            names (``q_norm``/``k_norm``, ``input_layernorm``, ...) onto the
+            trace-reconstructed module nodes. When omitted, nodes keep their
+            class-name-derived heuristic labels.
 
     Returns:
         Dict with ``prefill`` / ``decode`` trees (either may be ``None``),
@@ -894,6 +960,16 @@ def build_graph_from_trace(
         return {"prefill": None, "decode": None, "symbols": {},
                 "config": {}, "has_timing": False,
                 "error": "no module/op events (trace missing with_stack?)"}
+
+    # Overlay real module attribute names (q_norm/k_norm, input_layernorm, ...)
+    # from the reference module tree onto the class-name-based raw module nodes.
+    # Done before phase building so recovered names feed the structural signature
+    # and keep distinctly-named siblings from collapsing together.
+    if ref_module_tree:
+        try:
+            _apply_ref_names(roots, ref_module_tree)
+        except Exception:
+            pass  # naming enrichment is best-effort
 
     prefill_passes, decode_passes, n_pre, n_dec = _classify_steps(
         roots, batch_size)
@@ -942,6 +1018,7 @@ def build_graph_from_trace(
             "num_layers": summary.get("num_layers"),
         },
         "has_timing": True,
+        "has_module_names": bool(ref_module_tree),
         "timing_matched": total_ops,
         "timing_total_ops": total_ops,
         "timing_method": "trace_reconstruction",

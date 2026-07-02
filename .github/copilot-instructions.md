@@ -42,6 +42,9 @@ Flask web app (`app.py`) + static SPA (`static/index.html`) backed by a `breakdo
 **Key data flow:**
 - `model_info.py` fetches HF config → `model_graph.py` builds `ModuleNode`/`OpNode` tree → `app.py` serializes to JSON → `index.html` renders tree
 - `profiler.py` runs inference → `graph_from_trace.py` reconstructs the module/op tree from the trace (reusing `analyzer.py` shapes/memory/FLOPs + `classifier.py` backends) → `app.py` serializes to JSON. The removed `annotate_graph_*` / `parse_trace_with_modules` static-overlay path is not used anymore.
+- `module_naming.py` recovers real module attribute names (`q_norm`/`k_norm`, `input_layernorm`, ...) from the live model's `named_modules()` (`ref_tree_from_llm`, captured during profiling) and overlays them onto the reconstructed tree (`graph_from_trace._apply_ref_names`, applied before repeat-collapse). The trace alone only exposes class names, so same-class siblings would otherwise be indistinguishable. Opt-in via `build_graph_from_trace(..., ref_module_tree=...)`. Alignment unwraps reference `*Model` levels absent from the trace (`_effective_ref_children`) — vLLM's inner `*Model.forward` often emits no module event, and without unwrapping, matching stalls and names fall back to `norm`.
+
+**Two subtle invariants (don't regress):** (1) `_partition_steps` picks the main model class by **largest module subtree** (`_subtree_module_count`), NOT device time — the `LogitsProcessor` `lm_head` matmul can dominate `sub_dev`, which previously mis-selected it, dropped the prefill phase (`prefill: None`) and made both phases identical. (2) The frontend (`applyProfileResult`) auto-selects a phase that has a reconstructed tree so the graph shows immediately.
 
 **Backend classification priority:** vllm-xpu-kernels (exact match from registry) > triton (name patterns) > torch-xpu-ops (aten:: on XPU) > cpu > framework
 

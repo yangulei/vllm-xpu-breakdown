@@ -578,6 +578,15 @@ function applyProfileResult(data) {
     GRAPH_DATA = data.graph;
     document.getElementById('graph-section').classList.add('visible');
     updateGraphSubtitle();
+    // Auto-select a phase that actually has a reconstructed tree so the graph
+    // renders immediately (e.g. encoder models have no decode phase).
+    if (!GRAPH_DATA[currentPhase]) {
+      const avail = GRAPH_DATA.prefill ? 'prefill'
+        : (GRAPH_DATA.decode ? 'decode' : currentPhase);
+      const btn = document.querySelector(`.phase-btn[data-phase="${avail}"]`);
+      if (btn && avail !== currentPhase) { setPhase(btn); return; }
+      currentPhase = avail;
+    }
     renderGraph();
   }
 }
