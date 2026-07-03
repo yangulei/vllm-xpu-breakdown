@@ -251,12 +251,6 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
         <legend style="font-size:12px;font-weight:600;padding:0 6px">Prefill</legend>
         <div class="controls-row">
           <div class="control-group">
-            <label>Prefill Batch</label>
-            <input type="number" id="prefill-batch-size" value="1" disabled
-                   style="background:#eee"
-                   title="Fixed at 1: the profiled prefill measures a single sequence's prefill (S = Query Len). With batch > 1 vLLM packs the batch, so S would become Prefill Batch × Query Len.">
-          </div>
-          <div class="control-group">
             <label>Query Len</label>
             <input type="number" id="query-len" value="2048" min="1" step="1"
                    title="New prefill tokens computed this pass (the profiled prefill sequence length S).">
@@ -274,7 +268,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
           <div class="control-group">
             <label>Decode Batch</label>
             <input type="number" id="decode-batch-size" value="32" min="1" max="512"
-                   title="Concurrent sequences for the decode phase (often 32/64/128). If it differs from Prefill Batch, profiling runs two passes and merges them.">
+                   title="Concurrent sequences for the decode phase (often 32/64/128). The prefill is always profiled at batch 1, so profiling runs two passes (prefill@1 + decode@this) and merges them.">
           </div>
           <div class="control-group">
             <label>Decode Steps</label>
