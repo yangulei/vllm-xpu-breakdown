@@ -606,11 +606,6 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
 
         llm = LLM(**engine_kwargs)
 
-        # ignore_eos keeps every sequence alive for the full decode budget so
-        # the profiled decode step reflects the requested batch (a sequence
-        # hitting EOS early would shrink the observed decode concurrency ``B``).
-        sampling_params = SamplingParams(max_tokens=max_tokens, ignore_eos=True)
-
         if use_token_prompts:
             block_size = _get_block_size(llm)
             vocab_size = _get_vocab_size(llm, summary)
@@ -628,14 +623,27 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             return {os.path.join(trace_dir, f) for f in os.listdir(trace_dir)
                     if f.endswith(".json") or f.endswith(".json.gz")}
 
-        def _profiled_pass(pass_batch: int, pass_query_len: int):
+        def _profiled_pass(pass_batch: int, pass_query_len: int,
+                           pass_max_tokens: int):
             """Warm + run one profiled generate at the given batch/query size.
+
+            ``pass_max_tokens`` is the number of tokens to generate this pass:
+            the decode pass uses the full decode budget (so decode steps are
+            captured), while the prefill pass uses **1** — it only needs the
+            single prefill step (``S`` = ``query_len``), and generating extra
+            decode tokens would only bloat the trace and slow the run.
+
+            ``ignore_eos`` keeps every sequence alive for the full budget so the
+            profiled decode step reflects the requested batch (a sequence hitting
+            EOS early would shrink the observed decode concurrency ``B``).
 
             Returns ``(rank_files, cache_hit_note)``: the trace file(s) newly
             written by this pass (newest first, capped to ``tp_size``) and an
             optional prefix-cache-miss note.
             """
             note = None
+            pass_sampling = SamplingParams(max_tokens=pass_max_tokens,
+                                           ignore_eos=True)
             if use_token_prompts:
                 def _full_prompt(query_seed: int) -> "TokensPrompt":
                     q = _make_token_ids(pass_query_len, vocab_size, seed=query_seed)
@@ -656,13 +664,13 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
                         SamplingParams(max_tokens=1), use_tqdm=False,
                     )
                 for w in range(2):
-                    llm.generate(_batch(1000 * (w + 1)), sampling_params,
+                    llm.generate(_batch(1000 * (w + 1)), pass_sampling,
                                  use_tqdm=False)
                 profiled_prompts = _batch(900000)
 
                 before = _list_trace_files()
                 llm.start_profile()
-                outputs = llm.generate(profiled_prompts, sampling_params,
+                outputs = llm.generate(profiled_prompts, pass_sampling,
                                        use_tqdm=False)
                 llm.stop_profile()
 
@@ -688,17 +696,17 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
 
                 # First warmup pass also detects chat-template support.
                 try:
-                    llm.chat(conversations, sampling_params, use_tqdm=False)
+                    llm.chat(conversations, pass_sampling, use_tqdm=False)
                     use_chat = True
                 except Exception:
-                    llm.generate(prompts, sampling_params, use_tqdm=False)
+                    llm.generate(prompts, pass_sampling, use_tqdm=False)
                     use_chat = False
 
                 def _run_inference():
                     if use_chat:
-                        llm.chat(conversations, sampling_params, use_tqdm=False)
+                        llm.chat(conversations, pass_sampling, use_tqdm=False)
                     else:
-                        llm.generate(prompts, sampling_params, use_tqdm=False)
+                        llm.generate(prompts, pass_sampling, use_tqdm=False)
 
                 # Warmup primes Triton JIT / autotuning so the profiled trace
                 # reflects steady-state timing. Detection pass above is warmup
@@ -727,17 +735,24 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
 
         # --- Run the profiled pass(es) ---
         if two_pass:
-            # Prefill pass: batch = prefill_batch, real query_len (keeps its
-            # prefill phase). Decode pass: batch = decode_batch, query_len forced
-            # to 1 so decode is 1 new token/seq (matches real decode and avoids
-            # OOM from prefilling decode_batch x query_len tokens) — keeps its
-            # decode phase.
-            pre_files, note_pre = _profiled_pass(pf_batch, query_len)
+            # Prefill pass: batch = prefill_batch, real query_len, generate only
+            # 1 token so the trace holds exactly the prefill step (S=query_len)
+            # — we keep only its prefill phase. Decode pass: batch = decode_batch,
+            # query_len forced to 1 so decode is 1 new token/seq (matches real
+            # decode and avoids OOM from prefilling decode_batch x query_len
+            # tokens), generating the full decode budget — we keep its decode
+            # phase.
+            pre_files, note_pre = _profiled_pass(pf_batch, query_len,
+                                                 pass_max_tokens=1)
             dec_query = 1 if use_token_prompts else 0
-            dec_files, note_dec = _profiled_pass(dc_batch, dec_query)
+            dec_files, note_dec = _profiled_pass(dc_batch, dec_query,
+                                                 pass_max_tokens=max_tokens)
             cache_hit_note = note_pre or note_dec
         else:
-            single_files, cache_hit_note = _profiled_pass(dc_batch, query_len)
+            # Single pass yields both phases from one run, so it needs the full
+            # decode budget.
+            single_files, cache_hit_note = _profiled_pass(
+                dc_batch, query_len, pass_max_tokens=max_tokens)
 
         # Capture the real module hierarchy (attribute names like q_norm/k_norm)
         # from the loaded model while it is still alive, to enrich the

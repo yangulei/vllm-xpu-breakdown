@@ -299,10 +299,13 @@ Classifies ops by name prefix/pattern to backends. Priority order:
   `llm.generate` prefills and decodes the *same* batch (so `S` and `B` couple to
   one `batch_size`). When `prefill_batch_size != decode_batch_size`, `_run_profile`
   runs **two** profiled passes reusing the one loaded `LLM`: a **prefill pass** at
-  `prefill_batch` with the real `query_len` (keep its `prefill` tree, `S`=query_len)
+  `prefill_batch` with the real `query_len`, generating only **1** token so the
+  trace holds exactly the prefill step (keep its `prefill` tree, `S`=query_len),
   and a **decode pass** at `decode_batch` with `query_len` forced to **1** (decode
-  = 1 new token/seq; also avoids OOM from prefilling `decode_batch × query_len`)
-  (keep its `decode` tree, `B`=decode_batch). `_merge_two_pass_result` splices them:
+  = 1 new token/seq; also avoids OOM from prefilling `decode_batch × query_len`),
+  generating the full decode budget (keep its `decode` tree, `B`=decode_batch).
+  `_profiled_pass` takes a `pass_max_tokens` so each pass generates only what its
+  kept phase needs — the prefill pass no longer wastes time/trace on decode steps. `_merge_two_pass_result` splices them:
   decode pass is the base (its op/backend breakdown is the steady-state one), the
   prefill pass's `graph.prefill` is overlaid, and symbols are combined (`S`/`S+C`/`C`
   from prefill, `B` from decode). Each `_profiled_pass` snapshots `trace_dir` before
