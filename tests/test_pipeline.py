@@ -1324,6 +1324,40 @@ class TestGraphFromTrace(unittest.TestCase):
         self.assertIsNotNone(g["prefill"])
         self.assertIsNotNone(g["decode"])
 
+    def test_partial_batch_decode_steps_dropped(self):
+        # vLLM admits the batch in ramp-up waves, so early decode steps run
+        # fewer than `batch_size` sequences (partial rows like 2/30). Only the
+        # steady-state full-batch (32) steps must survive, so the decode op row
+        # dim symbolizes to B=32 rather than leaking literal 2/30 nodes.
+        from breakdown.graph_from_trace import build_graph_from_trace
+        summary = dict(self.SUMMARY)
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            # 1 prefill (40 tok) + ramp decode (2, 30) + steady decode (32, 32)
+            json.dump(_synthetic_trace([40, 2, 30, 32, 32]), f)
+            path = f.name
+        try:
+            g = build_graph_from_trace(path, summary, tp_size=1, batch_size=32)
+        finally:
+            os.unlink(path)
+
+        self.assertIsNotNone(g["decode"])
+        self.assertEqual(g["symbols"]["B"], 32)
+
+        def _row_dims(node, acc):
+            for o in node.get("ops", []):
+                for s in o.get("input_shapes", []):
+                    if s:
+                        acc.append(s[0])
+            for c in node.get("children", []):
+                _row_dims(c, acc)
+            return acc
+
+        rows = _row_dims(g["decode"], [])
+        # No partial-batch literal ints (2, 30) survived; batch dim is symbolic B.
+        self.assertNotIn(2, rows)
+        self.assertNotIn(30, rows)
+        self.assertIn("B", rows)
+
     def test_shapes_symbolized(self):
         g = self._build([8])
         model = g["prefill"]["children"][0]

@@ -341,18 +341,29 @@ Classifies ops by name prefix/pattern to backends. Priority order:
   phases and report `B = batch_size − 1` (a ramp step). Comparing to `batch_size`
   also classifies each chunk of a chunked prefill correctly. Verified end-to-end on
   XPU (Qwen3-4B): prefill@1 → `S=query_len`, decode@8 → `B=8`.
-- **The first decode step is always dropped from the decode average.**
-  `graph_from_trace._classify_steps` discards the first decode step's roots
-  before the phase tree is built: the initial decode forward after prefill pays
-  one-time warmup costs (KV/allocator warmup, oneDNN/Triton plan + autotune
-  caching under `torch.compile`) that would skew the steady-state per-op latency
-  average. The drop is **guarded** (`len(decode_steps) >= 2`) so a phase with a
-  single decode step is never emptied. The profiling UI exposes a **Decode
-  Steps** control (`max_tokens`, default **8**) with a `>= 2` minimum so at least
-  one steady-state step always remains after the drop. See
+- **Only steady-state, full-batch decode steps are kept.**
+  `graph_from_trace._classify_steps` restricts the decode phase to the steps
+  whose token dim equals the **maximum observed decode batch** before building
+  the phase tree. vLLM admits the `batch_size` sequences into the running batch
+  in **ramp-up waves**, so the early decode steps process fewer sequences and
+  their per-token ops (embedding, `rms_norm`/`fused_add_rms_norm`,
+  `rotary_embedding`, dense matmuls) carry **partial row counts**
+  (`2`/`4`/`28`/`30` instead of `32`). Those partial-batch steps are transient
+  and would otherwise surface as spurious literal-int (non-`B`) nodes in the
+  reconstructed decode graph — the symptom is duplicated near-`B` nodes like
+  `28`/`30`. Keeping only the max-batch steps makes the batch dim symbolize
+  cleanly to `B`. If the configured batch is never fully reached (e.g. KV-cache
+  pressure caps it below `batch_size`), the largest batch actually run is used
+  (the honest steady state). Among the surviving steady-state steps the **first
+  is additionally dropped as warmup**: the initial full-batch decode forward pays
+  one-time costs (KV/allocator warmup, oneDNN/Triton plan + autotune caching
+  under `torch.compile`) that would skew the per-op latency average. Both filters
+  are **guarded** so the decode phase is never emptied — at least one steady-state
+  step always remains. The profiling UI exposes a **Decode Steps** control
+  (`max_tokens`, default **8**) with a `>= 2` minimum. See
   `TestGraphFromTrace.test_first_decode_step_dropped_from_average` /
-  `test_single_decode_step_not_dropped`. Do NOT remove the guard or the UI
-  minimum.
+  `test_single_decode_step_not_dropped` / `test_partial_batch_decode_steps_dropped`.
+  Do NOT remove the guards or the UI minimum.
 - **Main model class is picked by subtree size, not device time.** The
   `LogitsProcessor`'s `lm_head` matmul (`V`-wide, once per decode step) can
   out-weigh the whole model forward, so selecting the main class by `sub_dev`

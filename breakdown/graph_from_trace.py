@@ -476,12 +476,23 @@ def _classify_steps(roots: list[_Raw], batch_size: int
     phases. Comparing to ``batch_size`` also classifies each chunk of a chunked
     prefill correctly.
 
-    The **first decode step is always dropped** from the decode phase: the
-    initial decode forward after prefill pays one-time warmup costs (KV/allocator
-    warmup, oneDNN/Triton plan + autotune caching under ``torch.compile``) that
-    would skew the steady-state per-op latency average. The drop is guarded so a
-    phase with a single decode step is never emptied — the profiling UI enforces
-    ``>= 2`` decode steps, so at least one steady-state step always remains.
+    Only **steady-state, full-batch decode steps are kept**. vLLM admits the
+    ``batch_size`` sequences into the running batch in ramp-up waves, so the
+    early decode steps process *fewer* than ``batch_size`` sequences (their norm/
+    rotary/matmul ops carry partial row counts like ``2``/``4``/``28``/``30``
+    instead of ``32``). Those partial-batch steps are transient and would show up
+    as spurious literal-int (non-``B``) nodes in the reconstructed graph, so the
+    decode phase is restricted to the steps whose token dim equals the **maximum
+    observed decode batch** (the steady state). If the configured batch is never
+    fully reached (e.g. KV-cache pressure caps it below ``batch_size``), the
+    largest batch actually run is used — which is the honest steady state.
+
+    Among those steady-state steps the **first is additionally dropped** as
+    warmup: the initial full-batch decode forward pays one-time costs (KV/
+    allocator warmup, oneDNN/Triton plan + autotune caching under
+    ``torch.compile``) that would skew the per-op latency average. Both filters
+    are guarded so the decode phase is never emptied — at least one steady-state
+    step always remains.
 
     Returns ``(prefill_roots, decode_roots, n_prefill_steps, n_decode_steps)``.
     """
@@ -494,7 +505,16 @@ def _classify_steps(roots: list[_Raw], batch_size: int
     prefill_steps = [s for s in steps if s["token"] > threshold]
     decode_steps = [s for s in steps if s["token"] <= threshold]
 
-    # Drop the warmup first decode step (guarded so decode is never emptied).
+    # Restrict decode to steady-state, full-batch steps: drop ramp-up/partial
+    # batches (fewer running seqs than the steady state) which would otherwise
+    # appear as spurious partial-row nodes. Guarded so decode is never emptied.
+    if decode_steps:
+        max_decode = max(s["token"] for s in decode_steps)
+        steady = [s for s in decode_steps if s["token"] == max_decode]
+        if steady:
+            decode_steps = steady
+
+    # Drop the warmup first steady decode step (guarded so decode is never emptied).
     if len(decode_steps) >= 2:
         decode_steps = decode_steps[1:]
 
