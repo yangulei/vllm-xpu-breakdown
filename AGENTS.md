@@ -311,6 +311,21 @@ Classifies ops by name prefix/pattern to backends. Priority order:
   single pass, identical to before. Frontend sends `prefill_batch_size` /
   `decode_batch_size`; `setPhase` no longer rewrites the inputs since one run now
   yields both phases. See `tests/test_two_pass_merge.py`.
+- **The scheduler is pinned so decode runs the full batch every step.**
+  `_run_profile` sets `max_num_seqs = max(prefill_batch, decode_batch)` (and
+  `max_num_batched_tokens` large enough for a whole-batch prefill step) *before*
+  constructing the `LLM`. Without this, vLLM's continuous-batching scheduler
+  caps per-iteration concurrency (by its default `max_num_seqs` and by how many
+  sequences' KV fits in cache) and dispatches an oversized batch in
+  **partial-batch waves** — a batch of 32 as e.g. `29 + 3`. Each wave has a
+  different row count (`num_running_seqs`), so `_symbolize` (which only maps the
+  max decode row count to `B`) leaves the partial waves as literal ints, and
+  `_merge_modules` (keys ops by `(name, shapes)`) can't merge them — they surface
+  as **duplicated `29`/`3` op nodes** in the decode graph instead of one `B`
+  node. Pinning `max_num_seqs` makes every decode forward run all
+  `decode_batch` sequences → a clean single `B`. Do NOT remove the pin; if a
+  batch's KV won't fit device memory, raise `gpu_memory_utilization` or lower
+  Context/Batch rather than reverting to the splitting default.
 - **Phase classification is `token_dim > batch_size`, not "max-token step = prefill".**
   `graph_from_trace._classify_steps` labels a step **prefill** iff its forward
   processes *more than one token per running sequence* (`token > batch_size`); a

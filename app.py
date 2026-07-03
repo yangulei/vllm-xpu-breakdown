@@ -576,19 +576,40 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             os.environ.pop("VLLM_TORCH_COMPILE_LEVEL", None)
             engine_kwargs["enforce_eager"] = True
 
-        llm = LLM(**engine_kwargs)
-
-        # ignore_eos keeps every sequence alive for the full decode budget so
-        # the profiled decode step reflects the requested batch (a sequence
-        # hitting EOS early would shrink the observed decode concurrency ``B``).
-        sampling_params = SamplingParams(max_tokens=max_tokens, ignore_eos=True)
-
         # Resolve the per-phase batch sizes. When prefill and decode batches
         # differ we profile two passes (real serving prefills ~1 sequence while
         # decoding many); otherwise a single pass reproduces legacy behaviour.
         pf_batch = int(prefill_batch_size) if prefill_batch_size else int(batch_size)
         dc_batch = int(decode_batch_size) if decode_batch_size else int(batch_size)
         two_pass = pf_batch != dc_batch
+        max_batch = max(pf_batch, dc_batch)
+
+        # Pin the scheduler so every decode step runs the *full* requested batch
+        # (``B = decode_batch``). Left to its defaults, vLLM's continuous-batching
+        # scheduler caps per-iteration concurrency (by ``max_num_seqs`` and by how
+        # many sequences' KV fits in cache) and runs an oversized batch in
+        # *partial-batch waves* — e.g. a batch of 32 dispatched as 29 + 3. Each
+        # wave has a different row count, so its ops neither symbolize to ``B``
+        # nor merge with the full-batch ops, surfacing as duplicated ``29``/``3``
+        # nodes in the reconstructed decode graph. ``max_num_seqs = max_batch``
+        # forces the scheduler to admit the whole batch in one iteration;
+        # ``max_num_batched_tokens`` is sized to also admit a whole batch's
+        # prefill tokens in a single step (prefill pass: ``pf_batch × query_len``;
+        # decode pass: ``dc_batch`` single-token prefills) so a full-shape step is
+        # never chunked. If the batch's KV cannot fit device memory, raise
+        # ``gpu_memory_utilization`` or lower Context/Batch rather than letting the
+        # run silently split.
+        engine_kwargs["max_num_seqs"] = max_batch
+        _prefill_step_tokens = pf_batch * max(int(query_len), 1)
+        engine_kwargs["max_num_batched_tokens"] = max(
+            _prefill_step_tokens, max_batch, 2048)
+
+        llm = LLM(**engine_kwargs)
+
+        # ignore_eos keeps every sequence alive for the full decode budget so
+        # the profiled decode step reflects the requested batch (a sequence
+        # hitting EOS early would shrink the observed decode concurrency ``B``).
+        sampling_params = SamplingParams(max_tokens=max_tokens, ignore_eos=True)
 
         if use_token_prompts:
             block_size = _get_block_size(llm)
