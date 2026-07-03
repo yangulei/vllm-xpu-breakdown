@@ -252,8 +252,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
         <div class="controls-row">
           <div class="control-group">
             <label>Prefill Batch</label>
-            <input type="number" id="prefill-batch-size" value="1" min="1" max="512"
-                   title="Concurrent sequences for the prefill phase (real serving is usually 1).">
+            <input type="number" id="prefill-batch-size" value="1" disabled
+                   style="background:#eee"
+                   title="Fixed at 1: the profiled prefill measures a single sequence's prefill (S = Query Len). With batch > 1 vLLM packs the batch, so S would become Prefill Batch × Query Len.">
           </div>
           <div class="control-group">
             <label>Query Len</label>
@@ -535,7 +536,9 @@ async function startProfile() {
   const profCtxLen = parseInt(document.getElementById('context-len').value);
   const profMaxLen = profQueryLen + (Number.isFinite(profCtxLen) ? profCtxLen : 4096);
 
-  const prefillBatch = parseInt(document.getElementById('prefill-batch-size').value) || 1;
+  // Prefill Batch is fixed at 1 (the profiled prefill measures a single
+  // sequence; batch > 1 would pack S into Prefill Batch x Query Len).
+  const prefillBatch = 1;
   const decodeBatch = parseInt(document.getElementById('decode-batch-size').value) || 1;
   // Decode Steps must be >= 2: reconstruction always drops the first (warmup)
   // decode step, so at least one steady-state step must remain.
