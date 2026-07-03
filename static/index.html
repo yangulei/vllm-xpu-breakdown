@@ -251,14 +251,14 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
         <legend style="font-size:12px;font-weight:600;padding:0 6px">Prefill</legend>
         <div class="controls-row">
           <div class="control-group">
-            <label>Query Len</label>
-            <input type="number" id="query-len" value="2048" min="1" step="1"
-                   title="New prefill tokens computed this pass (the profiled prefill sequence length S).">
-          </div>
-          <div class="control-group">
             <label>Context Len</label>
             <input type="number" id="context-len" value="2048" min="1" step="128"
                    title="Prefix-cached tokens the prefill query attends to (rounded down to a KV block boundary).">
+          </div>
+          <div class="control-group">
+            <label>Query Len</label>
+            <input type="number" id="query-len" value="2048" min="1" step="1"
+                   title="New prefill tokens computed this pass (the profiled prefill sequence length S).">
           </div>
         </div>
       </fieldset>
