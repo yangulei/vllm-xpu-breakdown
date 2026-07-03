@@ -227,6 +227,11 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
                title="Concurrent sequences for the decode phase (often 32/64/128). If it differs from Prefill Batch, profiling runs two passes and merges them.">
       </div>
       <div class="control-group">
+        <label>Decode Steps</label>
+        <input type="number" id="decode-steps" value="8" min="2" max="512"
+               title="Number of decode tokens to generate (= decode forward passes / max_tokens). Must be >= 2: the reconstruction always drops the first (warmup) decode step from the latency average. Fewer steps make a smaller trace; repeated decode steps are averaged anyway. 8 is a good balance.">
+      </div>
+      <div class="control-group">
         <label>Layers</label>
         <select id="num-layers-select">
           <option value="all">All</option>
@@ -513,6 +518,9 @@ async function startProfile() {
 
   const prefillBatch = parseInt(document.getElementById('prefill-batch-size').value) || 1;
   const decodeBatch = parseInt(document.getElementById('decode-batch-size').value) || 1;
+  // Decode Steps must be >= 2: reconstruction always drops the first (warmup)
+  // decode step, so at least one steady-state step must remain.
+  const decodeSteps = Math.max(2, parseInt(document.getElementById('decode-steps').value) || 8);
 
   const body = {
     model_id: modelId,
@@ -521,7 +529,7 @@ async function startProfile() {
     batch_size: prefillBatch,
     prefill_batch_size: prefillBatch,
     decode_batch_size: decodeBatch,
-    max_tokens: 128,
+    max_tokens: decodeSteps,
     query_len: profQueryLen,
     context_len: Number.isFinite(profCtxLen) ? profCtxLen : 0,
     num_profile_layers: (() => {

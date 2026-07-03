@@ -1247,6 +1247,83 @@ class TestGraphFromTrace(unittest.TestCase):
         linear = next(o for o in attn["ops"] if o["name"] == "aten::linear")
         self.assertAlmostEqual(linear["device_time_us"], 5.0, places=3)
 
+    def test_first_decode_step_dropped_from_average(self):
+        # The first (warmup) decode step must be excluded from the decode
+        # latency average. Here its kernel is 10x heavier than steady state;
+        # the reported decode op time must be the steady-state value, not a
+        # mean that includes the warmup step.
+        from breakdown.graph_from_trace import build_graph_from_trace
+        events, ext, corr, tid, midx = [], [0], [0], 7, [0]
+        clock = [0.0]
+
+        def kern(e, ts, dur):
+            corr[0] += 1
+            events.append({"ph": "X", "cat": "xpu_runtime", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": 0.1, "name": "l",
+                           "args": {"correlation": corr[0], "External id": e}})
+            events.append({"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+                           "ts": ts + 1000, "dur": dur, "name": "g",
+                           "args": {"correlation": corr[0]}})
+
+        def op(name, ts, dur, shapes, kdur):
+            ext[0] += 1
+            events.append({"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+                           "ts": ts, "dur": dur, "name": name,
+                           "args": {"External id": ext[0], "Input Dims": shapes,
+                                    "Input type": ["c10::BFloat16"]}})
+            if kdur:
+                kern(ext[0], ts, kdur)
+
+        def mod(cls, ts, dur):
+            events.append({"ph": "X", "cat": "python_function", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": dur,
+                           "name": f"nn.Module: {cls}_{midx[0]}"})
+            midx[0] += 1
+
+        def step(tokens, kdur):
+            t0 = clock[0]
+            mod("TinyForCausalLM", t0, 100)
+            mod("TinyAttention", t0 + 1, 40)
+            op("aten::linear", t0 + 2, 8, [[tokens, 16], [48, 16]], kdur)
+            clock[0] = t0 + 120
+
+        step(8, 5.0)      # prefill
+        step(1, 100.0)    # decode warmup (heavy) — must be dropped
+        step(1, 10.0)     # steady state
+        step(1, 10.0)     # steady state
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"traceEvents": events}, f)
+            path = f.name
+        try:
+            g = build_graph_from_trace(path, self.SUMMARY, tp_size=1,
+                                       batch_size=1)
+        finally:
+            os.unlink(path)
+
+        def _find_linear(node):
+            for o in node.get("ops", []):
+                if o["name"] == "aten::linear":
+                    return o
+            for c in node.get("children", []):
+                r = _find_linear(c)
+                if r:
+                    return r
+            return None
+
+        self.assertIsNotNone(g["decode"])
+        lin = _find_linear(g["decode"])
+        self.assertIsNotNone(lin)
+        # Average of the two steady steps (10, 10) — warmup 100 excluded.
+        self.assertAlmostEqual(lin["device_time_us"], 10.0, places=3)
+
+    def test_single_decode_step_not_dropped(self):
+        # Guard: with only one decode step the warmup drop must NOT empty the
+        # decode phase (the drop only applies when >= 2 decode steps exist).
+        g = self._build([8, 1])
+        self.assertIsNotNone(g["prefill"])
+        self.assertIsNotNone(g["decode"])
+
     def test_shapes_symbolized(self):
         g = self._build([8])
         model = g["prefill"]["children"][0]

@@ -476,6 +476,13 @@ def _classify_steps(roots: list[_Raw], batch_size: int
     phases. Comparing to ``batch_size`` also classifies each chunk of a chunked
     prefill correctly.
 
+    The **first decode step is always dropped** from the decode phase: the
+    initial decode forward after prefill pays one-time warmup costs (KV/allocator
+    warmup, oneDNN/Triton plan + autotune caching under ``torch.compile``) that
+    would skew the steady-state per-op latency average. The drop is guarded so a
+    phase with a single decode step is never emptied — the profiling UI enforces
+    ``>= 2`` decode steps, so at least one steady-state step always remains.
+
     Returns ``(prefill_roots, decode_roots, n_prefill_steps, n_decode_steps)``.
     """
     steps, _ = _partition_steps(roots)
@@ -484,18 +491,20 @@ def _classify_steps(roots: list[_Raw], batch_size: int
 
     threshold = max(int(batch_size), 1)
 
+    prefill_steps = [s for s in steps if s["token"] > threshold]
+    decode_steps = [s for s in steps if s["token"] <= threshold]
+
+    # Drop the warmup first decode step (guarded so decode is never emptied).
+    if len(decode_steps) >= 2:
+        decode_steps = decode_steps[1:]
+
     prefill: list[_Raw] = []
     decode: list[_Raw] = []
-    n_pre = n_dec = 0
-    for s in steps:
-        is_prefill = s["token"] > threshold
-        if is_prefill:
-            prefill.extend(s["roots"])
-            n_pre += 1
-        else:
-            decode.extend(s["roots"])
-            n_dec += 1
-    return prefill, decode, n_pre, n_dec
+    for s in prefill_steps:
+        prefill.extend(s["roots"])
+    for s in decode_steps:
+        decode.extend(s["roots"])
+    return prefill, decode, len(prefill_steps), len(decode_steps)
 
 
 # ===================================================================

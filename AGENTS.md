@@ -323,6 +323,18 @@ Classifies ops by name prefix/pattern to backends. Priority order:
   phases and report `B = batch_size − 1` (a ramp step). Comparing to `batch_size`
   also classifies each chunk of a chunked prefill correctly. Verified end-to-end on
   XPU (Qwen3-4B): prefill@1 → `S=query_len`, decode@8 → `B=8`.
+- **The first decode step is always dropped from the decode average.**
+  `graph_from_trace._classify_steps` discards the first decode step's roots
+  before the phase tree is built: the initial decode forward after prefill pays
+  one-time warmup costs (KV/allocator warmup, oneDNN/Triton plan + autotune
+  caching under `torch.compile`) that would skew the steady-state per-op latency
+  average. The drop is **guarded** (`len(decode_steps) >= 2`) so a phase with a
+  single decode step is never emptied. The profiling UI exposes a **Decode
+  Steps** control (`max_tokens`, default **8**) with a `>= 2` minimum so at least
+  one steady-state step always remains after the drop. See
+  `TestGraphFromTrace.test_first_decode_step_dropped_from_average` /
+  `test_single_decode_step_not_dropped`. Do NOT remove the guard or the UI
+  minimum.
 - **Main model class is picked by subtree size, not device time.** The
   `LogitsProcessor`'s `lm_head` matmul (`V`-wide, once per decode step) can
   out-weigh the whole model forward, so selecting the main class by `sub_dev`
