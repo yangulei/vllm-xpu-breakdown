@@ -838,6 +838,7 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
 
         profile_result["query_len"] = query_len or None
         profile_result["context_len"] = context_len or None
+        profile_result["context_len_aligned"] = profiled_context_len or None
         if cache_hit_note:
             profile_result["cache_hit_note"] = cache_hit_note
 
@@ -1095,13 +1096,17 @@ def download_trace():
     if not trace_path or not os.path.isfile(trace_path):
         return jsonify({"ok": False, "error": "Trace file not found"}), 404
 
-    # Build a descriptive filename.
-    # vllm_trace_{model}_{mode}_bs{bs}_qlen{q}_ctx{c}_gen{n}_tp{tp}_{device}_{n}layers.json.gz
-    model_short = result["model_id"].replace("/", "_")
+    # Build a descriptive filename encoding the profiled configuration:
+    #   vllm_trace_{model}_{mode}_ctx{context}_in{query}_out{gen}_bs{bs}_tp{tp}_{n}layers.json.gz
+    # where "ctx" is the block-aligned prefix-cache context the prefill attends
+    # to, "in" is the query length (new prefill tokens, S), "out" is the number
+    # of generated decode tokens, and "bs" is the decode batch. The model id is
+    # reduced to its final path component (org prefix dropped).
+    model_short = result["model_id"].split("/")[-1]
     mode = result.get("mode", "eager")
-    bs = result.get("batch_size", 1)
-    qlen = result.get("query_len") or ""
-    ctx = result.get("context_len") or ""
+    bs = result.get("decode_batch_size", result.get("batch_size", 1))
+    ctx = result.get("context_len_aligned") or result.get("context_len") or 0
+    qin = result.get("query_len") or 0
     gen = result.get("max_tokens", "")
     tp = result.get("tp_size", 1) or 1
     quant = result.get("quantization")
@@ -1109,12 +1114,9 @@ def download_trace():
     device = _DEVICE.upper()
     ext = ".json.gz" if trace_path.endswith(".gz") else ".json"
     quant_part = f"_{quant}" if quant else ""
-    gen_part = f"_gen{gen}" if gen else ""
-    qlen_part = f"_qlen{qlen}" if qlen else ""
-    ctx_part = f"_ctx{ctx}" if ctx else ""
     download_name = (
-        f"vllm_trace_{model_short}_{mode}_bs{bs}"
-        f"{qlen_part}{ctx_part}{gen_part}_tp{tp}{quant_part}_{device}_{layers}layers{ext}"
+        f"vllm_trace_{model_short}_{device}_{mode}_ctx{ctx}_in{qin}_out{gen}"
+        f"_bs{bs}_tp{tp}{quant_part}_{layers}layers{ext}"
     )
 
     return send_file(
