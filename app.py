@@ -42,6 +42,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from breakdown.analyzer import AnalyzedOp, analyze_ops
 from breakdown.classifier import Backend, classify_op
 from breakdown.graph_from_trace import build_graph_from_trace
+from breakdown.trace_parser import _detect_device_via_torch
 from breakdown.model_graph import (
     build_model_graph,
     min_profile_layers,
@@ -52,25 +53,8 @@ from breakdown.registry import ALL_VLLM_XPU_OPS
 app = Flask(__name__, static_folder="static")
 
 
-def _detect_device() -> str:
-    """Detect active accelerator: 'cuda' or 'xpu'.
-
-    Uses environment probing to avoid calling torch.cuda.is_available()
-    which would initialize CUDA and prevent vLLM from forking later.
-    """
-    # Avoid torch.cuda.is_available() — it initializes the CUDA runtime,
-    # making subsequent fork() impossible (vLLM's EngineCore uses fork/spawn).
-    if os.environ.get("CUDA_VISIBLE_DEVICES", "") != "":
-        return "cuda"
-    if os.path.exists("/dev/nvidia0"):
-        return "cuda"
-    if os.environ.get("BREAKDOWN_DEVICE"):
-        return os.environ["BREAKDOWN_DEVICE"]
-    return "xpu"
-
-
 # Cached at import time — won't change during server lifetime.
-_DEVICE = _detect_device()
+_DEVICE = _detect_device_via_torch() or "xpu"
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",

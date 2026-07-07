@@ -31,22 +31,67 @@ _COMPUTE_BACKENDS = frozenset({
 })
 
 
+def _detect_device_via_torch() -> str:
+    """Detect the active accelerator via the torch device APIs.
+
+    Returns ``"xpu"``, ``"cuda"`` or ``""``. Torch is imported lazily so this
+    module stays import-light; any failure (torch absent, driver error) simply
+    yields ``""`` so callers can fall back to other heuristics.
+    """
+    try:
+        import torch
+    except Exception:
+        return ""
+    try:
+        if getattr(torch, "xpu", None) is not None and torch.xpu.is_available():
+            return "xpu"
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return ""
+
+
+# Trace event categories that unambiguously identify the accelerator.
+_XPU_CATEGORIES = {"xpu_runtime", "xpu_op"}
+_CUDA_CATEGORIES = {"cuda_runtime", "cuda_op", "cuda_driver"}
+# Generic GPU categories that don't distinguish CUDA from XPU on their own.
+_GENERIC_GPU_CATEGORIES = {"kernel", "gpu_op", "gpu_memcpy", "gpu_kernel"}
+
+
 def _infer_device_from_trace(events: list[dict]) -> str:
     """Infer accelerator type from trace events.
 
-    Looks at kernel event categories: ``xpu_op`` → xpu, everything else → cuda.
-    Falls back to runtime detection.
+    XPU traces emit ``xpu_runtime`` host-launch events (and ``xpu_op``), while
+    CUDA traces emit ``cuda_runtime`` / ``cuda_op``. XPU kernel events, however,
+    share the generic ``kernel`` category with CUDA, so we must key off the
+    device-specific *runtime* categories rather than the kernel category.
+
+    Resolution order:
+      1. Device-specific trace categories (``xpu_*`` → xpu, ``cuda_*`` → cuda).
+      2. If only generic GPU kernels are present, auto-detect via the torch
+         device APIs (``torch.xpu.is_available()`` / ``torch.cuda.is_available()``).
+      3. Otherwise, return ``""``.
     """
+    saw_generic_gpu = False
     for evt in events:
         cat = evt.get("cat", "")
-        if cat == "xpu_op":
+        if cat in _XPU_CATEGORIES:
             return "xpu"
-        if cat in ("cuda_runtime", "cuda_op"):
+        if cat in _CUDA_CATEGORIES:
             return "cuda"
-    # Fallback: if there are GPU kernels, assume cuda (the common case).
-    for evt in events:
-        if evt.get("cat", "") in ("kernel", "gpu_op", "gpu_memcpy", "gpu_kernel"):
-            return "cuda"
+        if cat in _GENERIC_GPU_CATEGORIES:
+            saw_generic_gpu = True
+
+    # Ambiguous: generic GPU kernels with no device-specific runtime events.
+    # Auto-detect the accelerator from the running torch build.
+    if saw_generic_gpu:
+        detected = _detect_device_via_torch()
+        if detected:
+            return detected
     return ""
 
 
