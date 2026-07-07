@@ -11,11 +11,13 @@ from .classifier import Backend, ClassificationResult
 
 # Colors for each backend
 _BACKEND_COLORS = {
-    Backend.VLLM_XPU_KERNELS: "#4CAF50",  # green
-    Backend.TRITON: "#2196F3",              # blue
-    Backend.TORCH_XPU_OPS: "#FF9800",      # orange
-    Backend.CPU: "#9E9E9E",                 # grey
-    Backend.FRAMEWORK: "#BDBDBD",           # light grey
+    Backend.VLLM_XPU_KERNELS: "#4CAF50",    # green
+    Backend.VLLM_CUDA_KERNELS: "#76FF03",   # lime green
+    Backend.TRITON: "#2196F3",               # blue
+    Backend.TORCH_XPU_OPS: "#FF9800",        # orange
+    Backend.TORCH_CUDA_OPS: "#E91E63",       # pink
+    Backend.CPU: "#9E9E9E",                  # grey
+    Backend.FRAMEWORK: "#BDBDBD",            # light grey
 }
 
 _HTML_TEMPLATE = """\
@@ -24,7 +26,7 @@ _HTML_TEMPLATE = """\
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>vLLM-XPU Ops Breakdown</title>
+<title>vLLM Ops Breakdown</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -60,8 +62,8 @@ _HTML_TEMPLATE = """\
 </head>
 <body>
 
-<h1>vLLM-XPU Ops/Kernels Breakdown</h1>
-<p class="subtitle">Dispatch analysis for Intel XPU inference</p>
+<h1>vLLM Ops/Kernels Breakdown</h1>
+<p class="subtitle">Dispatch analysis for GPU inference</p>
 
 <div class="stats-row" id="stats-row"></div>
 

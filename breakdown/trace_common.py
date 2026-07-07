@@ -38,9 +38,16 @@ def _is_overhead_event(name: str) -> bool:
             return True
     if name.startswith("at::native::xpu::"):
         return True
+    # Filter out CUDA runtime / driver API calls (children of aten:: ops).
+    if name.startswith(("cudaLaunch", "cudaMalloc", "cudaFree",
+                        "cudaMemcpy", "cudaMemset", "cudaStream",
+                        "cudaEvent", "cudaDeviceSynchronize")):
+        return True
+    if name.startswith("at::native::") and "cuda" in name.lower():
+        return True
     # Raw SYCL kernel names: contain template brackets or are pure C++ symbols
     if "<" in name and "::" in name and not name.startswith(("aten::", "_C::",
-            "_C_cache_ops::", "_moe_C::", "_xpu_C::", "triton")):
+            "_C_cache_ops::", "_moe_C::", "_xpu_C::", "_cuda_C::", "triton")):
         return True
     # Bare kernel function names (gemm_kernel, etc.) — no aten:: prefix
     if name in ("gemm_kernel", "gemm_batch_kernel"):

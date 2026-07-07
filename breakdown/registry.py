@@ -96,12 +96,49 @@ _XPU_C_OPS: set[str] = {
     "topk_topp_sampler",
 }
 
+# ---- CUDA-specific ops (from vLLM main repo csrc/) ----
+# These are ops registered under _C/_C_cache_ops on CUDA builds that differ
+# from the XPU set, plus CUDA-only kernels (flash_attn, marlin, cutlass, etc.)
+_CUDA_C_OPS: set[str] = {
+    # Attention
+    "paged_attention_v1",
+    "paged_attention_v2",
+    "flash_attn_varlen_func",
+    "flash_attn_with_kvcache",
+    # Quantization / GEMM
+    "marlin_gemm",
+    "marlin_qqq_gemm",
+    "gptq_marlin_gemm",
+    "gptq_marlin_24_gemm",
+    "gptq_marlin_repack",
+    "awq_gemm",
+    "awq_dequantize",
+    "cutlass_scaled_mm",
+    "cutlass_scaled_mm_azp",
+    "cutlass_moe_mm",
+    # Quantized cache
+    "fp8_marlin_gemm",
+    "machete_gemm",
+    "machete_prepack",
+    # LoRA
+    "sgmv_shrink",
+    "sgmv_expand",
+    "sgmv_expand_slice",
+    # Misc CUDA kernels
+    "aqlm_gemm",
+    "aqlm_dequant",
+    "ggml_dequantize",
+    "ggml_mul_mat_vec",
+    "ggml_mul_mat_a8",
+}
+
 # Module-to-ops mapping
 STATIC_REGISTRY: dict[str, set[str]] = {
     "_C": _C_OPS,
     "_C_cache_ops": _C_CACHE_OPS,
     "_moe_C": _MOE_C_OPS,
     "_xpu_C": _XPU_C_OPS,
+    "_cuda_C": _CUDA_C_OPS,
 }
 
 # Flat set for quick lookup
@@ -115,18 +152,19 @@ MODULE_CATEGORIES: dict[str, str] = {
     "_C_cache_ops": "vllm-xpu-kernels (cache)",
     "_moe_C": "vllm-xpu-kernels (MoE)",
     "_xpu_C": "vllm-xpu-kernels (XPU-specific)",
+    "_cuda_C": "vllm-cuda-kernels (CUDA-specific)",
 }
 
 
 def discover_runtime_ops() -> dict[str, list[str]]:
-    """Introspect loaded torch.ops to find vllm_xpu_kernels ops at runtime.
+    """Introspect loaded torch.ops to find vllm custom-kernel ops at runtime.
 
     Returns a dict mapping namespace to list of op names.
-    Only works after vllm_xpu_kernels has been imported.
+    Only works after vllm (xpu or cuda) has been imported.
     """
     import torch
     result: dict[str, list[str]] = {}
-    for ns_name in ("_C", "_C_cache_ops", "_moe_C", "_xpu_C"):
+    for ns_name in ("_C", "_C_cache_ops", "_moe_C", "_xpu_C", "_cuda_C", "vllm"):
         ns = getattr(torch.ops, ns_name, None)
         if ns is None:
             continue

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """
-vLLM-XPU Ops/Kernels Breakdown — Web Application.
+vLLM Ops/Kernels Breakdown — Web Application.
 
 Interactive web UI for profiling vLLM inference on Intel XPU and visualizing
 the op dispatch breakdown.
@@ -26,6 +26,16 @@ from typing import Any
 
 from flask import Flask, Response, jsonify, request, send_file, send_from_directory
 
+# Force spawn for multiprocessing so vLLM's EngineCore doesn't hit
+# "Cannot re-initialize CUDA in forked subprocess".
+import multiprocessing
+try:
+    multiprocessing.set_start_method("spawn", force=True)
+except RuntimeError:
+    pass  # Already set
+
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from breakdown.analyzer import AnalyzedOp, analyze_ops
@@ -40,6 +50,26 @@ from breakdown.registry import ALL_VLLM_XPU_OPS
 
 app = Flask(__name__, static_folder="static")
 
+
+def _detect_device() -> str:
+    """Detect active accelerator: 'cuda' or 'xpu'.
+
+    Uses environment probing to avoid calling torch.cuda.is_available()
+    which would initialize CUDA and prevent vLLM from forking later.
+    """
+    # Avoid torch.cuda.is_available() — it initializes the CUDA runtime,
+    # making subsequent fork() impossible (vLLM's EngineCore uses fork/spawn).
+    if os.environ.get("CUDA_VISIBLE_DEVICES", "") != "":
+        return "cuda"
+    if os.path.exists("/dev/nvidia0"):
+        return "cuda"
+    if os.environ.get("BREAKDOWN_DEVICE"):
+        return os.environ["BREAKDOWN_DEVICE"]
+    return "xpu"
+
+
+# Cached at import time — won't change during server lifetime.
+_DEVICE = _detect_device()
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -692,6 +722,12 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             _profile_state["error"] = traceback.format_exc()
     finally:
         os.environ.pop("VLLM_TORCH_COMPILE_LEVEL", None)
+        try:
+            import torch.distributed as dist
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception:
+            pass
 
 
 @app.route("/api/profile", methods=["POST"])
@@ -925,26 +961,26 @@ def download_trace():
     if not trace_path or not os.path.isfile(trace_path):
         return jsonify({"ok": False, "error": "Trace file not found"}), 404
 
-    # Build a descriptive filename. A profiling run captures both the prefill
-    # (prompt) and decode (generation) phases in one trace, so label it
-    # "prefill+decode". Encode the engine max_model_len as "maxlen" (it is the
-    # KV budget, not the processed context length — labeling it "ctx" was
-    # misleading) and the generated token count as "gen".
-    # vllm_trace_{model}_{mode}_prefill+decode_bs{bs}_maxlen{n}_gen{n}_tp{tp}_{n}layers.json.gz
+    # Build a descriptive filename.
+    # vllm_trace_{model}_{mode}_bs{bs}_qlen{q}_ctx{c}_gen{n}_tp{tp}_{device}_{n}layers.json.gz
     model_short = result["model_id"].replace("/", "_")
     mode = result.get("mode", "eager")
     bs = result.get("batch_size", 1)
-    maxlen = result.get("max_model_len", "")
+    qlen = result.get("query_len") or ""
+    ctx = result.get("context_len") or ""
     gen = result.get("max_tokens", "")
     tp = result.get("tp_size", 1) or 1
     quant = result.get("quantization")
     layers = result.get("profiled_layers", "all")
+    device = _DEVICE.upper()
     ext = ".json.gz" if trace_path.endswith(".gz") else ".json"
     quant_part = f"_{quant}" if quant else ""
     gen_part = f"_gen{gen}" if gen else ""
+    qlen_part = f"_qlen{qlen}" if qlen else ""
+    ctx_part = f"_ctx{ctx}" if ctx else ""
     download_name = (
-        f"vllm_trace_{model_short}_{mode}_prefill+decode_bs{bs}"
-        f"_maxlen{maxlen}{gen_part}_tp{tp}{quant_part}_{layers}layers{ext}"
+        f"vllm_trace_{model_short}_{mode}_bs{bs}"
+        f"{qlen_part}{ctx_part}{gen_part}_tp{tp}{quant_part}_{device}_{layers}layers{ext}"
     )
 
     return send_file(
@@ -1338,7 +1374,7 @@ def export_shape_matrix():
     # Use first config to count ops
     test_graph = build_model_graph(
         summary, prefill_len=1, decode_batch=1, context_len=1,
-        tp_size=tp_sizes[0], quantization=quantization,
+        tp_size=tp_sizes[0], quantization=quantization, device=_DEVICE,
     )
     test_tree = test_graph.get("prefill") or test_graph.get("decode")
     test_ops_count = 0
@@ -1390,6 +1426,7 @@ def export_shape_matrix():
             context_len=cfg["context_len"],
             tp_size=cfg["tp_size"],
             quantization=quantization,
+            device=_DEVICE,
         )
         graph_cfg = graph.get("config", {})
         symbols = graph.get("symbols", {})
@@ -1488,12 +1525,12 @@ def export_shape_matrix():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="vLLM-XPU Breakdown Web UI")
+    parser = argparse.ArgumentParser(description="vLLM Breakdown Web UI")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
-    print(f"Starting vLLM-XPU Breakdown at http://{args.host}:{args.port}")
+    print(f"Starting vLLM Breakdown at http://{args.host}:{args.port}")
     print(f"Open http://localhost:{args.port} in your browser")
     app.run(host=args.host, port=args.port, debug=args.debug)
