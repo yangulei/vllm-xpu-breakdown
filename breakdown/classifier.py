@@ -16,8 +16,32 @@ class Backend(str, Enum):
     TORCH_XPU_OPS = "torch-xpu-ops"
     CPU = "cpu"
     FRAMEWORK = "framework"
+    CCL = "ccl"
     VLLM_CUDA_KERNELS = "vllm-cuda-kernels"
     TORCH_CUDA_OPS = "torch-cuda-ops"
+
+
+# Collective-communication (oneCCL / NCCL) op indicators. These are the
+# distributed tensor-parallel / pipeline-parallel comm calls (all_reduce,
+# all_gather, reduce_scatter, all_to_all, ...) that should be attributed to the
+# communication library rather than to a compute backend. Bare "gather"/
+# "scatter" are intentionally excluded so cache/MoE gather ops aren't misfiled.
+_CCL_NAMESPACES = ("c10d::", "ccl::", "oneccl::", "nccl::")
+_CCL_KEYWORDS = (
+    "all_reduce", "allreduce",
+    "all_gather", "allgather",
+    "reduce_scatter", "reducescatter",
+    "all_to_all", "alltoall",
+    "_allgather_base", "_reduce_scatter_base",
+)
+
+
+def _is_ccl(name: str) -> bool:
+    """Return True if the op is a collective-communication (CCL) call."""
+    low = name.lower()
+    if low.startswith(_CCL_NAMESPACES):
+        return True
+    return any(kw in low for kw in _CCL_KEYWORDS)
 
 
 # Op name prefixes/substrings that indicate Triton-compiled kernels
@@ -177,6 +201,11 @@ def classify_op(name: str, device_type: str = "",
     has_device_time = self_device_time_us > 0 or device_time_us > 0
     is_xpu = device_type in ("xpu", "XPU")
     is_cuda = device_type in ("cuda", "CUDA")
+
+    # 0. Collective communication (oneCCL / NCCL) — tensor/pipeline-parallel
+    #    comm calls form their own category, independent of compute backend.
+    if _is_ccl(name):
+        return Backend.CCL, "collective-comm"
 
     # 1. Check against vllm custom-kernels registry (shared ops like rms_norm
     #    exist on both CUDA and XPU builds of vLLM)

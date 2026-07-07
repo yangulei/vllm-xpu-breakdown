@@ -288,6 +288,23 @@ class TestClassifier(unittest.TestCase):
             backend, _ = classify_op(op)
             self.assertEqual(backend, Backend.FRAMEWORK, f"{op} should be framework")
 
+    def test_ccl_collective_ops(self):
+        # Collective-communication (oneCCL/NCCL) calls form their own category.
+        for op in ["c10d::allreduce_", "c10d::allgather_",
+                   "c10d::reduce_scatter_", "c10d::_allgather_base_",
+                   "vllm::all_reduce", "all_to_all"]:
+            backend, cat = classify_op(op, device_type="xpu",
+                                       device_time_us=10.0)
+            self.assertEqual(backend, Backend.CCL, f"{op} should be ccl")
+            self.assertEqual(cat, "collective-comm")
+
+    def test_ccl_does_not_capture_moe_gather(self):
+        # Bare gather/scatter (cache/MoE) must not be misfiled as CCL.
+        for op in ["moe_gather", "gather_cache"]:
+            backend, _ = classify_op(op, device_type="xpu",
+                                     device_time_us=10.0)
+            self.assertNotEqual(backend, Backend.CCL, f"{op} should not be ccl")
+
 
 # ===================================================================
 # Overhead Filter Tests

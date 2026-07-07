@@ -18,6 +18,7 @@ _BACKEND_COLORS = {
     Backend.TORCH_CUDA_OPS: "#E91E63",       # pink
     Backend.CPU: "#9E9E9E",                  # grey
     Backend.FRAMEWORK: "#BDBDBD",            # light grey
+    Backend.CCL: "#7B1FA2",                  # purple
 }
 
 _HTML_TEMPLATE = """\

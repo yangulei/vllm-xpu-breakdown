@@ -226,11 +226,18 @@ Exports a flat Excel table sweeping across configurations:
 ### Op Classification (`classifier.py`)
 
 Classifies ops by name prefix/pattern to backends. Priority order:
-1. vllm-xpu-kernels (exact match from registry)
-2. triton (kernel name patterns)
-3. torch-xpu-ops (aten:: ops that run on XPU)
-4. cpu (fallback ops)
-5. framework (reshaping, profiler markers)
+1. ccl (collective-comm: `c10d::`/`ccl::` namespaces or all_reduce/all_gather/reduce_scatter/all_to_all keywords)
+2. vllm-xpu-kernels (exact match from registry)
+3. triton (kernel name patterns)
+4. torch-xpu-ops (aten:: ops that run on XPU)
+5. cpu (fallback ops)
+6. framework (reshaping, profiler markers)
+
+CCL is checked **first** so tensor/pipeline-parallel comm calls (including
+`vllm::all_reduce`-style ops) land in their own category rather than being
+absorbed into vllm-xpu-kernels. Bare `gather`/`scatter` are intentionally
+**not** CCL keywords so cache/MoE gather ops (`moe_gather`, `gather_cache`)
+aren't misfiled.
 
 ## Conventions
 
