@@ -636,7 +636,7 @@ class TestFlaskAPI(unittest.TestCase):
     def test_index_page(self):
         resp = self.client.get("/")
         self.assertEqual(resp.status_code, 200)
-        self.assertIn(b"vLLM-XPU", resp.data)
+        self.assertIn(b"vLLM Ops/Kernels Breakdown", resp.data)
 
     def test_model_endpoint_qwen3(self):
         resp = self.client.get(f"/api/model/{QWEN3_4B_MODEL_ID}")
