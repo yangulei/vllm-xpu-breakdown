@@ -43,10 +43,25 @@ MOCK_QWEN3_CONFIG = {
 
 
 class TestShapeMatrixExport(unittest.TestCase):
-    """Tests for /api/export/shape-matrix endpoint."""
+    """Tests for /api/export/shape-matrix endpoint (always profile-derived)."""
 
     def setUp(self):
         self.client = app.test_client()
+        # The Shape Matrix is derived from a completed profiling run; inject one.
+        import app as app_module
+        self._saved_state = app_module._profile_state
+        app_module._profile_state = {
+            "status": "done",
+            "result": {"graph": _mock_profile_graph()},
+            "error": None,
+            "model_id": "Qwen/Qwen3-4B",
+            "settings": {"query_len": 128, "context_len": 0,
+                         "decode_batch_size": 8, "tp_size": 1, "mode": "eager"},
+        }
+
+    def tearDown(self):
+        import app as app_module
+        app_module._profile_state = self._saved_state
 
     def _export(self, data: dict):
         """Helper to call the endpoint."""
@@ -422,7 +437,6 @@ class TestShapeMatrixProfileSource(unittest.TestCase):
         app_module._profile_state = self._saved_state
 
     def _export(self, data: dict):
-        data = {"source": "profile", **data}
         return self.client.post(
             "/api/export/shape-matrix",
             data=json.dumps(data),
@@ -627,17 +641,6 @@ class TestShapeMatrixProfileSource(unittest.TestCase):
         })
         self.assertEqual(resp.status_code, 400)
         self.assertIn("other/model", resp.json["error"])
-
-    @patch("app.fetch_model_config", return_value=MOCK_QWEN3_CONFIG)
-    def test_invalid_source(self, mock_fetch):
-        """An unknown source value is rejected."""
-        resp = self.client.post(
-            "/api/export/shape-matrix",
-            data=json.dumps({"model_id": "Qwen/Qwen3-4B", "source": "bogus"}),
-            content_type="application/json",
-        )
-        self.assertEqual(resp.status_code, 400)
-        self.assertIn("source", resp.json["error"])
 
 
 if __name__ == "__main__":

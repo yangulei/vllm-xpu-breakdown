@@ -20,9 +20,10 @@ there is no interactive static-graph view.
    reflects what actually executed, so it tracks whatever vLLM/the backends
    dispatched instead of relying on a hand-maintained static graph.
 2. **Config-driven shape sweep** — `build_model_graph` (from the HuggingFace
-   config) still powers the **Shape Matrix Excel export**
-   (`/api/export/shape-matrix`), a sweep across seq/context/batch/TP. It is no
-   longer exposed as an interactive graph endpoint.
+   config) is the analytic shape builder. It is **no longer wired to any
+   endpoint**: the Shape Matrix export is now profile-derived (see below) and no
+   interactive graph endpoint exists. `build_model_graph` remains only for its
+   unit tests / potential reuse.
 
 > **Environment assumption:** the profiling path assumes torch-xpu and vLLM are
 > installed and an Intel XPU is available. (`model_graph.py`/`model_info.py`
@@ -91,8 +92,9 @@ pytest tests/ -v
 
 ### Model Graph Builder (`model_graph.py`)
 
-The config-driven shape builder. It powers the **Shape Matrix Excel export**
-(no longer an interactive graph view). Key concepts:
+The config-driven shape builder. It is **no longer wired to any endpoint** (the
+Shape Matrix export is profile-derived; there is no interactive graph view). It
+is kept for its unit tests / potential reuse. Key concepts:
 
 - **`_ARCH_FAMILY_MAP`** — Maps HuggingFace `architectures` field to family names (35+ entries). This determines which graph builder is used.
 - **Architecture category sets** — `_MLA_ARCHS`, `_VL_ARCHS`, `_ENCODER_ARCHS`, `_DIFFUSION_ARCHS` control routing in `build_model_graph()`.
@@ -256,52 +258,48 @@ Exports a flat Excel table sweeping across configurations:
 - Symbolic Shape column keeps S/B/C/TP symbolic, resolves model constants to numbers
 - Row limit guard (`_MAX_MATRIX_ROWS = 50000`) prevents excessive generation
 
-**Two shape sources (`source` param, default `"config"`):**
-- **`"config"`** — analytic, config-driven (`build_model_graph` per config). Fast;
-  the op set is *inferred* from `config.json`.
-- **`"profile"`** — grounded in the latest completed profiling run. The
-  reconstructed graph (`_profile_state["result"]["graph"]`) is used as an **op
-  template**: its real dispatched ops already carry symbolic shapes (`S`/`B`/`C`/
-  `n_h·d/TP`/`S+C`/...), the exact same vocabulary the exporter resolves. For each
-  config, `_config_symbols` overrides `S`/`B`/`C`/`S+C`/`TP` in a copy of the
-  profile's `symbols`, every op's shapes are re-resolved (`_resolve_shape_ints`),
-  and **Memory/FLOPs are recomputed per config** via `estimate_memory` /
-  `estimate_flops` (the template's own values were measured at the profiled
-  point). An extra **Info** sheet records the profiled config + caveats. Filename
-  gets a `_config`/`_profile` suffix.
-  - **Accurate per-tensor dtypes + shape validation (profile source):** each
-    reconstructed op now carries `recorded_shapes` (the numeric shapes as
-    captured) and `input_dtypes` (the real per-tensor dtypes from the trace's
-    `Input type`, parsed aligned-with-shapes by `graph_from_trace.
-    _parse_input_dims_types`). The export uses `input_dtypes` for the **Shape**
-    column dtype (via `_format_op_shape_with_dtypes(..., recorded_dtypes=...)`,
-    falling back to the `_get_tensor_dtype` heuristic when absent) and for a
-    dtype-accurate **Memory** estimate (`_profile_op_memory` sizes each input
-    tensor by *its own* dtype — so an fp8/int4 weight counts 1 byte while a bf16
-    activation counts 2). The Info sheet adds a **shape round-trip validation**
-    (`_validate_derived_shapes`): re-resolving every op's symbolic
-    `input_shapes` at the *profiled* config must reproduce `recorded_shapes`
-    (context-annotated `S+C`/`C` KV dims excluded, since context is deliberately
-    added, not recorded). Note: memory/FLOPs are still analytic estimates, not
-    measured — only the op set, shapes, dtypes and backends come from the trace.
-  - **Invariants:** requires `_profile_state["status"]=="done"` and the profiled
-    `model_id` to match the requested one (else 400). The op *set* is fixed at the
-    profiled config — sweeping TP only divides `/TP` dims, it does **not**
-    synthesize comm ops that weren't profiled, so profile at **each TP** you need.
-    Query/batch/context (`S`/`B`/`C`) are **parametric** and need only one base
-    profile: `C` enters solely via the prefill attention KV rows (`S+C`), which
-    `graph_from_trace._annotate_attention_kv` rewrites **only when the base profile
-    had a non-zero context**. So you do **not** profile per context — one profile
-    with any (small, cheap) non-zero context makes every other context length
-    derivable; a `context=0` base leaves KV rows as `S` and context can't be
-    derived. Device time is not extrapolated into the sweep. Because both graph
-    builders emit the identical serialized shape, the Excel writer
-    (`_flatten_graph_nodes` / `_format_op_shape_with_dtypes` /
-    `_partially_resolve_dim`) consumes either unchanged.
-  - **Frontend:** the Shape Matrix tab's `sm-source` selector offers config /
-    profile-latest / profile-fresh. `profile-fresh` runs a profile at the Profile
-    tab's base config (`buildProfileBody`, shared with `startProfile`) via
-    `runProfileForMatrix`, polls to completion, then exports `source=profile`.
+**Always profile-derived (there is no config-driven path).** The op set and real
+shapes come from the latest completed profiling run for the model. The
+reconstructed graph (`_profile_state["result"]["graph"]`) is used as an **op
+template**: its real dispatched ops already carry symbolic shapes (`S`/`B`/`C`/
+`n_h·d/TP`/`S+C`/...), the exact vocabulary the exporter resolves. For each
+config, `_config_symbols` overrides `S`/`B`/`C`/`S+C`/`TP` in a copy of the
+profile's `symbols`, every op's shapes are re-resolved (`_resolve_shape_ints`),
+and **Memory/FLOPs are recomputed per config** via `_profile_op_memory` /
+`estimate_flops`. An **Info** sheet records the profiled config, caveats, and a
+validation summary. Filename ends in `_profile.xlsx`.
+> `build_model_graph` (config-driven builder in `model_graph.py`) is **no longer
+> wired to any endpoint** — the export never calls it. It stays in the tree only
+> for its unit tests / potential reuse. Do not re-add a config `source` branch.
+- **Acquisition + invariants:** requires `_profile_state["status"]=="done"` and
+  the profiled `model_id` to match the requested one (else 400). The **frontend
+  guarantees** a matching run exists before calling: `ensureProfileForMatrix`
+  reuses the latest completed run, waits out any in-progress run, or launches a
+  fresh profile (`buildProfileBody`, shared with `startProfile`) via
+  `runProfileForMatrix` and polls to completion. The op *set* is fixed at the
+  profiled config — sweeping TP only divides `/TP` dims, it does **not**
+  synthesize comm ops that weren't profiled, so profile at **each TP** you need.
+  Query/batch/context (`S`/`B`/`C`) are **parametric** and need only one base
+  profile: `C` enters solely via the prefill attention KV rows (`S+C`), which
+  `graph_from_trace._annotate_attention_kv` rewrites **only when the base profile
+  had a non-zero context**. So you do **not** profile per context — one profile
+  with any (small, cheap) non-zero context makes every other context length
+  derivable; a `context=0` base leaves KV rows as `S` and context can't be
+  derived. Device time is not extrapolated into the sweep.
+- **Accurate per-tensor dtypes + shape validation:** each reconstructed op carries
+  `recorded_shapes` (the numeric shapes as captured) and `input_dtypes` (the real
+  per-tensor dtypes from the trace's `Input type`, parsed aligned-with-shapes by
+  `graph_from_trace._parse_input_dims_types`). The export uses `input_dtypes` for
+  the **Shape** column dtype (via `_format_op_shape_with_dtypes(...,
+  recorded_dtypes=...)`, falling back to the `_get_tensor_dtype` heuristic when
+  absent) and for a dtype-accurate **Memory** estimate (`_profile_op_memory` sizes
+  each input tensor by *its own* dtype — an fp8/int4 weight counts 1 byte while a
+  bf16 activation counts 2). The Info sheet adds a **shape round-trip validation**
+  (`_validate_derived_shapes`): re-resolving every op's symbolic `input_shapes` at
+  the *profiled* config must reproduce `recorded_shapes` (context-annotated
+  `S+C`/`C` KV dims excluded, since context is deliberately added, not recorded).
+  Note: memory/FLOPs are still analytic estimates — only the op set, shapes,
+  dtypes and backends come from the trace.
 
 ### Op Classification (`classifier.py`)
 
@@ -350,7 +348,7 @@ aren't misfiled.
 | `/api/profile/status` | GET | Poll profiling status |
 | `/api/profile/result` | GET | Fetch profiling result (ops + reconstructed graph) |
 | `/api/profile/trace` | GET | Download raw trace file |
-| `/api/export/shape-matrix` | POST | Export multi-config shape sweep to Excel (`source`: config-driven or profile-derived) |
+| `/api/export/shape-matrix` | POST | Export profile-derived multi-config shape sweep to Excel |
 
 ## Common Pitfalls
 
@@ -521,8 +519,9 @@ aren't misfiled.
   it does NOT overlay timing onto a static graph. The `annotate_graph_*` and
   `parse_trace_with_modules` helpers were removed; don't reintroduce them. There
   is **no interactive static-graph endpoint** (`/api/model/<id>/graph` and
-  `/api/export/static-graph` were removed) — `build_model_graph` is only reached
-  through the Shape Matrix export.
+  `/api/export/static-graph` were removed). `build_model_graph` is now wired to
+  **no endpoint at all** — the Shape Matrix export is profile-derived
+  (`graph_from_trace`); the config builder is kept only for its tests.
 - The `_ARCH_FAMILY_MAP` keys must exactly match HuggingFace `architectures[0]` values
 - Encoder models return `decode: None` (no autoregressive decode phase)
 - Diffusion models return `prefill: None, decode: None` with a `note` field

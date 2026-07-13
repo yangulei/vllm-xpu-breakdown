@@ -327,37 +327,11 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
       <p style="font-size:12px;color:#666;margin-bottom:16px">
         Export a flat table of op shapes/dtypes for the loaded model across all combinations of
         sequence length, context length, batch size, and TP size. Use Excel filters to select configurations.
+        Shapes are grounded in a real profiling run — the latest run for this model is reused,
+        or a fresh profile (using the Profile tab settings) is launched automatically if none exists.
       </p>
 
       <div class="controls-row" style="margin-bottom:16px">
-        <div class="control-group">
-          <label>Shape Source</label>
-          <select id="sm-source" onchange="updateShapeSourceHint()">
-            <option value="config" selected>Config-driven (analytic, fast)</option>
-            <option value="profile-latest">Profile-derived — use latest run</option>
-            <option value="profile-fresh">Profile-derived — run a fresh profile now</option>
-          </select>
-        </div>
-      </div>
-      <p id="sm-source-hint" style="font-size:11px;color:#888;margin:-6px 0 16px;line-height:1.5"></p>
-
-      <div class="controls-row" style="margin-bottom:16px">
-        <div class="control-group">
-          <label>Quantization</label>
-          <select id="sm-quant">
-            <option value="auto" selected>None (default)</option>
-            <option value="none">None (BF16)</option>
-            <option value="fp8">FP8</option>
-            <option value="gptq">GPTQ</option>
-            <option value="awq">AWQ</option>
-            <option value="squeezellm">SqueezeLLM</option>
-            <option value="marlin">Marlin</option>
-            <option value="gptq_marlin">GPTQ-Marlin</option>
-            <option value="awq_marlin">AWQ-Marlin</option>
-            <option value="bitsandbytes">BitsAndBytes</option>
-            <option value="gguf">GGUF</option>
-          </select>
-        </div>
         <div class="control-group">
           <label>TP Sizes (comma-separated)</label>
           <input id="sm-tp-sizes" type="text" value="1, 2, 4, 8"
@@ -458,12 +432,10 @@ async function loadConfig() {
     modelSummary = data.summary;
     showModelSummary(modelId, data.summary);
 
-    // Update quant dropdown default labels (profile + shape-matrix tabs)
+    // Update quant dropdown default label (profile tab)
     const mq = data.summary.quant_method;
     const autoLabel = mq ? `${mq.toUpperCase()} (default)` : 'None (default)';
     document.querySelector('#quant-select option[value="auto"]').textContent = autoLabel;
-    const smAuto = document.querySelector('#sm-quant option[value="auto"]');
-    if (smAuto) smAuto.textContent = autoLabel;
 
     document.getElementById('graph-section').classList.add('visible');
 
@@ -1098,39 +1070,28 @@ async function downloadShapeMatrix() {
   const decodeBatchSizes = document.getElementById('sm-decode-batch-sizes').value.trim()
     .split(',').map(s => parseInt(s.trim())).filter(n => n > 0);
 
-  const quant = document.getElementById('sm-quant').value || 'auto';
-
-  // Shape source: config-driven (default) or profile-derived (latest / fresh).
-  const sourceSel = document.getElementById('sm-source').value;
-  const source = sourceSel === 'config' ? 'config' : 'profile';
-
   const payload = {
     model_id: modelId,
-    source: source,
     tp_sizes: tpSizes,
     prefill_seq_lens: prefillSeqLens,
     prefill_ctx_lens: prefillCtxLens,
     prefill_batch_sizes: prefillBatchSizes,
     decode_ctx_lens: decodeCtxLens,
     decode_batch_sizes: decodeBatchSizes,
-    quantization: quant,
   };
 
   btn.disabled = true;
 
   try {
-    // Profile-derived (fresh): kick off a profiling run at the Profile tab's
-    // base config and wait for it to finish before deriving the sweep.
-    if (sourceSel === 'profile-fresh') {
-      status.textContent = 'Running a fresh profile (this may take several minutes)...';
-      try {
-        await runProfileForMatrix(modelId, status);
-      } catch (e) {
-        alert('Profiling failed: ' + e.message);
-        status.textContent = '';
-        btn.disabled = false;
-        return;
-      }
+    // The Shape Matrix is derived from a profiling run: reuse the latest
+    // completed run for this model, or launch a fresh one if none matches.
+    try {
+      await ensureProfileForMatrix(modelId, status);
+    } catch (e) {
+      alert('Profiling failed: ' + e.message);
+      status.textContent = '';
+      btn.disabled = false;
+      return;
     }
 
     status.textContent = 'Generating shape matrix...';
@@ -1165,8 +1126,24 @@ async function downloadShapeMatrix() {
   }
 }
 
+// Ensure a completed profiling run matching this model exists before deriving
+// the Shape Matrix: reuse the latest run if it matches, wait out any run in
+// progress, otherwise launch a fresh one (using the Profile tab base config).
+async function ensureProfileForMatrix(modelId, status) {
+  const getStatus = async () => (await fetch('/api/profile/status')).json();
+  let s = await getStatus();
+  while (s.status === 'running') {
+    status.textContent = 'Waiting for the in-progress profile to finish...';
+    await new Promise(r => setTimeout(r, 2000));
+    s = await getStatus();
+  }
+  if (s.status === 'done' && s.model_id === modelId) return;  // reuse latest
+  status.textContent = 'No matching profile found — running one now (may take several minutes)...';
+  await runProfileForMatrix(modelId, status);
+}
+
 // Run a fresh profiling run (reusing the Profile tab base config) and resolve
-// once it completes. Rejects on error / timeout so the caller can abort.
+// once it completes. Rejects on error so the caller can abort.
 function runProfileForMatrix(modelId, status) {
   return new Promise((resolve, reject) => {
     const body = buildProfileBody(modelId);
@@ -1192,31 +1169,6 @@ function runProfileForMatrix(modelId, status) {
   });
 }
 
-// Update the source hint + toggle relevance of the Quantization control.
-function updateShapeSourceHint() {
-  const sel = document.getElementById('sm-source').value;
-  const hint = document.getElementById('sm-source-hint');
-  const quantCtl = document.getElementById('sm-quant');
-  if (sel === 'config') {
-    hint.textContent = 'Analytic sweep from config.json — no profiling run required. '
-      + 'The op set is inferred, not measured.';
-    if (quantCtl) quantCtl.disabled = false;
-  } else {
-    hint.innerHTML = 'Grounds shapes in a real profiling run: the reconstructed graph\u2019s '
-      + 'actually-dispatched ops become a symbolic template that is re-resolved per configuration. '
-      + '<strong>The op set is fixed at the profiled config</strong> (TP collectives, MoE routing, '
-      + 'chunked-prefill splits) \u2014 so profile at <strong>each TP</strong> you need. '
-      + 'Query, batch, and context (S/B/C) are parametric: one profile with a small '
-      + '<strong>non-zero context</strong> captures C (as S+C on the attention KV rows), and every '
-      + 'other length is derived \u2014 no need to profile per context. '
-      + (sel === 'profile-latest'
-          ? 'Uses the <strong>latest</strong> profiling run (run one in the Profile tab first).'
-          : 'Runs a <strong>fresh</strong> profile using the Profile tab settings, then derives the sweep.')
-      + ' Quantization/dtype come from the profiled run.';
-    if (quantCtl) quantCtl.disabled = true;
-  }
-}
-
 // ---- Init ----
 document.getElementById('model-input').addEventListener('keydown', e => {
   if (e.key === 'Enter') loadConfig();
@@ -1239,9 +1191,6 @@ document.getElementById('model-input').addEventListener('keydown', e => {
     });
   } catch(e) { /* ignore – suggestions are optional */ }
 })();
-
-// Render the Shape Matrix source hint on load.
-updateShapeSourceHint();
 </script>
 </body>
 </html>

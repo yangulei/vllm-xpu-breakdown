@@ -116,37 +116,36 @@ Export op shapes across multiple configurations for analysis:
 POST /api/export/shape-matrix
 {
   "model_id": "Qwen/Qwen3-4B",
-  "source": "config",
   "prefill_seq_lens": [128, 1024, 4096],
   "prefill_ctx_lens": [0, 8192],
   "prefill_batch_sizes": [1],
   "decode_ctx_lens": [8192],
   "decode_batch_sizes": [1, 8, 32, 128],
-  "tp_sizes": [1, 4],
-  "quantization": "auto"
+  "tp_sizes": [1, 4]
 }
 ```
 
-Produces an Excel file with one row per (Phase, SeqLen, CtxLen, BatchSize, TP, Op) combination. Columns include symbolic shapes (with `S`, `B`, `C`, `TP` kept as variables), concrete shapes with dtypes, memory, FLOPs, and arithmetic intensity.
+Produces an Excel file with one row per (Phase, SeqLen, CtxLen, BatchSize, TP, Op) combination. Columns include symbolic shapes (with `S`, `B`, `C`, `TP` kept as variables), concrete shapes with real per-tensor dtypes, memory, FLOPs, and arithmetic intensity.
 
-**Two shape sources** (`source`):
+**Grounded in a real profiling run.** The op set and real shapes come from an
+actual profiling run: profile once at a typical config, and the
+actually-dispatched ops (with their symbolic shapes and recorded per-tensor
+dtypes) become a template that is re-resolved for every other
+(seq/ctx/batch/TP) case, with memory/FLOPs recomputed per config. This makes the
+matrix accurate to what the model really executes on XPU — the intended input
+for downstream optimization work. The Shape Matrix tab handles this
+automatically: it **reuses the latest completed run** for the model, or
+**launches a fresh profile** (using the Profile tab settings) if none exists.
+The exported workbook adds an **Info** sheet with the profiled config, caveats,
+and a shape round-trip **validation** summary. Because the op set is fixed at
+the profiled config, profile at **each TP** you need (sweeping TP only divides
+`/TP` dims). Query, batch, and context (`S`/`B`/`C`) are **parametric** — you do
+**not** profile per context: one base profile with any small non-zero context
+captures `C` (as `S+C` on the attention KV rows) and every other context length
+is derived. (A base profile with `context=0` leaves the KV rows as `S`, so
+context can't be derived.) Memory/FLOPs remain analytic estimates (op+shape),
+not measured.
 
-- **`"config"`** (default) — a fast, analytic sweep derived from the HuggingFace
-  `config.json`. The op set is *inferred*, no profiling run required.
-- **`"profile"`** — grounds the sweep in a **real profiling run**: profile once at
-  a typical config, and the actually-dispatched ops (with their symbolic shapes)
-  become a template that is re-resolved for every other (seq/ctx/batch/TP) case,
-  with memory/FLOPs recomputed per config. This makes the matrix accurate to what
-  the model really executes on XPU — the intended input for downstream
-  optimization work. Requires a completed profiling run for the same model
-  (use the **Shape Source** control in the Shape Matrix tab: *use latest run* or
-  *run a fresh profile now*). The exported workbook adds an **Info** sheet with the
-  profiled config and caveats. Because the op set is fixed at the profiled config,
-  profile at **each TP** you need (sweeping TP only divides `/TP` dims). Query,
-  batch, and context (`S`/`B`/`C`) are **parametric** — you do **not** profile per
-  context: one base profile with any small non-zero context captures `C` (as `S+C`
-  on the attention KV rows) and every other context length is derived. (A base
-  profile with `context=0` leaves the KV rows as `S`, so context can't be derived.)
 
 ## Comparing Eager vs Compiled
 

@@ -50,7 +50,6 @@ from breakdown.classifier import Backend, classify_op
 from breakdown.graph_from_trace import build_graph_from_trace
 from breakdown.trace_parser import _detect_device_via_torch
 from breakdown.model_graph import (
-    build_model_graph,
     min_profile_layers,
 )
 from breakdown.model_info import fetch_model_config, get_dim_symbols, summarize_config
@@ -1586,7 +1585,7 @@ def _validate_derived_shapes(template: dict) -> dict:
 
 @app.route("/api/export/shape-matrix", methods=["POST"])
 def export_shape_matrix():
-    """Export op shapes/dtypes for the current model across configurations.
+    """Export op shapes/dtypes across configurations, grounded in a profiling run.
 
     Produces a flat Excel table where each row is one
     (Phase, SeqLen, CtxLen, BatchSize, TP, Op) combination.
@@ -1597,15 +1596,14 @@ def export_shape_matrix():
       (assumes chunked prefill; seq_len = chunk size)
     Decode configs: seq_len fixed to 1, sweep context_lens × batch_sizes × tp_sizes
 
-    ``source`` selects how op shapes are derived:
-      * ``"config"`` (default) — analytic, config-driven (``build_model_graph``).
-        Fast; the op set is inferred from ``config.json``.
-      * ``"profile"`` — grounded in the latest profiling run: the reconstructed
-        graph's real dispatched ops become a symbolic template whose shapes are
-        re-resolved per configuration (memory/FLOPs recomputed). Accurate to what
-        actually executed. The op *set* is fixed at the profiled config (TP
-        collectives, MoE routing, chunked-prefill splits), so profile at the TP
-        and with the context you care about.
+    The op set + real shapes come from the latest completed profiling run for
+    this model (its reconstructed graph is used as a symbolic template): each
+    config re-resolves S/B/C/TP and recomputes Memory/FLOPs from the resolved
+    shapes (using the recorded per-tensor dtypes). The op set is fixed at the
+    profiled config (TP collectives, MoE routing, chunked-prefill splits), so the
+    caller profiles at each TP it needs; S/B/C are parametric from one profile.
+    The frontend ensures a matching profile exists (reusing the latest run or
+    launching a fresh one) before calling this endpoint.
     """
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -1616,12 +1614,6 @@ def export_shape_matrix():
     model_id = data.get("model_id")
     if not model_id:
         return jsonify({"ok": False, "error": "No model_id specified"}), 400
-
-    # Shape source: analytic config-driven (default) or profile-derived.
-    source = data.get("source", "config")
-    if source not in ("config", "profile"):
-        return jsonify({"ok": False,
-                        "error": "source must be 'config' or 'profile'"}), 400
 
     # Prefill settings
     prefill_seq_lens = data.get("prefill_seq_lens",
@@ -1636,13 +1628,6 @@ def export_shape_matrix():
 
     # TP sizes
     tp_sizes = data.get("tp_sizes", [1, 2, 4, 8])
-
-    # Quantization normalization
-    quantization = data.get("quantization", None)
-    if quantization == "auto":
-        quantization = None
-    elif quantization == "none":
-        quantization = "none"
 
     # Validate inputs
     if not isinstance(prefill_seq_lens, list) or not prefill_seq_lens:
@@ -1665,85 +1650,54 @@ def export_shape_matrix():
             for bs in prefill_batch_sizes:
                 for tp in tp_sizes:
                     configs.append({
-                        "phase": "prefill",
-                        "seq_len": seq,
-                        "ctx_len": ctx,
-                        "batch_size": bs,
-                        "tp_size": tp,
-                        "prefill_len": seq,
-                        "decode_batch": bs,
-                        "context_len": ctx,
+                        "phase": "prefill", "seq_len": seq, "ctx_len": ctx,
+                        "batch_size": bs, "tp_size": tp,
                     })
     for ctx in decode_ctx_lens:
         for bs in decode_batch_sizes:
             for tp in tp_sizes:
                 configs.append({
-                    "phase": "decode",
-                    "seq_len": 1,
-                    "ctx_len": ctx,
-                    "batch_size": bs,
-                    "tp_size": tp,
-                    "prefill_len": 1,
-                    "decode_batch": bs,
-                    "context_len": ctx,
+                    "phase": "decode", "seq_len": 1, "ctx_len": ctx,
+                    "batch_size": bs, "tp_size": tp,
                 })
 
     if not configs:
         return jsonify({"ok": False,
                         "error": "No configurations generated."}), 400
 
-    # Fetch model config
-    try:
-        config = fetch_model_config(model_id)
-        summary = summarize_config(config)
-    except Exception as e:
-        return jsonify({"ok": False,
-                        "error": f"Failed to fetch model config: {e}"}), 400
+    # Grab the latest reconstructed graph as the op template (real dispatched ops
+    # with symbolic shapes) and validate it matches the requested model. The
+    # frontend guarantees a matching completed run exists before calling here.
+    with _profile_lock:
+        state_status = _profile_state["status"]
+        state_model = _profile_state.get("model_id")
+        state_result = _profile_state.get("result")
+        profile_settings = _profile_state.get("settings")
+    if state_status != "done" or not state_result:
+        return jsonify({
+            "ok": False,
+            "error": "The Shape Matrix is derived from a profiling run, but no "
+                     "completed run is available. Run a profile first.",
+        }), 400
+    profile_template = state_result.get("graph")
+    if not profile_template or not (profile_template.get("prefill")
+                                    or profile_template.get("decode")):
+        return jsonify({
+            "ok": False,
+            "error": "The latest profile has no reconstructed graph to "
+                     "derive shapes from.",
+        }), 400
+    if state_model and state_model != model_id:
+        return jsonify({
+            "ok": False,
+            "error": f"Latest profile is for '{state_model}', not '{model_id}'. "
+                     "Profile that model or switch the model ID.",
+        }), 400
 
-    # Profile-derived source: grab the latest reconstructed graph as the op
-    # template (real dispatched ops with symbolic shapes) and validate it
-    # matches the requested model.
-    profile_template = None
-    profile_settings = None
-    if source == "profile":
-        with _profile_lock:
-            state_status = _profile_state["status"]
-            state_model = _profile_state.get("model_id")
-            state_result = _profile_state.get("result")
-            profile_settings = _profile_state.get("settings")
-        if state_status != "done" or not state_result:
-            return jsonify({
-                "ok": False,
-                "error": "Profile-derived export requires a completed profiling "
-                         "run. Run a profile first (Profile tab), then export.",
-            }), 400
-        profile_template = state_result.get("graph")
-        if not profile_template or not (profile_template.get("prefill")
-                                        or profile_template.get("decode")):
-            return jsonify({
-                "ok": False,
-                "error": "The latest profile has no reconstructed graph to "
-                         "derive shapes from.",
-            }), 400
-        if state_model and state_model != model_id:
-            return jsonify({
-                "ok": False,
-                "error": f"Latest profile is for '{state_model}', not "
-                         f"'{model_id}'. Profile that model or switch the "
-                         "model ID.",
-            }), 400
+    pdtype_bytes = profile_template.get("config", {}).get("dtype_bytes", 2)
 
-    # Estimate row count (configs × ~ops_per_config) for limit check
-    if source == "profile":
-        pdtype_bytes = profile_template.get("config", {}).get("dtype_bytes", 2)
-        test_tree = (profile_template.get("prefill")
-                     or profile_template.get("decode"))
-    else:
-        test_graph = build_model_graph(
-            summary, prefill_len=1, decode_batch=1, context_len=1,
-            tp_size=tp_sizes[0], quantization=quantization, device=_DEVICE,
-        )
-        test_tree = test_graph.get("prefill") or test_graph.get("decode")
+    # Estimate row count (configs × ~ops_per_config) for the limit guard.
+    test_tree = profile_template.get("prefill") or profile_template.get("decode")
     test_ops_count = 0
     if test_tree:
         for node in _flatten_graph_nodes(test_tree):
@@ -1785,40 +1739,25 @@ def export_shape_matrix():
         c.alignment = Alignment(horizontal="center")
 
     row = 2
+    graph_cfg = profile_template.get("config", {})
+    base_symbols = profile_template.get("symbols", {})
     for cfg in configs:
-        if source == "profile":
-            graph_cfg = profile_template.get("config", {})
-            symbols = _config_symbols(profile_template.get("symbols", {}), cfg)
-            tree = profile_template.get(cfg["phase"])
-        else:
-            graph = build_model_graph(
-                summary,
-                prefill_len=cfg["prefill_len"],
-                decode_batch=cfg["decode_batch"],
-                context_len=cfg["context_len"],
-                tp_size=cfg["tp_size"],
-                quantization=quantization,
-                device=_DEVICE,
-            )
-            graph_cfg = graph.get("config", {})
-            symbols = graph.get("symbols", {})
-            tree = graph.get(cfg["phase"])
+        tree = profile_template.get(cfg["phase"])
         if not tree:
             continue
+        symbols = _config_symbols(base_symbols, cfg)
 
         flat_nodes = _flatten_graph_nodes(tree)
         for node_info in flat_nodes:
             effective_repeat = node_info.get("effective_repeat", 1)
             for op in node_info["ops"]:
-                # For profile-derived rows, prefer the real per-tensor dtypes
-                # recorded in the trace over the config-driven heuristic.
-                recorded_dtypes = (op.get("input_dtypes")
-                                   if source == "profile" else None)
+                # Prefer the real per-tensor dtypes recorded in the trace.
+                recorded_dtypes = op.get("input_dtypes")
                 shape_str = _format_op_shape_with_dtypes(
                     op, symbols, graph_cfg, recorded_dtypes=recorded_dtypes)
 
                 # Symbolic shape: keep only config variables (S, B, C, TP)
-                # symbolic, resolve model constants to config.json numbers
+                # symbolic, resolve model constants to numbers.
                 sym_shapes = op.get("input_shapes", [])
                 if sym_shapes:
                     sym_parts = []
@@ -1834,23 +1773,17 @@ def export_shape_matrix():
                 else:
                     symbolic_str = "—"
 
-                if source == "profile":
-                    # The template op's memory/FLOPs were measured at the
-                    # profiled config; recompute them from this config's
-                    # resolved shapes so every row is self-consistent. Memory
-                    # uses the recorded per-tensor dtypes for accuracy.
-                    resolved = _resolve_shape_ints(sym_shapes, symbols)
-                    op_name = op.get("name", "")
-                    if recorded_dtypes:
-                        mem_bytes = _profile_op_memory(
-                            op_name, resolved, recorded_dtypes, pdtype_bytes)
-                    else:
-                        mem_bytes = estimate_memory(
-                            op_name, resolved, pdtype_bytes)
-                    flops = estimate_flops(op_name, resolved)
+                # Recompute Memory/FLOPs from this config's resolved shapes so
+                # every row is self-consistent; Memory uses the recorded
+                # per-tensor dtypes for accuracy.
+                resolved = _resolve_shape_ints(sym_shapes, symbols)
+                op_name = op.get("name", "")
+                if recorded_dtypes:
+                    mem_bytes = _profile_op_memory(
+                        op_name, resolved, recorded_dtypes, pdtype_bytes)
                 else:
-                    mem_bytes = op.get("memory_bytes", 0)
-                    flops = op.get("flops", 0)
+                    mem_bytes = estimate_memory(op_name, resolved, pdtype_bytes)
+                flops = estimate_flops(op_name, resolved)
                 ai = round(flops / mem_bytes, 2) if mem_bytes > 0 else 0
 
                 # Merge module path and op role into single column
@@ -1896,74 +1829,72 @@ def export_shape_matrix():
     if row > 2:
         ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{row - 1}"
 
-    # Provenance / caveats sheet for profile-derived exports so the optimization
-    # engineers know exactly which profiling run the shapes were grounded in.
-    if source == "profile":
-        info = wb.create_sheet("Info")
-        ps = profile_settings or {}
-        pcfg = profile_template.get("config", {})
-        info_rows = [
-            ("Shape source", "profile-derived (grounded in a profiling run)"),
-            ("Model", model_id),
-            ("Profiled query_len (S)", ps.get("query_len")),
-            ("Profiled context_len (C)", ps.get("context_len")),
-            ("Profiled decode batch (B)", ps.get("decode_batch_size")),
-            ("Profiled TP", pcfg.get("tp_size", ps.get("tp_size"))),
-            ("Profiled quantization", pcfg.get("quantization")),
-            ("Profiled mode", ps.get("mode")),
-            ("", ""),
-            ("How rows are derived",
-             "The profile contributes the accurate op set, real recorded "
-             "shapes and backends. Shapes are re-resolved per config "
-             "(S/B/C/TP). Memory/FLOPs are then analytic functions of "
-             "(op, shape, dtype) — the same estimator the config-driven path "
-             "uses, recomputed per config — NOT measured values."),
-            ("Memory/FLOPs are estimates",
-             "Heuristic (op+shape) estimates, not measured; e.g. attention "
-             "FLOPs are not modeled. Only the op set and shapes come from the "
-             "trace. Measured device time is intentionally not in this sweep."),
-            ("Caveat — op set / TP",
-             "The op set (TP collectives, MoE routing, chunked-prefill splits) "
-             "is fixed at the profiled config. Profile at each TP you need — "
-             "sweeping TP only divides /TP dims, it does not add comm ops that "
-             "weren't profiled."),
-            ("Context (C) is parametric",
-             "No need to profile per context. One base profile with any "
-             "non-zero context captures C as S+C on the prefill attention KV "
-             "rows; every other context length is then derived by resolving C. "
-             "A base profile with context=0 leaves KV rows as S, so context "
-             "can't be derived — profile with a small non-zero context."),
-            ("Caveat — timing",
-             "Device time is valid only at the profiled point and is not "
-             "included in this sweep; rows carry shapes/memory/FLOPs only."),
-        ]
-        # Round-trip validation: re-resolving each op's symbolic shape at the
-        # profiled config must reproduce the shape actually recorded in the
-        # trace — a self-consistency proof for the derivation machinery.
-        vres = _validate_derived_shapes(profile_template)
-        if vres["total"]:
-            pct = 100.0 * vres["matched"] / vres["total"]
+    # Provenance / caveats sheet so the optimization engineers know exactly
+    # which profiling run the shapes were grounded in.
+    info = wb.create_sheet("Info")
+    ps = profile_settings or {}
+    pcfg = profile_template.get("config", {})
+    info_rows = [
+        ("Shape source", "profile-derived (grounded in a profiling run)"),
+        ("Model", model_id),
+        ("Profiled query_len (S)", ps.get("query_len")),
+        ("Profiled context_len (C)", ps.get("context_len")),
+        ("Profiled decode batch (B)", ps.get("decode_batch_size")),
+        ("Profiled TP", pcfg.get("tp_size", ps.get("tp_size"))),
+        ("Profiled quantization", pcfg.get("quantization")),
+        ("Profiled mode", ps.get("mode")),
+        ("", ""),
+        ("How rows are derived",
+         "The profile contributes the accurate op set, real recorded "
+         "shapes and backends. Shapes are re-resolved per config "
+         "(S/B/C/TP). Memory/FLOPs are then analytic functions of "
+         "(op, shape, dtype), recomputed per config — NOT measured values."),
+        ("Memory/FLOPs are estimates",
+         "Heuristic (op+shape) estimates, not measured; e.g. attention "
+         "FLOPs are not modeled. Only the op set and shapes come from the "
+         "trace. Measured device time is intentionally not in this sweep."),
+        ("Caveat — op set / TP",
+         "The op set (TP collectives, MoE routing, chunked-prefill splits) "
+         "is fixed at the profiled config. Profile at each TP you need — "
+         "sweeping TP only divides /TP dims, it does not add comm ops that "
+         "weren't profiled."),
+        ("Context (C) is parametric",
+         "No need to profile per context. One base profile with any "
+         "non-zero context captures C as S+C on the prefill attention KV "
+         "rows; every other context length is then derived by resolving C. "
+         "A base profile with context=0 leaves KV rows as S, so context "
+         "can't be derived — profile with a small non-zero context."),
+        ("Caveat — timing",
+         "Device time is valid only at the profiled point and is not "
+         "included in this sweep; rows carry shapes/memory/FLOPs only."),
+    ]
+    # Round-trip validation: re-resolving each op's symbolic shape at the
+    # profiled config must reproduce the shape actually recorded in the
+    # trace — a self-consistency proof for the derivation machinery.
+    vres = _validate_derived_shapes(profile_template)
+    if vres["total"]:
+        pct = 100.0 * vres["matched"] / vres["total"]
+        info_rows.append((
+            "Shape validation",
+            f"{vres['matched']}/{vres['total']} op input shapes "
+            f"({pct:.1f}%) re-resolve at the profiled config to exactly the "
+            "shape recorded in the trace (context-annotated KV rows "
+            "excluded). This validates the symbolic derivation.",
+        ))
+        if vres["mismatched"]:
             info_rows.append((
-                "Shape validation",
-                f"{vres['matched']}/{vres['total']} op input shapes "
-                f"({pct:.1f}%) re-resolve at the profiled config to exactly the "
-                "shape recorded in the trace (context-annotated KV rows "
-                "excluded). This validates the symbolic derivation.",
+                "Validation mismatches",
+                f"{vres['mismatched']} mismatched. Examples: "
+                + " | ".join(vres["examples"]),
             ))
-            if vres["mismatched"]:
-                info_rows.append((
-                    "Validation mismatches",
-                    f"{vres['mismatched']} mismatched. Examples: "
-                    + " | ".join(vres["examples"]),
-                ))
-        for r_idx, (k, v) in enumerate(info_rows, 1):
-            kc = info.cell(r_idx, 1, k)
-            kc.font = Font(bold=True, size=10)
-            kc.alignment = Alignment(vertical="top")
-            vc = info.cell(r_idx, 2, "" if v is None else str(v))
-            vc.alignment = Alignment(wrap_text=True, vertical="top")
-        info.column_dimensions["A"].width = 26
-        info.column_dimensions["B"].width = 90
+    for r_idx, (k, v) in enumerate(info_rows, 1):
+        kc = info.cell(r_idx, 1, k)
+        kc.font = Font(bold=True, size=10)
+        kc.alignment = Alignment(vertical="top")
+        vc = info.cell(r_idx, 2, "" if v is None else str(v))
+        vc.alignment = Alignment(wrap_text=True, vertical="top")
+    info.column_dimensions["A"].width = 26
+    info.column_dimensions["B"].width = 90
 
     # Write to buffer
     buf = io.BytesIO()
@@ -1971,14 +1902,8 @@ def export_shape_matrix():
     buf.seek(0)
 
     model_name = model_id.replace("/", "_")
-    # Resolve effective quantization for filename (align with what model actually uses)
-    effective_quant = quantization
-    if not effective_quant or effective_quant == "none":
-        effective_quant = summary.get("quant_method")
-    quant_tag = effective_quant if effective_quant else "none"
-    source_tag = "profile" if source == "profile" else "config"
-    filename = (f"vllm_xpu_shape_matrix_{model_name}_{quant_tag}_"
-                f"{source_tag}.xlsx")
+    quant_tag = pcfg.get("quantization") or "none"
+    filename = f"vllm_xpu_shape_matrix_{model_name}_{quant_tag}_profile.xlsx"
 
     return Response(
         buf.getvalue(),
