@@ -607,6 +607,36 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             return {os.path.join(trace_dir, f) for f in os.listdir(trace_dir)
                     if f.endswith(".json") or f.endswith(".json.gz")}
 
+        def _install_span_hooks() -> bool:
+            """Install capture-time module-name span hooks in the worker(s).
+
+            Registers forward hooks that emit ``record_function(
+            "module::<qname>::<Cls>")`` spans around every module's forward, so
+            the trace carries real attribute names (``q_norm``/``k_norm``,
+            ``self_attn``, ...) and ``build_graph_from_trace`` reconstructs the
+            tree with exact names — no reference-tree overlay needed (research
+            R1). Best-effort: on any failure the run proceeds and naming falls
+            back to the ``module_naming`` overlay.
+            """
+            try:
+                from breakdown.module_hooks import install_module_span_hooks_on
+                llm.apply_model(install_module_span_hooks_on)
+                return True
+            except Exception:
+                logger.warning("module span hooks: install failed; module names "
+                               "will fall back to the name overlay",
+                               exc_info=True)
+                return False
+
+        def _remove_span_hooks(installed: bool) -> None:
+            if not installed:
+                return
+            try:
+                from breakdown.module_hooks import remove_module_span_hooks_on
+                llm.apply_model(remove_module_span_hooks_on)
+            except Exception:
+                logger.warning("module span hooks: remove failed", exc_info=True)
+
         def _profiled_pass(pass_batch: int, pass_query_len: int,
                            pass_max_tokens: int):
             """Warm + run one profiled generate at the given batch/query size.
@@ -653,10 +683,12 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
                 profiled_prompts = _batch(900000)
 
                 before = _list_trace_files()
+                _spans = _install_span_hooks()
                 llm.start_profile()
                 outputs = llm.generate(profiled_prompts, pass_sampling,
                                        use_tqdm=False)
                 llm.stop_profile()
+                _remove_span_hooks(_spans)
 
                 # Verify the context was served from cache. A miss means the
                 # profiled prefill recomputed the whole context (S = context +
@@ -699,9 +731,11 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
                     _run_inference()
 
                 before = _list_trace_files()
+                _spans = _install_span_hooks()
                 llm.start_profile()
                 _run_inference()
                 llm.stop_profile()
+                _remove_span_hooks(_spans)
 
             # torch's profiler writes the trace on stop_profile; wait briefly for
             # the new file(s) to appear, then return them (newest first).
@@ -738,30 +772,34 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             single_files, cache_hit_note = _profiled_pass(
                 dc_batch, query_len, pass_max_tokens=max_tokens)
 
-        # Capture the real module hierarchy (attribute names like q_norm/k_norm)
-        # from the loaded model while it is still alive, to enrich the
-        # trace-reconstructed graph with structural names.
+        # Module attribute names (q_norm/k_norm, ...) come primarily from the
+        # capture-time ``module::`` spans installed above, which the
+        # reconstruction reads directly from the trace. We still capture a
+        # ``named_modules()`` reference tree from the live model as a *fallback*
+        # overlay: ``build_graph_from_trace`` uses it only if the trace lacks
+        # those spans (e.g. hook install failed, or an older trace).
         ref_module_tree = None
         try:
             from breakdown.module_naming import ref_tree_from_llm
             ref_module_tree = ref_tree_from_llm(llm)
         except Exception:
-            logger.warning("ref_tree_from_llm raised; module names disabled",
-                           exc_info=True)
+            logger.warning("ref_tree_from_llm raised; fallback name overlay "
+                           "disabled", exc_info=True)
             ref_module_tree = None
 
         if ref_module_tree:
             logger.info(
-                "Module-name recovery: got reference tree from live model "
-                "(root=%s, %d top-level children)",
+                "Module-name overlay (fallback): got reference tree from live "
+                "model (root=%s, %d top-level children)",
                 ref_module_tree.get("cls"),
                 len(ref_module_tree.get("children", [])),
             )
         else:
             logger.warning(
-                "Module-name recovery: could NOT read module names from the "
-                "live model (ref_tree_from_llm returned None). q_norm/k_norm and "
-                "other attribute names will fall back to class heuristics."
+                "Module-name overlay (fallback): could NOT read module names "
+                "from the live model (ref_tree_from_llm returned None). If the "
+                "capture-time spans also failed, q_norm/k_norm and other "
+                "attribute names will fall back to class heuristics."
             )
             # Fallback: the offline meta-device path. Heavy (re-instantiates on
             # meta) but lets naming work when the live-model traversal fails.
@@ -775,7 +813,7 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
                     )
                     if ref_module_tree:
                         logger.info(
-                            "Module-name recovery: recovered names via "
+                            "Module-name overlay (fallback): recovered names via "
                             "meta-device fallback."
                         )
                 except Exception:

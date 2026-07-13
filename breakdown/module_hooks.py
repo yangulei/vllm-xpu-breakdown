@@ -96,3 +96,32 @@ def module_span_hooks(model: Any):
         yield handles
     finally:
         remove_module_span_hooks(handles)
+
+
+# ``LLM.apply_model`` runs a callable in the worker process that owns the model
+# (and the profiler). The handles it returns are not needed on the caller side,
+# so stash them on the model and provide a matching remover that reads them back.
+_SPAN_HANDLES_ATTR = "_xpu_breakdown_span_handles"
+
+
+def install_module_span_hooks_on(model: Any) -> int:
+    """``apply_model``-friendly installer; stashes handles on the model.
+
+    Returns the number of hooks installed (picklable across the worker boundary).
+    """
+    handles = install_module_span_hooks(model)
+    setattr(model, _SPAN_HANDLES_ATTR, handles)
+    return len(handles)
+
+
+def remove_module_span_hooks_on(model: Any) -> bool:
+    """``apply_model``-friendly remover for hooks installed on ``model``."""
+    handles = getattr(model, _SPAN_HANDLES_ATTR, None)
+    if handles:
+        remove_module_span_hooks(handles)
+        try:
+            delattr(model, _SPAN_HANDLES_ATTR)
+        except Exception:
+            pass
+    return True
+
