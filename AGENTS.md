@@ -239,16 +239,23 @@ config, `_config_symbols` overrides `S`/`B`/`C`/`S+C`/`TP` in a copy of the
 profile's `symbols`, every op's shapes are re-resolved (`_resolve_shape_ints`),
 and **Memory/FLOPs are recomputed per config** via `_profile_op_memory` /
 `estimate_flops`. An **Info** sheet records the profiled config, caveats, and a
-validation summary. Filename ends in `_profile.xlsx`.
+validation summary. Filename is
+`vllm_xpu_shape_matrix_<model>_<quant>.xlsx`.
 > There is **no config-driven builder** — `model_graph.py` was deleted. The
 > Shape Matrix is purely profile-derived; do not re-add a config `source` branch
 > or a static graph builder.
 - **Acquisition + invariants:** requires `_profile_state["status"]=="done"` and
-  the profiled `model_id` to match the requested one (else 400). The **frontend
-  guarantees** a matching run exists before calling: `ensureProfileForMatrix`
-  reuses the latest completed run, waits out any in-progress run, or launches a
-  fresh profile (`buildProfileBody`, shared with `startProfile`) via
-  `runProfileForMatrix` and polls to completion. The op *set* is fixed at the
+  both the profiled `model_id` **and** the profiled quantization to match the
+  requested ones (else 400) — quantization must match because the derived
+  dtypes/memory are only valid for the quantization the run actually used
+  (compared via the run's `settings["quantization"]`, `""`/`auto`/`none`→None).
+  The **frontend guarantees** a matching run exists before calling:
+  `ensureProfileForMatrix` reuses the latest completed run only when its model
+  **and** `settings.quantization` match the Shape Matrix's `Quantization`
+  selector, waits out any in-progress run, or launches a fresh profile
+  (`buildProfileBody`, shared with `startProfile`, with `quantization`
+  overridden to the selected one) via `runProfileForMatrix` and polls to
+  completion. The op *set* is fixed at the
   profiled config — sweeping TP only divides `/TP` dims, it does **not**
   synthesize comm ops that weren't profiled, so profile at **each TP** you need.
   Query/batch/context (`S`/`B`/`C`) are **parametric** and need only one base

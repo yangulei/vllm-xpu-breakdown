@@ -116,6 +116,10 @@ class TestShapeMatrixExport(unittest.TestCase):
     @patch("app.fetch_model_config", return_value=MOCK_QWEN3_CONFIG)
     def test_quantization_in_filename(self, mock_fetch):
         """Filename should include quantization tag."""
+        import app as app_module
+        # The Shape Matrix reuses the last run only when the quantization
+        # matches, so profile settings must report the same fp8 quantization.
+        app_module._profile_state["settings"]["quantization"] = "fp8"
         resp = self._export({
             "model_id": "Qwen/Qwen3-4B",
             "prefill_seq_lens": [128],
@@ -128,6 +132,23 @@ class TestShapeMatrixExport(unittest.TestCase):
         })
         cd = resp.headers.get("Content-Disposition", "")
         self.assertIn("fp8", cd)
+
+    @patch("app.fetch_model_config", return_value=MOCK_QWEN3_CONFIG)
+    def test_quantization_mismatch_rejected(self, mock_fetch):
+        """Requesting a quantization the profile didn't use is rejected."""
+        # Default injected run has no quantization; requesting fp8 must 400.
+        resp = self._export({
+            "model_id": "Qwen/Qwen3-4B",
+            "prefill_seq_lens": [128],
+            "prefill_ctx_lens": [0],
+            "prefill_batch_sizes": [1],
+            "decode_ctx_lens": [4096],
+            "decode_batch_sizes": [1],
+            "tp_sizes": [1],
+            "quantization": "fp8",
+        })
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("quantization", resp.get_json()["error"].lower())
 
     @patch("app.fetch_model_config", return_value=MOCK_QWEN3_CONFIG)
     def test_always_both_phases(self, mock_fetch):
@@ -463,7 +484,7 @@ class TestShapeMatrixProfileSource(unittest.TestCase):
         names = {ws.cell(r, 7).value for r in range(2, 200)
                  if ws.cell(r, 7).value}
         self.assertIn("vllm::unified_attention_with_output", names)
-        self.assertIn("profile", resp.headers.get("Content-Disposition", ""))
+        self.assertIn("fp8", resp.headers.get("Content-Disposition", ""))
 
     @patch("app.fetch_model_config", return_value=MOCK_QWEN3_CONFIG)
     def test_profile_tp_divides_shapes(self, mock_fetch):

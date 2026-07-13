@@ -1722,6 +1722,29 @@ def export_shape_matrix():
                      "Profile that model or switch the model ID.",
         }), 400
 
+    # The derived shapes/dtypes/memory are only valid for the quantization the
+    # run actually used, so the requested quantization must match the profiled
+    # one. Normalize "", "auto", "none" → None (no quantization).
+    def _norm_quant(q: object) -> str | None:
+        if not q or str(q).lower() in ("auto", "none"):
+            return None
+        return str(q).lower()
+
+    requested_quant = _norm_quant(data.get("quantization"))
+    profiled_quant = _norm_quant(
+        (profile_settings or {}).get("quantization")
+        if profile_settings else
+        profile_template.get("config", {}).get("quantization")
+    )
+    if requested_quant != profiled_quant:
+        return jsonify({
+            "ok": False,
+            "error": f"Latest profile used quantization "
+                     f"'{profiled_quant or 'none'}', not "
+                     f"'{requested_quant or 'none'}'. Re-profile with the "
+                     "requested quantization or change the selection.",
+        }), 400
+
     pdtype_bytes = profile_template.get("config", {}).get("dtype_bytes", 2)
 
     # Estimate row count (configs × ~ops_per_config) for the limit guard.
@@ -1930,8 +1953,12 @@ def export_shape_matrix():
     buf.seek(0)
 
     model_name = model_id.replace("/", "_")
-    quant_tag = pcfg.get("quantization") or "none"
-    filename = f"vllm_xpu_shape_matrix_{model_name}_{quant_tag}_profile.xlsx"
+    # Tag with the quantization method, or the model's concrete activation dtype
+    # (e.g. bf16/fp16) when the run is unquantized — never a bare "none".
+    quant_tag = pcfg.get("quantization") or _bytes_to_dtype(
+        pcfg.get("dtype_bytes", 2)
+    )
+    filename = f"vllm_xpu_shape_matrix_{model_name}_{quant_tag}.xlsx"
 
     return Response(
         buf.getvalue(),

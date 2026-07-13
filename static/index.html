@@ -337,6 +337,22 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
           <input id="sm-tp-sizes" type="text" value="1, 2, 4, 8"
                  style="font-family:monospace">
         </div>
+        <div class="control-group">
+          <label>Quantization</label>
+          <select id="sm-quant-select">
+            <option value="auto" selected>None (default)</option>
+            <option value="none">None (BF16)</option>
+            <option value="fp8">FP8</option>
+            <option value="gptq">GPTQ</option>
+            <option value="awq">AWQ</option>
+            <option value="squeezellm">SqueezeLLM</option>
+            <option value="marlin">Marlin</option>
+            <option value="gptq_marlin">GPTQ-Marlin</option>
+            <option value="awq_marlin">AWQ-Marlin</option>
+            <option value="bitsandbytes">BitsAndBytes</option>
+            <option value="gguf">GGUF</option>
+          </select>
+        </div>
       </div>
 
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
@@ -1070,6 +1086,14 @@ async function downloadShapeMatrix() {
   const decodeBatchSizes = document.getElementById('sm-decode-batch-sizes').value.trim()
     .split(',').map(s => parseInt(s.trim())).filter(n => n > 0);
 
+  // Quantization: the Shape Matrix is grounded in a profiling run, so the run
+  // must have used the same quantization for the derived shapes/dtypes/memory
+  // to be valid. null = no quantization (BF16).
+  const smQuant = (() => {
+    const q = document.getElementById('sm-quant-select').value;
+    return (q === 'auto' || q === 'none') ? null : q;
+  })();
+
   const payload = {
     model_id: modelId,
     tp_sizes: tpSizes,
@@ -1078,15 +1102,17 @@ async function downloadShapeMatrix() {
     prefill_batch_sizes: prefillBatchSizes,
     decode_ctx_lens: decodeCtxLens,
     decode_batch_sizes: decodeBatchSizes,
+    quantization: smQuant,
   };
 
   btn.disabled = true;
 
   try {
     // The Shape Matrix is derived from a profiling run: reuse the latest
-    // completed run for this model, or launch a fresh one if none matches.
+    // completed run for this model *and* quantization, or launch a fresh one
+    // if none matches.
     try {
-      await ensureProfileForMatrix(modelId, status);
+      await ensureProfileForMatrix(modelId, payload.quantization, status);
     } catch (e) {
       alert('Profiling failed: ' + e.message);
       status.textContent = '';
@@ -1126,27 +1152,34 @@ async function downloadShapeMatrix() {
   }
 }
 
-// Ensure a completed profiling run matching this model exists before deriving
-// the Shape Matrix: reuse the latest run if it matches, wait out any run in
-// progress, otherwise launch a fresh one (using the Profile tab base config).
-async function ensureProfileForMatrix(modelId, status) {
+// Ensure a completed profiling run matching this model *and* quantization
+// exists before deriving the Shape Matrix: reuse the latest run if it matches,
+// wait out any run in progress, otherwise launch a fresh one (using the
+// Profile tab base config with the requested quantization).
+async function ensureProfileForMatrix(modelId, quant, status) {
   const getStatus = async () => (await fetch('/api/profile/status')).json();
+  const wantQuant = quant || null;
   let s = await getStatus();
   while (s.status === 'running') {
     status.textContent = 'Waiting for the in-progress profile to finish...';
     await new Promise(r => setTimeout(r, 2000));
     s = await getStatus();
   }
-  if (s.status === 'done' && s.model_id === modelId) return;  // reuse latest
+  const runQuant = (s.settings && s.settings.quantization) || null;
+  if (s.status === 'done' && s.model_id === modelId && runQuant === wantQuant) {
+    return;  // reuse latest run — model and quantization both match
+  }
   status.textContent = 'No matching profile found — running one now (may take several minutes)...';
-  await runProfileForMatrix(modelId, status);
+  await runProfileForMatrix(modelId, wantQuant, status);
 }
 
-// Run a fresh profiling run (reusing the Profile tab base config) and resolve
-// once it completes. Rejects on error so the caller can abort.
-function runProfileForMatrix(modelId, status) {
+// Run a fresh profiling run (reusing the Profile tab base config, overriding
+// the quantization to the one requested for the Shape Matrix) and resolve once
+// it completes. Rejects on error so the caller can abort.
+function runProfileForMatrix(modelId, quant, status) {
   return new Promise((resolve, reject) => {
     const body = buildProfileBody(modelId);
+    body.quantization = quant || null;
     fetch('/api/profile', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
