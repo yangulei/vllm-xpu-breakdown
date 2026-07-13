@@ -39,7 +39,13 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from breakdown.analyzer import AnalyzedOp, analyze_ops
+from breakdown.analyzer import (
+    AnalyzedOp,
+    analyze_ops,
+    dtype_size,
+    estimate_flops,
+    estimate_memory,
+)
 from breakdown.classifier import Backend, classify_op
 from breakdown.graph_from_trace import build_graph_from_trace
 from breakdown.trace_parser import _detect_device_via_torch
@@ -1239,12 +1245,18 @@ _MAX_MATRIX_ROWS = 50000
 
 
 def _format_op_shape_with_dtypes(
-    op: dict, symbols: dict[str, int], graph_cfg: dict
+    op: dict, symbols: dict[str, int], graph_cfg: dict,
+    recorded_dtypes: list[str] | None = None,
 ) -> str:
     """Format op shapes as concrete values with per-tensor dtypes.
 
     Example: "[128, 2560, bf16] × [2560, 6144, fp8]"
     Resolves symbolic dims (including composite like "S+C") via the symbols dict.
+
+    When ``recorded_dtypes`` is given (the real per-tensor dtypes captured in the
+    profiling trace, aligned with ``op["input_shapes"]``), it takes precedence
+    over the config-driven ``_get_tensor_dtype`` heuristic so the exported dtype
+    is exactly what the op actually ran.
     """
     op_shapes = op.get("input_shapes", [])
     if not op_shapes:
@@ -1253,7 +1265,11 @@ def _format_op_shape_with_dtypes(
     parts = []
     for shape_idx, shape in enumerate(op_shapes):
         if isinstance(shape, list):
-            tensor_dtype = _get_tensor_dtype(shape_idx, role, graph_cfg)
+            tensor_dtype = None
+            if recorded_dtypes and shape_idx < len(recorded_dtypes):
+                tensor_dtype = _friendly_dtype(recorded_dtypes[shape_idx])
+            if not tensor_dtype:
+                tensor_dtype = _get_tensor_dtype(shape_idx, role, graph_cfg)
             dims = []
             for dim in shape:
                 dims.append(str(_resolve_dim(dim, symbols)))
@@ -1428,6 +1444,146 @@ def _resolve_constant_expr(expr: str, symbols: dict[str, int]) -> str:
     return expr
 
 
+# ---- Profile-derived Shape Matrix helpers ----
+
+_FRIENDLY_DTYPE = {
+    "bfloat16": "bf16", "bf16": "bf16",
+    "float16": "fp16", "fp16": "fp16",
+    "float32": "fp32", "float": "fp32", "fp32": "fp32",
+    "float8_e4m3fn": "fp8e4m3", "float8_e5m2": "fp8e5m2", "fp8": "fp8",
+    "int8": "int8", "uint8": "uint8",
+    "int64": "i64", "int32": "i32", "int16": "i16", "long": "i64", "int": "i32",
+    "bool": "bool",
+}
+
+
+def _friendly_dtype(name: str) -> str:
+    """Short display name for a recorded trace dtype ('bfloat16' → 'bf16')."""
+    if not name:
+        return ""
+    return _FRIENDLY_DTYPE.get(name.lower(), name.lower())
+
+
+def _prod_ints(shape) -> int:
+    p = 1
+    for d in shape:
+        if isinstance(d, int):
+            p *= d
+        else:
+            return 0
+    return p
+
+
+_MM_OP_BASES = {"mm", "addmm", "linear", "matmul", "bmm", "_scaled_mm",
+                "fp8_gemm", "fp4_gemm", "int4_gemm_w4a16", "int4_gemm_w4a8"}
+
+
+def _profile_op_memory(op_name: str, shapes: list[list[int]],
+                       dtypes: list[str], act_bytes: int) -> int:
+    """Estimate op memory using the *recorded per-tensor* dtypes.
+
+    Reads are sized per input tensor with its own dtype (so an fp8/int4 weight
+    counts 1 byte while a bf16 activation counts 2) — more accurate than a
+    single global dtype for quantized ops. The write (output) is sized at the
+    activation dtype. Falls back to 0 when shapes aren't concrete.
+    """
+    if not shapes:
+        return 0
+    reads = 0
+    for i, s in enumerate(shapes):
+        n = _prod_ints(s)
+        if n == 0:
+            return 0
+        b = dtype_size(dtypes[i]) if i < len(dtypes) and dtypes[i] else act_bytes
+        reads += n * b
+    base = op_name.split("::")[-1].lower()
+    if (base in _MM_OP_BASES and len(shapes) >= 2
+            and len(shapes[0]) >= 2 and len(shapes[1]) >= 2):
+        out = _prod_ints(shapes[0][:-1]) * shapes[1][-1]
+    else:
+        out = _prod_ints(shapes[0])
+    return reads + out * act_bytes
+
+
+def _config_symbols(base_symbols: dict[str, int], cfg: dict) -> dict[str, int]:
+    """Return a copy of a profile graph's symbol table with the config
+    variables (S/B/C/S+C/TP) overridden for one matrix configuration.
+
+    Config *constants* (H, I, n_h·d, V, ...) are kept as-is so the op template's
+    symbolic shapes resolve to this configuration's concrete dims.
+    """
+    sym = dict(base_symbols)
+    if cfg["phase"] == "prefill":
+        s_val = int(cfg["seq_len"])
+    else:
+        s_val = 1  # decode advances each sequence by one token
+    c_val = int(cfg.get("ctx_len") or 0)
+    sym["S"] = s_val
+    sym["B"] = int(cfg["batch_size"])
+    sym["C"] = c_val
+    sym["S+C"] = s_val + c_val
+    sym["TP"] = int(cfg["tp_size"])
+    return sym
+
+
+def _resolve_shape_ints(input_shapes, symbols: dict[str, int]) -> list[list[int]]:
+    """Resolve an op's (symbolic) input shapes to concrete integer tensor shapes.
+
+    Only fully-resolvable tensor (list) shapes with all-integer dims are kept;
+    scalars and shapes with a dim that can't be resolved to an int are dropped,
+    so ``estimate_memory``/``estimate_flops`` see a clean ``list[list[int]]``.
+    """
+    out: list[list[int]] = []
+    for shape in input_shapes or []:
+        if not isinstance(shape, list):
+            continue
+        dims = [_resolve_dim(d, symbols) for d in shape]
+        if all(isinstance(d, int) for d in dims):
+            out.append(dims)
+    return out
+
+
+def _validate_derived_shapes(template: dict) -> dict:
+    """Round-trip check that the symbolic derivation reproduces reality.
+
+    Resolving each op's symbolic ``input_shapes`` at the *profiled* config (the
+    template's own ``symbols``) must reproduce the numeric shape recorded in the
+    trace (``recorded_shapes``). Context-annotated KV dims (``C`` / ``S+C``) are
+    excluded because the context is deliberately added, not recorded; dims that
+    don't resolve to an int are skipped (can't compare). Returns counts + a few
+    mismatch examples for the Info sheet.
+    """
+    syms = template.get("symbols", {})
+    total = matched = 0
+    examples: list[str] = []
+    for phase in ("prefill", "decode"):
+        tree = template.get(phase)
+        if not tree:
+            continue
+        for node in _flatten_graph_nodes(tree):
+            for op in node["ops"]:
+                recorded = op.get("recorded_shapes")
+                sym = op.get("input_shapes")
+                if not recorded or not sym:
+                    continue
+                for rec, ss in zip(recorded, sym):
+                    if not isinstance(ss, list) or not isinstance(rec, list):
+                        continue
+                    if any(isinstance(d, str) and d in ("C", "S+C") for d in ss):
+                        continue  # deliberately context-annotated KV row
+                    resolved = [_resolve_dim(d, syms) for d in ss]
+                    if not all(isinstance(d, int) for d in resolved):
+                        continue  # unresolved dim — nothing to compare
+                    total += 1
+                    if resolved == list(rec):
+                        matched += 1
+                    elif len(examples) < 6:
+                        examples.append(
+                            f"{op.get('name', '')} {ss}\u2192{resolved} vs {rec}")
+    return {"total": total, "matched": matched,
+            "mismatched": total - matched, "examples": examples}
+
+
 @app.route("/api/export/shape-matrix", methods=["POST"])
 def export_shape_matrix():
     """Export op shapes/dtypes for the current model across configurations.
@@ -1440,6 +1596,16 @@ def export_shape_matrix():
     Prefill configs: sweep seq_lens × context_lens × batch_sizes × tp_sizes
       (assumes chunked prefill; seq_len = chunk size)
     Decode configs: seq_len fixed to 1, sweep context_lens × batch_sizes × tp_sizes
+
+    ``source`` selects how op shapes are derived:
+      * ``"config"`` (default) — analytic, config-driven (``build_model_graph``).
+        Fast; the op set is inferred from ``config.json``.
+      * ``"profile"`` — grounded in the latest profiling run: the reconstructed
+        graph's real dispatched ops become a symbolic template whose shapes are
+        re-resolved per configuration (memory/FLOPs recomputed). Accurate to what
+        actually executed. The op *set* is fixed at the profiled config (TP
+        collectives, MoE routing, chunked-prefill splits), so profile at the TP
+        and with the context you care about.
     """
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -1450,6 +1616,12 @@ def export_shape_matrix():
     model_id = data.get("model_id")
     if not model_id:
         return jsonify({"ok": False, "error": "No model_id specified"}), 400
+
+    # Shape source: analytic config-driven (default) or profile-derived.
+    source = data.get("source", "config")
+    if source not in ("config", "profile"):
+        return jsonify({"ok": False,
+                        "error": "source must be 'config' or 'profile'"}), 400
 
     # Prefill settings
     prefill_seq_lens = data.get("prefill_seq_lens",
@@ -1528,13 +1700,50 @@ def export_shape_matrix():
         return jsonify({"ok": False,
                         "error": f"Failed to fetch model config: {e}"}), 400
 
+    # Profile-derived source: grab the latest reconstructed graph as the op
+    # template (real dispatched ops with symbolic shapes) and validate it
+    # matches the requested model.
+    profile_template = None
+    profile_settings = None
+    if source == "profile":
+        with _profile_lock:
+            state_status = _profile_state["status"]
+            state_model = _profile_state.get("model_id")
+            state_result = _profile_state.get("result")
+            profile_settings = _profile_state.get("settings")
+        if state_status != "done" or not state_result:
+            return jsonify({
+                "ok": False,
+                "error": "Profile-derived export requires a completed profiling "
+                         "run. Run a profile first (Profile tab), then export.",
+            }), 400
+        profile_template = state_result.get("graph")
+        if not profile_template or not (profile_template.get("prefill")
+                                        or profile_template.get("decode")):
+            return jsonify({
+                "ok": False,
+                "error": "The latest profile has no reconstructed graph to "
+                         "derive shapes from.",
+            }), 400
+        if state_model and state_model != model_id:
+            return jsonify({
+                "ok": False,
+                "error": f"Latest profile is for '{state_model}', not "
+                         f"'{model_id}'. Profile that model or switch the "
+                         "model ID.",
+            }), 400
+
     # Estimate row count (configs × ~ops_per_config) for limit check
-    # Use first config to count ops
-    test_graph = build_model_graph(
-        summary, prefill_len=1, decode_batch=1, context_len=1,
-        tp_size=tp_sizes[0], quantization=quantization, device=_DEVICE,
-    )
-    test_tree = test_graph.get("prefill") or test_graph.get("decode")
+    if source == "profile":
+        pdtype_bytes = profile_template.get("config", {}).get("dtype_bytes", 2)
+        test_tree = (profile_template.get("prefill")
+                     or profile_template.get("decode"))
+    else:
+        test_graph = build_model_graph(
+            summary, prefill_len=1, decode_batch=1, context_len=1,
+            tp_size=tp_sizes[0], quantization=quantization, device=_DEVICE,
+        )
+        test_tree = test_graph.get("prefill") or test_graph.get("decode")
     test_ops_count = 0
     if test_tree:
         for node in _flatten_graph_nodes(test_tree):
@@ -1577,18 +1786,23 @@ def export_shape_matrix():
 
     row = 2
     for cfg in configs:
-        graph = build_model_graph(
-            summary,
-            prefill_len=cfg["prefill_len"],
-            decode_batch=cfg["decode_batch"],
-            context_len=cfg["context_len"],
-            tp_size=cfg["tp_size"],
-            quantization=quantization,
-            device=_DEVICE,
-        )
-        graph_cfg = graph.get("config", {})
-        symbols = graph.get("symbols", {})
-        tree = graph.get(cfg["phase"])
+        if source == "profile":
+            graph_cfg = profile_template.get("config", {})
+            symbols = _config_symbols(profile_template.get("symbols", {}), cfg)
+            tree = profile_template.get(cfg["phase"])
+        else:
+            graph = build_model_graph(
+                summary,
+                prefill_len=cfg["prefill_len"],
+                decode_batch=cfg["decode_batch"],
+                context_len=cfg["context_len"],
+                tp_size=cfg["tp_size"],
+                quantization=quantization,
+                device=_DEVICE,
+            )
+            graph_cfg = graph.get("config", {})
+            symbols = graph.get("symbols", {})
+            tree = graph.get(cfg["phase"])
         if not tree:
             continue
 
@@ -1596,7 +1810,12 @@ def export_shape_matrix():
         for node_info in flat_nodes:
             effective_repeat = node_info.get("effective_repeat", 1)
             for op in node_info["ops"]:
-                shape_str = _format_op_shape_with_dtypes(op, symbols, graph_cfg)
+                # For profile-derived rows, prefer the real per-tensor dtypes
+                # recorded in the trace over the config-driven heuristic.
+                recorded_dtypes = (op.get("input_dtypes")
+                                   if source == "profile" else None)
+                shape_str = _format_op_shape_with_dtypes(
+                    op, symbols, graph_cfg, recorded_dtypes=recorded_dtypes)
 
                 # Symbolic shape: keep only config variables (S, B, C, TP)
                 # symbolic, resolve model constants to config.json numbers
@@ -1615,8 +1834,23 @@ def export_shape_matrix():
                 else:
                     symbolic_str = "—"
 
-                mem_bytes = op.get("memory_bytes", 0)
-                flops = op.get("flops", 0)
+                if source == "profile":
+                    # The template op's memory/FLOPs were measured at the
+                    # profiled config; recompute them from this config's
+                    # resolved shapes so every row is self-consistent. Memory
+                    # uses the recorded per-tensor dtypes for accuracy.
+                    resolved = _resolve_shape_ints(sym_shapes, symbols)
+                    op_name = op.get("name", "")
+                    if recorded_dtypes:
+                        mem_bytes = _profile_op_memory(
+                            op_name, resolved, recorded_dtypes, pdtype_bytes)
+                    else:
+                        mem_bytes = estimate_memory(
+                            op_name, resolved, pdtype_bytes)
+                    flops = estimate_flops(op_name, resolved)
+                else:
+                    mem_bytes = op.get("memory_bytes", 0)
+                    flops = op.get("flops", 0)
                 ai = round(flops / mem_bytes, 2) if mem_bytes > 0 else 0
 
                 # Merge module path and op role into single column
@@ -1662,6 +1896,75 @@ def export_shape_matrix():
     if row > 2:
         ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{row - 1}"
 
+    # Provenance / caveats sheet for profile-derived exports so the optimization
+    # engineers know exactly which profiling run the shapes were grounded in.
+    if source == "profile":
+        info = wb.create_sheet("Info")
+        ps = profile_settings or {}
+        pcfg = profile_template.get("config", {})
+        info_rows = [
+            ("Shape source", "profile-derived (grounded in a profiling run)"),
+            ("Model", model_id),
+            ("Profiled query_len (S)", ps.get("query_len")),
+            ("Profiled context_len (C)", ps.get("context_len")),
+            ("Profiled decode batch (B)", ps.get("decode_batch_size")),
+            ("Profiled TP", pcfg.get("tp_size", ps.get("tp_size"))),
+            ("Profiled quantization", pcfg.get("quantization")),
+            ("Profiled mode", ps.get("mode")),
+            ("", ""),
+            ("How rows are derived",
+             "The profile contributes the accurate op set, real recorded "
+             "shapes and backends. Shapes are re-resolved per config "
+             "(S/B/C/TP). Memory/FLOPs are then analytic functions of "
+             "(op, shape, dtype) — the same estimator the config-driven path "
+             "uses, recomputed per config — NOT measured values."),
+            ("Memory/FLOPs are estimates",
+             "Heuristic (op+shape) estimates, not measured; e.g. attention "
+             "FLOPs are not modeled. Only the op set and shapes come from the "
+             "trace. Measured device time is intentionally not in this sweep."),
+            ("Caveat — op set / TP",
+             "The op set (TP collectives, MoE routing, chunked-prefill splits) "
+             "is fixed at the profiled config. Profile at each TP you need — "
+             "sweeping TP only divides /TP dims, it does not add comm ops that "
+             "weren't profiled."),
+            ("Context (C) is parametric",
+             "No need to profile per context. One base profile with any "
+             "non-zero context captures C as S+C on the prefill attention KV "
+             "rows; every other context length is then derived by resolving C. "
+             "A base profile with context=0 leaves KV rows as S, so context "
+             "can't be derived — profile with a small non-zero context."),
+            ("Caveat — timing",
+             "Device time is valid only at the profiled point and is not "
+             "included in this sweep; rows carry shapes/memory/FLOPs only."),
+        ]
+        # Round-trip validation: re-resolving each op's symbolic shape at the
+        # profiled config must reproduce the shape actually recorded in the
+        # trace — a self-consistency proof for the derivation machinery.
+        vres = _validate_derived_shapes(profile_template)
+        if vres["total"]:
+            pct = 100.0 * vres["matched"] / vres["total"]
+            info_rows.append((
+                "Shape validation",
+                f"{vres['matched']}/{vres['total']} op input shapes "
+                f"({pct:.1f}%) re-resolve at the profiled config to exactly the "
+                "shape recorded in the trace (context-annotated KV rows "
+                "excluded). This validates the symbolic derivation.",
+            ))
+            if vres["mismatched"]:
+                info_rows.append((
+                    "Validation mismatches",
+                    f"{vres['mismatched']} mismatched. Examples: "
+                    + " | ".join(vres["examples"]),
+                ))
+        for r_idx, (k, v) in enumerate(info_rows, 1):
+            kc = info.cell(r_idx, 1, k)
+            kc.font = Font(bold=True, size=10)
+            kc.alignment = Alignment(vertical="top")
+            vc = info.cell(r_idx, 2, "" if v is None else str(v))
+            vc.alignment = Alignment(wrap_text=True, vertical="top")
+        info.column_dimensions["A"].width = 26
+        info.column_dimensions["B"].width = 90
+
     # Write to buffer
     buf = io.BytesIO()
     wb.save(buf)
@@ -1673,7 +1976,9 @@ def export_shape_matrix():
     if not effective_quant or effective_quant == "none":
         effective_quant = summary.get("quant_method")
     quant_tag = effective_quant if effective_quant else "none"
-    filename = f"vllm_xpu_shape_matrix_{model_name}_{quant_tag}.xlsx"
+    source_tag = "profile" if source == "profile" else "config"
+    filename = (f"vllm_xpu_shape_matrix_{model_name}_{quant_tag}_"
+                f"{source_tag}.xlsx")
 
     return Response(
         buf.getvalue(),

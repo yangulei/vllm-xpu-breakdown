@@ -256,6 +256,53 @@ Exports a flat Excel table sweeping across configurations:
 - Symbolic Shape column keeps S/B/C/TP symbolic, resolves model constants to numbers
 - Row limit guard (`_MAX_MATRIX_ROWS = 50000`) prevents excessive generation
 
+**Two shape sources (`source` param, default `"config"`):**
+- **`"config"`** — analytic, config-driven (`build_model_graph` per config). Fast;
+  the op set is *inferred* from `config.json`.
+- **`"profile"`** — grounded in the latest completed profiling run. The
+  reconstructed graph (`_profile_state["result"]["graph"]`) is used as an **op
+  template**: its real dispatched ops already carry symbolic shapes (`S`/`B`/`C`/
+  `n_h·d/TP`/`S+C`/...), the exact same vocabulary the exporter resolves. For each
+  config, `_config_symbols` overrides `S`/`B`/`C`/`S+C`/`TP` in a copy of the
+  profile's `symbols`, every op's shapes are re-resolved (`_resolve_shape_ints`),
+  and **Memory/FLOPs are recomputed per config** via `estimate_memory` /
+  `estimate_flops` (the template's own values were measured at the profiled
+  point). An extra **Info** sheet records the profiled config + caveats. Filename
+  gets a `_config`/`_profile` suffix.
+  - **Accurate per-tensor dtypes + shape validation (profile source):** each
+    reconstructed op now carries `recorded_shapes` (the numeric shapes as
+    captured) and `input_dtypes` (the real per-tensor dtypes from the trace's
+    `Input type`, parsed aligned-with-shapes by `graph_from_trace.
+    _parse_input_dims_types`). The export uses `input_dtypes` for the **Shape**
+    column dtype (via `_format_op_shape_with_dtypes(..., recorded_dtypes=...)`,
+    falling back to the `_get_tensor_dtype` heuristic when absent) and for a
+    dtype-accurate **Memory** estimate (`_profile_op_memory` sizes each input
+    tensor by *its own* dtype — so an fp8/int4 weight counts 1 byte while a bf16
+    activation counts 2). The Info sheet adds a **shape round-trip validation**
+    (`_validate_derived_shapes`): re-resolving every op's symbolic
+    `input_shapes` at the *profiled* config must reproduce `recorded_shapes`
+    (context-annotated `S+C`/`C` KV dims excluded, since context is deliberately
+    added, not recorded). Note: memory/FLOPs are still analytic estimates, not
+    measured — only the op set, shapes, dtypes and backends come from the trace.
+  - **Invariants:** requires `_profile_state["status"]=="done"` and the profiled
+    `model_id` to match the requested one (else 400). The op *set* is fixed at the
+    profiled config — sweeping TP only divides `/TP` dims, it does **not**
+    synthesize comm ops that weren't profiled, so profile at **each TP** you need.
+    Query/batch/context (`S`/`B`/`C`) are **parametric** and need only one base
+    profile: `C` enters solely via the prefill attention KV rows (`S+C`), which
+    `graph_from_trace._annotate_attention_kv` rewrites **only when the base profile
+    had a non-zero context**. So you do **not** profile per context — one profile
+    with any (small, cheap) non-zero context makes every other context length
+    derivable; a `context=0` base leaves KV rows as `S` and context can't be
+    derived. Device time is not extrapolated into the sweep. Because both graph
+    builders emit the identical serialized shape, the Excel writer
+    (`_flatten_graph_nodes` / `_format_op_shape_with_dtypes` /
+    `_partially_resolve_dim`) consumes either unchanged.
+  - **Frontend:** the Shape Matrix tab's `sm-source` selector offers config /
+    profile-latest / profile-fresh. `profile-fresh` runs a profile at the Profile
+    tab's base config (`buildProfileBody`, shared with `startProfile`) via
+    `runProfileForMatrix`, polls to completion, then exports `source=profile`.
+
 ### Op Classification (`classifier.py`)
 
 Classifies ops by name prefix/pattern to backends. Priority order:
@@ -303,7 +350,7 @@ aren't misfiled.
 | `/api/profile/status` | GET | Poll profiling status |
 | `/api/profile/result` | GET | Fetch profiling result (ops + reconstructed graph) |
 | `/api/profile/trace` | GET | Download raw trace file |
-| `/api/export/shape-matrix` | POST | Export config-driven multi-config shape sweep to Excel |
+| `/api/export/shape-matrix` | POST | Export multi-config shape sweep to Excel (`source`: config-driven or profile-derived) |
 
 ## Common Pitfalls
 

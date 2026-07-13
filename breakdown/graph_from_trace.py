@@ -86,6 +86,30 @@ def _load_trace(path: str) -> dict:
 
 def _parse_input_dims(args: dict) -> list[list[int]]:
     """Extract numeric input shapes from a cpu_op's args."""
+    return _parse_input_dims_types(args)[0]
+
+
+def _normalize_dtype(t: Any) -> str:
+    """Normalize a trace dtype token to a ``DTYPE_BYTES`` key.
+
+    ``'c10::BFloat16' → 'bfloat16'``, ``'Float' → 'float'``,
+    ``'c10::Float8_e4m3fn' → 'float8_e4m3fn'``. Unknown tokens are lowered and
+    returned as-is (``dtype_size`` then falls back to 2 bytes).
+    """
+    if not t:
+        return ""
+    name = str(t).split("::")[-1].lower().replace("torch.", "")
+    name = name.replace("half", "float16")
+    return name
+
+
+def _parse_input_dims_types(args: dict) -> tuple[list[list[int]], list[str]]:
+    """Extract numeric input shapes and per-tensor dtypes, kept aligned.
+
+    Only non-empty tensor inputs are retained (scalars / empty inputs dropped);
+    the returned dtype list is parallel to the shape list, so ``dtypes[i]`` is
+    the recorded dtype of the tensor with shape ``shapes[i]``.
+    """
     dims = args.get("Input Dims")
     if dims is None:
         raw = args.get("input_shapes")
@@ -95,27 +119,26 @@ def _parse_input_dims(args: dict) -> list[list[int]]:
             except (ValueError, SyntaxError):
                 dims = None
     if not isinstance(dims, (list, tuple)):
-        return []
+        return [], []
+    types = args.get("Input type")
+    if not isinstance(types, (list, tuple)):
+        types = []
     shapes: list[list[int]] = []
-    for tensor in dims:
+    dtypes: list[str] = []
+    for i, tensor in enumerate(dims):
         if isinstance(tensor, (list, tuple)) and tensor:
             shape = [int(d) for d in tensor if isinstance(d, (int, float))]
             if shape:
                 shapes.append(shape)
-    return shapes
+                dtypes.append(_normalize_dtype(types[i] if i < len(types) else ""))
+    return shapes, dtypes
 
 
 def _first_dtype(args: dict) -> str:
     """First concrete input dtype, e.g. 'c10::BFloat16' → 'bfloat16'."""
-    types = args.get("Input type")
-    if isinstance(types, (list, tuple)):
-        for t in types:
-            if not t:
-                continue
-            name = str(t).split("::")[-1].lower()
-            name = name.replace("bfloat16", "bfloat16").replace("half", "float16")
-            if name in DTYPE_BYTES:
-                return name
+    for name in _parse_input_dims_types(args)[1]:
+        if name in DTYPE_BYTES:
+            return name
     return ""
 
 
@@ -181,7 +204,7 @@ class _Raw:
     """A node in the raw trace nesting tree (a module or a leaf op)."""
 
     __slots__ = ("kind", "label", "ts", "end", "dur", "ext", "shapes",
-                 "dtype", "children", "self_dev", "sub_dev", "attr_name")
+                 "dtype", "dtypes", "children", "self_dev", "sub_dev", "attr_name")
 
     def __init__(self, kind: str, label: str, ts: float, dur: float):
         self.kind = kind          # "module" or "op"
@@ -192,6 +215,7 @@ class _Raw:
         self.ext: int | None = None
         self.shapes: list[list[int]] = []
         self.dtype = ""
+        self.dtypes: list[str] = []   # per-tensor recorded dtypes (aligned)
         self.children: list[_Raw] = []
         self.self_dev = 0.0       # device us launched directly by this op
         self.sub_dev = 0.0        # device us of this node + all descendants
@@ -386,8 +410,8 @@ def _build_raw_forest(events: list[dict]) -> list[_Raw]:
             n = _Raw("op", name, ts, dur)
             a = e.get("args", {})
             n.ext = a.get("External id")
-            n.shapes = _parse_input_dims(a)
-            n.dtype = _first_dtype(a)
+            n.shapes, n.dtypes = _parse_input_dims_types(a)
+            n.dtype = next((d for d in n.dtypes if d in DTYPE_BYTES), "")
             nodes.append(n)
 
     if not nodes:
@@ -766,6 +790,8 @@ def _finalize_node(
             "category": category,
             "input_shapes": sym_shapes,
             "output_shape": out_shape,
+            "recorded_shapes": [list(s) for s in shapes],
+            "input_dtypes": list(raw.dtypes),
             "memory_bytes": mem,
             "flops": flops,
             "ai": round(flops / mem, 2) if mem > 0 else 0,
