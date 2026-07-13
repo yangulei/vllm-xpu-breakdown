@@ -194,6 +194,10 @@ def summarize_config(config: dict[str, Any]) -> dict[str, Any]:
         "model_type": config.get("model_type", "unknown"),
         "hidden_size": hidden_size,
         "num_layers": num_layers,
+        # True when the decoder layer count lives under ``text_config`` (nested
+        # multimodal configs, e.g. MiniMax-M3) rather than at the top level. Used
+        # to target a reduced-layer ``hf_overrides`` dict at the right key.
+        "layers_under_text_config": "num_hidden_layers" in tcfg,
         "num_heads": num_heads,
         "num_kv_heads": num_kv_heads,
         "head_dim": head_dim,

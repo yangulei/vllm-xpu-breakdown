@@ -174,6 +174,32 @@ def _set_num_hidden_layers(hf_config, n: int):
     return hf_config
 
 
+def _build_layer_override(
+    profiled_layers: int,
+    quantization: str | None,
+    layers_under_text_config: bool,
+):
+    """Build the ``hf_overrides`` value for reduced-layer profiling.
+
+    Normally we return a callable that sets ``num_hidden_layers`` where it
+    actually lives (top level, or nested under ``text_config`` for multimodal
+    models like MiniMax-M3). vLLM applies callables in place, preserving the
+    rest of the config.
+
+    When ``quantization`` is requested, vLLM's ``get_quant_config`` rejects a
+    callable ("hf_overrides must be a dict ...") because it reads the quant
+    config out of ``hf_overrides``. In that case we return a **dict** override
+    targeting the right key instead — vLLM applies nested ``text_config`` dicts
+    recursively.
+    """
+    if quantization:
+        if layers_under_text_config:
+            return {"text_config": {"num_hidden_layers": profiled_layers}}
+        return {"num_hidden_layers": profiled_layers}
+    # Module-level partial so it pickles for the spawned EngineCore subprocess.
+    return functools.partial(_set_num_hidden_layers, n=profiled_layers)
+
+
 def _make_token_ids(n: int, vocab_size: int, seed: int) -> list[int]:
     """Deterministically build ``n`` valid, non-special token ids.
 
@@ -550,13 +576,13 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             # Some multimodal models (e.g. MiniMax-M3) nest the decoder layer
             # count under ``text_config``. A top-level ``num_hidden_layers``
             # override is silently ignored there, so the full model is built
-            # and exhausts device memory (UR_RESULT_ERROR_DEVICE_LOST). Pass a
-            # callable override (vLLM applies callables in place, preserving the
-            # rest of the config) that sets the count where it actually lives.
-            # Must be a module-level partial so it pickles for the spawned
-            # EngineCore subprocess.
-            engine_kwargs["hf_overrides"] = functools.partial(
-                _set_num_hidden_layers, n=profiled_layers
+            # and exhausts device memory (UR_RESULT_ERROR_DEVICE_LOST). The
+            # helper returns a callable normally, but a dict when quantization
+            # is set (vLLM's ``get_quant_config`` requires a dict override).
+            engine_kwargs["hf_overrides"] = _build_layer_override(
+                profiled_layers,
+                quantization,
+                bool(summary.get("layers_under_text_config")),
             )
 
         # Set compile / eager mode

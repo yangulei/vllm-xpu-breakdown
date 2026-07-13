@@ -1736,3 +1736,93 @@ class TestPhasePartition(unittest.TestCase):
         self.assertIsNotNone(g["decode"])
         self.assertEqual(g["symbols"].get("S"), 128)
         self.assertEqual(g["symbols"].get("B"), 8)
+
+
+class TestLayerOverride(unittest.TestCase):
+    """Reduced-layer ``hf_overrides`` construction (app._build_layer_override).
+
+    Regression coverage for the FP8/quantization failure: vLLM's
+    ``get_quant_config`` requires ``hf_overrides`` to be a *dict* when
+    quantization is requested, so a callable override (used for the non-quant
+    reduced-layer path) triggered:
+
+        ValidationError: hf_overrides must be a dict for get_quant_config ...
+    """
+
+    def _build(self, *args, **kwargs):
+        import app
+        return app._build_layer_override(*args, **kwargs)
+
+    def test_no_quant_returns_callable(self):
+        # Without quantization we keep the picklable callable override.
+        import functools
+        ov = self._build(2, None, False)
+        self.assertIsInstance(ov, functools.partial)
+
+    def test_quant_flat_returns_dict(self):
+        # With quantization (flat model) the override MUST be a plain dict so
+        # get_quant_config accepts it. This is the exact FP8 regression.
+        ov = self._build(2, "fp8", False)
+        self.assertIsInstance(ov, dict)
+        self.assertEqual(ov, {"num_hidden_layers": 2})
+        self.assertNotIn("text_config", ov)
+
+    def test_quant_nested_targets_text_config(self):
+        # Nested multimodal configs (e.g. MiniMax-M3) keep the layer count under
+        # text_config; the dict override must target it there.
+        ov = self._build(3, "fp8", True)
+        self.assertIsInstance(ov, dict)
+        self.assertEqual(ov, {"text_config": {"num_hidden_layers": 3}})
+
+    def test_quant_override_is_dict_for_all_methods(self):
+        # Any truthy quantization method must yield a dict, never a callable.
+        for q in ("fp8", "awq", "gptq", "int4", "bitsandbytes"):
+            with self.subTest(quantization=q):
+                self.assertIsInstance(self._build(1, q, False), dict)
+
+    def test_callable_sets_flat_layers(self):
+        import app
+
+        class _Cfg:
+            num_hidden_layers = 36
+        cfg = _Cfg()
+        app._build_layer_override(4, None, False)(cfg)
+        self.assertEqual(cfg.num_hidden_layers, 4)
+
+    def test_callable_sets_nested_layers(self):
+        import app
+
+        class _TextCfg:
+            num_hidden_layers = 57
+
+        class _Cfg:
+            num_hidden_layers = 999
+            text_config = _TextCfg()
+        cfg = _Cfg()
+        app._build_layer_override(5, None, True)(cfg)
+        # The nested count is what actually drives the model build.
+        self.assertEqual(cfg.text_config.num_hidden_layers, 5)
+
+
+class TestLayersUnderTextConfigFlag(unittest.TestCase):
+    """summarize_config exposes where the decoder layer count lives."""
+
+    def test_flat_config_flag_false(self):
+        s = summarize_config({
+            "architectures": ["Qwen3ForCausalLM"],
+            "num_hidden_layers": 36,
+            "hidden_size": 2560,
+            "num_attention_heads": 32,
+        })
+        self.assertFalse(s["layers_under_text_config"])
+
+    def test_nested_config_flag_true(self):
+        s = summarize_config({
+            "architectures": ["MiniMaxM3SparseForConditionalGeneration"],
+            "text_config": {
+                "num_hidden_layers": 57,
+                "hidden_size": 4096,
+                "num_attention_heads": 32,
+            },
+        })
+        self.assertTrue(s["layers_under_text_config"])
