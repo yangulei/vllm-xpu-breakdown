@@ -439,7 +439,17 @@ aren't misfiled.
   cpu_ops (leaking their time), whereas launch-site containment is stable across
   eager and compiled passes. Do NOT revert to `External id` mapping
   (`_build_device_time_map` was replaced by `_collect_kernel_launches` +
-  `_attribute_kernels`).
+  `_attribute_kernels`). **Research R2** (pure flow-based attribution + deleting
+  the `is_cuda` async workaround) is a *deliberate deferral*: CUDA-graph launch
+  drift is not fixed by R1's spans alone and cannot be validated on this XPU
+  host, so the hardware-validated launch-site path and the `is_cuda`-gated
+  corrections are kept as-is.
+- **Worker thread is chosen by the module-span anchor (research R6), not raw
+  cpu_op count.** `_build_raw_forest` picks the tid carrying the capture-time
+  `module::` spans when present; only legacy (span-less) traces fall back to the
+  busiest-cpu_op tid. This avoids mis-selecting a wrong thread under tensor
+  parallelism (several threads dispatch ops). Do NOT revert to an unconditional
+  busiest-cpu_op guess.
 - **Triton kernels with no `cpu_op` surface as synthetic `triton::<kernel>` ops.**
   Kernels launched straight from Python via `triton.jit` (Gemma RMSNorm,
   MiniMax-M3 lightning indexer, block-sparse attention) never emit an
