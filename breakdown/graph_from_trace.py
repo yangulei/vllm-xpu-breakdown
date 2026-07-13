@@ -37,7 +37,12 @@ from typing import Any
 
 from .analyzer import DTYPE_BYTES, dtype_size, estimate_flops, estimate_memory
 from .classifier import classify_op
-from .trace_common import _is_overhead_event
+from .trace_common import (
+    MODULE_SPAN_PREFIX,
+    _is_overhead_event,
+    module_span_display_name,
+    parse_module_span,
+)
 from .trace_parser import _infer_device_from_trace, _infer_role, _strip_instance_idx
 
 # Chrome-trace categories that carry device (GPU/XPU) kernel time.
@@ -304,7 +309,22 @@ def _functional_module_class(name: str) -> str | None:
 
 
 def _build_raw_forest(events: list[dict]) -> list[_Raw]:
-    """Build the module/op nesting forest for the busiest worker thread."""
+    """Build the module/op nesting forest for the busiest worker thread.
+
+    Two capture modes are supported, chosen automatically:
+
+    * **Named-span mode** (preferred) — when the trace carries capture-time
+      ``user_annotation`` spans named ``module::<qname>::<Cls>`` (emitted by
+      :mod:`breakdown.module_hooks`), module boundaries come from those spans, so
+      every module node has its **real attribute name** (``q_norm``/``k_norm``,
+      ``self_attn``, ...) straight from the trace — no reference-tree overlay,
+      no registration-order assumption. The class-only ``nn.Module:`` frames are
+      ignored to avoid duplicating the tree.
+    * **Legacy mode** — older traces (and third-party / upload traces) without
+      those spans fall back to the class-only ``nn.Module: <Cls>_<idx>``
+      ``python_function`` events; names are recovered afterwards by the
+      ``module_naming`` overlay (``_apply_ref_names``).
+    """
     cpu_ops = [e for e in events if e.get("cat") == "cpu_op"
                and e.get("ph") == "X"]
     if not cpu_ops:
@@ -316,6 +336,13 @@ def _build_raw_forest(events: list[dict]) -> list[_Raw]:
         tid_counts[e.get("tid")] = tid_counts.get(e.get("tid"), 0) + 1
     worker_tid = max(tid_counts, key=tid_counts.get)
 
+    # Named-span mode iff the worker thread carries capture-time module spans.
+    named_span_mode = any(
+        e.get("tid") == worker_tid and e.get("cat") == "user_annotation"
+        and str(e.get("name", "")).startswith(MODULE_SPAN_PREFIX)
+        for e in events
+    )
+
     nodes: list[_Raw] = []
     for e in events:
         if e.get("tid") != worker_tid or e.get("ph") != "X":
@@ -324,7 +351,21 @@ def _build_raw_forest(events: list[dict]) -> list[_Raw]:
         name = e.get("name", "")
         ts = e.get("ts", 0)
         dur = e.get("dur", 0) or 0
+        if cat == "user_annotation":
+            # Only meaningful in named-span mode; carries the real module path.
+            if named_span_mode:
+                parsed = parse_module_span(name)
+                if parsed is not None:
+                    qname, cls = parsed
+                    node = _Raw("module", cls or "Module", ts, dur)
+                    node.attr_name = module_span_display_name(qname, cls)
+                    nodes.append(node)
+            continue
         if cat == "python_function" and name.startswith("nn.Module:"):
+            # In named-span mode the module boundaries come from the spans; the
+            # class-only frames would duplicate the tree, so skip them.
+            if named_span_mode:
+                continue
             cls = name.split("nn.Module:", 1)[1].strip()
             nodes.append(_Raw("module", cls, ts, dur))
         elif cat == "python_function":
@@ -1254,6 +1295,22 @@ def _dim_is(sym: Any, value: int) -> bool:
     return isinstance(sym, str) and sym.split("/")[0] in ("n_kv", "n_h·d_kv")
 
 
+def _forest_has_named_modules(roots: list[_Raw]) -> bool:
+    """True if any module node already carries a real attribute name.
+
+    Set only when the trace was captured with :mod:`breakdown.module_hooks`
+    spans, in which case the reference-tree overlay is unnecessary (names are
+    already exact).
+    """
+    stack = list(roots)
+    while stack:
+        n = stack.pop()
+        if n.kind == "module" and n.attr_name:
+            return True
+        stack.extend(n.children)
+    return False
+
+
 def build_graph_from_trace(
     trace_path: str,
     summary: dict | None = None,
@@ -1308,7 +1365,13 @@ def build_graph_from_trace(
     # from the reference module tree onto the class-name-based raw module nodes.
     # Done before phase building so recovered names feed the structural signature
     # and keep distinctly-named siblings from collapsing together.
-    if ref_module_tree:
+    #
+    # Skipped when the trace already carries capture-time module-name spans
+    # (breakdown.module_hooks): those give exact names on the raw forest with no
+    # alignment, so the reference-tree overlay is redundant. The overlay remains
+    # the fallback for legacy / upload traces without spans.
+    captured_names = _forest_has_named_modules(roots)
+    if ref_module_tree and not captured_names:
         try:
             _apply_ref_names(roots, ref_module_tree)
         except Exception:
@@ -1389,7 +1452,7 @@ def build_graph_from_trace(
             "num_layers": summary.get("num_layers"),
         },
         "has_timing": True,
-        "has_module_names": bool(ref_module_tree),
+        "has_module_names": captured_names or bool(ref_module_tree),
         "timing_matched": total_ops,
         "timing_total_ops": total_ops,
         "timing_method": "trace_reconstruction",

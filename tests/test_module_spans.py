@@ -123,5 +123,136 @@ class TestModuleSpanHooks(unittest.TestCase):
         self.assertEqual(self._profile_spans(install=False), [])
 
 
+def _span_trace():
+    """A trace using capture-time ``module::`` spans (no ``nn.Module:`` frames).
+
+    Two Qwen3-style decoder layers, each with an attention block containing two
+    same-class ``RMSNorm`` siblings (``q_norm``/``k_norm``) plus the two layer
+    norms — the exact case that class-only traces cannot disambiguate.
+    """
+    events = []
+    ext = [0]
+    corr = [0]
+    tid = 7
+
+    def kern(e, ts, dur):
+        corr[0] += 1
+        events.append({"ph": "X", "cat": "xpu_runtime", "tid": tid, "pid": tid,
+                       "ts": ts, "dur": 0.1, "name": "l",
+                       "args": {"correlation": corr[0], "External id": e}})
+        events.append({"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+                       "ts": ts + 1000, "dur": dur, "name": "g",
+                       "args": {"correlation": corr[0]}})
+
+    def op(name, ts, dur, shapes, kdur=0.0):
+        ext[0] += 1
+        events.append({"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+                       "ts": ts, "dur": dur, "name": name,
+                       "args": {"External id": ext[0], "Input Dims": shapes,
+                                "Input type": ["c10::BFloat16"]}})
+        if kdur:
+            kern(ext[0], ts, kdur)
+
+    def span(qname, cls, ts, dur):
+        from breakdown.trace_common import module_span_label
+        events.append({"ph": "X", "cat": "user_annotation", "tid": tid,
+                       "pid": tid, "ts": ts, "dur": dur,
+                       "name": module_span_label(qname, cls)})
+
+    span("", "Qwen3ForCausalLM", 0, 400)
+    span("model", "Qwen3Model", 1, 398)
+    span("model.embed_tokens", "VocabParallelEmbedding", 2, 2)
+    op("aten::embedding", 2, 1, [[32000, 16], [8]])
+    for li in range(2):
+        b = 10 + li * 180
+        span(f"model.layers.{li}", "Qwen3DecoderLayer", b, 178)
+        span(f"model.layers.{li}.input_layernorm", "RMSNorm", b + 1, 2)
+        op("aten::rms_norm", b + 1, 1, [[8, 16]], 1.0)
+        span(f"model.layers.{li}.self_attn", "Qwen3Attention", b + 5, 80)
+        op("aten::linear", b + 6, 4, [[8, 16], [48, 16]], 5.0)
+        span(f"model.layers.{li}.self_attn.q_norm", "RMSNorm", b + 12, 2)
+        op("aten::rms_norm", b + 12, 1, [[8, 16]], 1.0)
+        span(f"model.layers.{li}.self_attn.k_norm", "RMSNorm", b + 15, 2)
+        op("aten::rms_norm", b + 15, 1, [[8, 16]], 1.0)
+        span(f"model.layers.{li}.post_attention_layernorm", "RMSNorm", b + 90, 2)
+        op("aten::rms_norm", b + 90, 1, [[8, 16]], 1.0)
+        span(f"model.layers.{li}.mlp", "Qwen3MLP", b + 95, 20)
+        op("aten::linear", b + 96, 4, [[8, 16], [64, 16]], 7.0)
+    return {"traceEvents": events}
+
+
+class TestNamedSpanReconstruction(unittest.TestCase):
+    """Reconstruct real module names directly from capture-time spans."""
+
+    SUMMARY = {
+        "architecture": "Qwen3ForCausalLM", "hidden_size": 16, "num_heads": 3,
+        "num_kv_heads": 3, "head_dim": 16, "intermediate_size": 64,
+        "vocab_size": 32000, "num_layers": 2, "dtype": "bfloat16",
+    }
+
+    def _build(self, ref_tree=None):
+        from breakdown.graph_from_trace import build_graph_from_trace
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(_span_trace(), f)
+            path = f.name
+        try:
+            return build_graph_from_trace(path, self.SUMMARY, tp_size=1,
+                                          batch_size=1,
+                                          ref_module_tree=ref_tree)
+        finally:
+            os.unlink(path)
+
+    def _layer(self, g):
+        model = g["prefill"]["children"][0]
+        self.assertEqual(model["name"], "model")
+        return next(c for c in model["children"]
+                    if c["module_type"] == "Qwen3DecoderLayer")
+
+    def test_real_names_without_ref_tree(self):
+        # Names come straight from the trace spans — no reference tree passed.
+        g = self._build(ref_tree=None)
+        self.assertTrue(g["has_module_names"])
+        layer = self._layer(g)
+        self.assertEqual(layer["name"], "decoder_layer")
+        names = {c["module_type"]: c["name"] for c in layer["children"]}
+        self.assertEqual(names["Qwen3Attention"], "self_attn")
+        self.assertEqual(names["Qwen3MLP"], "mlp")
+        layer_norms = [c["name"] for c in layer["children"]
+                       if c["module_type"] == "RMSNorm"]
+        self.assertEqual(layer_norms,
+                         ["input_layernorm", "post_attention_layernorm"])
+
+    def test_qnorm_knorm_distinguished(self):
+        g = self._build(ref_tree=None)
+        layer = self._layer(g)
+        attn = next(c for c in layer["children"]
+                    if c["module_type"] == "Qwen3Attention")
+        attn_norms = [c["name"] for c in attn["children"]
+                      if c["module_type"] == "RMSNorm"]
+        self.assertEqual(attn_norms, ["q_norm", "k_norm"])
+
+    def test_layers_still_collapse(self):
+        # Distinct per-layer qnames (layers.0/layers.1) must not defeat the
+        # repeat-collapse: both map to the display name "decoder_layer".
+        g = self._build(ref_tree=None)
+        model = g["prefill"]["children"][0]
+        layer_nodes = [c for c in model["children"]
+                       if c["module_type"] == "Qwen3DecoderLayer"]
+        self.assertEqual(len(layer_nodes), 1)
+        self.assertEqual(layer_nodes[0]["repeat_count"], 2)
+
+    def test_ref_tree_ignored_when_spans_present(self):
+        # A (deliberately empty) ref tree must not override the exact span names.
+        bogus = {"attr": "", "cls": "Qwen3ForCausalLM", "is_group": False,
+                 "group_size": 1, "children": []}
+        g = self._build(ref_tree=bogus)
+        layer = self._layer(g)
+        attn = next(c for c in layer["children"]
+                    if c["module_type"] == "Qwen3Attention")
+        attn_norms = [c["name"] for c in attn["children"]
+                      if c["module_type"] == "RMSNorm"]
+        self.assertEqual(attn_norms, ["q_norm", "k_norm"])
+
+
 if __name__ == "__main__":
     unittest.main()
