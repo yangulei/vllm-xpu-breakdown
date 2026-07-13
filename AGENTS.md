@@ -38,7 +38,8 @@ chat.py                   — Interactive chat with profiling
 breakdown/
   model_graph.py          — Static (config-driven) model graph builder
   graph_from_trace.py     — Profile-first graph reconstruction from a trace
-  module_naming.py        — Recover real module attribute names (q_norm/k_norm)
+  module_hooks.py         — Capture-time module-name spans (forward hooks)
+  module_naming.py        — Fallback: recover names from named_modules() overlay
   model_info.py           — HuggingFace config fetcher and summarizer
   analyzer.py             — Op analysis (shapes, memory, FLOPs, AI)
   classifier.py           — Op → backend classification
@@ -125,9 +126,18 @@ returns the same serialized shape (`{prefill, decode, symbols, config,
 has_timing, timing_*, source}`) as `build_model_graph`, so the frontend renders
 it unchanged. How it works:
 
-- **Module tree** — `nn.Module: <Cls>_<idx>` python_function events nest by
-  time-containment (sort by `(ts asc, end desc)`, pop a stack while the top ends
-  before the current node).
+- **Module tree** — built from **capture-time module spans** when present
+  (research R1, the primary path): `module_hooks` installs forward hooks that
+  open a `record_function("module::<qualified_name>::<Cls>")` span around every
+  module's forward, so the trace carries `user_annotation` events with the
+  **real attribute path** (`model.layers.0.self_attn.q_norm`). `_build_raw_forest`
+  auto-detects those spans on the worker thread and builds module nodes directly
+  from them (real names, no overlay, no ordering assumption), skipping the
+  class-only `nn.Module: <Cls>_<idx>` frames to avoid duplication. **Legacy
+  fallback:** traces without spans (older runs / uploads) use the `nn.Module:
+  <Cls>_<idx>` python_function events + the `module_naming` overlay. Either way,
+  events nest by time-containment (sort by `(ts asc, end desc)`, pop a stack
+  while the top ends before the current node).
 - **Op shapes** — taken from each `cpu_op`'s `Input Dims` / `Input type`, then
   symbolized (`_symbolize`) against the model config so dims show as `S`, `B`,
   `C`, `H`, `/TP`, etc.
@@ -150,20 +160,42 @@ it unchanged. How it works:
   different structural signatures so they stay as separate runs. The structural
   signature includes the node's (recovered) `name`, so distinctly-named siblings
   (`q_norm`/`k_norm`) are kept apart while genuinely-repeated layers still merge.
+  Capture-time spans name repeated `ModuleList` elements by their **list
+  attribute** (`model.layers.0` → `decoder_layer`, not `0`) so they still merge.
 
 The old `annotate_graph_timing` / `annotate_graph_from_modules` /
 `parse_trace_with_modules` paths were **removed**. Do not reintroduce a
 static-overlay step in the profiling worker.
 
-### Module Attribute Naming (`module_naming.py`)
+### Module Attribute Naming — capture-time spans (`module_hooks.py`) + overlay fallback (`module_naming.py`)
 
-The profiler only labels module events with their **class** (`nn.Module:
-<Cls>_<idx>`), so sibling modules of the same class (Qwen3 `q_norm`/`k_norm`,
-both `RMSNorm`; `input_layernorm`/`post_attention_layernorm`; ...) are
-indistinguishable and fall back to a class-heuristic name. `module_naming.py`
-ports the *idea* from the (retired) `torch_export` branch — derive the real
-attribute name of every module from the model's `named_modules()` — and overlays
-those names onto the accurate profile-based tree instead of rebuilding it.
+Same-class sibling modules (Qwen3 `q_norm`/`k_norm`, both `RMSNorm`;
+`input_layernorm`/`post_attention_layernorm`; ...) are indistinguishable in a
+class-only trace. There are **two** ways to recover the real names; the first is
+now primary:
+
+**1. Capture-time spans (`module_hooks.py`, research R1 — primary).**
+`install_module_span_hooks(model)` registers a `register_forward_pre_hook` /
+`register_forward_hook` pair on every `named_modules()` entry that opens a
+`record_function("module::<qualified_name>::<Cls>")` span around the forward.
+These `user_annotation` events nest exactly like the module forwards and embed
+the exact attribute path + class, so `graph_from_trace._build_raw_forest`
+reconstructs the tree with real names **directly from the trace** — no
+alignment, no registration-order assumption, causally correct even under async
+execution (the span is opened at dispatch time). During live profiling
+`_run_profile` installs the hooks in the worker via
+`LLM.apply_model(install_module_span_hooks_on)` right before `start_profile` and
+removes them after `stop_profile` (best-effort; warmup runs stay unhooked). The
+label grammar and the display-name derivation (`module_span_display_name` — a
+numeric `ModuleList` leaf like `layers.0` becomes `decoder_layer`/`layers` so
+siblings still collapse) live torch-free in `trace_common`.
+
+**2. `named_modules()` overlay (`module_naming.py`) — fallback.** Kept for legacy
+/ upload traces that have no spans. `build_graph_from_trace` applies it only when
+the reconstructed forest has no captured names (`_forest_has_named_modules`). It
+ports the *idea* from the retired `torch_export` branch — derive names from the
+model's `named_modules()` — and overlays them onto the accurate profile-based
+tree instead of rebuilding it.
 
 - **`build_ref_tree(named_modules)`** — pure/torch-free. Builds a reference tree
   of `{attr, cls, children, is_group, group_size}` from
@@ -173,7 +205,7 @@ those names onto the accurate profile-based tree instead of rebuilding it.
   representative — mirroring the trace's layer collapse.
 - **`ref_tree_from_llm(llm)`** — extracts the tree from the *live* vLLM model
   during profiling (via `LLM.apply_model`, falling back to attribute traversal).
-  Cheap: the model is already loaded. This is the primary path.
+  Cheap: the model is already loaded.
 - **`ref_tree_from_config(...)`** — `meta`-device instantiation fallback
   (always trusts remote code). Heavy + network. Used by the trace-upload path **and** as a live-path fallback: if
   `ref_tree_from_llm` returns `None` during profiling, `_run_profile` retries
@@ -195,7 +227,8 @@ those names onto the accurate profile-based tree instead of rebuilding it.
   `build_graph_from_trace(..., ref_module_tree=...)` opts in; without a ref tree
   the class-heuristic names are used (backward compatible). The assumption:
   sibling modules **of the same class** execute in their registration/definition
-  order (holds for q_norm-before-k_norm, the layer norms, etc.).
+  order (holds for q_norm-before-k_norm, the layer norms, etc.). Capture-time
+  spans (path 1) do **not** rely on this assumption.
 
 ### Symbolic Shape System
 
@@ -378,12 +411,25 @@ aren't misfiled.
   prefill phase disappeared (`prefill: None`, blank graph until you click Decode)
   and prefill/decode looked identical. `_partition_steps` now uses
   `_subtree_module_count`. Do NOT revert to a device-time heuristic.
-- **Module-name alignment must unwrap `*Model` levels absent from the trace.**
+- **Module names come from capture-time spans; the overlay is a fallback.**
+  `module_hooks` installs forward hooks that emit
+  `record_function("module::<qname>::<Cls>")` `user_annotation` spans during the
+  profiled generate, so `graph_from_trace._build_raw_forest` reads the real
+  attribute path straight from the trace (no alignment, no ordering assumption).
+  `build_graph_from_trace` only applies the `module_naming` overlay when the
+  forest has **no** captured names (`_forest_has_named_modules` → false), i.e.
+  for legacy/upload traces. Do NOT make the overlay unconditional — it would
+  redundantly (and possibly wrongly) relabel a correctly-named span tree. When
+  editing the span label format, update **both** `trace_common.module_span_label`
+  and `parse_module_span` (the emitter in `module_hooks` and the parser in
+  `graph_from_trace` share them).
+- **Module-name alignment (fallback path) must unwrap `*Model` levels absent from the trace.**
   vLLM nests the decoder stack under an inner `*Model` module whose `forward`
   usually emits no trace module event, so the trace nests it directly under
   `*ForCausalLM`. `module_naming._effective_ref_children` flattens reference
   levels whose class isn't among a node's actual trace-child classes; without it,
   child matching stalls at the missing level and `q_norm`/`k_norm` stay `norm`.
+  (Capture-time spans don't hit this — they carry the full path already.)
 - **Device time is attributed by launch-site containment, not `External id`.**
   `graph_from_trace.py` links each device `kernel` to its host launch call
   (`kernel.correlation → xpu_runtime`, the "flow arrow") and attributes it to the

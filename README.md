@@ -19,10 +19,14 @@ is no static graph view.
 
 - **Profiling (profile-first)** — Runs real vLLM inference on Intel XPU with
   `torch.profiler` (`with_stack` + `record_shapes`) and **reconstructs the model
-  graph directly from the trace**: the captured `nn.Module` call stack rebuilds
-  the module hierarchy, `Input Dims` give real op shapes, and kernel device time
+  graph directly from the trace**: the captured module call stack rebuilds the
+  module hierarchy, `Input Dims` give real op shapes, and kernel device time
   is attributed to each op through the `correlation → runtime → External id`
-  chain. Because the tree is derived from what actually executed, it tracks
+  chain. Module nodes carry their **real attribute names** (`q_norm`/`k_norm`,
+  `self_attn`, ...) because profiling installs forward hooks that emit
+  `record_function("module::<path>::<Cls>")` spans at capture time; a
+  `named_modules()` overlay is the fallback for legacy/uploaded traces without
+  those spans. Because the tree is derived from what actually executed, it tracks
   whatever vLLM/the backends dispatched and does not drift as vLLM evolves.
   Requires a working Intel XPU with torch-xpu and vLLM installed.
 - **Static shape sweeps** — `build_model_graph` derives op shapes/memory/FLOPs
@@ -139,17 +143,20 @@ static/index.html       Interactive frontend (SPA, vanilla JS)
 breakdown/
   model_graph.py        Config-driven shape builder (Shape Matrix export sweep)
   graph_from_trace.py   Profile-first graph reconstruction (from torch profiler trace)
+  module_hooks.py       Capture-time module-name spans (forward hooks; research R1)
+  module_naming.py      Fallback name overlay from named_modules() (legacy/upload traces)
   model_info.py         HuggingFace model config fetching & summarization
   analyzer.py           Shape symbolization, memory/FLOPs estimation, layer merging
   profiler.py           torch.profiler wrapper (XPU activity, shapes, stacks)
   classifier.py         Op classification: vllm-xpu-kernels | triton | torch-xpu-ops | cpu
   registry.py           Known op list from vllm-xpu-kernels (68 ops across 4 modules)
   trace_parser.py       Chrome trace JSON parser + module/role inference helpers
-  trace_common.py       Torch-free trace helpers (overhead-event filtering)
+  trace_common.py       Torch-free trace helpers (overhead filter, module-span labels)
   report.py             Console, CSV, JSON report generators
   visualize.py          Static HTML report generator
 tests/
   test_pipeline.py            Unit tests (incl. graph reconstruction; requires torch)
+  test_module_spans.py        Capture-time module-span emission + reconstruction tests
   test_shape_matrix_export.py Shape Matrix Export endpoint tests
   test_real_profile.py        Integration test (requires GPU)
 ```
