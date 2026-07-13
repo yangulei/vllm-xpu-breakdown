@@ -35,13 +35,10 @@ No linter or pre-commit is configured for this project.
 
 Flask web app (`app.py`) + static SPA (`static/index.html`) backed by a `breakdown/` analysis engine.
 
-**Analysis model** — the in-app Model Graph is **always reconstructed from a profiling run**; there is no interactive static-graph view.
-1. **Dynamic (profile-first)** — Runs vLLM inference on Intel XPU with `torch.profiler` (`with_stack` + `record_shapes`), then **reconstructs the model graph directly from the trace** in `graph_from_trace.py` (nn.Module call stack + `Input Dims` shapes + kernel device time via `correlation → runtime → External id`). The reconstructed tree reflects what actually executed, so it doesn't drift as vLLM/backends change.
-2. **Config-driven shape sweep** — `build_model_graph` (in `model_graph.py`) derives op shapes/memory/FLOPs from `config.json` for the **Shape Matrix Excel export** (`/api/export/shape-matrix`). It is not exposed as an interactive graph endpoint.
+**Analysis model** — the in-app Model Graph is **always reconstructed from a profiling run**; there is no interactive static-graph view and no config-driven graph builder. **Dynamic (profile-first)** — Runs vLLM inference on Intel XPU with `torch.profiler` (`with_stack` + `record_shapes`), then **reconstructs the model graph directly from the trace** in `graph_from_trace.py` (nn.Module call stack + `Input Dims` shapes + `Input type` dtypes + kernel device time via `correlation → runtime → External id`). The reconstructed tree reflects what actually executed, so it doesn't drift as vLLM/backends change. Both the web UI graph and the Shape Matrix Excel export (`/api/export/shape-matrix`) are built from this reconstruction.
 
 **Key data flow:**
-- `model_info.py` fetches HF config → `model_graph.py` builds `ModuleNode`/`OpNode` tree → `app.py` serializes to JSON → `index.html` renders tree
-- `profiler.py` runs inference → `graph_from_trace.py` reconstructs the module/op tree from the trace (reusing `analyzer.py` shapes/memory/FLOPs + `classifier.py` backends) → `app.py` serializes to JSON. The removed `annotate_graph_*` / `parse_trace_with_modules` static-overlay path is not used anymore.
+- `profiler.py` runs inference → `graph_from_trace.py` reconstructs the module/op tree from the trace (reusing `analyzer.py` shapes/memory/FLOPs + `classifier.py` backends) → `app.py` serializes to JSON → `index.html` renders tree. The removed `annotate_graph_*` / `parse_trace_with_modules` static-overlay path and the deleted `model_graph.py` config builder are not used anymore.
 - **Module names — capture-time spans (primary, `module_hooks.py`).** During profiling, `_run_profile` installs forward hooks (via `LLM.apply_model(install_module_span_hooks_on)`) that emit `record_function("module::<qualified_name>::<Cls>")` `user_annotation` spans around every module's forward. `graph_from_trace._build_raw_forest` auto-detects those spans and builds module nodes with **real attribute names straight from the trace** — no alignment, no registration-order assumption, correct even under async. Label helpers (`module_span_label`/`parse_module_span`/`module_span_display_name`) live torch-free in `trace_common.py`.
 - **Module names — `named_modules()` overlay (fallback, `module_naming.py`).** For legacy/upload traces without spans, `module_naming.py` recovers names from the live model's `named_modules()` (`ref_tree_from_llm`) and overlays them (`graph_from_trace._apply_ref_names`, before repeat-collapse). `build_graph_from_trace` applies it **only** when the forest has no captured names (`_forest_has_named_modules`). Alignment unwraps reference `*Model` levels absent from the trace (`_effective_ref_children`) — vLLM's inner `*Model.forward` often emits no module event, and without unwrapping, matching stalls and names fall back to `norm`.
 
@@ -55,24 +52,23 @@ Flask web app (`app.py`) + static SPA (`static/index.html`) backed by a `breakdo
 
 - All Python files start with `# SPDX-License-Identifier: Apache-2.0`
 - Use `from __future__ import annotations` and modern type syntax (`dict[str, Any]`, `list[int] | None`)
-- Assume torch-xpu + vLLM are installed and an Intel XPU is available; `model_graph.py`/`model_info.py` stay import-light but a torch-free CPU-only install is no longer a design goal
+- Assume torch-xpu + vLLM are installed and an Intel XPU is available; `model_info.py` stays import-light but a torch-free CPU-only install is no longer a design goal
 - Op shapes use string symbols (`"H"`, `"S"`, `"n_h·d"`) resolved to concrete values at display/export time
-- All graph builders accept `tp_size` and produce per-rank shapes (dimensions divided by TP)
+- Graph reconstruction accepts `tp_size` and produces per-rank shapes (dimensions divided by TP)
 - The web UI is a single HTML file with inline CSS/JS — no bundler or build step
-- `app.py` is large (~1300 lines) — use `view_range` to read targeted sections
+- `app.py` is large (~1700 lines) — use `view_range` to read targeted sections
 
 ## Adding a New Model Architecture
 
-1. Add mapping in `_ARCH_FAMILY_MAP` in `model_graph.py` (key must exactly match HuggingFace `architectures[0]`)
-2. Route to appropriate builder in `build_model_graph()` — check category sets: `_MLA_ARCHS`, `_VL_ARCHS`, `_ENCODER_ARCHS`, `_DIFFUSION_ARCHS`
-3. If the attention/MLP pattern is novel, add a new `_build_*` function
-4. Test: `python -c "from breakdown.model_graph import build_model_graph; from breakdown.model_info import fetch_model_config, summarize_config; c = fetch_model_config('org/model'); s = summarize_config(c); g = build_model_graph(s); print(g.keys())"`
+The model graph is reconstructed from the trace, so no static builder is needed:
+1. Ensure `breakdown/model_info.py` `summarize_config` extracts the model's key dims so shapes symbolize (`S`/`B`/`C`/`H`/`I`/`n_h·d`/…).
+2. Classify any novel ops (see below).
+3. Profile it and confirm the reconstructed graph + Shape Matrix look right.
 
 ## Adding a New Op/Kernel
 
 1. Add op name to `ALL_VLLM_XPU_OPS` set in `breakdown/registry.py`
 2. If the op has a unique classification pattern, update `breakdown/classifier.py`
-3. Reference the op in the appropriate graph builder in `model_graph.py` with correct shapes
 
 ## API Endpoints
 

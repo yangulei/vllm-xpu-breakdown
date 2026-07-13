@@ -23,9 +23,9 @@ What the trace gives us (captured with ``with_stack=True`` and
   that never emit an ``aten``/``_C`` ``cpu_op`` surface as ``triton::`` ops on
   their module, and fused/eager kernels are handled identically.
 
-The output dict matches the serialized shape produced by
-``model_graph.build_model_graph`` (``prefill`` / ``decode`` trees, ``symbols``,
-``config``) so the existing web UI renders it unchanged.
+The output dict is a serialized module tree (``prefill`` / ``decode`` trees,
+``symbols``, ``config``) that the web UI and the Shape Matrix export both render
+/ consume unchanged.
 """
 
 from __future__ import annotations
@@ -1378,8 +1378,8 @@ def build_graph_from_trace(
 
     Returns:
         Dict with ``prefill`` / ``decode`` trees (either may be ``None``),
-        ``symbols``, ``config`` and timing metadata — matching the serialized
-        format of ``build_model_graph`` plus per-op ``device_time_us``.
+        ``symbols``, ``config`` and timing metadata (a serialized module tree
+        the web UI and Shape Matrix export consume) plus per-op ``device_time_us``.
     """
     summary = summary or {}
     trace = _load_trace(trace_path)

@@ -29,11 +29,9 @@ is no static graph view.
   those spans. Because the tree is derived from what actually executed, it tracks
   whatever vLLM/the backends dispatched and does not drift as vLLM evolves.
   Requires a working Intel XPU with torch-xpu and vLLM installed.
-- **Static shape sweeps** — `build_model_graph` derives op shapes/memory/FLOPs
-  from the HuggingFace `config.json` for the **Shape Matrix export** (a
-  config-driven sweep across seq/context/batch/TP). It no longer powers an
-  interactive graph view — the in-app Model Graph is always the profiled
-  reconstruction.
+- **Shape Matrix export** — sweeps op shapes/memory/FLOPs across
+  seq/context/batch/TP configurations, grounded in a real profiling run (the
+  reconstructed ops are re-resolved per config). See below.
 
 ## Supported Architectures
 
@@ -160,7 +158,6 @@ app.py                  Web server (Flask) — model config, profiling, exports,
 run_profile.py          CLI entry point — standalone profiling + reports
 static/index.html       Interactive frontend (SPA, vanilla JS)
 breakdown/
-  model_graph.py        Config-driven shape builder (Shape Matrix export sweep)
   graph_from_trace.py   Profile-first graph reconstruction (from torch profiler trace)
   module_hooks.py       Capture-time module-name spans (forward hooks; research R1)
   module_naming.py      Fallback name overlay from named_modules() (legacy/upload traces)

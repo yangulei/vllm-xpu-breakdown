@@ -296,3 +296,16 @@ def get_dim_symbols(summary: dict[str, Any]) -> dict[int, str]:
         symbols[vit_h] = "H_vit"
 
     return symbols
+
+
+def min_profile_layers(model_summary: dict) -> int:
+    """Compute minimum layers to profile to capture all unique layer types.
+
+    For pure dense or pure MoE models: 1 layer suffices.
+    For hybrid models (e.g. DeepSeek with first_k_dense_replace=3):
+      need first_k_dense + 1 to capture both dense and MoE layers.
+    """
+    first_k = model_summary.get("first_k_dense_replace", 0) or 0
+    if first_k > 0 and model_summary.get("is_moe"):
+        return first_k + 1
+    return 1

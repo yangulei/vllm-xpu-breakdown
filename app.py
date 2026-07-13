@@ -49,10 +49,12 @@ from breakdown.analyzer import (
 from breakdown.classifier import Backend, classify_op
 from breakdown.graph_from_trace import build_graph_from_trace
 from breakdown.trace_parser import _detect_device_via_torch
-from breakdown.model_graph import (
+from breakdown.model_info import (
+    fetch_model_config,
+    get_dim_symbols,
     min_profile_layers,
+    summarize_config,
 )
-from breakdown.model_info import fetch_model_config, get_dim_symbols, summarize_config
 from breakdown.registry import ALL_VLLM_XPU_OPS
 
 app = Flask(__name__, static_folder="static")

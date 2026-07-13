@@ -12,23 +12,19 @@ This is a profiling and static-analysis tool for vLLM inference on Intel XPU (GP
 - **framework** — Tensor reshaping, profiler overhead
 
 The tool's in-app **Model Graph is always reconstructed from a profiling run**;
-there is no interactive static-graph view.
-1. **Dynamic profiling (profile-first)** — Runs actual inference via vLLM on
-   Intel XPU, then **reconstructs the model graph directly from the torch
-   profiler trace** (nn.Module call stack + `Input Dims` shapes + kernel device
-   time via the correlation→runtime→External-id chain). The reconstructed tree
-   reflects what actually executed, so it tracks whatever vLLM/the backends
-   dispatched instead of relying on a hand-maintained static graph.
-2. **Config-driven shape sweep** — `build_model_graph` (from the HuggingFace
-   config) is the analytic shape builder. It is **no longer wired to any
-   endpoint**: the Shape Matrix export is now profile-derived (see below) and no
-   interactive graph endpoint exists. `build_model_graph` remains only for its
-   unit tests / potential reuse.
+there is no interactive static-graph view, and no config-driven graph builder.
+**Dynamic profiling (profile-first)** — Runs actual inference via vLLM on Intel
+XPU, then **reconstructs the model graph directly from the torch profiler trace**
+(nn.Module call stack + `Input Dims` shapes + `Input type` dtypes + kernel device
+time via the correlation→runtime→External-id chain). The reconstructed tree
+reflects what actually executed, so it tracks whatever vLLM/the backends
+dispatched instead of relying on a hand-maintained static graph. Both the web UI
+graph and the Shape Matrix export are built from this reconstruction.
 
 > **Environment assumption:** the profiling path assumes torch-xpu and vLLM are
-> installed and an Intel XPU is available. (`model_graph.py`/`model_info.py`
-> happen to be import-light, but supporting a torch-free CPU-only install is no
-> longer a design goal.)
+> installed and an Intel XPU is available. (`model_info.py` happens to be
+> import-light, but supporting a torch-free CPU-only install is no longer a
+> design goal.)
 
 ## Project Structure
 
@@ -37,11 +33,10 @@ app.py                    — Flask web server (API + static serving + exports)
 run_profile.py            — CLI profiling entry point
 chat.py                   — Interactive chat with profiling
 breakdown/
-  model_graph.py          — Static (config-driven) model graph builder
   graph_from_trace.py     — Profile-first graph reconstruction from a trace
   module_hooks.py         — Capture-time module-name spans (forward hooks)
   module_naming.py        — Fallback: recover names from named_modules() overlay
-  model_info.py           — HuggingFace config fetcher and summarizer
+  model_info.py           — HuggingFace config fetcher/summarizer + min_profile_layers
   analyzer.py             — Op analysis (shapes, memory, FLOPs, AI)
   classifier.py           — Op → backend classification
   registry.py             — Known vllm-xpu-kernels ops list
@@ -90,43 +85,20 @@ pytest tests/ -v
 
 ## Key Architecture Decisions
 
-### Model Graph Builder (`model_graph.py`)
-
-The config-driven shape builder. It is **no longer wired to any endpoint** (the
-Shape Matrix export is profile-derived; there is no interactive graph view). It
-is kept for its unit tests / potential reuse. Key concepts:
-
-- **`_ARCH_FAMILY_MAP`** — Maps HuggingFace `architectures` field to family names (35+ entries). This determines which graph builder is used.
-- **Architecture category sets** — `_MLA_ARCHS`, `_VL_ARCHS`, `_ENCODER_ARCHS`, `_DIFFUSION_ARCHS` control routing in `build_model_graph()`.
-- **`ModuleNode` / `OpNode`** — Tree structure representing model modules and their ops with shapes, backends, memory, and FLOPs.
-- **Phase-aware** — Each model gets separate `prefill` and `decode` graphs (different token dimensions).
-
-Architecture-specific builders:
-| Builder | Used for |
-|---------|----------|
-| `_build_decoder_layer` | Standard GQA decoder (Llama, Qwen, Mistral) |
-| `_build_moe_layer` | MoE decoder (Mixtral, Qwen-MoE) |
-| `_build_mla_decoder_layer` | MLA attention (DeepSeek-V2/V3) |
-| `_build_mla_moe_layer` | MLA + MoE (DeepSeek-V3) |
-| `_build_vision_encoder` | ViT for VL models |
-| `_build_encoder_model` | BERT/RoBERTa for embedding/reranker |
-| `_build_diffusion_placeholder` | Diffusion models (not vLLM-served) |
-
 > **MLA profiling is supported on XPU.** Dynamic profiling of MLA models
 > (DeepSeek-V2/V3/V4, GLM-MoE-DSA) used to be hard-rejected in `app.py`
 > because MLA required FlashAttention. vLLM-XPU now provides MLA backends
 > (`TRITON_MLA` for dense MLA, `XPU_MLA_SPARSE` for DeepSeek sparse attention),
 > so that block was removed. Do not re-add an MLA architecture guard in the
-> profiling path. See `TestMLAModelGraph` in `tests/test_pipeline.py`.
+> profiling path.
 
 ### Profile-First Graph Reconstruction (`graph_from_trace.py`)
 
-The profiling flow no longer overlays timing onto the static graph. Instead
+The model graph is reconstructed straight from the torch profiler trace.
 `build_graph_from_trace(trace_path, summary, tp_size, batch_size, quantization)`
-reconstructs the module/op tree straight from the torch profiler trace and
-returns the same serialized shape (`{prefill, decode, symbols, config,
-has_timing, timing_*, source}`) as `build_model_graph`, so the frontend renders
-it unchanged. How it works:
+returns a serialized module/op tree (`{prefill, decode, symbols, config,
+has_timing, timing_*, source}`) that the frontend and the Shape Matrix export
+consume unchanged. How it works:
 
 - **Module tree** — built from **capture-time module spans** when present
   (research R1, the primary path): `module_hooks` installs forward hooks that
@@ -268,9 +240,9 @@ profile's `symbols`, every op's shapes are re-resolved (`_resolve_shape_ints`),
 and **Memory/FLOPs are recomputed per config** via `_profile_op_memory` /
 `estimate_flops`. An **Info** sheet records the profiled config, caveats, and a
 validation summary. Filename ends in `_profile.xlsx`.
-> `build_model_graph` (config-driven builder in `model_graph.py`) is **no longer
-> wired to any endpoint** — the export never calls it. It stays in the tree only
-> for its unit tests / potential reuse. Do not re-add a config `source` branch.
+> There is **no config-driven builder** — `model_graph.py` was deleted. The
+> Shape Matrix is purely profile-derived; do not re-add a config `source` branch
+> or a static graph builder.
 - **Acquisition + invariants:** requires `_profile_state["status"]=="done"` and
   the profiled `model_id` to match the requested one (else 400). The **frontend
   guarantees** a matching run exists before calling: `ensureProfileForMatrix`
@@ -321,21 +293,24 @@ aren't misfiled.
 
 - **License header** — All Python files start with `# SPDX-License-Identifier: Apache-2.0`
 - **Type annotations** — Use `from __future__ import annotations` and modern syntax (`dict[str, Any]`, `list[int] | None`)
-- **Environment** — Assume torch-xpu and vLLM are installed and an Intel XPU is available. `model_graph.py`/`model_info.py` remain import-light (they don't pull in torch/vLLM at import time), which keeps static analysis fast, but supporting a torch-free CPU-only install is no longer a design requirement.
+- **Environment** — Assume torch-xpu and vLLM are installed and an Intel XPU is available. `model_info.py` remains import-light (it doesn't pull in torch/vLLM at import time), which keeps config fetching fast, but supporting a torch-free CPU-only install is no longer a design requirement.
 - **Symbolic shapes** — Op shapes use string symbols (`"H"`, `"S"`, `"n_h·d/TP"`) with `/TP` for TP-divided dims
 - **TP-awareness** — All graph builders accept `tp_size`; shapes always show `/TP` for split dimensions; `cfg["_tp_*"]` keys hold divided values for numeric calculations
 
 ## Adding a New Model
 
-1. If the architecture is new, add mapping in `_ARCH_FAMILY_MAP` in `model_graph.py`
-2. If the attention/MLP pattern is novel, add a new builder function
-3. Test with: `python -c "from breakdown.model_graph import build_model_graph; ..."`
+The model graph is reconstructed from the trace, so a new architecture needs no
+static builder. Ensure:
+1. `breakdown/model_info.py` `summarize_config` extracts the model's key dims
+   (hidden size, heads, intermediate, experts, MLA/VL nesting) so shapes
+   symbolize (`S`/`B`/`C`/`H`/`I`/`n_h·d`/…) in the reconstruction.
+2. Any novel ops are classified — see *Adding a New Op/Kernel*.
+3. Profile it and confirm the reconstructed graph + Shape Matrix look right.
 
 ## Adding a New Op/Kernel
 
 1. Add the op name to `breakdown/registry.py` `ALL_VLLM_XPU_OPS` set
 2. If the op has a unique classification pattern, update `breakdown/classifier.py`
-3. Reference the op in the appropriate graph builder with correct shapes
 
 ## API Endpoints
 
@@ -513,18 +488,15 @@ aren't misfiled.
   1-MoE-layer reduced trace of MiniMax-M3 reads `x57`. Totals are recomputed via
   `_recompute_totals`. Triggers only when `summary["num_layers"]` exceeds the
   profiled decoder-layer count.
-- `model_graph.py` is ~1600 lines — use `view_range` to read targeted sections
 - `app.py` is ~1700 lines — use `view_range` to read targeted sections
 - **Profiling reconstructs the graph from the trace** (`graph_from_trace.py`) —
   it does NOT overlay timing onto a static graph. The `annotate_graph_*` and
   `parse_trace_with_modules` helpers were removed; don't reintroduce them. There
   is **no interactive static-graph endpoint** (`/api/model/<id>/graph` and
-  `/api/export/static-graph` were removed). `build_model_graph` is now wired to
-  **no endpoint at all** — the Shape Matrix export is profile-derived
-  (`graph_from_trace`); the config builder is kept only for its tests.
-- The `_ARCH_FAMILY_MAP` keys must exactly match HuggingFace `architectures[0]` values
-- Encoder models return `decode: None` (no autoregressive decode phase)
-- Diffusion models return `prefill: None, decode: None` with a `note` field
+  `/api/export/static-graph` were removed) and **no config-driven graph builder**
+  (`model_graph.py` / `build_model_graph` were deleted). The Shape Matrix export
+  is profile-derived (`graph_from_trace`); don't reintroduce a static builder.
+- Encoder models have no autoregressive decode phase
 - The web UI is a single HTML file with inline CSS/JS — no build step needed
 - `model_info.py` fetches from HuggingFace API — tests should mock HTTP calls
 - Shape strings contain `/TP` always (even when TP=1) — resolve via `symbols["TP"]`
@@ -536,22 +508,6 @@ aren't misfiled.
   fallback, derives `first_k_dense_replace` from the leading zeros of a
   per-layer `moe_layer_freq` list, and maps `dense_intermediate_size` → dense
   MLP / `intermediate_size` → MoE experts. M3 uses standard GQA (not MLA).
-- MiniMax-M3 sparse attention is modeled to match the **actual XPU dispatch**
-  (not the DeepSeek/CUDA indexer ops). `_build_attention_ops(..., sparse=True)`
-  emits: a fused `fused_minimax_m3_qknorm_rope_kv_insert` vllm-xpu-kernels op
-  (replaces the dense q_norm/k_norm/rotary/reshape_and_cache — it also writes the
-  K/V and index-key caches), the Triton lightning-indexer score
-  (`minimax_m3_index_score` prefill / `minimax_m3_index_decode` decode), a Triton
-  `minimax_m3_index_topk` (prefill only; decode fuses top-k into the score
-  kernel), and the Triton block-sparse attention itself
-  (`minimax_m3_sparse_attn` prefill / `minimax_m3_sparse_attn_decode` decode —
-  the decode kernel merges its split-K partials internally, so there is no
-  separate `merge_attn_states`). The index Q/K projection is fused into
-  `qkv_proj`, so it is not a separate matmul. On XPU the flash/MSA sparse path is
-  CUDA-SM100-only, so sparse attention always runs Triton — do NOT model it as
-  `flash_attn_varlen_fwd`. Only the MoE layers are sparse; the dense prefix
-  layers keep full attention. The MoE layer builder passes
-  `sparse=cfg.get("sparse_attention")`.
 
 ## Updating Documentation
 
@@ -577,4 +533,3 @@ When making significant changes to this repository, update documentation accordi
 4. **How to verify** — After updating, check that:
    - Project Structure listing matches actual files (`ls breakdown/ tests/ scripts/`)
    - API Endpoints table matches routes in `app.py` (`grep "@app.route" app.py`)
-   - Builder table matches functions in `model_graph.py` (`grep "^def _build_" breakdown/model_graph.py`)
