@@ -254,5 +254,56 @@ class TestNamedSpanReconstruction(unittest.TestCase):
         self.assertEqual(attn_norms, ["q_norm", "k_norm"])
 
 
+class TestWorkerThreadSelection(unittest.TestCase):
+    """R6: the module-span thread is the worker, even if a decoy thread has
+    more cpu_ops (the old 'busiest cpu_op tid' heuristic would mis-select it)."""
+
+    SUMMARY = {
+        "architecture": "Qwen3ForCausalLM", "hidden_size": 16, "num_heads": 3,
+        "num_kv_heads": 3, "head_dim": 16, "intermediate_size": 64,
+        "vocab_size": 32000, "num_layers": 1, "dtype": "bfloat16",
+    }
+
+    def _trace_with_decoy(self):
+        events = _span_trace()["traceEvents"]
+        # Add a decoy thread (tid=1) with MANY cpu_ops but no module spans, so
+        # it dominates the raw cpu_op count.
+        for i in range(500):
+            events.append({"ph": "X", "cat": "cpu_op", "tid": 1, "pid": 1,
+                           "ts": 5000 + i, "dur": 1, "name": "aten::decoy_add",
+                           "args": {"External id": 10_000 + i,
+                                    "Input Dims": [[4, 4]],
+                                    "Input type": ["c10::BFloat16"]}})
+        return {"traceEvents": events}
+
+    def test_span_thread_selected_over_busier_decoy(self):
+        from breakdown.graph_from_trace import build_graph_from_trace
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(self._trace_with_decoy(), f)
+            path = f.name
+        try:
+            g = build_graph_from_trace(path, self.SUMMARY, tp_size=1,
+                                       batch_size=1)
+        finally:
+            os.unlink(path)
+
+        self.assertTrue(g["has_module_names"])
+
+        def _op_names(node, acc):
+            for o in node.get("ops", []):
+                acc.append(o["name"])
+            for c in node.get("children", []):
+                _op_names(c, acc)
+            return acc
+
+        tree = g["prefill"] or g["decode"]
+        self.assertIsNotNone(tree)
+        # The decoy thread's ops must not leak into the reconstructed tree.
+        self.assertNotIn("aten::decoy_add", _op_names(tree, []))
+        # Real span names still recovered from the worker (span) thread.
+        model = tree["children"][0]
+        self.assertEqual(model["name"], "model")
+
+
 if __name__ == "__main__":
     unittest.main()

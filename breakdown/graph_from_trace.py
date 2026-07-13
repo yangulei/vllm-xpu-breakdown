@@ -330,18 +330,26 @@ def _build_raw_forest(events: list[dict]) -> list[_Raw]:
     if not cpu_ops:
         return []
 
-    # The worker thread runs the model forward; pick the tid with most cpu_ops.
-    tid_counts: dict[Any, int] = {}
-    for e in cpu_ops:
-        tid_counts[e.get("tid")] = tid_counts.get(e.get("tid"), 0) + 1
-    worker_tid = max(tid_counts, key=tid_counts.get)
-
-    # Named-span mode iff the worker thread carries capture-time module spans.
-    named_span_mode = any(
-        e.get("tid") == worker_tid and e.get("cat") == "user_annotation"
-        and str(e.get("name", "")).startswith(MODULE_SPAN_PREFIX)
-        for e in events
-    )
+    # Choose the worker thread that ran the model forward. When capture-time
+    # module spans are present (research R1), the thread carrying them is an
+    # unambiguous anchor to the forward (R6): the "busiest cpu_op thread" guess
+    # can pick the wrong worker under tensor parallelism, where several threads
+    # dispatch ops. Fall back to the busiest cpu_op thread for legacy traces
+    # without spans.
+    span_tid_counts: dict[Any, int] = {}
+    for e in events:
+        if (e.get("ph") == "X" and e.get("cat") == "user_annotation"
+                and str(e.get("name", "")).startswith(MODULE_SPAN_PREFIX)):
+            span_tid_counts[e.get("tid")] = span_tid_counts.get(e.get("tid"), 0) + 1
+    if span_tid_counts:
+        worker_tid = max(span_tid_counts, key=span_tid_counts.get)
+        named_span_mode = True
+    else:
+        tid_counts: dict[Any, int] = {}
+        for e in cpu_ops:
+            tid_counts[e.get("tid")] = tid_counts.get(e.get("tid"), 0) + 1
+        worker_tid = max(tid_counts, key=tid_counts.get)
+        named_span_mode = False
 
     nodes: list[_Raw] = []
     for e in events:
