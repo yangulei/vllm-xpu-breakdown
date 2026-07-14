@@ -206,6 +206,21 @@ consume unchanged. How it works:
   GPU-specific "multiple RowParallelLinear in one MLP, keep just the last" async
   compensation stays `is_cuda`-gated. See
   `TestGraphFromTrace.test_rowparallel_in_mlp_named_down_proj_on_xpu`.
+- **MoE router / experts are surfaced from functional python_function frames
+  (`_FUNCTIONAL_MODULE_FRAMES`).** vLLM runs the MoE routing (`fused_topk_bias`
+  — sigmoid/topk/gather) and expert compute (`xpu_fused_moe` — grouped
+  GEMM/remap/gather/swiglu) as plain `python_function` frames inside the fused
+  `vllm::moe_forward_shared` op, **not** as `nn.Module` forwards. With no module
+  boundary, their ops and kernels collapsed into the single `moe_forward_shared`
+  op node, so the `FusedMoE` graph showed neither the router nor the experts
+  (only the hoisted `shared_experts` MLP). `_functional_module_class` promotes
+  those two frames (and the V1 `Sampler`) to **synthetic modules** with explicit
+  display names (`router`, `moe`); `_hoist_modules_under_ops` then lifts them out
+  of the wrapping op, so `FusedMoE` reads `shared_experts → router → moe →
+  reduce`. Each entry is `(path_substr, funcname, synthetic_class,
+  display_name)`; device time is conserved (the wrapping op keeps only its
+  residual self time). See
+  `TestGraphFromTrace.test_moe_router_and_experts_surfaced_from_functional_frames`.
 
 The old `annotate_graph_timing` / `annotate_graph_from_modules` /
 `parse_trace_with_modules` paths were **removed**. Do not reintroduce a

@@ -306,29 +306,46 @@ def _attribute_kernels(roots: list[_Raw],
 # sampler's ops become bare op roots and get dropped by ``_partition_steps``
 # (which keeps only module roots), so the reconstructed tree stops at
 # ``LogitsProcessor``. Map the sampler's ``__call__`` frame to a synthetic
-# ``Sampler`` module so its ops attach to a proper node. ``(path_substr,
-# funcname, synthetic_class)`` — only the outermost ``__call__`` matches, giving
-# exactly one boundary per step.
+# ``Sampler`` module so its ops attach to a proper node.
+#
+# The same trick surfaces the MoE routing and expert compute. vLLM dispatches
+# the whole MoE block as one fused custom op (``vllm::moe_forward_shared``)
+# whose Python body calls the router (``fused_topk_bias`` — sigmoid/topk/gather)
+# and the expert kernels (``xpu_fused_moe`` — grouped GEMM/remap/gather) as
+# plain functions, not ``nn.Module`` forwards. Without a boundary their ops and
+# kernels collapse into the single ``moe_forward_shared`` op node, so the
+# ``FusedMoE`` graph showed neither the router nor the experts (only the hoisted
+# ``shared_experts`` MLP). Promoting the two frames to synthetic modules makes
+# ``FusedMoE`` read ``shared_experts → router → moe → reduce``; each is then
+# hoisted out of the wrapping op by ``_hoist_modules_under_ops``.
+#
+# ``(path_substr, funcname, synthetic_class, display_name)`` — ``display_name``
+# is the attribute-style label shown in the graph (``None`` → derive from the
+# class). Only the outermost matching frame becomes a boundary per step.
 _FUNCTIONAL_MODULE_FRAMES = (
-    ("sample/sampler.py", "__call__", "Sampler"),
+    ("sample/sampler.py", "__call__", "Sampler", None),
+    ("fused_topk_bias_router.py", "fused_topk_bias", "FusedTopKBiasRouter",
+     "router"),
+    ("fused_moe_interface.py", "xpu_fused_moe", "XpuFusedMoE", "moe"),
 )
 
 
-def _functional_module_class(name: str) -> str | None:
-    """Return a synthetic module class for a functional (non-nn.Module) frame.
+def _functional_module_class(name: str) -> tuple[str, str | None] | None:
+    """Return ``(class, display_name)`` for a functional (non-nn.Module) frame.
 
     ``name`` is a torch-profiler python_function label of the form
-    ``"<path>(<lineno>): <func>"``. Returns the mapped class name (e.g.
-    ``"Sampler"``) when the frame is a recognised functional module boundary,
-    else ``None``.
+    ``"<path>(<lineno>): <func>"``. Returns the mapped ``(synthetic_class,
+    display_name)`` when the frame is a recognised functional module boundary
+    (``display_name`` may be ``None`` to derive it from the class), else
+    ``None``.
     """
     head, sep, func = name.partition("): ")
     if not sep:
         return None
     path = head.rsplit("(", 1)[0]
-    for path_substr, funcname, cls in _FUNCTIONAL_MODULE_FRAMES:
+    for path_substr, funcname, cls, display in _FUNCTIONAL_MODULE_FRAMES:
         if funcname == func and path_substr in path:
-            return cls
+            return cls, display
     return None
 
 
@@ -401,9 +418,13 @@ def _build_raw_forest(events: list[dict]) -> list[_Raw]:
             cls = name.split("nn.Module:", 1)[1].strip()
             nodes.append(_Raw("module", cls, ts, dur))
         elif cat == "python_function":
-            cls = _functional_module_class(name)
-            if cls:
-                nodes.append(_Raw("module", cls, ts, dur))
+            mapped = _functional_module_class(name)
+            if mapped:
+                cls, display = mapped
+                node = _Raw("module", cls, ts, dur)
+                if display:
+                    node.attr_name = display
+                nodes.append(node)
         elif cat == "cpu_op":
             if _is_overhead_event(name):
                 continue

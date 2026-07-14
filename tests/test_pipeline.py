@@ -1189,6 +1189,114 @@ class TestGraphFromTrace(unittest.TestCase):
         self.assertLess(moe_op["order"], mlp["order"])
         self.assertLess(mlp["order"], reduce_op["order"])
 
+    def test_moe_router_and_experts_surfaced_from_functional_frames(self):
+        # vLLM runs the MoE router (``fused_topk_bias``) and expert compute
+        # (``xpu_fused_moe``) as plain ``python_function`` frames inside the
+        # fused ``vllm::moe_forward_shared`` op — not as ``nn.Module`` forwards.
+        # Without promoting those frames to synthetic module boundaries, their
+        # ops (topk/gather routing, grouped-GEMM experts) collapse into the
+        # single ``moe_forward_shared`` op node and the ``FusedMoE`` graph shows
+        # neither the router nor the experts. They must surface as ``router`` and
+        # ``moe`` children of ``FusedMoE`` (order: router → moe), with their ops
+        # and device time moved out of the wrapping op.
+        from breakdown.graph_from_trace import build_graph_from_trace
+        events = []
+        ext = [0]
+        corr = [0]
+        tid = 7
+
+        def kern(e, ts, dur):
+            corr[0] += 1
+            events.append({"ph": "X", "cat": "xpu_runtime", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": 0.1, "name": "l",
+                           "args": {"correlation": corr[0], "External id": e}})
+            events.append({"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+                           "ts": ts + 1000, "dur": dur, "name": "g",
+                           "args": {"correlation": corr[0]}})
+
+        def op(name, ts, dur, shapes, kdur=0.0):
+            ext[0] += 1
+            events.append({"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+                           "ts": ts, "dur": dur, "name": name,
+                           "args": {"External id": ext[0], "Input Dims": shapes,
+                                    "Input type": ["c10::BFloat16"]}})
+            if kdur:
+                kern(ext[0], ts, kdur)
+
+        def mod(cls, idx, ts, dur):
+            events.append({"ph": "X", "cat": "python_function", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": dur,
+                           "name": f"nn.Module: {cls}_{idx}"})
+
+        def pyfn(name, ts, dur):
+            events.append({"ph": "X", "cat": "python_function", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": dur, "name": name})
+
+        tokens = 8
+        mod("TinyForCausalLM", 0, 0.0, 400)
+        mod("TinyDecoderLayer", 0, 1.0, 350)
+        mod("TinyMoE", 0, 5.0, 340)
+        mod("FusedMoE", 0, 20.0, 300)
+        # Fused MoE custom op wrapping the router + experts (nested under it).
+        op("vllm::moe_forward_shared", 22.0, 280, [[tokens, 16], [tokens, 4]],
+           5.0)
+        # Router: fused_topk_bias python_function wrapping topk/gather.
+        pyfn(".../fused_moe/router/fused_topk_bias_router.py(100): "
+             "fused_topk_bias", 40.0, 60)
+        op("aten::topk", 42.0, 20, [[tokens, 4]], 8.0)
+        op("aten::gather", 66.0, 20, [[tokens, 4]], 4.0)
+        # Experts: xpu_fused_moe python_function wrapping the grouped GEMM.
+        pyfn(".../vllm_xpu_kernels/fused_moe_interface.py(515): xpu_fused_moe",
+             120.0, 120)
+        op("_xpu_C::cutlass_grouped_gemm_interface", 122.0, 100,
+           [[tokens, 16], [16, 32]], 30.0)
+        # Back at FusedMoE level, after the op closes: the TP reduce.
+        op("c10d::allreduce_", 310.0, 5, [[tokens, 16]], 3.0)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"traceEvents": events}, f)
+            path = f.name
+        try:
+            g = build_graph_from_trace(path, self.SUMMARY, tp_size=1,
+                                       batch_size=1)
+        finally:
+            os.unlink(path)
+
+        def find(node, cls):
+            if node.get("module_type") == cls:
+                return node
+            for c in node.get("children", []):
+                r = find(c, cls)
+                if r:
+                    return r
+            return None
+
+        tree = g["prefill"] or g["decode"]
+        fused = find(tree, "FusedMoE")
+        self.assertIsNotNone(fused)
+        children = {c["name"]: c for c in fused["children"]}
+        # Router and experts surfaced as named children of FusedMoE.
+        self.assertIn("router", children)
+        self.assertIn("moe", children)
+        router, moe = children["router"], children["moe"]
+        # Each kept its own ops (moved out of the fused op).
+        self.assertTrue(any(o["name"] == "aten::topk" for o in router["ops"]))
+        self.assertTrue(any(o["name"] == "aten::gather" for o in router["ops"]))
+        self.assertTrue(any(o["name"] == "_xpu_C::cutlass_grouped_gemm_interface"
+                            for o in moe["ops"]))
+        # Device time is conserved and counted once: the wrapping op keeps only
+        # its own 5us; router holds 8+4=12us, experts hold 30us.
+        moe_op = next(o for o in fused["ops"]
+                      if o["name"] == "vllm::moe_forward_shared")
+        self.assertAlmostEqual(moe_op["device_time_us"], 5.0, places=2)
+        self.assertAlmostEqual(router["total_device_time_us"], 12.0, places=2)
+        self.assertAlmostEqual(moe["total_device_time_us"], 30.0, places=2)
+        # Execution order: router → moe → reduce.
+        reduce_op = next(o for o in fused["ops"]
+                         if o["name"] == "c10d::allreduce_")
+        self.assertLess(router["order"], moe["order"])
+        self.assertLess(moe["order"], reduce_op["order"])
+
     def test_rowparallel_in_mlp_named_down_proj_on_xpu(self):
         # RowParallelLinear defaults to ``o_proj`` (attention output), but inside
         # an MLP/expert module it is the ``down_proj``. The disambiguation used
