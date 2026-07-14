@@ -319,6 +319,16 @@ def _attribute_kernels(roots: list[_Raw],
 # ``FusedMoE`` read ``shared_experts → router → moe → reduce``; each is then
 # hoisted out of the wrapping op by ``_hoist_modules_under_ops``.
 #
+# It also groups the fused all-reduce + RMSNorm. Gemma-style models (MiniMax-M3)
+# fuse the residual tensor-parallel all-reduce with the following RMSNorm as
+# ``fused_allreduce_gemma_rms_norm``, a ``python_function`` that wraps both the
+# ``c10d::allreduce_`` op **and** the ``MiniMAXGemmaRMSNorm`` module. Without a
+# boundary the all-reduce and the norm float up as two unrelated siblings of the
+# decoder layer (a bare ``c10d::allreduce_`` op next to a ``post_attention_-
+# layernorm`` norm), which reads as an unexplained "norm" at the layer edge.
+# Promoting the frame makes it a parent node ``fused_allreduce_gemma_rms_norm →
+# {allreduce, norm}`` so the fusion is explicit.
+#
 # ``(path_substr, funcname, synthetic_class, display_name)`` — ``display_name``
 # is the attribute-style label shown in the graph (``None`` → derive from the
 # class). Only the outermost matching frame becomes a boundary per step.
@@ -327,6 +337,8 @@ _FUNCTIONAL_MODULE_FRAMES = (
     ("fused_topk_bias_router.py", "fused_topk_bias", "FusedTopKBiasRouter",
      "router"),
     ("fused_moe_interface.py", "xpu_fused_moe", "XpuFusedMoE", "moe"),
+    ("fused_allreduce_gemma_rms_norm.py", "fused_allreduce_gemma_rms_norm",
+     "FusedAllreduceGemmaRMSNorm", "fused_allreduce_gemma_rms_norm"),
 )
 
 

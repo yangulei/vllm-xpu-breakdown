@@ -221,6 +221,24 @@ consume unchanged. How it works:
   display_name)`; device time is conserved (the wrapping op keeps only its
   residual self time). See
   `TestGraphFromTrace.test_moe_router_and_experts_surfaced_from_functional_frames`.
+- **The fused all-reduce + RMSNorm is grouped as a parent node
+  (`_FUNCTIONAL_MODULE_FRAMES`).** Gemma-style models (MiniMax-M3) fuse the
+  residual tensor-parallel all-reduce with the following RMSNorm as
+  `fused_allreduce_gemma_rms_norm` — a `python_function` that wraps **both** the
+  `c10d::allreduce_` op **and** the `MiniMAXGemmaRMSNorm` module. Without a
+  boundary the all-reduce and the norm float up as two unrelated siblings of the
+  decoder layer (a bare `c10d::allreduce_` op next to a lone norm), so a layer
+  appeared to have an unexplained "norm" at its edges — and because vLLM
+  dispatches the pre-attention fused norm right after the *previous* layer's
+  forward returns, by time-containment it lands at the **start** of the current
+  layer (so a layer could show a fused norm at both its beginning, the
+  previous layer's tail, and after attention). Promoting the frame makes it a
+  parent node `fused_allreduce_gemma_rms_norm → {allreduce, norm}` so the fusion
+  is explicit. The frame path is MiniMax-specific, so other models are
+  unaffected. The wrapped `MiniMAXGemmaRMSNorm` moves under the fused node
+  (labeled `norm`); only the **bare** (un-fused) `input_layernorm` — the first
+  layer's, which has no preceding all-reduce — stays a direct layer child. See
+  `TestGraphFromTrace.test_fused_allreduce_gemma_rms_norm_grouped`.
 
 The old `annotate_graph_timing` / `annotate_graph_from_modules` /
 `parse_trace_with_modules` paths were **removed**. Do not reintroduce a
