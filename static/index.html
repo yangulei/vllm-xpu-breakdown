@@ -309,6 +309,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
           <div style="display:flex;gap:4px;align-items:center">
             <button class="btn btn-secondary" id="download-trace-btn" onclick="downloadTrace()"
                     style="font-size:11px;padding:3px 10px;display:none">⬇ Download Trace</button>
+            <button class="btn btn-secondary" id="download-prefill-trace-btn" onclick="downloadTrace('prefill')"
+                    style="font-size:11px;padding:3px 10px;display:none">⬇ Prefill Trace</button>
+            <button class="btn btn-secondary" id="download-decode-trace-btn" onclick="downloadTrace('decode')"
+                    style="font-size:11px;padding:3px 10px;display:none">⬇ Decode Trace</button>
           </div>
         </div>
         <div class="graph-phase-toggle">
@@ -653,9 +657,16 @@ function applyProfileResult(data) {
     showStatus('error', 'Note: ' + data.cache_hit_note);
     setTimeout(() => showStatus('hide'), 8000);
   }
-  // Show download button if trace available
+  // Show download button(s). Two-pass runs expose a per-phase trace each; a
+  // single-pass run exposes the one combined trace.
+  var hasPre = data.has_prefill_trace, hasDec = data.has_decode_trace;
+  var twoPass = hasPre && hasDec;
   document.getElementById('download-trace-btn').style.display =
-    data.has_trace ? '' : 'none';
+    (!twoPass && data.has_trace) ? '' : 'none';
+  document.getElementById('download-prefill-trace-btn').style.display =
+    twoPass ? '' : 'none';
+  document.getElementById('download-decode-trace-btn').style.display =
+    twoPass ? '' : 'none';
   // Show the reconstructed graph if available
   if (data.graph) {
     GRAPH_DATA = data.graph;
@@ -1095,8 +1106,10 @@ function buildTreeNode(node, isRoot, hasTiming) {
   return div;
 }
 
-function downloadTrace() {
-  window.location.href = '/api/profile/trace';
+function downloadTrace(phase) {
+  window.location.href = phase
+    ? '/api/profile/trace?pass=' + encodeURIComponent(phase)
+    : '/api/profile/trace';
 }
 
 // ---- Tabs ----

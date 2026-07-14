@@ -362,7 +362,7 @@ static builder. Ensure:
 | `/api/profile/upload` | POST | Reconstruct graph + op breakdown from uploaded trace file(s) |
 | `/api/profile/status` | GET | Poll profiling status |
 | `/api/profile/result` | GET | Fetch profiling result (ops + reconstructed graph) |
-| `/api/profile/trace` | GET | Download raw trace file |
+| `/api/profile/trace` | GET | Download raw trace file (two-pass runs: `?pass=prefill\|decode`; default = decode) |
 | `/api/export/shape-matrix` | POST | Export profile-derived multi-config shape sweep to Excel |
 
 ## Common Pitfalls
@@ -410,10 +410,18 @@ static builder. Ensure:
   prefill pass's `graph.prefill` is overlaid, and symbols are combined (`S`/`S+C`/`C`
   from prefill, `B` from decode). Each `_profiled_pass` snapshots `trace_dir` before
   its `start_profile` and returns only the file(s) it wrote, so the two passes'
-  traces don't cross-contaminate. Equal batches (or only legacy `batch_size`) → a
+  traces don't cross-contaminate. Because the merged result's base is the decode
+  pass (`result = dict(dec)`), its `trace_file` is the *decode* trace — so a plain
+  `/api/profile/trace` download is decode-only. `_merge_two_pass_result` therefore
+  also stashes `prefill_trace_file` / `decode_trace_file`, and the download endpoint
+  accepts `?pass=prefill|decode` (default = decode) to serve either; the frontend
+  shows two buttons (Prefill/Decode Trace) for two-pass runs and the single
+  "Download Trace" button otherwise (`has_prefill_trace`/`has_decode_trace` flags on
+  `/api/profile/result`). Equal batches (or only legacy `batch_size`) → a
   single pass, identical to before. Frontend sends `prefill_batch_size` /
   `decode_batch_size`; `setPhase` no longer rewrites the inputs since one run now
-  yields both phases. See `tests/test_two_pass_merge.py`.
+  yields both phases. See `tests/test_two_pass_merge.py` and
+  `tests/test_trace_download.py`.
 - **The scheduler is pinned so decode runs the full batch every step.**
   `_run_profile` sets `max_num_seqs = max(prefill_batch, decode_batch)` (and
   `max_num_batched_tokens` large enough for a whole-batch prefill step) *before*

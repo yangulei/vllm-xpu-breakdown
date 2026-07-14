@@ -421,6 +421,11 @@ def _merge_two_pass_result(pre: dict, dec: dict,
     result["prefill_batch_size"] = prefill_bs
     result["decode_batch_size"] = decode_bs
     result["two_pass"] = True
+    # Retain BOTH passes' trace files so the trace-download endpoint can serve
+    # either phase. ``trace_file`` (inherited from the decode pass via
+    # ``dict(dec)``) stays the default so existing clients are unaffected.
+    result["prefill_trace_file"] = pre.get("trace_file")
+    result["decode_trace_file"] = dec.get("trace_file")
 
     gpre = pre.get("graph") or {}
     gdec = dec.get("graph") or {}
@@ -1133,36 +1138,61 @@ def profile_result():
                 "error": _profile_state.get("error"),
             }), 202
         result = _profile_state["result"]
-    # Don't expose internal trace_file path; indicate availability
-    client_result = {k: v for k, v in result.items() if k != "trace_file"}
+    # Don't expose internal trace_file path(s); indicate availability instead.
+    _internal = {"trace_file", "prefill_trace_file", "decode_trace_file"}
+    client_result = {k: v for k, v in result.items() if k not in _internal}
     client_result["has_trace"] = bool(result.get("trace_file"))
+    client_result["has_prefill_trace"] = bool(result.get("prefill_trace_file"))
+    client_result["has_decode_trace"] = bool(result.get("decode_trace_file"))
     return jsonify({"ok": True, "data": client_result})
 
 
 @app.route("/api/profile/trace")
 def download_trace():
-    """Download the profiled trace file with a descriptive filename."""
+    """Download a profiled trace file with a descriptive filename.
+
+    Two-pass runs (separate prefill/decode batch sizes) write a separate trace
+    per pass. Use ``?pass=prefill`` or ``?pass=decode`` to pick one; without it
+    the default (decode, i.e. the merged base) is served for backward compat.
+    """
     with _profile_lock:
         if _profile_state["status"] != "done" or not _profile_state.get("result"):
             return jsonify({"ok": False, "error": "No profile result available"}), 404
         result = _profile_state["result"]
 
-    trace_path = result.get("trace_file")
+    which = (request.args.get("pass") or "").strip().lower()
+    if which == "prefill":
+        trace_path = result.get("prefill_trace_file")
+        pass_tag = "_prefill"
+        pass_bs = result.get("prefill_batch_size")
+        pass_gen = 1  # prefill pass generates a single token
+    elif which == "decode":
+        trace_path = result.get("decode_trace_file") or result.get("trace_file")
+        pass_tag = "_decode"
+        pass_bs = result.get("decode_batch_size", result.get("batch_size", 1))
+        pass_gen = result.get("max_tokens", "")
+    else:
+        trace_path = result.get("trace_file")
+        # Tag the filename only when the run actually has distinct passes.
+        pass_tag = "_decode" if result.get("two_pass") else ""
+        pass_bs = result.get("decode_batch_size", result.get("batch_size", 1))
+        pass_gen = result.get("max_tokens", "")
+
     if not trace_path or not os.path.isfile(trace_path):
         return jsonify({"ok": False, "error": "Trace file not found"}), 404
 
     # Build a descriptive filename encoding the profiled configuration:
-    #   vllm_trace_{model}_{mode}_ctx{context}_in{query}_out{gen}_bs{bs}_tp{tp}_{n}layers.json.gz
+    #   vllm_trace_{model}_{mode}[_prefill|_decode]_ctx{context}_in{query}_out{gen}_bs{bs}_tp{tp}_{n}layers.json.gz
     # where "ctx" is the block-aligned prefix-cache context the prefill attends
     # to, "in" is the query length (new prefill tokens, S), "out" is the number
-    # of generated decode tokens, and "bs" is the decode batch. The model id is
+    # of generated decode tokens, and "bs" is the pass's batch. The model id is
     # reduced to its final path component (org prefix dropped).
     model_short = result["model_id"].split("/")[-1]
     mode = result.get("mode", "eager")
-    bs = result.get("decode_batch_size", result.get("batch_size", 1))
+    bs = pass_bs if pass_bs is not None else result.get("batch_size", 1)
     ctx = result.get("context_len_aligned") or result.get("context_len") or 0
     qin = result.get("query_len") or 0
-    gen = result.get("max_tokens", "")
+    gen = pass_gen
     tp = result.get("tp_size", 1) or 1
     quant = result.get("quantization")
     layers = result.get("profiled_layers", "all")
@@ -1170,8 +1200,8 @@ def download_trace():
     ext = ".json.gz" if trace_path.endswith(".gz") else ".json"
     quant_part = f"_{quant}" if quant else ""
     download_name = (
-        f"vllm_trace_{model_short}_{device}_{mode}_ctx{ctx}_in{qin}_out{gen}"
-        f"_bs{bs}_tp{tp}{quant_part}_{layers}layers{ext}"
+        f"vllm_trace_{model_short}_{device}_{mode}{pass_tag}_ctx{ctx}_in{qin}"
+        f"_out{gen}_bs{bs}_tp{tp}{quant_part}_{layers}layers{ext}"
     )
 
     return send_file(
