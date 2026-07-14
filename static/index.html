@@ -213,10 +213,16 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
       </div>
       <div class="control-group">
         <label>Layers</label>
-        <select id="num-layers-select">
+        <select id="num-layers-select" onchange="onLayersModeChange()">
           <option value="all">All</option>
           <option value="min" selected>Min (large models)</option>
+          <option value="custom">Custom…</option>
         </select>
+      </div>
+      <div class="control-group" id="num-layers-custom-group" style="display:none">
+        <label>Layer Count</label>
+        <input type="number" id="num-layers-custom" value="6" min="1" step="1"
+               title="Exact number of decoder layers to build for profiling (between Min and All). For hybrid models the first first_k_dense_replace layers are dense and the rest MoE — e.g. 6 = 3 dense + 3 MoE for MiniMax-M3. Unprofiled layers are extrapolated in the timing.">
       </div>
       <div class="control-group">
         <label>TP Size</label>
@@ -459,12 +465,26 @@ async function loadConfig() {
     if (data.min_profile_layers) {
       const sel = document.getElementById('num-layers-select');
       const minOpt = sel.querySelector('option[value="min"]');
+      const min = data.min_profile_layers;
+      const fk = data.summary?.first_k_dense_replace || 0;
+      const total = data.summary?.num_layers;
       if (minOpt) {
-        const min = data.min_profile_layers;
-        const fk = data.summary?.first_k_dense_replace || 0;
         minOpt.textContent = fk > 0
           ? `Min: ${min} (${fk} dense + ${min - fk} MoE)`
           : `Min: ${min}`;
+      }
+      // Bound the custom layer-count input to [min, total] and pick a sensible
+      // default: for hybrid (dense + MoE) models capture a few MoE layers on
+      // top of the dense prefix (e.g. 6 = 3 dense + 3 MoE for MiniMax-M3),
+      // otherwise fall back to Min.
+      const customInput = document.getElementById('num-layers-custom');
+      if (customInput) {
+        customInput.min = min;
+        if (total) customInput.max = total;
+        let def = fk > 0 ? fk * 2 : min;
+        if (total) def = Math.min(def, total);
+        def = Math.max(def, min);
+        customInput.value = def;
       }
     }
   } catch(e) {
@@ -518,6 +538,12 @@ function showModelSummary(modelId, s) {
 // ---- Profiling ----
 let pollTimer = null;
 
+function onLayersModeChange() {
+  const v = document.getElementById('num-layers-select').value;
+  document.getElementById('num-layers-custom-group').style.display =
+    v === 'custom' ? '' : 'none';
+}
+
 function buildProfileBody(modelId) {
   // Query Len = number of new prompt tokens the profiled prefill computes.
   // Context Len = prior tokens served from the prefix cache (APC) that the
@@ -547,7 +573,12 @@ function buildProfileBody(modelId) {
     context_len: Number.isFinite(profCtxLen) ? profCtxLen : 0,
     num_profile_layers: (() => {
       const v = document.getElementById('num-layers-select').value;
-      return v === 'all' ? null : v;
+      if (v === 'all') return null;
+      if (v === 'custom') {
+        const n = parseInt(document.getElementById('num-layers-custom').value);
+        return Number.isFinite(n) && n > 0 ? String(n) : 'min';
+      }
+      return v;
     })(),
     tensor_parallel_size: parseInt(document.getElementById('tp-size-select').value),
     quantization: (() => {
@@ -565,7 +596,9 @@ async function startProfile() {
 
   document.getElementById('profile-btn').disabled = true;
   const layerMode = document.getElementById('num-layers-select').value;
-  const layerNote = layerMode === '1' ? ' (1-layer mode — timing will be extrapolated)' : '';
+  const layerNote = layerMode !== 'all'
+    ? ' (reduced-layer mode — decoder-layer timing will be extrapolated to the full layer count)'
+    : '';
   showStatus('running', 'Loading model and profiling...' + layerNote + ' This may take several minutes.');
 
   try {
