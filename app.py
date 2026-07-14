@@ -17,6 +17,7 @@ import io
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -264,6 +265,58 @@ def _collect_module_types(node: dict | None) -> set[str]:
     for c in node.get("children", []):
         out |= _collect_module_types(c)
     return out
+
+
+# Descriptive trace filename produced by the download endpoint, e.g.
+#   vllm_trace_MiniMax-M3_XPU_eager_decode_ctx2048_in1536_out8_bs32_tp4_6layers.json.gz
+# The stable ``_ctx…_in…_out…_bs…_tp…[_quant]_…layers`` tail (plus the optional
+# ``_prefill``/``_decode`` pass tag and the ``_device_mode`` before it) lets the
+# upload endpoint recover the full profiled configuration, making a
+# download -> upload reconstruction a lossless round-trip.
+_TRACE_NAME_RE = re.compile(
+    r"_(?P<device>XPU|CUDA|GPU|CPU)_(?P<mode>eager|compile)"
+    r"(?:_(?P<pass>prefill|decode))?"
+    r"_ctx(?P<ctx>\d+)_in(?P<qin>\d+)_out(?P<gen>[A-Za-z0-9]+)"
+    r"_bs(?P<bs>\d+)_tp(?P<tp>\d+)"
+    r"(?:_(?P<quant>[A-Za-z0-9]+))?_(?P<layers>[A-Za-z0-9]+)layers",
+    re.IGNORECASE,
+)
+
+
+def _parse_trace_filename(name: str) -> dict:
+    """Recover profiling config from a download-endpoint trace filename.
+
+    Returns a dict with keys ``pass`` (``"prefill"``/``"decode"``/``None``),
+    ``mode``, ``device``, ``context_len``, ``query_len``, ``gen``,
+    ``batch_size``, ``tp``, ``quantization`` and ``profiled_layers`` (``None``
+    when the name encodes ``all`` layers). An unrecognized name yields ``{}``.
+    """
+    m = _TRACE_NAME_RE.search(name or "")
+    if not m:
+        return {}
+    g = m.groupdict()
+
+    def _int(v: str | None) -> int | None:
+        try:
+            return int(v)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
+    quant = g.get("quant")
+    if quant and quant.lower() in ("none", "auto"):
+        quant = None
+    return {
+        "device": (g.get("device") or "").upper(),
+        "mode": (g.get("mode") or "").lower(),
+        "pass": (g.get("pass") or "").lower() or None,
+        "context_len": _int(g.get("ctx")),
+        "query_len": _int(g.get("qin")),
+        "gen": _int(g.get("gen")),
+        "batch_size": _int(g.get("bs")),
+        "tp": _int(g.get("tp")),
+        "quantization": quant,
+        "profiled_layers": _int(g.get("layers")),  # "all" -> None
+    }
 
 
 def _build_result_from_traces(
@@ -995,13 +1048,31 @@ def start_profile():
 def upload_profile():
     """Reconstruct the model graph and op breakdown from uploaded trace(s).
 
-    Accepts a multipart form with one or more ``trace`` files (a torch profiler
-    Chrome trace, ``.json`` or ``.json.gz``; with TP>1 upload one file per rank,
-    rank-0 first) plus optional form fields:
+    Accepts a multipart form with one or more ``trace`` files (torch profiler
+    Chrome traces, ``.json`` or ``.json.gz``). The upload path mirrors the live
+    profiler so a **download -> upload round-trip** reconstructs the same graph
+    (and drives the Shape Matrix export) on a machine **without an XPU/GPU**:
+
+      - **Two-pass pair** — upload the separate ``…_prefill_…`` and
+        ``…_decode_…`` files the download endpoint produces for a two-pass run
+        (distinct prefill/decode batch sizes). Each pass's phase graph is built
+        with that pass's batch/query size and merged via ``_merge_two_pass_result``
+        (prefill tree + decode base), exactly like a live two-pass run — so the
+        reconstructed graph has **both** phases, not decode only.
+      - **Single trace** — one file (optionally several rank files for TP>1,
+        rank-0 first) reconstructs a single run; extra files average device time.
+
+    The descriptive download filenames are self-describing
+    (``…_{mode}[_prefill|_decode]_ctx{C}_in{S}_out{gen}_bs{B}_tp{TP}[_{quant}]_{N}layers``),
+    so mode/TP/quant/query/context/batch and the prefill|decode split are
+    recovered from the names via ``_parse_trace_filename`` — no need to re-enter
+    them. Explicit form fields still override, and legacy names without the
+    encoded tail fall back to form fields:
 
       - ``model_id``: HF id used to fetch config for shape symbols / summary
       - ``tensor_parallel_size`` / ``tp_size``: ranks represented by the uploads
-      - ``batch_size``, ``quantization``, ``mode``
+      - ``batch_size`` / ``prefill_batch_size`` / ``decode_batch_size``
+      - ``quantization``, ``mode``, ``query_len``, ``context_len``
       - ``num_profile_layers`` / ``actual_layers``: for reduced-layer scaling
 
     Parsing is fast, so this runs synchronously and stores the result in the
@@ -1021,23 +1092,63 @@ def upload_profile():
 
     form = request.form
     model_id = (form.get("model_id") or "").strip()
-    mode = form.get("mode", "eager")
-    tp_size = int(form.get("tensor_parallel_size") or form.get("tp_size") or 1)
-    batch_size = int(form.get("batch_size") or 1)
-    quantization = form.get("quantization") or None
-    if quantization in ("", "auto", "none"):
-        quantization = None
 
-    # Persist uploads under output/traces so the trace-download endpoint works.
+    # Persist uploads under output/traces so the trace-download endpoint works,
+    # keeping each file's original (descriptive) name for config recovery.
     from werkzeug.utils import secure_filename
     trace_dir = os.path.abspath("output/traces")
     os.makedirs(trace_dir, exist_ok=True)
-    saved: list[str] = []
+    saved: list[tuple[str, dict]] = []  # (saved_path, parsed-filename meta)
     for f in files:
+        orig = os.path.basename(f.filename or "")
         name = secure_filename(f.filename) or "uploaded_trace.json"
         dest = os.path.join(trace_dir, name)
         f.save(dest)
-        saved.append(dest)
+        saved.append((dest, _parse_trace_filename(orig)))
+
+    # Recover the profiled configuration from the descriptive download
+    # filenames, falling back to explicit form fields (form always wins).
+    metas = [m for _, m in saved if m]
+
+    def _from_names(key: str, default=None):
+        for m in metas:
+            v = m.get(key)
+            if v is not None and v != "":
+                return v
+        return default
+
+    mode = form.get("mode") or _from_names("mode") or "eager"
+    tp_size = int(form.get("tensor_parallel_size") or form.get("tp_size")
+                  or _from_names("tp") or 1)
+    quant_form = form.get("quantization")
+    quantization = (quant_form if quant_form not in (None, "", "auto", "none")
+                    else _from_names("quantization"))
+    if quantization in ("", "auto", "none"):
+        quantization = None
+    query_len = form.get("query_len") or _from_names("query_len")
+    query_len = int(query_len) if query_len else None
+    context_len = form.get("context_len") or _from_names("context_len")
+    context_len = int(context_len) if context_len else None
+
+    # Split the uploads by pass tag. A prefill file + a decode file form a
+    # two-pass pair (each may itself carry extra rank files); anything without a
+    # tag is a plain single run (rank-0 first).
+    pre = [(p, m) for p, m in saved if m.get("pass") == "prefill"]
+    dec = [(p, m) for p, m in saved if m.get("pass") == "decode"]
+    untagged = [(p, m) for p, m in saved if not m.get("pass")]
+    two_pass = bool(pre) and bool(dec)
+
+    if two_pass:
+        pf_batch = (pre[0][1].get("batch_size")
+                    or int(form.get("prefill_batch_size") or 1))
+        dc_batch = (dec[0][1].get("batch_size")
+                    or int(form.get("decode_batch_size")
+                            or form.get("batch_size") or 1))
+        batch_size = dc_batch
+    else:
+        batch_size = int(form.get("batch_size")
+                         or _from_names("batch_size") or 1)
+        pf_batch = dc_batch = batch_size
 
     # Fetch model config for shape symbols / summary (best-effort).
     try:
@@ -1049,7 +1160,8 @@ def upload_profile():
 
     actual_layers = form.get("actual_layers") or summary.get("num_layers")
     actual_layers = int(actual_layers) if actual_layers else None
-    profiled_layers = form.get("num_profile_layers") or actual_layers
+    profiled_layers = (form.get("num_profile_layers")
+                       or _from_names("profiled_layers") or actual_layers)
     profiled_layers = int(profiled_layers) if profiled_layers else None
     layer_scale = (
         actual_layers / profiled_layers
@@ -1065,15 +1177,21 @@ def upload_profile():
             "settings": {
                 "mode": mode,
                 "batch_size": batch_size,
+                "prefill_batch_size": pf_batch if two_pass else None,
+                "decode_batch_size": dc_batch if two_pass else None,
                 "tp_size": tp_size,
                 "quantization": quantization,
+                "query_len": query_len,
+                "context_len": context_len,
                 "uploaded": True,
             },
         }
 
     # Reconstruct real module attribute names by instantiating the model on
-    # ``meta`` (no weights). Heavy + network-dependent. Without a recovered
-    # tree, uploaded traces keep heuristic names.
+    # ``meta`` (no weights). Heavy + network-dependent, and only used as a
+    # *fallback* overlay — traces profiled by this tool already carry
+    # capture-time ``module::`` name spans, so ``build_graph_from_trace``
+    # ignores this tree when those spans are present.
     ref_module_tree = None
     if model_id:
         try:
@@ -1086,21 +1204,44 @@ def upload_profile():
         except Exception:
             ref_module_tree = None
 
-    try:
-        result = _build_result_from_traces(
-            saved[:tp_size] if len(saved) >= tp_size else saved,
+    def _build(rank_files: list[str], bsz: int, qlen: int | None) -> dict:
+        return _build_result_from_traces(
+            rank_files[:tp_size] if len(rank_files) >= tp_size else rank_files,
             model_id=model_id,
             summary=summary,
             dim_symbols=dim_symbols,
             tp_size=tp_size,
-            batch_size=batch_size,
+            batch_size=bsz,
             mode=mode,
             quantization=quantization,
             profiled_layers=profiled_layers,
             actual_layers=actual_layers,
             layer_scale=layer_scale,
             ref_module_tree=ref_module_tree,
+            query_len=qlen,
+            context_len=context_len,
         )
+
+    try:
+        if two_pass:
+            # Mirror the live two-pass build: the prefill pass supplies the
+            # prefill tree (S = query_len), the decode pass is the steady-state
+            # base (B = decode_batch); ``_merge_two_pass_result`` splices them.
+            res_pre = _build([p for p, _ in pre], pf_batch, query_len or None)
+            res_dec = _build([p for p, _ in dec], dc_batch,
+                             1 if query_len else None)
+            result = _merge_two_pass_result(res_pre, res_dec, pf_batch, dc_batch)
+        else:
+            group = untagged or dec or pre
+            # A lone decode-tagged pass computes 1 new token/seq (query forced
+            # to 1); otherwise use the recovered query length.
+            qlen = (1 if (not untagged and dec and query_len)
+                    else (query_len or None))
+            result = _build([p for p, _ in group], batch_size, qlen)
+
+        result["query_len"] = query_len or None
+        result["context_len"] = context_len or None
+        result["context_len_aligned"] = context_len or None
         with _profile_lock:
             _profile_state["status"] = "done"
             _profile_state["result"] = result

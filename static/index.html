@@ -288,7 +288,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 
     <div style="display:flex;gap:8px">
       <button class="btn btn-primary" id="profile-btn" onclick="startProfile()">▶ Profile</button>
-      <button class="btn btn-secondary" id="upload-trace-btn" onclick="document.getElementById('trace-upload').click()">⬆ Upload Trace</button>
+      <button class="btn btn-secondary" id="upload-trace-btn" title="Reconstruct the model graph from downloaded trace file(s) — no XPU/GPU needed. For a two-pass run, select BOTH the _prefill_ and _decode_ files to rebuild both phases; the profiled config (mode/TP/quant/query/context/batch) is recovered from the filenames." onclick="document.getElementById('trace-upload').click()">⬆ Upload Trace</button>
       <input type="file" id="trace-upload" accept=".json,.gz,.json.gz" multiple
              style="display:none" onchange="uploadTrace(this.files)">
     </div>

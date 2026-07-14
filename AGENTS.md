@@ -429,7 +429,7 @@ static builder. Ensure:
 | `/api/model/<hf_id>` | GET | Fetch/summarize HF model config (+ `min_profile_layers`) |
 | `/api/cached-models` | GET | List previously loaded model IDs |
 | `/api/profile` | POST | Start async profiling run |
-| `/api/profile/upload` | POST | Reconstruct graph + op breakdown from uploaded trace file(s) |
+| `/api/profile/upload` | POST | Reconstruct graph + op breakdown from uploaded trace file(s); a `_prefill`+`_decode` pair is merged into both phases (see *Trace upload round-trip*) |
 | `/api/profile/status` | GET | Poll profiling status |
 | `/api/profile/result` | GET | Fetch profiling result (ops + reconstructed graph) |
 | `/api/profile/trace` | GET | Download raw trace file (two-pass runs: `?pass=prefill\|decode`; default = decode) |
@@ -492,6 +492,29 @@ static builder. Ensure:
   `decode_batch_size`; `setPhase` no longer rewrites the inputs since one run now
   yields both phases. See `tests/test_two_pass_merge.py` and
   `tests/test_trace_download.py`.
+- **Trace upload is a lossless round-trip — a `_prefill`+`_decode` pair rebuilds
+  both phases (not decode only).** `/api/profile/upload` must mirror the live
+  two-pass build so you can profile once on the XPU box, **download the separate
+  prefill/decode traces**, and reconstruct the graph / drive the Shape Matrix
+  export on a **GPU-less** machine. The download filenames are self-describing
+  (`vllm_trace_<model>_<device>_<mode>[_prefill|_decode]_ctx<C>_in<S>_out<gen>_bs<B>_tp<TP>[_<quant>]_<N>layers`),
+  so `upload_profile` parses each with `_parse_trace_filename` (`_TRACE_NAME_RE`)
+  to recover mode/TP/quant/`query_len`/`context_len`/per-pass batch **and the
+  prefill|decode split** — explicit form fields still override; legacy names
+  without the encoded tail fall back to form fields. It groups the uploads by
+  pass tag: a prefill file **and** a decode file → build each phase with its own
+  batch/query (`res_pre` at `pf_batch`/`query_len`, `res_dec` at
+  `dc_batch`/query=1) and splice via the **same** `_merge_two_pass_result`; the
+  merged result stashes `prefill_trace_file`/`decode_trace_file` so re-download
+  (`?pass=`) round-trips again. **Do NOT revert to treating multiple uploads as
+  TP ranks** — the pre-fix bug built the graph only from `rank_files[0]` (the
+  decode pass, which by design has only decode steps → `prefill: None`) and
+  silently averaged the prefill trace in as a bogus rank, so uploading the pair
+  "worked for Decode only". Untagged single files (optionally several rank files)
+  still reconstruct one run and average device time. The upload path now also
+  threads recovered `query_len`/`context_len` into `_build_result_from_traces`
+  so `C`/`S+C` symbolize (previously ignored → the Shape Matrix lost context).
+  See `tests/test_upload_two_pass.py`.
 - **The scheduler is pinned so decode runs the full batch every step.**
   `_run_profile` sets `max_num_seqs = max(prefill_batch, decode_batch)` (and
   `max_num_batched_tokens` large enough for a whole-batch prefill step) *before*
