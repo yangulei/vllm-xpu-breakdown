@@ -665,17 +665,32 @@ def _merge_modules(instances: list[_Raw], n_forward: int) -> dict:
     """
     base = instances[0]
 
-    # --- aggregate direct ops by (name, shapes) ---
+    # --- aggregate direct ops by (name, shapes, occurrence-within-instance) ---
+    # A single module instance can dispatch the *same* op (identical name +
+    # shapes) more than once. A TP decoder layer, for example, runs two
+    # identical ``c10d::allreduce_`` residual reductions: the post-attention one
+    # (before ``post_attention_layernorm``) and the post-MLP one. The post-MLP
+    # allreduce is dispatched after the layer's forward returns, so by
+    # time-containment it lands at the *start* of the next layer — giving that
+    # layer two same-signature allreduces. Keying only by (name, shapes) merges
+    # them into one node positioned at the first (leading) occurrence, which
+    # hides the post-attention allreduce entirely. Index each occurrence within
+    # its instance — mirroring the child-module grouping below — so repeated ops
+    # stay distinct and still align by position across merged forward passes.
     op_groups: dict[tuple, dict] = {}
     op_order: list[tuple] = []
     for inst in instances:
+        op_occ: dict[tuple, int] = {}
         for op in _direct_ops(inst):
             sig = _op_signature(op)
-            g = op_groups.get(sig)
+            occ = op_occ.get(sig, 0)
+            op_occ[sig] = occ + 1
+            gkey = (sig, occ)
+            g = op_groups.get(gkey)
             if g is None:
                 g = {"raw": op, "dev": 0.0, "host": 0.0, "count": 0}
-                op_groups[sig] = g
-                op_order.append(sig)
+                op_groups[gkey] = g
+                op_order.append(gkey)
             g["dev"] += op.sub_dev
             g["host"] += op.dur
             g["count"] += 1
@@ -706,12 +721,16 @@ def _merge_modules(instances: list[_Raw], n_forward: int) -> dict:
     order_index: dict[tuple, int] = {}
     order_by_name: dict[str, int] = {}
     seen_child: dict[str, int] = {}
+    seen_op: dict[tuple, int] = {}
     pos = 0
     for c in sorted(base.children, key=lambda n: n.ts):
         if c.kind == "op":
             if c.label in _PLUMBING_OPS:
                 continue
-            key = ("op", _op_signature(c))
+            sig = _op_signature(c)
+            occ = seen_op.get(sig, 0)
+            seen_op[sig] = occ + 1
+            key = ("op", (sig, occ))
             order_by_name.setdefault(c.label, pos)
         elif c.kind == "module":
             norm = _strip_instance_idx(c.label)
@@ -777,8 +796,8 @@ def _finalize_node(
     order_index = merged.get("order_index", {})
     order_by_name = merged.get("order_by_name", {})
     extra_order = merged.get("layout_len", 0)
-    for sig in merged["op_order"]:
-        g = merged["op_groups"][sig]
+    for gkey in merged["op_order"]:
+        g = merged["op_groups"][gkey]
         raw = g["raw"]
         # Per-forward, per-module-instance averages.
         dev = g["dev"] / n_forward
@@ -818,7 +837,7 @@ def _finalize_node(
         ]
         out_shape = _symbolize(_output_shape(raw.label, shapes),
                                symbols_val, token_symbol, token_val)
-        op_order_pos = order_index.get(("op", sig))
+        op_order_pos = order_index.get(("op", gkey))
         if op_order_pos is None:
             op_order_pos = order_by_name.get(raw.label)
         if op_order_pos is None:

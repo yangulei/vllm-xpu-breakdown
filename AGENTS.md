@@ -155,6 +155,20 @@ consume unchanged. How it works:
   name-keyed order so multi-shape merges keep them grouped at their slot. The
   frontend (`buildTreeNode`) sorts the combined op+child list by `order`
   (legacy results without `order` fall back to ops-then-children).
+- **Repeated same-signature ops are occurrence-indexed, not merged.**
+  `_merge_modules` groups a module's direct ops by `(name, shapes, occurrence
+  index within the instance)` — mirroring the child-module grouping — **not**
+  by `(name, shapes)` alone. A TP decoder layer dispatches two *identical*
+  `c10d::allreduce_` residual reductions: its own **post-attention** one (before
+  `post_attention_layernorm`) and the previous layer's **post-MLP** one, which
+  is dispatched after that layer's forward returns and so time-contains at the
+  *start* of this layer (before `input_layernorm`). Keying ops by `(name,
+  shapes)` alone collapsed both into a single node at the leading position,
+  **hiding the post-attention allreduce** in every layer after the first (the
+  symptom: "allreduce before `post_attention_layernorm` missing in the 2nd/3rd
+  layers"). Occurrence indexing keeps them distinct and still aligns each
+  occurrence across merged forward passes. See
+  `TestGraphFromTrace.test_repeated_same_signature_op_kept_distinct`.
 
 The old `annotate_graph_timing` / `annotate_graph_from_modules` /
 `parse_trace_with_modules` paths were **removed**. Do not reintroduce a
@@ -409,9 +423,9 @@ static builder. Ensure:
   **partial-batch waves** — a batch of 32 as e.g. `29 + 3`. Each wave has a
   different row count (`num_running_seqs`), so `_symbolize` (which only maps the
   max decode row count to `B`) leaves the partial waves as literal ints, and
-  `_merge_modules` (keys ops by `(name, shapes)`) can't merge them — they surface
-  as **duplicated `29`/`3` op nodes** in the decode graph instead of one `B`
-  node. Pinning `max_num_seqs` makes every decode forward run all
+  `_merge_modules` (keys ops by `(name, shapes, occurrence)`) can't merge them —
+  they surface as **duplicated `29`/`3` op nodes** in the decode graph instead of
+  one `B` node. Pinning `max_num_seqs` makes every decode forward run all
   `decode_batch` sequences → a clean single `B`. Do NOT remove the pin; if a
   batch's KV won't fit device memory, raise `gpu_memory_utilization` or lower
   Context/Batch rather than reverting to the splitting default.

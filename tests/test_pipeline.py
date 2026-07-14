@@ -1023,6 +1023,80 @@ class TestGraphFromTrace(unittest.TestCase):
         self.assertLess(attn["order"], allreduce["order"])
         self.assertLess(allreduce["order"], mlp["order"])
 
+    def test_repeated_same_signature_op_kept_distinct(self):
+        # A single module instance can dispatch the *same* op (identical name +
+        # shapes) twice. This mirrors a TP MiniMax-M3 decoder layer, which runs
+        # two identical ``c10d::allreduce_`` residual reductions: the post-MLP
+        # one of the previous layer time-contains at *this* layer's start
+        # (before ``input_layernorm``), and this layer's own post-attention one
+        # sits before ``post_attention_layernorm``. Grouping ops only by
+        # (name, shapes) collapsed both into one node at the leading position,
+        # hiding the post-attention allreduce. Both must now survive, ordered.
+        from breakdown.graph_from_trace import build_graph_from_trace
+        events = []
+        ext = [0]
+        tid = 7
+
+        def op(name, ts, dur, shapes):
+            ext[0] += 1
+            events.append({"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+                           "ts": ts, "dur": dur, "name": name,
+                           "args": {"External id": ext[0], "Input Dims": shapes,
+                                    "Input type": ["c10::BFloat16"]}})
+
+        def mod(cls, idx, ts, dur):
+            events.append({"ph": "X", "cat": "python_function", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": dur,
+                           "name": f"nn.Module: {cls}_{idx}"})
+
+        tokens = 8
+        mod("TinyForCausalLM", 0, 0.0, 200)
+        mod("TinyDecoderLayer", 0, 1.0, 150)
+        # Leading allreduce (previous layer's post-MLP residual, landed here).
+        op("c10d::allreduce_", 2.0, 3, [[tokens, 16]])
+        mod("TinyInputNorm", 0, 6.0, 5)
+        mod("TinyAttention", 0, 12.0, 30)
+        op("aten::mm", 13.0, 8, [[tokens, 16], [16, 16]])  # sets token dim
+        # This layer's own post-attention allreduce — same name + shapes.
+        op("c10d::allreduce_", 50.0, 3, [[tokens, 16]])
+        mod("TinyPostNorm", 0, 55.0, 5)
+        mod("TinyMLP", 0, 62.0, 40)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"traceEvents": events}, f)
+            path = f.name
+        try:
+            g = build_graph_from_trace(path, self.SUMMARY, tp_size=1,
+                                       batch_size=1)
+        finally:
+            os.unlink(path)
+
+        def find(node, cls):
+            if node.get("module_type") == cls:
+                return node
+            for c in node.get("children", []):
+                r = find(c, cls)
+                if r:
+                    return r
+            return None
+
+        layer = find(g["prefill"], "TinyDecoderLayer")
+        self.assertIsNotNone(layer)
+        allreduces = [o for o in layer["ops"]
+                      if o["name"] == "c10d::allreduce_"]
+        # Both identical-signature allreduces are preserved as distinct ops.
+        self.assertEqual(len(allreduces), 2)
+        attn = next(c for c in layer["children"]
+                    if c["module_type"] == "TinyAttention")
+        post = next(c for c in layer["children"]
+                    if c["module_type"] == "TinyPostNorm")
+        # The second (post-attention) allreduce must render between attention
+        # and post_attention_layernorm — not be merged away to the top.
+        orders = sorted(o["order"] for o in allreduces)
+        self.assertLess(orders[0], attn["order"])   # leading one is first
+        self.assertLess(attn["order"], orders[1])   # post-attn one after attn
+        self.assertLess(orders[1], post["order"])   # ...and before post-norm
+
     def test_first_decode_step_dropped_from_average(self):
         # The first (warmup) decode step must be excluded from the decode
         # latency average. Here its kernel is 10x heavier than steady state;
