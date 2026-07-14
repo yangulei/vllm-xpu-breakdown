@@ -1097,6 +1097,98 @@ class TestGraphFromTrace(unittest.TestCase):
         self.assertLess(attn["order"], orders[1])   # post-attn one after attn
         self.assertLess(orders[1], post["order"])   # ...and before post-norm
 
+    def test_module_wrapped_in_fused_op_is_hoisted(self):
+        # vLLM dispatches the MoE block as a single fused custom op
+        # (``vllm::moe_forward_shared``) whose implementation internally calls
+        # the ``shared_experts`` MLP forward, so by time-containment the whole
+        # MLP module subtree nests *under the op event*. Reconstruction only
+        # surfaces a module's direct child modules/ops, so the wrapped MLP (and
+        # its gate_up/down projections) used to vanish from the graph. The hoist
+        # must lift it out to sit beside the op as a child of ``FusedMoE``, with
+        # its own device time counted once (moved out of the op's rollup).
+        from breakdown.graph_from_trace import build_graph_from_trace
+        events = []
+        ext = [0]
+        corr = [0]
+        tid = 7
+
+        def kern(e, ts, dur):
+            corr[0] += 1
+            events.append({"ph": "X", "cat": "xpu_runtime", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": 0.1, "name": "l",
+                           "args": {"correlation": corr[0], "External id": e}})
+            events.append({"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+                           "ts": ts + 1000, "dur": dur, "name": "g",
+                           "args": {"correlation": corr[0]}})
+
+        def op(name, ts, dur, shapes, kdur=0.0):
+            ext[0] += 1
+            events.append({"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+                           "ts": ts, "dur": dur, "name": name,
+                           "args": {"External id": ext[0], "Input Dims": shapes,
+                                    "Input type": ["c10::BFloat16"]}})
+            if kdur:
+                kern(ext[0], ts, kdur)
+
+        def mod(cls, idx, ts, dur):
+            events.append({"ph": "X", "cat": "python_function", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": dur,
+                           "name": f"nn.Module: {cls}_{idx}"})
+
+        tokens = 8
+        mod("TinyForCausalLM", 0, 0.0, 300)
+        mod("TinyDecoderLayer", 0, 1.0, 250)
+        mod("TinyMoE", 0, 5.0, 240)
+        op("aten::mm", 6.0, 4, [[tokens, 16], [16, 16]], 2.0)  # router/gate
+        # Fused MoE op wrapping the shared-experts MLP module (nested under it).
+        mod("FusedMoE", 0, 20.0, 200)
+        op("vllm::moe_forward_shared", 22.0, 180, [[tokens, 16], [tokens, 4]],
+           9.0)                                     # the op itself (routed moe)
+        mod("TinyMLP", 0, 40.0, 120)                # shared_experts, WRAPPED
+        op("aten::linear", 42.0, 8, [[tokens, 16], [64, 16]], 7.0)  # gate_up
+        op("aten::linear", 60.0, 8, [[tokens, 32], [16, 32]], 6.0)  # down
+        # Back at FusedMoE level, after the op closes: the TP reduce.
+        op("c10d::allreduce_", 210.0, 5, [[tokens, 16]], 3.0)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"traceEvents": events}, f)
+            path = f.name
+        try:
+            g = build_graph_from_trace(path, self.SUMMARY, tp_size=1,
+                                       batch_size=1)
+        finally:
+            os.unlink(path)
+
+        def find(node, cls):
+            if node.get("module_type") == cls:
+                return node
+            for c in node.get("children", []):
+                r = find(c, cls)
+                if r:
+                    return r
+            return None
+
+        fused = find(g["prefill"], "FusedMoE")
+        self.assertIsNotNone(fused)
+        # The wrapped MLP was hoisted out of the op to a child of FusedMoE.
+        mlp = next((c for c in fused["children"]
+                    if c["module_type"] == "TinyMLP"), None)
+        self.assertIsNotNone(mlp)
+        # It kept its own projection ops.
+        self.assertEqual(sum(1 for o in mlp["ops"]
+                             if o["name"] == "aten::linear"), 2)
+        # Device time is conserved and counted once: the op no longer includes
+        # the MLP's kernels (7+6=13us), only its own (9us); the MLP holds 13us.
+        moe_op = next(o for o in fused["ops"]
+                      if o["name"] == "vllm::moe_forward_shared")
+        self.assertAlmostEqual(moe_op["device_time_us"], 9.0, places=2)
+        self.assertAlmostEqual(mlp["total_device_time_us"], 13.0, places=2)
+        # Execution order: op (0) → hoisted MLP (1) → reduce (2).
+        reduce_op = next(o for o in fused["ops"]
+                         if o["name"] == "c10d::allreduce_")
+        self.assertLess(moe_op["order"], mlp["order"])
+        self.assertLess(mlp["order"], reduce_op["order"])
+
     def test_first_decode_step_dropped_from_average(self):
         # The first (warmup) decode step must be excluded from the decode
         # latency average. Here its kernel is 10x heavier than steady state;

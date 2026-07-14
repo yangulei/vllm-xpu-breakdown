@@ -433,7 +433,70 @@ def _build_raw_forest(events: list[dict]) -> list[_Raw]:
         stack.append(n)
 
     _attribute_kernels(roots, _collect_kernel_launches(events, worker_tid))
+    # Surface modules that a fused custom op wraps (see _hoist_modules_under_ops)
+    # before rolling up device time so their subtree isn't double-counted.
+    roots = _hoist_modules_under_ops(roots)
     _compute_sub_dev(roots)
+    return roots
+
+
+def _hoist_modules_under_ops(roots: list[_Raw]) -> list[_Raw]:
+    """Re-parent modules time-contained under an op to their nearest module.
+
+    vLLM dispatches several fused blocks as a single custom ``cpu_op`` whose
+    implementation *internally calls real ``nn.Module`` forwards*. The clearest
+    case is the MoE block: ``vllm::moe_forward_shared`` wraps the
+    ``shared_experts`` MLP (``MergedColumnParallelLinear`` → ``SiluAndMul`` →
+    ``RowParallelLinear``) plus the router/expert math, so by time-containment
+    the whole ``shared_experts`` module subtree nests **under the op event**
+    rather than beside it. Reconstruction treats modules as the tree skeleton and
+    only surfaces a module's *direct* child modules/ops (``_module_children`` /
+    ``_direct_ops``), so any module buried under an op was silently dropped —
+    e.g. the ``FusedMoE`` node showed only its flat op list and the shared
+    experts' ``gate_up_proj``/``down_proj`` matmuls vanished from the graph.
+
+    This lifts every module whose enclosing parent is an op up to its nearest
+    ancestor module (the module that owns the wrapping op), preserving each
+    module's own subtree. Order is restored later from timestamps
+    (``_merge_modules`` sorts a node's children by ``ts``), so the hoisted module
+    slots in at the point it actually ran. Run **after** ``_attribute_kernels``
+    (which relies on the non-overlapping time-containment forest for launch-site
+    lookup) and **before** ``_compute_sub_dev`` (which then rolls device time up
+    through the corrected parentage, so a hoisted subtree is counted once, under
+    its module, not also inside the wrapping op).
+    """
+    parent: dict[int, _Raw] = {}
+    stack = list(roots)
+    while stack:
+        n = stack.pop()
+        for c in n.children:
+            parent[id(c)] = n
+            stack.append(c)
+
+    def nearest_module_ancestor(node: _Raw) -> _Raw | None:
+        cur = parent.get(id(node))
+        while cur is not None and cur.kind != "module":
+            cur = parent.get(id(cur))
+        return cur
+
+    # Collect (module, target) using the *original* parentage before mutating.
+    moves: list[tuple[_Raw, _Raw | None]] = []
+    stack = list(roots)
+    while stack:
+        n = stack.pop()
+        stack.extend(n.children)
+        if n.kind == "module":
+            p = parent.get(id(n))
+            if p is not None and p.kind == "op":
+                moves.append((n, nearest_module_ancestor(n)))
+
+    for mod, target in moves:
+        parent[id(mod)].children.remove(mod)
+        if target is None:
+            roots.append(mod)
+        else:
+            target.children.append(mod)
+        parent[id(mod)] = target
     return roots
 
 

@@ -169,6 +169,27 @@ consume unchanged. How it works:
   layers"). Occurrence indexing keeps them distinct and still aligns each
   occurrence across merged forward passes. See
   `TestGraphFromTrace.test_repeated_same_signature_op_kept_distinct`.
+- **Modules wrapped inside a fused custom op are hoisted out
+  (`_hoist_modules_under_ops`).** vLLM dispatches some fused blocks as a single
+  custom `cpu_op` whose implementation *internally calls real `nn.Module`
+  forwards*, so by time-containment the wrapped module subtree nests **under the
+  op event** rather than beside it. The clearest case is the MoE block:
+  `vllm::moe_forward_shared` wraps the `shared_experts` MLP
+  (`MergedColumnParallelLinear` → `SiluAndMul` → `RowParallelLinear`) plus the
+  router/expert math, so the whole `shared_experts` subtree lands under the op.
+  Reconstruction only surfaces a module's **direct** child modules/ops
+  (`_module_children` / `_direct_ops`), so a module buried under an op was
+  silently dropped — the `FusedMoE` node showed only its flat op list and the
+  shared experts' `gate_up_proj`/`down_proj` matmuls **vanished from the graph**
+  (symptom: "MoE layer missing details — should be shared_experts → router →
+  moe → reduce"). `_hoist_modules_under_ops` lifts every module whose enclosing
+  parent is an op up to its **nearest ancestor module** (preserving each
+  module's own subtree); order is restored from timestamps by `_merge_modules`.
+  It runs **after** `_attribute_kernels` (which needs the non-overlapping
+  time-containment forest for launch-site lookup) and **before**
+  `_compute_sub_dev` (so the hoisted subtree's device time rolls up **once**,
+  under its module, not also inside the wrapping op — verified device-conserving).
+  See `TestGraphFromTrace.test_module_wrapped_in_fused_op_is_hoisted`.
 
 The old `annotate_graph_timing` / `annotate_graph_from_modules` /
 `parse_trace_with_modules` paths were **removed**. Do not reintroduce a
