@@ -136,6 +136,25 @@ consume unchanged. How it works:
   (`q_norm`/`k_norm`) are kept apart while genuinely-repeated layers still merge.
   Capture-time spans name repeated `ModuleList` elements by their **list
   attribute** (`model.layers.0` → `decoder_layer`, not `0`) so they still merge.
+- **Execution-order interleaving** — each direct op and child module of a node
+  carries an `order` index (`_merge_modules` builds it from the base instance's
+  children sorted by `ts`; `_finalize_node` stamps it on every op/child), so the
+  UI renders a module's direct ops and submodules **interleaved in the order
+  they ran** instead of all-ops-then-all-children. This matters because vLLM
+  ops frequently nest one level *above* their semantic module: a cpu_op whose
+  `ts` lands just after the child module's forward event closes (the forward
+  returned before the async op ran) time-contains under the *parent*, e.g. the
+  decoder layer's post-attention `c10d::allreduce_` + `aten::clone` (the XPU
+  decomposition of `fused_allreduce_gemma_rms_norm` → allreduce + norm) and
+  MiniMax-M3 attention's `fused_minimax_m3_qknorm_rope_kv_insert` (runs after
+  `qkv_proj`). Without the `order` field these floated to the top of their
+  parent, making the layer look like it *started* with copy+allreduce and
+  putting `qknorm_rope` ahead of `qkv_proj`. The raw time-containment forest was
+  already correct; only rendering reordered. Same-named ops whose exact
+  `(name, shapes)` signature isn't in the base layout fall back to a
+  name-keyed order so multi-shape merges keep them grouped at their slot. The
+  frontend (`buildTreeNode`) sorts the combined op+child list by `order`
+  (legacy results without `order` fall back to ops-then-children).
 
 The old `annotate_graph_timing` / `annotate_graph_from_modules` /
 `parse_trace_with_modules` paths were **removed**. Do not reintroduce a

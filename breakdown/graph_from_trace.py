@@ -695,6 +695,35 @@ def _merge_modules(instances: list[_Raw], n_forward: int) -> dict:
                 child_order.append(key)
             child_groups[key].append(cm)
 
+    # --- combined execution-order layout (base instance, chronological) ---
+    # Direct ops and child modules are interleaved by timestamp here so the
+    # finalized node can render them in the order they actually executed,
+    # instead of emitting all ops before all children (which floated e.g. the
+    # decoder layer's post-attention ``allreduce`` to the top of the layer and
+    # the attention's ``qknorm_rope`` op ahead of ``qkv_proj``). Synthetic
+    # ``triton::`` ops are appended to a module's child list out of order, so we
+    # sort by ``ts`` to recover true execution order.
+    order_index: dict[tuple, int] = {}
+    order_by_name: dict[str, int] = {}
+    seen_child: dict[str, int] = {}
+    pos = 0
+    for c in sorted(base.children, key=lambda n: n.ts):
+        if c.kind == "op":
+            if c.label in _PLUMBING_OPS:
+                continue
+            key = ("op", _op_signature(c))
+            order_by_name.setdefault(c.label, pos)
+        elif c.kind == "module":
+            norm = _strip_instance_idx(c.label)
+            idx = seen_child.get(norm, 0)
+            seen_child[norm] = idx + 1
+            key = ("child", (norm, idx))
+        else:
+            continue
+        if key not in order_index:
+            order_index[key] = pos
+            pos += 1
+
     return {
         "module_type": _strip_instance_idx(base.label),
         "attr_name": base.attr_name,
@@ -702,6 +731,9 @@ def _merge_modules(instances: list[_Raw], n_forward: int) -> dict:
         "op_order": op_order,
         "child_groups": child_groups,
         "child_order": child_order,
+        "order_index": order_index,
+        "order_by_name": order_by_name,
+        "layout_len": pos,
         "n_forward": n_forward,
     }
 
@@ -742,6 +774,9 @@ def _finalize_node(
     node_cpu = 0.0
     node_mem = 0
     node_flops = 0
+    order_index = merged.get("order_index", {})
+    order_by_name = merged.get("order_by_name", {})
+    extra_order = merged.get("layout_len", 0)
     for sig in merged["op_order"]:
         g = merged["op_groups"][sig]
         raw = g["raw"]
@@ -783,6 +818,12 @@ def _finalize_node(
         ]
         out_shape = _symbolize(_output_shape(raw.label, shapes),
                                symbols_val, token_symbol, token_val)
+        op_order_pos = order_index.get(("op", sig))
+        if op_order_pos is None:
+            op_order_pos = order_by_name.get(raw.label)
+        if op_order_pos is None:
+            op_order_pos = extra_order
+            extra_order += 1
         ops_out.append({
             "name": raw.label,
             "role": role,
@@ -799,6 +840,7 @@ def _finalize_node(
             "device_time_us": round(dev, 2),
             "cpu_time_us": round(cpu, 2),
             "count": count,
+            "order": op_order_pos,
         })
         node_dev += dev
         node_cpu += cpu
@@ -829,6 +871,11 @@ def _finalize_node(
             token_val=token_val,
             device_type=device_type,
         )
+        child_order_pos = order_index.get(("child", key))
+        if child_order_pos is None:
+            child_order_pos = extra_order
+            extra_order += 1
+        child["order"] = child_order_pos
         raw_children.append(child)
 
     # Collapse runs of adjacent structurally-identical siblings (e.g. the

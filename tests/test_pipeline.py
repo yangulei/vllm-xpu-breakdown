@@ -944,6 +944,85 @@ class TestGraphFromTrace(unittest.TestCase):
         linear = next(o for o in attn["ops"] if o["name"] == "aten::linear")
         self.assertAlmostEqual(linear["device_time_us"], 5.0, places=3)
 
+    def test_ops_and_children_interleaved_by_execution_order(self):
+        # A direct op of a module that executes *between* two child modules must
+        # render between them (via its ``order`` field), not be hoisted above
+        # both children. This mirrors the MiniMax-M3 case where the decoder
+        # layer's post-attention ``c10d::allreduce_`` (a direct op, launched
+        # after the attention submodule) was floating to the top of the layer.
+        from breakdown.graph_from_trace import build_graph_from_trace
+        events = []
+        ext = [0]
+        corr = [0]
+        tid = 7
+
+        def kern(e, ts, dur):
+            corr[0] += 1
+            events.append({"ph": "X", "cat": "xpu_runtime", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": 0.1, "name": "l",
+                           "args": {"correlation": corr[0], "External id": e}})
+            events.append({"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+                           "ts": ts + 1000, "dur": dur, "name": "g",
+                           "args": {"correlation": corr[0]}})
+
+        def op(name, ts, dur, shapes, kdur):
+            ext[0] += 1
+            events.append({"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+                           "ts": ts, "dur": dur, "name": name,
+                           "args": {"External id": ext[0], "Input Dims": shapes,
+                                    "Input type": ["c10::BFloat16"]}})
+            if kdur:
+                kern(ext[0], ts, kdur)
+
+        def mod(cls, idx, ts, dur):
+            events.append({"ph": "X", "cat": "python_function", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": dur,
+                           "name": f"nn.Module: {cls}_{idx}"})
+
+        tokens = 8
+        mod("TinyForCausalLM", 0, 0.0, 200)
+        mod("TinyDecoderLayer", 0, 1.0, 150)
+        mod("TinyAttention", 0, 2.0, 30)          # child module (order 0)
+        op("aten::linear", 3.0, 8, [[tokens, 16], [48, 16]], 5.0)
+        # Direct op of the layer, launched *after* the attention submodule
+        # closes (ts 50 > attention end 32) — floats up to the layer.
+        op("c10d::allreduce_", 50.0, 8, [], 3.0)  # layer direct op (order 1)
+        mod("TinyMLP", 0, 60.0, 40)               # child module (order 2)
+        op("aten::linear", 61.0, 8, [[tokens, 16], [64, 16]], 7.0)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"traceEvents": events}, f)
+            path = f.name
+        try:
+            g = build_graph_from_trace(path, self.SUMMARY, tp_size=1,
+                                       batch_size=1)
+        finally:
+            os.unlink(path)
+
+        def find(node, cls):
+            if node.get("module_type") == cls:
+                return node
+            for c in node.get("children", []):
+                r = find(c, cls)
+                if r:
+                    return r
+            return None
+
+        layer = find(g["prefill"], "TinyDecoderLayer")
+        self.assertIsNotNone(layer)
+        allreduce = next(o for o in layer["ops"]
+                         if o["name"] == "c10d::allreduce_")
+        attn = next(c for c in layer["children"]
+                    if c["module_type"] == "TinyAttention")
+        mlp = next(c for c in layer["children"]
+                   if c["module_type"] == "TinyMLP")
+        # Every direct op / child carries an execution-order index.
+        for item in (allreduce, attn, mlp):
+            self.assertIn("order", item)
+        # The allreduce op must sort between attention and mlp, not before both.
+        self.assertLess(attn["order"], allreduce["order"])
+        self.assertLess(allreduce["order"], mlp["order"])
+
     def test_first_decode_step_dropped_from_average(self):
         # The first (warmup) decode step must be excluded from the decode
         # latency average. Here its kernel is 10x heavier than steady state;

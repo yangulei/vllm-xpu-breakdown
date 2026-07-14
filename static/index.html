@@ -959,77 +959,93 @@ function buildTreeNode(node, isRoot, hasTiming) {
   const childrenDiv = document.createElement('div');
   childrenDiv.className = 'tree-children';
 
-  // Ops list
-  if (node.ops && node.ops.length > 0) {
-    const opsDiv = document.createElement('div');
-    opsDiv.className = 'tree-ops';
-    for (const op of node.ops) {
-      const opEl = document.createElement('div');
-      opEl.className = 'tree-op';
-      const shapesHtml = fmtShapeGraph(op.input_shapes, op);
-      let costParts = [];
-      if (op.memory_bytes > 0) costParts.push(fmtBytes(op.memory_bytes));
-      if (op.flops > 0) costParts.push(fmtFlops(op.flops));
-      if (op.ai > 0) costParts.push(fmtAI2(op.ai));
-      // Add timing if profiled
-      let timingHtml = '';
-      if (hasTiming && op.device_time_us > 0) {
-        timingHtml = ` <span style="color:#1565c0;font-weight:600;font-size:10px;margin-left:4px">⏱ ${fmtTime(op.device_time_us)}</span>`;
-      } else if (hasTiming) {
-        timingHtml = ' <span style="color:#bbb;font-size:10px">—</span>';
-      }
-      // If sub-ops exist, use the high-level name; kernel details are in sub-ops
-      const opName = (op.sub_ops && op.sub_ops.length > 0) ? op.name : (op.profiled_name || op.name);
-      opEl.innerHTML = `
-        <span class="op-role">${op.role}</span>
-        <span class="op-name">${escHtml(opName)}</span>
-        <span class="badge op-backend ${op.backend.replace(/[^a-z-]/g,'')}"
-              style="font-size:10px">${op.backend}</span>
-        <span class="op-shapes">${shapesHtml}</span>
-        <span class="op-cost">${costParts.join(' · ')}${timingHtml}</span>`;
-      opsDiv.appendChild(opEl);
-
-      // Render sub-ops (constituent kernels) if present
-      if (op.sub_ops && op.sub_ops.length > 0) {
-        // Toggle icon for fold/unfold
-        const subToggle = document.createElement('span');
-        subToggle.className = 'tree-toggle';
-        subToggle.style.cssText = 'cursor:pointer;font-size:10px;margin-left:4px;color:#888;';
-        subToggle.textContent = '▶';
-        opEl.appendChild(subToggle);
-
-        const subOpsDiv = document.createElement('div');
-        subOpsDiv.className = 'tree-sub-ops collapsed';
-        subOpsDiv.style.cssText = 'margin-left:28px;padding:2px 0 4px;border-left:2px solid #e0e0e0;padding-left:8px;';
-        for (const sub of op.sub_ops) {
-          const subEl = document.createElement('div');
-          subEl.style.cssText = 'font-size:10px;color:#555;line-height:1.6;font-family:monospace;';
-          const pct = op.device_time_us > 0
-            ? (sub.device_time_us / op.device_time_us * 100).toFixed(1)
-            : '—';
-          subEl.innerHTML = `<span style="color:#888">↳</span> ${escHtml(sub.name)} `
-            + `<span style="color:#1565c0">${fmtTime(sub.device_time_us)}</span> `
-            + `<span style="color:#888">(${pct}%)</span>`;
-          subOpsDiv.appendChild(subEl);
-        }
-        opsDiv.appendChild(subOpsDiv);
-
-        // Make the entire op row clickable (like parent tree headers)
-        opEl.style.cursor = 'pointer';
-        opEl.addEventListener('click', (e) => {
-          e.stopPropagation();
-          const collapsed = subOpsDiv.classList.toggle('collapsed');
-          subToggle.textContent = collapsed ? '▶' : '▼';
-        });
-      }
+  // Interleave direct ops and child modules in true execution order.
+  // Backend stamps an `order` sequence on each op and child (a single
+  // chronological counter per module). Without it (legacy/upload results) we
+  // fall back to ops-then-children by giving ops small indices and children
+  // large ones. Contiguous ops share a `.tree-ops` container for styling.
+  const appendOpEl = (opsDiv, op) => {
+    const opEl = document.createElement('div');
+    opEl.className = 'tree-op';
+    const shapesHtml = fmtShapeGraph(op.input_shapes, op);
+    let costParts = [];
+    if (op.memory_bytes > 0) costParts.push(fmtBytes(op.memory_bytes));
+    if (op.flops > 0) costParts.push(fmtFlops(op.flops));
+    if (op.ai > 0) costParts.push(fmtAI2(op.ai));
+    // Add timing if profiled
+    let timingHtml = '';
+    if (hasTiming && op.device_time_us > 0) {
+      timingHtml = ` <span style="color:#1565c0;font-weight:600;font-size:10px;margin-left:4px">⏱ ${fmtTime(op.device_time_us)}</span>`;
+    } else if (hasTiming) {
+      timingHtml = ' <span style="color:#bbb;font-size:10px">—</span>';
     }
-    childrenDiv.appendChild(opsDiv);
-  }
+    // If sub-ops exist, use the high-level name; kernel details are in sub-ops
+    const opName = (op.sub_ops && op.sub_ops.length > 0) ? op.name : (op.profiled_name || op.name);
+    opEl.innerHTML = `
+      <span class="op-role">${op.role}</span>
+      <span class="op-name">${escHtml(opName)}</span>
+      <span class="badge op-backend ${op.backend.replace(/[^a-z-]/g,'')}"
+            style="font-size:10px">${op.backend}</span>
+      <span class="op-shapes">${shapesHtml}</span>
+      <span class="op-cost">${costParts.join(' · ')}${timingHtml}</span>`;
+    opsDiv.appendChild(opEl);
 
-  // Sub-modules
-  if (node.children) {
-    for (const child of node.children) {
-      childrenDiv.appendChild(buildTreeNode(child, false, hasTiming));
+    // Render sub-ops (constituent kernels) if present
+    if (op.sub_ops && op.sub_ops.length > 0) {
+      // Toggle icon for fold/unfold
+      const subToggle = document.createElement('span');
+      subToggle.className = 'tree-toggle';
+      subToggle.style.cssText = 'cursor:pointer;font-size:10px;margin-left:4px;color:#888;';
+      subToggle.textContent = '▶';
+      opEl.appendChild(subToggle);
+
+      const subOpsDiv = document.createElement('div');
+      subOpsDiv.className = 'tree-sub-ops collapsed';
+      subOpsDiv.style.cssText = 'margin-left:28px;padding:2px 0 4px;border-left:2px solid #e0e0e0;padding-left:8px;';
+      for (const sub of op.sub_ops) {
+        const subEl = document.createElement('div');
+        subEl.style.cssText = 'font-size:10px;color:#555;line-height:1.6;font-family:monospace;';
+        const pct = op.device_time_us > 0
+          ? (sub.device_time_us / op.device_time_us * 100).toFixed(1)
+          : '—';
+        subEl.innerHTML = `<span style="color:#888">↳</span> ${escHtml(sub.name)} `
+          + `<span style="color:#1565c0">${fmtTime(sub.device_time_us)}</span> `
+          + `<span style="color:#888">(${pct}%)</span>`;
+        subOpsDiv.appendChild(subEl);
+      }
+      opsDiv.appendChild(subOpsDiv);
+
+      // Make the entire op row clickable (like parent tree headers)
+      opEl.style.cursor = 'pointer';
+      opEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const collapsed = subOpsDiv.classList.toggle('collapsed');
+        subToggle.textContent = collapsed ? '▶' : '▼';
+      });
+    }
+  };
+
+  const ops = node.ops || [];
+  const kids = node.children || [];
+  const items = [];
+  ops.forEach((op, i) => items.push({
+    order: (op.order != null ? op.order : i), seq: i, kind: 'op', data: op }));
+  kids.forEach((c, i) => items.push({
+    order: (c.order != null ? c.order : 1e9 + i), seq: i, kind: 'child', data: c }));
+  items.sort((a, b) => (a.order - b.order) || (a.seq - b.seq));
+
+  let curOpsDiv = null;
+  for (const it of items) {
+    if (it.kind === 'op') {
+      if (!curOpsDiv) {
+        curOpsDiv = document.createElement('div');
+        curOpsDiv.className = 'tree-ops';
+        childrenDiv.appendChild(curOpsDiv);
+      }
+      appendOpEl(curOpsDiv, it.data);
+    } else {
+      curOpsDiv = null;
+      childrenDiv.appendChild(buildTreeNode(it.data, false, hasTiming));
     }
   }
 
