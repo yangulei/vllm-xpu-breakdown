@@ -1189,6 +1189,38 @@ class TestGraphFromTrace(unittest.TestCase):
         self.assertLess(moe_op["order"], mlp["order"])
         self.assertLess(mlp["order"], reduce_op["order"])
 
+    def test_rowparallel_in_mlp_named_down_proj_on_xpu(self):
+        # RowParallelLinear defaults to ``o_proj`` (attention output), but inside
+        # an MLP/expert module it is the ``down_proj``. The disambiguation used
+        # to be gated to CUDA, so on XPU the shared_experts MLP hoisted out of a
+        # fused MoE op (whose down_proj the reference-name overlay can't reach,
+        # since the ref tree lists it under ``MoE.shared_experts`` while the trace
+        # nests it under ``FusedMoE``) mislabeled its down projection as
+        # ``o_proj`` — even though the dense MLP's overlay-named down_proj was
+        # correct. The parent-type disambiguation must be device-agnostic.
+        from breakdown.graph_from_trace import _disambiguate_child_name
+        mlp_parent = {"module_type": "MiniMaxM3MLP",
+                      "child_order": [("MergedColumnParallelLinear", 0),
+                                      ("SiluAndMulWithClamp", 0),
+                                      ("RowParallelLinear", 0)]}
+        attn_parent = {"module_type": "MiniMaxM3Attention",
+                       "child_order": [("RowParallelLinear", 0)]}
+        # XPU (is_cuda=False): RowParallelLinear in an MLP -> down_proj.
+        self.assertEqual(
+            _disambiguate_child_name("RowParallelLinear", 2, mlp_parent,
+                                     is_cuda=False),
+            "down_proj")
+        # ... but in attention it stays o_proj on XPU too.
+        self.assertEqual(
+            _disambiguate_child_name("RowParallelLinear", 0, attn_parent,
+                                     is_cuda=False),
+            "o_proj")
+        # CUDA behavior is unchanged.
+        self.assertEqual(
+            _disambiguate_child_name("RowParallelLinear", 2, mlp_parent,
+                                     is_cuda=True),
+            "down_proj")
+
     def test_first_decode_step_dropped_from_average(self):
         # The first (warmup) decode step must be excluded from the decode
         # latency average. Here its kernel is 10x heavier than steady state;

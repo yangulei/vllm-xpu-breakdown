@@ -190,6 +190,22 @@ consume unchanged. How it works:
   `_compute_sub_dev` (so the hoisted subtree's device time rolls up **once**,
   under its module, not also inside the wrapping op — verified device-conserving).
   See `TestGraphFromTrace.test_module_wrapped_in_fused_op_is_hoisted`.
+- **A `RowParallelLinear` inside an MLP/expert module names to `down_proj` on
+  every device, not just CUDA.** `RowParallelLinear` is both the attention
+  output projection (`o_proj`) and the MLP/MoE down projection (`down_proj`), so
+  the class-heuristic default (`_module_display_name` → `o_proj`) is wrong for
+  the MLP one whenever the reference-name overlay didn't tag it.
+  `_disambiguate_child_name` resolves it by **parent module type**
+  (MLP/expert/feedforward → `down_proj`; attention → `o_proj`). This used to be
+  gated to `is_cuda`, which broke the **hoisted `shared_experts` MLP on XPU**:
+  after `_hoist_modules_under_ops` lifts it out of `moe_forward_shared` it sits
+  under `FusedMoE`, but the reference tree lists it under `MoE.shared_experts`,
+  so `_apply_ref_names` can't align it and its `down_proj` stayed unnamed →
+  mislabeled `o_proj` (while the dense MLP's overlay-named `down_proj` was
+  correct). The parent-type disambiguation is now device-agnostic; only the
+  GPU-specific "multiple RowParallelLinear in one MLP, keep just the last" async
+  compensation stays `is_cuda`-gated. See
+  `TestGraphFromTrace.test_rowparallel_in_mlp_named_down_proj_on_xpu`.
 
 The old `annotate_graph_timing` / `annotate_graph_from_modules` /
 `parse_trace_with_modules` paths were **removed**. Do not reintroduce a

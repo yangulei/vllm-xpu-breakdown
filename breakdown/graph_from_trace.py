@@ -1253,31 +1253,34 @@ def _disambiguate_child_name(cls: str, occ_idx: int, parent_merged: dict,
     # also the MLP/MoE down projection (down_proj) — both share the class, so the
     # generic ``_module_display_name`` (which maps RowParallelLinear → o_proj)
     # mislabels the MLP one as o_proj whenever the reference-name overlay fails
-    # to tag it (e.g. torch.compile/cudagraph GPU traces whose module events
-    # don't line up with the reference tree). Disambiguate by the parent module.
-    # CUDA-only: the XPU path has reliable nesting + names and keeps the generic
-    # ``_module_display_name`` mapping.
-    #
-    # On GPU, async timing can also cause Attention's RowParallelLinear to be
-    # incorrectly time-contained inside MLP, giving MLP TWO RowParallelLinear
-    # children. In standard architectures MLP has exactly one (down_proj), which
-    # executes AFTER gate_up_proj — so only the LAST RowParallelLinear in MLP
-    # is "down_proj"; earlier ones are likely misplaced from Attention.
-    if is_cuda:
-        is_mlp = ("mlp" in parent_type or "moe" in parent_type
-                  or "expert" in parent_type or "feedforward" in parent_type)
-        is_attn = "attention" in parent_type or "attn" in parent_type
-        if "rowparallel" in low:
-            if is_mlp:
-                # Count RowParallelLinear siblings in this parent
-                row_parallel_count = sum(
-                    1 for key in parent_merged["child_order"]
-                    if "rowparallel" in key[0].lower()
-                )
-                if row_parallel_count <= 1:
-                    return "down_proj"
-                # Multiple RowParallel inside MLP: only the last is down_proj,
-                # earlier ones are likely misplaced from Attention (GPU timing).
+    # to tag it. Disambiguate by the parent module: a RowParallelLinear inside an
+    # MLP/expert/feedforward module is always the down projection; inside
+    # attention it's the output projection. This is **device-agnostic** — the
+    # reference-name overlay can miss modules for reasons unrelated to CUDA async
+    # timing. On XPU the shared_experts MLP is hoisted out of the fused
+    # ``moe_forward_shared`` op (``_hoist_modules_under_ops``), so it sits under
+    # ``FusedMoE`` while the reference tree lists it under ``MoE.shared_experts``;
+    # alignment can't match it, leaving its ``down_proj`` unnamed. Without this
+    # the shared expert's down projection read as ``o_proj`` even though the dense
+    # MLP's (overlay-named) down_proj was correct.
+    is_mlp = ("mlp" in parent_type or "moe" in parent_type
+              or "expert" in parent_type or "feedforward" in parent_type)
+    is_attn = "attention" in parent_type or "attn" in parent_type
+    if "rowparallel" in low:
+        if is_mlp:
+            # Count RowParallelLinear siblings in this parent
+            row_parallel_count = sum(
+                1 for key in parent_merged["child_order"]
+                if "rowparallel" in key[0].lower()
+            )
+            if row_parallel_count <= 1:
+                return "down_proj"
+            # Multiple RowParallel inside MLP: only the last is down_proj, the
+            # earlier ones are misplaced from Attention. This happens on GPU
+            # where async timing can time-contain Attention's RowParallelLinear
+            # inside MLP; XPU nesting is reliable and normally hits the count<=1
+            # branch above, so gate the compensation to CUDA.
+            if is_cuda:
                 last_rp_idx = max(
                     key[1] for key in parent_merged["child_order"]
                     if "rowparallel" in key[0].lower()
@@ -1285,11 +1288,12 @@ def _disambiguate_child_name(cls: str, occ_idx: int, parent_merged: dict,
                 if occ_idx == last_rp_idx:
                     return "down_proj"
                 return "o_proj"
-            if is_attn:
-                return "o_proj"
-        if "mergedcolumn" in low or "columnparallel" in low:
-            if is_mlp:
-                return "gate_up_proj"
+            return "down_proj"
+        if is_attn:
+            return "o_proj"
+    if "mergedcolumn" in low or "columnparallel" in low:
+        if is_mlp:
+            return "gate_up_proj"
 
     return _module_display_name(cls)
 
