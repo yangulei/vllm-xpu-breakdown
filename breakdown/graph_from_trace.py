@@ -613,10 +613,20 @@ def _coalesce_duplicate_child_modules(roots: list[_Raw]) -> None:
     sums their directly-launched device time.
 
     Distinct sibling modules have distinct instance labels (``_0``/``_1``/…), so
-    this is a no-op for them. Run **after** :func:`_hoist_modules_under_ops`
-    (which relocates the empty shell to become a sibling of the real forward) and
-    **before** :func:`_compute_sub_dev` (so the unioned subtree's device time
-    rolls up once, under the single surviving node).
+    this is a no-op for them. **Only real profiler module events** (``nn.Module:
+    <Cls>_<idx>``, which carry a per-object instance index) are eligible: two
+    events sharing ``SharedExperts_0`` are the same object. Synthetic
+    functional-frame modules (``_FUNCTIONAL_MODULE_FRAMES`` →
+    ``FusedAllreduceGemmaRMSNorm``, ``FusedTopKBiasRouter``, ``XpuFusedMoE``, …)
+    have a **bare class label with no index**, so genuinely-distinct occurrences
+    (e.g. a decoder layer's pre- and post-attention ``fused_allreduce_gemma_-
+    rms_norm``) legitimately share a label and must **not** be merged — they are
+    skipped here (``_strip_instance_idx`` is a no-op on them).
+
+    Run **after** :func:`_hoist_modules_under_ops` (which relocates the empty
+    shell to become a sibling of the real forward) and **before**
+    :func:`_compute_sub_dev` (so the unioned subtree's device time rolls up once,
+    under the single surviving node).
     """
     stack: list[_Raw] = list(roots)
     while stack:
@@ -626,6 +636,11 @@ def _coalesce_duplicate_child_modules(roots: list[_Raw]) -> None:
         changed: list[_Raw] = []
         for cm in n.children:
             if cm.kind != "module":
+                continue
+            # Only real instance-indexed module events (SharedExperts_0) are the
+            # same object when repeated; synthetic frame modules (no index) may
+            # legitimately repeat as distinct siblings — leave them alone.
+            if _strip_instance_idx(cm.label) == cm.label:
                 continue
             rep = seen.get(cm.label)
             if rep is None:

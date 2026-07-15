@@ -1405,6 +1405,94 @@ class TestGraphFromTrace(unittest.TestCase):
         self.assertAlmostEqual(moe_op["device_time_us"], 9.0, places=2)
         self.assertAlmostEqual(shared[0]["total_device_time_us"], 13.0, places=2)
 
+    def test_synthetic_frame_duplicates_not_coalesced(self):
+        # The duplicate-module coalescing must ONLY merge real instance-indexed
+        # module events (``SharedExperts_0`` twice = same object). Synthetic
+        # functional-frame modules (``_FUNCTIONAL_MODULE_FRAMES``) have a bare
+        # class label with no index, so genuinely-distinct occurrences share a
+        # label — a Gemma decoder layer has two ``fused_allreduce_gemma_rms_norm``
+        # (pre- and post-attention). They must stay as two separate siblings, not
+        # collapse into one.
+        from breakdown.graph_from_trace import build_graph_from_trace
+        events = []
+        ext = [0]
+        corr = [0]
+        tid = 7
+
+        def kern(e, ts, dur):
+            corr[0] += 1
+            events.append({"ph": "X", "cat": "xpu_runtime", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": 0.1, "name": "l",
+                           "args": {"correlation": corr[0], "External id": e}})
+            events.append({"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+                           "ts": ts + 1000, "dur": dur, "name": "g",
+                           "args": {"correlation": corr[0]}})
+
+        def op(name, ts, dur, shapes, kdur=0.0):
+            ext[0] += 1
+            events.append({"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+                           "ts": ts, "dur": dur, "name": name,
+                           "args": {"External id": ext[0], "Input Dims": shapes,
+                                    "Input type": ["c10::BFloat16"]}})
+            if kdur:
+                kern(ext[0], ts, kdur)
+
+        def mod(cls, idx, ts, dur):
+            events.append({"ph": "X", "cat": "python_function", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": dur,
+                           "name": f"nn.Module: {cls}_{idx}"})
+
+        def pyfn(name, ts, dur):
+            events.append({"ph": "X", "cat": "python_function", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": dur, "name": name})
+
+        FRAME = (".../fused_allreduce_gemma_rms_norm.py(20): "
+                 "fused_allreduce_gemma_rms_norm")
+        tokens = 8
+        mod("TinyForCausalLM", 0, 0.0, 400)
+        mod("TinyDecoderLayer", 0, 1.0, 380)
+        # Pre-attention fused norm (frame wraps allreduce + norm module).
+        pyfn(FRAME, 10.0, 40)
+        op("c10d::allreduce_", 12.0, 5, [[tokens, 16]], 3.0)
+        mod("TinyRMSNorm", 0, 20.0, 20)
+        op("aten::rms_norm", 22.0, 5, [[tokens, 16]], 2.0)
+        # Attention in between.
+        mod("TinyAttention", 0, 60.0, 40)
+        op("aten::mm", 62.0, 8, [[tokens, 16], [16, 16]], 4.0)
+        # Post-attention fused norm — SAME frame label, distinct occurrence.
+        pyfn(FRAME, 120.0, 40)
+        op("c10d::allreduce_", 122.0, 5, [[tokens, 16]], 3.0)
+        mod("TinyRMSNorm", 1, 130.0, 20)
+        op("aten::rms_norm", 132.0, 5, [[tokens, 16]], 2.0)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"traceEvents": events}, f)
+            path = f.name
+        try:
+            g = build_graph_from_trace(path, self.SUMMARY, tp_size=1,
+                                       batch_size=1)
+        finally:
+            os.unlink(path)
+
+        def find(node, cls):
+            if node.get("module_type") == cls:
+                return node
+            for c in node.get("children", []):
+                r = find(c, cls)
+                if r:
+                    return r
+            return None
+
+        layer = find(g["prefill"] or g["decode"], "TinyDecoderLayer")
+        self.assertIsNotNone(layer)
+        fused = [c for c in layer["children"]
+                 if c["module_type"] == "FusedAllreduceGemmaRMSNorm"]
+        # Two distinct fused norms, NOT collapsed into one.
+        self.assertEqual(len(fused), 2)
+        for fn in fused:
+            self.assertTrue(any(o["name"] == "c10d::allreduce_"
+                                for o in fn["ops"]))
+
     def test_fused_allreduce_gemma_rms_norm_grouped(self):
         # Gemma-style models (MiniMax-M3) fuse the residual TP all-reduce with
         # the following RMSNorm as ``fused_allreduce_gemma_rms_norm``, a

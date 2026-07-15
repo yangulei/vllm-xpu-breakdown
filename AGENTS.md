@@ -205,11 +205,20 @@ consume unchanged. How it works:
   ops/modules into the earliest occurrence and sums their directly-launched
   device time. Distinct siblings have distinct instance labels (`_0`/`_1`/…), so
   it's a no-op for them (a single un-duplicated module like the empty
-  `MiniMaxM3IndexerTritonImpl` is left untouched). Runs **after**
-  `_hoist_modules_under_ops` (which relocates the empty shell to a sibling of the
-  real forward) and **before** `_compute_sub_dev` (so the unioned subtree's
-  device time rolls up once). See
-  `TestGraphFromTrace.test_duplicate_shared_experts_module_coalesced`.
+  `MiniMaxM3IndexerTritonImpl` is left untouched). **Only real instance-indexed
+  module events are eligible** (`_strip_instance_idx(label) != label`): synthetic
+  functional-frame modules (`_FUNCTIONAL_MODULE_FRAMES` →
+  `FusedAllreduceGemmaRMSNorm`, `FusedTopKBiasRouter`, `XpuFusedMoE`, …) carry a
+  **bare class label with no index**, so genuinely-distinct repeats — e.g. a
+  Gemma decoder layer's **two** `fused_allreduce_gemma_rms_norm` (pre- and
+  post-attention) — legitimately share a label and must **not** be merged; they
+  are skipped. Runs **after** `_hoist_modules_under_ops` (which relocates the
+  empty shell to a sibling of the real forward) and **before** `_compute_sub_dev`
+  (so the unioned subtree's device time rolls up once). Verified against the real
+  MiniMax-M3 CUDA (duplicate shell present) **and** XPU (no duplicate — XPU
+  doesn't double-record shared experts, so the coalesce is a clean no-op) traces.
+  See `TestGraphFromTrace.test_duplicate_shared_experts_module_coalesced` and
+  `test_synthetic_frame_duplicates_not_coalesced`.
 - **A `RowParallelLinear` inside an MLP/expert module names to `down_proj` on
   every device, not just CUDA.** `RowParallelLinear` is both the attention
   output projection (`o_proj`) and the MLP/MoE down projection (`down_proj`), so
