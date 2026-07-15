@@ -49,6 +49,12 @@ from .trace_parser import _infer_device_from_trace, _infer_role, _strip_instance
 _KERNEL_CATEGORIES = {"kernel", "gpu_memcpy", "xpu_op", "gpu_op", "cuda_op",
                       "cuda_runtime", "gpu_kernel"}
 
+# Host-side launch-API event categories (``cudaLaunchKernelExC``,
+# ``urEnqueueKernelLaunch``, ...). These correlate to a device kernel and are
+# used to locate its launch site; they are not surfaced as ops themselves when
+# the kernel they launch is already surfaced.
+_RUNTIME_CATEGORIES = {"cuda_runtime", "xpu_runtime"}
+
 # Ops that are pure tensor plumbing — kept out of the reconstructed op lists to
 # avoid drowning the real compute ops. They carry no device time anyway.
 _PLUMBING_OPS = frozenset({
@@ -163,11 +169,18 @@ def _collect_kernel_launches(events: list[dict], worker_tid: Any
     provides the launch site.
     """
     corr_to_rt: dict[int, dict] = {}
+    kernel_corrs: set = set()
     for evt in events:
-        if evt.get("cat") in ("xpu_runtime", "cuda_runtime"):
+        cat = evt.get("cat")
+        if cat in _RUNTIME_CATEGORIES:
             corr = evt.get("args", {}).get("correlation")
             if corr is not None:
                 corr_to_rt[corr] = evt
+        elif cat in _KERNEL_CATEGORIES:
+            # Correlations backed by an actual device kernel / memcpy event.
+            corr = evt.get("args", {}).get("correlation")
+            if corr is not None:
+                kernel_corrs.add(corr)
 
     # Build External-id → CPU op timestamp map for fallback attribution
     ext_to_ts: dict[int, float] = {}
@@ -179,10 +192,19 @@ def _collect_kernel_launches(events: list[dict], worker_tid: Any
 
     launches: list[tuple[float, str, float]] = []
     for evt in events:
-        if evt.get("cat") not in _KERNEL_CATEGORIES:
+        cat = evt.get("cat")
+        if cat not in _KERNEL_CATEGORIES:
             continue
         args = evt.get("args", {})
         corr = args.get("correlation")
+        # A runtime launch-API event (``cudaLaunchKernelExC`` /
+        # ``urEnqueueKernelLaunch``) is host-side launch overhead for a device
+        # kernel that is itself surfaced separately. Skip it so it doesn't show
+        # up as a duplicate synthetic op (e.g. ``triton::cudaLaunchKernelExC``
+        # next to the real FlashInfer RMSNorm kernel). Runtime events with no
+        # backing kernel event are still emitted as a fallback.
+        if cat in _RUNTIME_CATEGORIES and corr in kernel_corrs:
+            continue
         rt = corr_to_rt.get(corr) if corr is not None else None
         if rt is not None and rt.get("tid") == worker_tid:
             launches.append((rt.get("ts", 0), evt.get("name", ""),
@@ -254,6 +276,33 @@ def _enclosing_module(node: _Raw, module_of: dict[int, _Raw]) -> _Raw | None:
     return None
 
 
+def _clean_kernel_name(name: str) -> str:
+    """Strip the cutlass/functor object-repr + tensor-ptr tail from a raw
+    device-kernel symbol so synthetic op names stay readable.
+
+    e.g. ``kernel_cutlass_kernel_flashinfernormkernelsrmsnormRMSNormKernel_object_at__tensorptrbf16gmemalign128...___T_0``
+    → ``kernel_cutlass_kernel_flashinfernormkernelsrmsnormRMSNormKernel``.
+    """
+    idx = name.find("_object_at")
+    if idx > 0:
+        name = name[:idx]
+    return name
+
+
+def _synthetic_op_label(name: str) -> str:
+    """Namespaced display label for a Python-direct device kernel (no cpu_op).
+
+    FlashInfer kernels get a ``flashinfer::`` namespace (rather than
+    ``triton::``, which misrepresented them as Triton-compiled); every other
+    orphan kernel keeps ``triton::``. The ``_object_at...`` object-repr tail is
+    dropped either way so the name is readable.
+    """
+    clean = _clean_kernel_name(name)
+    if "flashinfer" in clean.lower():
+        return "flashinfer::" + clean
+    return "triton::" + clean
+
+
 def _attribute_kernels(roots: list[_Raw],
                        launches: list[tuple[float, str, float]]) -> None:
     """Attribute every device kernel to its host launch site.
@@ -289,10 +338,10 @@ def _attribute_kernels(roots: list[_Raw],
         mod = _enclosing_module(node, parent)
         if mod is None:
             continue
-        key = (id(mod), name)
+        key = (id(mod), _clean_kernel_name(name))
         op = synth.get(key)
         if op is None:
-            op = _Raw("op", "triton::" + name, ts, 0.0)
+            op = _Raw("op", _synthetic_op_label(name), ts, 0.0)
             synth[key] = op
             mod.children.append(op)
             parent[id(op)] = mod

@@ -388,16 +388,25 @@ validation summary. Filename is
 Classifies ops by name prefix/pattern to backends. Priority order:
 1. ccl (collective-comm: `c10d::`/`ccl::` namespaces or all_reduce/all_gather/reduce_scatter/all_to_all keywords)
 2. vllm-xpu-kernels (exact match from registry)
-3. triton (kernel name patterns)
-4. torch-xpu-ops (aten:: ops that run on XPU)
-5. cpu (fallback ops)
-6. framework (reshaping, profiler markers)
+3. flashinfer (op name contains `flashinfer` — FlashInfer RMSNorm/attention kernels launched directly from Python)
+4. triton (kernel name patterns)
+5. torch-xpu-ops (aten:: ops that run on XPU)
+6. cpu (fallback ops)
+7. framework (reshaping, profiler markers)
 
 CCL is checked **first** so tensor/pipeline-parallel comm calls (including
 `vllm::all_reduce`-style ops) land in their own category rather than being
 absorbed into vllm-xpu-kernels. Bare `gather`/`scatter` are intentionally
 **not** CCL keywords so cache/MoE gather ops (`moe_gather`, `gather_cache`)
 aren't misfiled.
+
+**FlashInfer** is checked **before** Triton: FlashInfer RMSNorm /
+fused-add-RMSNorm / attention kernels are launched straight from Python with no
+`aten`/`_C` cpu_op, so they surface as synthetic kernel ops under the
+`triton::` prefix (e.g.
+`triton::kernel_cutlass_kernel_flashinfernormkernelsrmsnormRMSNormKernel_...`).
+The embedded `flashinfer` symbol routes them to their own backend rather than
+`triton`.
 
 ## Conventions
 
@@ -615,9 +624,27 @@ static builder. Ensure:
   Kernels launched straight from Python via `triton.jit` (Gemma RMSNorm,
   MiniMax-M3 lightning indexer, block-sparse attention) never emit an
   `aten`/`_C` cpu_op. `_attribute_kernels` adds them as `triton::`-prefixed ops
-  on their enclosing module (classified as `triton`). Real ops (`aten::mm`,
+  on their enclosing module (classified as `triton`, unless the kernel symbol
+  embeds `flashinfer` → the FlashInfer backend). Real ops (`aten::mm`,
   `c10d::allreduce_`, `vllm::unified_attention_with_output`) get the kernel time
   added to themselves instead.
+- **Host-side launch-API events are NOT surfaced as ops.** A device kernel is
+  linked to its launch call (`cudaLaunchKernelExC` / `urEnqueueKernelLaunch`, cat
+  `cuda_runtime`/`xpu_runtime`) via its correlation id. Those runtime events are
+  in `_KERNEL_CATEGORIES` (so they can act as a launch-site fallback), but
+  `_collect_kernel_launches` **skips a runtime event whose correlation is backed
+  by an actual device kernel event** (`_RUNTIME_CATEGORIES` + `kernel_corrs`).
+  Otherwise a Python-direct launch (e.g. FlashInfer RMSNorm) surfaced **twice** —
+  once as the real kernel op and once as a duplicate `triton::cudaLaunchKernelExC`
+  launch-overhead op next to it. A runtime event with no backing kernel event is
+  still emitted (fallback for traces that only carry runtime events). See
+  `TestGraphFromTrace.test_flashinfer_kernel_surfaced_launcher_suppressed`.
+- **FlashInfer kernels classify as the `flashinfer` backend.** FlashInfer
+  RMSNorm/fused-add-RMSNorm/attention kernels launch directly from Python (no
+  `aten`/`_C` cpu_op), so `_attribute_kernels` surfaces them as
+  `triton::kernel_cutlass_kernel_flashinfernorm...` synthetic ops. `classify_op`
+  routes any op whose name contains `flashinfer` to `Backend.FLASHINFER`
+  (checked before the Triton pattern match).
 - **`vllm::` namespace ops classify as vllm-xpu-kernels.** `classify_op` maps the
   `vllm::` prefix (dispatch ops: `unified_attention_with_output`,
   `unified_kv_cache_update`, `moe_forward_shared`, `xpu_topk_topp_sampler`)

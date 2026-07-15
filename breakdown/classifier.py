@@ -12,6 +12,7 @@ from .registry import ALL_VLLM_XPU_OPS, get_op_category
 class Backend(str, Enum):
     """Dispatch backend for an operation."""
     VLLM_XPU_KERNELS = "vllm-xpu-kernels"
+    FLASHINFER = "flashinfer"
     TRITON = "triton"
     TORCH_XPU_OPS = "torch-xpu-ops"
     CPU = "cpu"
@@ -43,6 +44,15 @@ def _is_ccl(name: str) -> bool:
         return True
     return any(kw in low for kw in _CCL_KEYWORDS)
 
+
+# Op name substrings that indicate FlashInfer kernels. FlashInfer RMSNorm /
+# fused-add-RMSNorm / attention kernels are launched directly from Python (no
+# ``aten``/``_C`` cpu_op), so they surface as synthetic kernel ops whose name
+# embeds ``flashinfer`` (e.g.
+# ``kernel_cutlass_kernel_flashinfernormkernelsrmsnormRMSNormKernel_...``).
+_FLASHINFER_INDICATORS = (
+    "flashinfer",
+)
 
 # Op name prefixes/substrings that indicate Triton-compiled kernels
 _TRITON_INDICATORS = (
@@ -228,17 +238,24 @@ def classify_op(name: str, device_type: str = "",
         cat = get_op_category(stripped) or "vllm-cuda-kernels"
         return Backend.VLLM_CUDA_KERNELS, cat
 
-    # 2. Check for Triton kernels
+    # 2. Check for FlashInfer kernels (before Triton — the synthetic op name is
+    #    ``triton::``-prefixed but the embedded kernel symbol is FlashInfer's).
+    low = name.lower()
+    for indicator in _FLASHINFER_INDICATORS:
+        if indicator in low:
+            return Backend.FLASHINFER, "flashinfer-kernel"
+
+    # 3. Check for Triton kernels
     for indicator in _TRITON_INDICATORS:
         if indicator in name:
             return Backend.TRITON, "triton-compiled"
 
-    # 3. Check for framework overhead (before aten compute check)
+    # 4. Check for framework overhead (before aten compute check)
     for prefix in _FRAMEWORK_PREFIXES:
         if name.startswith(prefix):
             return Backend.FRAMEWORK, "framework-overhead"
 
-    # 4. ATen compute ops on accelerator → torch-{cuda,xpu}-ops
+    # 5. ATen compute ops on accelerator → torch-{cuda,xpu}-ops
     if name in _ATEN_COMPUTE_OPS or stripped in _ATEN_COMPUTE_OPS:
         if is_cuda:
             return Backend.TORCH_CUDA_OPS, "aten-cuda"
@@ -247,17 +264,17 @@ def classify_op(name: str, device_type: str = "",
         else:
             return Backend.CPU, "aten-cpu"
 
-    # 5. Any aten:: op with device time → torch-{cuda,xpu}-ops
+    # 6. Any aten:: op with device time → torch-{cuda,xpu}-ops
     if name.startswith("aten::") and has_device_time:
         if is_cuda:
             return Backend.TORCH_CUDA_OPS, "aten-cuda"
         return Backend.TORCH_XPU_OPS, "aten-xpu"
 
-    # 6. Any aten:: op without device time → framework
+    # 7. Any aten:: op without device time → framework
     if name.startswith("aten::"):
         return Backend.FRAMEWORK, "aten-overhead"
 
-    # 7. CPU-only ops
+    # 8. CPU-only ops
     if device_type in ("cpu", "CPU") or not has_device_time:
         return Backend.CPU, "cpu"
 

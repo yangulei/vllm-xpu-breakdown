@@ -240,6 +240,23 @@ class TestClassifier(unittest.TestCase):
         backend, _ = classify_op("CompiledFxGraph_123")
         self.assertEqual(backend, Backend.TRITON)
 
+    def test_flashinfer_rmsnorm_kernel(self):
+        # Real synthetic op name from MiniMax-M3 CUDA profiling: FlashInfer
+        # RMSNorm is launched directly from Python (no aten/_C cpu_op), so the
+        # kernel symbol embeds "flashinfer" under the "triton::" synthetic prefix.
+        name = ("triton::kernel_cutlass_kernel_flashinfernormkernelsrmsnorm"
+                "RMSNormKernel_object_at__tensorptrbf16gmemalign128oi646144"
+                "61441_tensorptrbf16gmemalign16o61441___T_0")
+        backend, cat = classify_op(name, device_type="cuda", device_time_us=50)
+        self.assertEqual(backend, Backend.FLASHINFER)
+        self.assertEqual(cat, "flashinfer-kernel")
+
+    def test_flashinfer_fused_add_rmsnorm_kernel(self):
+        name = ("triton::kernel_cutlass_kernel_flashinfernormkernels"
+                "fused_add_rmsnormFusedAddRMSNormKernel_object_at__T_0")
+        backend, _ = classify_op(name, device_type="cuda", device_time_us=50)
+        self.assertEqual(backend, Backend.FLASHINFER)
+
     def test_triton_fused_kernel(self):
         # Real kernel name from Qwen3 profiling
         backend, _ = classify_op("triton_red_fused__to_copy_add_mean_mul_pow_rsqrt_0")
@@ -1724,6 +1741,68 @@ class TestGraphFromTrace(unittest.TestCase):
                        if o["name"] == "triton::_rms_norm_kernel")
         self.assertEqual(norm_op["backend"], "triton")
         self.assertAlmostEqual(norm_op["device_time_us"], 4.0, places=3)
+
+    def test_flashinfer_kernel_surfaced_launcher_suppressed(self):
+        # FlashInfer RMSNorm launches directly from Python: a cuda_runtime
+        # ``cudaLaunchKernelExC`` event (inside the decoder-layer module) backing
+        # a device ``kernel`` whose symbol embeds "flashinfer". The kernel must
+        # surface as a FlashInfer op; the launch-API runtime event must NOT
+        # appear as a duplicate ``triton::cudaLaunchKernelExC`` op.
+        from breakdown.graph_from_trace import build_graph_from_trace
+        tid = 7
+        fi_kernel = ("kernel_cutlass_kernel_flashinfernormkernelsrmsnorm"
+                     "RMSNormKernel_object_at__T_0")
+        events = [
+            {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
+             "ts": 0, "dur": 100, "name": "nn.Module: TinyForCausalLM_0"},
+            {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
+             "ts": 1, "dur": 98, "name": "nn.Module: TinyModel_0"},
+            {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
+             "ts": 10, "dur": 30, "name": "nn.Module: TinyDecoderLayer_0"},
+            {"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+             "ts": 11, "dur": 8, "name": "aten::linear",
+             "args": {"External id": 1, "Input Dims": [[8, 16], [48, 16]],
+                      "Input type": ["c10::BFloat16", "c10::BFloat16"]}},
+            {"ph": "X", "cat": "cuda_runtime", "tid": tid, "pid": tid,
+             "ts": 12, "dur": 0.1, "name": "cudaLaunchKernelExC",
+             "args": {"correlation": 1, "External id": 1}},
+            {"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+             "ts": 2000, "dur": 5.0, "name": "gemm_cuda_kernel",
+             "args": {"correlation": 1}},
+            # FlashInfer norm: cudaLaunchKernelExC (inside the layer) + kernel.
+            {"ph": "X", "cat": "cuda_runtime", "tid": tid, "pid": tid,
+             "ts": 30, "dur": 0.1, "name": "cudaLaunchKernelExC",
+             "args": {"correlation": 2, "External id": 999}},
+            {"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+             "ts": 3000, "dur": 4.0, "name": fi_kernel,
+             "args": {"correlation": 2}},
+        ]
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"traceEvents": events}, f)
+            path = f.name
+        try:
+            g = build_graph_from_trace(path, self.SUMMARY, tp_size=1,
+                                       batch_size=1)
+        finally:
+            os.unlink(path)
+
+        def all_ops(node):
+            yield from node.get("ops", [])
+            for c in node.get("children", []):
+                yield from all_ops(c)
+
+        ops = list(all_ops(g["prefill"]))
+        # No launch-API event should be surfaced as an op.
+        self.assertFalse(any("cudaLaunchKernelExC" in o["name"] for o in ops),
+                         "runtime launch-API event must not surface as an op")
+        fi_op = next(o for o in ops if "flashinfer" in o["name"].lower())
+        self.assertEqual(fi_op["backend"], "flashinfer")
+        self.assertAlmostEqual(fi_op["device_time_us"], 4.0, places=3)
+        # Name is cleaned: "flashinfer::" namespace, no misleading "triton::"
+        # prefix and no "_object_at..." cutlass object-repr tail.
+        self.assertTrue(fi_op["name"].startswith("flashinfer::"), fi_op["name"])
+        self.assertNotIn("triton::", fi_op["name"])
+        self.assertNotIn("_object_at", fi_op["name"])
 
     def test_layer_extrapolation_to_config_count(self):
         # Reduced-layer profiling captures 2 decoder layers; the config says the
