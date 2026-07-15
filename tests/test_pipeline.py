@@ -1314,6 +1314,97 @@ class TestGraphFromTrace(unittest.TestCase):
         self.assertLess(router["order"], moe["order"])
         self.assertLess(moe["order"], reduce_op["order"])
 
+    def test_duplicate_shared_experts_module_coalesced(self):
+        # vLLM's MoE shared-experts overlap records the *same* module object's
+        # forward twice within one parent forward: once as an empty shell whose
+        # compute is fused into the sibling ``vllm::moe_forward_shared`` op
+        # (hoisted out empty) and once as the real MLP forward. Both events carry
+        # the identical profiler label (``SharedExperts_0`` twice), so the graph
+        # used to show a spurious empty ``SharedExperts`` sibling next to the
+        # real one. They must collapse to a single node holding the MLP, with
+        # device time conserved. The empty-first order here mirrors the CUDA
+        # prefill trace (decode has empty-last — coalescing is order-agnostic).
+        from breakdown.graph_from_trace import build_graph_from_trace
+        events = []
+        ext = [0]
+        corr = [0]
+        tid = 7
+
+        def kern(e, ts, dur):
+            corr[0] += 1
+            events.append({"ph": "X", "cat": "xpu_runtime", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": 0.1, "name": "l",
+                           "args": {"correlation": corr[0], "External id": e}})
+            events.append({"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+                           "ts": ts + 1000, "dur": dur, "name": "g",
+                           "args": {"correlation": corr[0]}})
+
+        def op(name, ts, dur, shapes, kdur=0.0):
+            ext[0] += 1
+            events.append({"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+                           "ts": ts, "dur": dur, "name": name,
+                           "args": {"External id": ext[0], "Input Dims": shapes,
+                                    "Input type": ["c10::BFloat16"]}})
+            if kdur:
+                kern(ext[0], ts, kdur)
+
+        def mod(cls, idx, ts, dur):
+            events.append({"ph": "X", "cat": "python_function", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": dur,
+                           "name": f"nn.Module: {cls}_{idx}"})
+
+        tokens = 8
+        mod("TinyForCausalLM", 0, 0.0, 400)
+        mod("TinyDecoderLayer", 0, 1.0, 380)
+        mod("TinyMoE", 0, 5.0, 370)
+        mod("MoERunner", 0, 8.0, 360)
+        # Fused MoE op (routed experts). The empty shared_experts shell is
+        # recorded *inside* it and gets hoisted out empty.
+        op("vllm::moe_forward_shared", 20.0, 180, [[tokens, 16], [tokens, 4]],
+           9.0)
+        mod("SharedExperts", 0, 30.0, 20)          # empty shell (no ops)
+        # The real shared_experts forward, same object → same label, with MLP.
+        mod("SharedExperts", 0, 210.0, 120)
+        mod("TinyMLP", 0, 212.0, 110)
+        op("aten::linear", 214.0, 8, [[tokens, 16], [64, 16]], 7.0)   # gate_up
+        op("aten::linear", 232.0, 8, [[tokens, 32], [16, 32]], 6.0)   # down
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"traceEvents": events}, f)
+            path = f.name
+        try:
+            g = build_graph_from_trace(path, self.SUMMARY, tp_size=1,
+                                       batch_size=1)
+        finally:
+            os.unlink(path)
+
+        def find(node, cls):
+            if node.get("module_type") == cls:
+                return node
+            for c in node.get("children", []):
+                r = find(c, cls)
+                if r:
+                    return r
+            return None
+
+        runner = find(g["prefill"], "MoERunner")
+        self.assertIsNotNone(runner)
+        # Exactly one SharedExperts child — the empty duplicate is gone.
+        shared = [c for c in runner["children"]
+                  if c["module_type"] == "SharedExperts"]
+        self.assertEqual(len(shared), 1)
+        # The surviving node holds the real MLP subtree.
+        mlp = find(shared[0], "TinyMLP")
+        self.assertIsNotNone(mlp)
+        self.assertEqual(sum(1 for o in mlp["ops"]
+                             if o["name"] == "aten::linear"), 2)
+        # Device time is conserved: the fused op keeps its own 9us; the shared
+        # experts hold the MLP's 7+6=13us (not lost to the empty shell).
+        moe_op = next(o for o in runner["ops"]
+                      if o["name"] == "vllm::moe_forward_shared")
+        self.assertAlmostEqual(moe_op["device_time_us"], 9.0, places=2)
+        self.assertAlmostEqual(shared[0]["total_device_time_us"], 13.0, places=2)
+
     def test_fused_allreduce_gemma_rms_norm_grouped(self):
         # Gemma-style models (MiniMax-M3) fuse the residual TP all-reduce with
         # the following RMSNorm as ``fused_allreduce_gemma_rms_norm``, a
@@ -1399,6 +1490,120 @@ class TestGraphFromTrace(unittest.TestCase):
         self.assertIsNotNone(norm)
         # Device time is conserved under the fused node (allreduce 6 + norm 4).
         self.assertAlmostEqual(fused["total_device_time_us"], 10.0, places=2)
+
+    def test_cuda_triton_moe_experts_surfaced(self):
+        # On CUDA the routed MoE experts run through the Triton modular kernel
+        # ``experts/triton_moe.py(198): apply`` (a python_function, not an
+        # nn.Module) inside the fused ``vllm::moe_forward_shared`` op, and the
+        # grouped-GEMM ``fused_moe_kernel`` is launched via the CUDA *driver* API
+        # (``cuLaunchKernelEx``, cat ``cuda_driver``) with no runtime-API launch
+        # event. Two things must happen for the experts to be visible: (1) the
+        # ``triton_moe.py apply`` frame is promoted to a ``moe`` module and
+        # hoisted out of the op; (2) ``cuda_driver`` counts as a launch-site
+        # category so the Triton kernel is attributed to its real launch site
+        # (inside ``moe``) instead of falling back to External id and collapsing
+        # into ``moe_forward_shared``'s start.
+        from breakdown.graph_from_trace import build_graph_from_trace
+        events = []
+        ext = [0]
+        corr = [0]
+        tid = 7
+
+        def driver_kern(ts, dur, kname):
+            # A device kernel launched via the CUDA driver API: the launch event
+            # (cat cuda_driver) sits on the worker thread at ``ts``; the kernel
+            # event carries the device duration and links back by correlation.
+            corr[0] += 1
+            events.append({"ph": "X", "cat": "cuda_driver", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": 0.1,
+                           "name": "cuLaunchKernelEx",
+                           "args": {"correlation": corr[0]}})
+            events.append({"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+                           "ts": ts + 5000, "dur": dur, "name": kname,
+                           "args": {"correlation": corr[0]}})
+
+        def op(name, ts, dur, shapes, kdur=0.0):
+            ext[0] += 1
+            events.append({"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+                           "ts": ts, "dur": dur, "name": name,
+                           "args": {"External id": ext[0], "Input Dims": shapes,
+                                    "Input type": ["c10::BFloat16"]}})
+            if kdur:
+                corr[0] += 1
+                events.append({"ph": "X", "cat": "cuda_runtime", "tid": tid,
+                               "pid": tid, "ts": ts, "dur": 0.1, "name": "l",
+                               "args": {"correlation": corr[0],
+                                        "External id": ext[0]}})
+                events.append({"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+                               "ts": ts + 5000, "dur": kdur, "name": "g",
+                               "args": {"correlation": corr[0]}})
+
+        def mod(cls, idx, ts, dur):
+            events.append({"ph": "X", "cat": "python_function", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": dur,
+                           "name": f"nn.Module: {cls}_{idx}"})
+
+        def pyfn(name, ts, dur):
+            events.append({"ph": "X", "cat": "python_function", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": dur, "name": name})
+
+        tokens = 8
+        mod("TinyForCausalLM", 0, 0.0, 500)
+        mod("TinyDecoderLayer", 0, 1.0, 480)
+        mod("TinyMoE", 0, 5.0, 460)
+        mod("MoERunner", 0, 8.0, 450)
+        # Fused MoE custom op wrapping the routed-expert Triton kernel. Its own
+        # residual self-time is a small kernel (2us).
+        op("vllm::moe_forward_shared", 20.0, 400, [[tokens, 16], [tokens, 4]],
+           2.0)
+        # The Triton experts modular-kernel apply frame (promoted to ``moe``).
+        pyfn(".../fused_moe/experts/triton_moe.py(198): apply", 60.0, 300)
+        op("_moe_C::moe_align_block_size", 66.0, 10, [[tokens, 4]], 3.0)
+        # Grouped GEMM: driver-launched Triton kernel, no cpu_op, no runtime API.
+        driver_kern(120.0, 40.0, "fused_moe_kernel")
+        op("_C::silu_and_mul_with_clamp", 200.0, 8, [[tokens, 32]], 4.0)
+        op("_moe_C::moe_sum", 300.0, 8, [[tokens, 4, 16]], 5.0)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"traceEvents": events}, f)
+            path = f.name
+        try:
+            g = build_graph_from_trace(path, self.SUMMARY, tp_size=1,
+                                       batch_size=1)
+        finally:
+            os.unlink(path)
+
+        def find(node, cls):
+            if node.get("module_type") == cls:
+                return node
+            for c in node.get("children", []):
+                r = find(c, cls)
+                if r:
+                    return r
+            return None
+
+        runner = find(g["prefill"] or g["decode"], "MoERunner")
+        self.assertIsNotNone(runner)
+        moe = next((c for c in runner["children"]
+                    if c["name"] == "moe"), None)
+        self.assertIsNotNone(moe)
+        self.assertEqual(moe["module_type"], "TritonExperts")
+        # The routed-expert ops surfaced on the moe node.
+        names = {o["name"] for o in moe["ops"]}
+        self.assertIn("_moe_C::moe_align_block_size", names)
+        self.assertIn("_moe_C::moe_sum", names)
+        # The driver-launched grouped GEMM surfaced as a triton op on moe.
+        fmk = next((o for o in moe["ops"]
+                    if o["name"] == "triton::fused_moe_kernel"), None)
+        self.assertIsNotNone(fmk)
+        self.assertEqual(fmk["backend"], "triton")
+        self.assertAlmostEqual(fmk["device_time_us"], 40.0, places=2)
+        # Device time moved out of the fused op onto moe (op keeps only its 2us
+        # residual; moe holds 3 + 40 + 4 + 5 = 52us). Total is conserved.
+        moe_op = next(o for o in runner["ops"]
+                      if o["name"] == "vllm::moe_forward_shared")
+        self.assertAlmostEqual(moe_op["device_time_us"], 2.0, places=2)
+        self.assertAlmostEqual(moe["total_device_time_us"], 52.0, places=2)
 
     def test_rowparallel_in_mlp_named_down_proj_on_xpu(self):
         # RowParallelLinear defaults to ``o_proj`` (attention output), but inside

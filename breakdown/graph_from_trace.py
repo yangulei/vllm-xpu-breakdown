@@ -50,10 +50,16 @@ _KERNEL_CATEGORIES = {"kernel", "gpu_memcpy", "xpu_op", "gpu_op", "cuda_op",
                       "cuda_runtime", "gpu_kernel"}
 
 # Host-side launch-API event categories (``cudaLaunchKernelExC``,
-# ``urEnqueueKernelLaunch``, ...). These correlate to a device kernel and are
-# used to locate its launch site; they are not surfaced as ops themselves when
-# the kernel they launch is already surfaced.
-_RUNTIME_CATEGORIES = {"cuda_runtime", "xpu_runtime"}
+# ``cuLaunchKernelEx``, ``urEnqueueKernelLaunch``, ...). These correlate to a
+# device kernel and are used to locate its launch site; they are not surfaced as
+# ops themselves when the kernel they launch is already surfaced. ``cuda_driver``
+# is the CUDA *driver* launch API (``cuLaunchKernel``/``cuLaunchKernelEx``) that
+# Triton uses directly — without it, Triton kernels (e.g. the MoE
+# ``fused_moe_kernel`` grouped GEMM) have no runtime-API launch event, so
+# launch-site lookup falls back to ``External id`` and misattributes them to the
+# enclosing custom op's start (collapsing all expert GEMM time into
+# ``vllm::moe_forward_shared`` instead of the ``moe`` node).
+_RUNTIME_CATEGORIES = {"cuda_runtime", "cuda_driver", "xpu_runtime"}
 
 # Ops that are pure tensor plumbing — kept out of the reconstructed op lists to
 # avoid drowning the real compute ops. They carry no device time anyway.
@@ -360,13 +366,17 @@ def _attribute_kernels(roots: list[_Raw],
 # The same trick surfaces the MoE routing and expert compute. vLLM dispatches
 # the whole MoE block as one fused custom op (``vllm::moe_forward_shared``)
 # whose Python body calls the router (``fused_topk_bias`` — sigmoid/topk/gather)
-# and the expert kernels (``xpu_fused_moe`` — grouped GEMM/remap/gather) as
-# plain functions, not ``nn.Module`` forwards. Without a boundary their ops and
-# kernels collapse into the single ``moe_forward_shared`` op node, so the
-# ``FusedMoE`` graph showed neither the router nor the experts (only the hoisted
-# ``shared_experts`` MLP). Promoting the two frames to synthetic modules makes
-# ``FusedMoE`` read ``shared_experts → router → moe → reduce``; each is then
-# hoisted out of the wrapping op by ``_hoist_modules_under_ops``.
+# and the routed-expert kernels as plain functions, not ``nn.Module`` forwards.
+# The expert compute has a per-backend entry frame: XPU dispatches it through
+# ``xpu_fused_moe`` (``fused_moe_interface.py`` — grouped GEMM/remap/gather),
+# CUDA through the Triton modular kernel ``apply`` (``experts/triton_moe.py`` —
+# ``moe_align_block_size`` → ``fused_moe_kernel`` grouped GEMM → activation →
+# ``moe_sum``). Without a boundary their ops and kernels collapse into the single
+# ``moe_forward_shared`` op node, so the ``FusedMoE`` graph showed neither the
+# router nor the experts (only the hoisted ``shared_experts`` MLP). Promoting the
+# frames to synthetic modules makes ``FusedMoE`` read
+# ``shared_experts → router → moe → reduce``; each is then hoisted out of the
+# wrapping op by ``_hoist_modules_under_ops``.
 #
 # It also groups the fused all-reduce + RMSNorm. Gemma-style models (MiniMax-M3)
 # fuse the residual tensor-parallel all-reduce with the following RMSNorm as
@@ -386,6 +396,7 @@ _FUNCTIONAL_MODULE_FRAMES = (
     ("fused_topk_bias_router.py", "fused_topk_bias", "FusedTopKBiasRouter",
      "router"),
     ("fused_moe_interface.py", "xpu_fused_moe", "XpuFusedMoE", "moe"),
+    ("experts/triton_moe.py", "apply", "TritonExperts", "moe"),
     ("fused_allreduce_gemma_rms_norm.py", "fused_allreduce_gemma_rms_norm",
      "FusedAllreduceGemmaRMSNorm", "fused_allreduce_gemma_rms_norm"),
 )
@@ -518,6 +529,9 @@ def _build_raw_forest(events: list[dict]) -> list[_Raw]:
     # Surface modules that a fused custom op wraps (see _hoist_modules_under_ops)
     # before rolling up device time so their subtree isn't double-counted.
     roots = _hoist_modules_under_ops(roots)
+    # Collapse the same module object recorded twice in one forward (MoE
+    # shared-experts overlap) into a single node before device time rolls up.
+    _coalesce_duplicate_child_modules(roots)
     _compute_sub_dev(roots)
     return roots
 
@@ -580,6 +594,56 @@ def _hoist_modules_under_ops(roots: list[_Raw]) -> list[_Raw]:
             target.children.append(mod)
         parent[id(mod)] = target
     return roots
+
+
+def _coalesce_duplicate_child_modules(roots: list[_Raw]) -> None:
+    """Merge sibling module nodes that share the same profiler instance label.
+
+    A single module *object*'s forward can be recorded more than once within one
+    parent forward. vLLM's MoE shared-experts overlap is the clearest case:
+    ``shared_experts`` is entered once as an **empty shell** whose compute is
+    fused into the sibling ``vllm::moe_forward_shared`` custom op (hoisted out
+    empty by :func:`_hoist_modules_under_ops`) and once as the **real MLP**
+    forward. Both events carry the *identical* profiler label (e.g.
+    ``SharedExperts_0`` twice), so they are the same object and must collapse to
+    one node — otherwise the reconstructed graph shows a spurious empty
+    ``SharedExperts`` sibling next to the real one. The order varies (empty-first
+    in prefill, empty-last in decode), so this keys purely on the shared label,
+    unions the duplicates' child ops/modules into the earliest occurrence and
+    sums their directly-launched device time.
+
+    Distinct sibling modules have distinct instance labels (``_0``/``_1``/…), so
+    this is a no-op for them. Run **after** :func:`_hoist_modules_under_ops`
+    (which relocates the empty shell to become a sibling of the real forward) and
+    **before** :func:`_compute_sub_dev` (so the unioned subtree's device time
+    rolls up once, under the single surviving node).
+    """
+    stack: list[_Raw] = list(roots)
+    while stack:
+        n = stack.pop()
+        seen: dict[str, _Raw] = {}
+        dups: set[int] = set()
+        changed: list[_Raw] = []
+        for cm in n.children:
+            if cm.kind != "module":
+                continue
+            rep = seen.get(cm.label)
+            if rep is None:
+                seen[cm.label] = cm
+            else:
+                rep.children.extend(cm.children)
+                rep.self_dev += cm.self_dev
+                rep.ts = min(rep.ts, cm.ts)
+                rep.end = max(rep.end, cm.end)
+                if not rep.attr_name:
+                    rep.attr_name = cm.attr_name
+                dups.add(id(cm))
+                changed.append(rep)
+        if dups:
+            n.children = [c for c in n.children if id(c) not in dups]
+            for rep in changed:
+                rep.children.sort(key=lambda x: (x.ts, -x.end))
+        stack.extend(c for c in n.children if c.kind == "module")
 
 
 def _compute_sub_dev(roots: list[_Raw]) -> None:

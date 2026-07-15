@@ -190,6 +190,26 @@ consume unchanged. How it works:
   `_compute_sub_dev` (so the hoisted subtree's device time rolls up **once**,
   under its module, not also inside the wrapping op — verified device-conserving).
   See `TestGraphFromTrace.test_module_wrapped_in_fused_op_is_hoisted`.
+- **The same module object recorded twice in one forward is coalesced
+  (`_coalesce_duplicate_child_modules`).** vLLM's MoE shared-experts overlap
+  enters `shared_experts` **twice** within one MoE forward: once as an **empty
+  shell** whose compute is fused into the sibling `vllm::moe_forward_shared`
+  custom op (hoisted out empty by `_hoist_modules_under_ops`) and once as the
+  **real MLP** forward. Both events carry the *identical* profiler instance label
+  (`SharedExperts_0` twice), so they are the same object — but reconstruction
+  used to render them as two sibling nodes, one a spurious **empty**
+  `SharedExperts` next to the real one (symptom: "MiniMaxM3MoE graph
+  inconsistent with the trace in prefill"). The empty/real order varies
+  (empty-**first** in the CUDA prefill trace, empty-**last** in decode), so the
+  coalesce keys purely on the shared full label, unions the duplicates' child
+  ops/modules into the earliest occurrence and sums their directly-launched
+  device time. Distinct siblings have distinct instance labels (`_0`/`_1`/…), so
+  it's a no-op for them (a single un-duplicated module like the empty
+  `MiniMaxM3IndexerTritonImpl` is left untouched). Runs **after**
+  `_hoist_modules_under_ops` (which relocates the empty shell to a sibling of the
+  real forward) and **before** `_compute_sub_dev` (so the unioned subtree's
+  device time rolls up once). See
+  `TestGraphFromTrace.test_duplicate_shared_experts_module_coalesced`.
 - **A `RowParallelLinear` inside an MLP/expert module names to `down_proj` on
   every device, not just CUDA.** `RowParallelLinear` is both the attention
   output projection (`o_proj`) and the MLP/MoE down projection (`down_proj`), so
@@ -208,19 +228,29 @@ consume unchanged. How it works:
   `TestGraphFromTrace.test_rowparallel_in_mlp_named_down_proj_on_xpu`.
 - **MoE router / experts are surfaced from functional python_function frames
   (`_FUNCTIONAL_MODULE_FRAMES`).** vLLM runs the MoE routing (`fused_topk_bias`
-  — sigmoid/topk/gather) and expert compute (`xpu_fused_moe` — grouped
-  GEMM/remap/gather/swiglu) as plain `python_function` frames inside the fused
-  `vllm::moe_forward_shared` op, **not** as `nn.Module` forwards. With no module
-  boundary, their ops and kernels collapsed into the single `moe_forward_shared`
-  op node, so the `FusedMoE` graph showed neither the router nor the experts
-  (only the hoisted `shared_experts` MLP). `_functional_module_class` promotes
-  those two frames (and the V1 `Sampler`) to **synthetic modules** with explicit
-  display names (`router`, `moe`); `_hoist_modules_under_ops` then lifts them out
-  of the wrapping op, so `FusedMoE` reads `shared_experts → router → moe →
-  reduce`. Each entry is `(path_substr, funcname, synthetic_class,
-  display_name)`; device time is conserved (the wrapping op keeps only its
-  residual self time). See
-  `TestGraphFromTrace.test_moe_router_and_experts_surfaced_from_functional_frames`.
+  — sigmoid/topk/gather) and expert compute as plain `python_function` frames
+  inside the fused `vllm::moe_forward_shared` op, **not** as `nn.Module`
+  forwards. The routed-expert entry frame is **backend-specific**: XPU dispatches
+  through `xpu_fused_moe` (`fused_moe_interface.py` — grouped
+  GEMM/remap/gather/swiglu), CUDA through the Triton modular kernel `apply`
+  (`experts/triton_moe.py` — `moe_align_block_size` → `fused_moe_kernel` grouped
+  GEMM → activation → `moe_sum`). With no module boundary, their ops and kernels
+  collapsed into the single `moe_forward_shared` op node, so the `FusedMoE` graph
+  showed neither the router nor the experts (only the hoisted `shared_experts`
+  MLP). `_functional_module_class` promotes those frames (and the V1 `Sampler`)
+  to **synthetic modules** with explicit display names (`router`, `moe` — CUDA's
+  Triton-experts class is `TritonExperts`, XPU's `XpuFusedMoE`);
+  `_hoist_modules_under_ops` then lifts them out of the wrapping op, so
+  `FusedMoE` reads `shared_experts → router → moe → reduce`. Each entry is
+  `(path_substr, funcname, synthetic_class, display_name)`; device time is
+  conserved (the wrapping op keeps only its residual self time). **On CUDA the
+  routed-expert `fused_moe_kernel` grouped GEMM is Triton-launched via the CUDA
+  *driver* API (`cuLaunchKernelEx`, cat `cuda_driver`), which must be a
+  launch-site category (`_RUNTIME_CATEGORIES`) or the GEMM time falls back to
+  External-id attribution and collapses into `moe_forward_shared`'s start instead
+  of landing on `moe`** (see the launch-site pitfall below). See
+  `TestGraphFromTrace.test_moe_router_and_experts_surfaced_from_functional_frames`
+  and `test_cuda_triton_moe_experts_surfaced`.
 - **The fused all-reduce + RMSNorm is grouped as a parent node
   (`_FUNCTIONAL_MODULE_FRAMES`).** Gemma-style models (MiniMax-M3) fuse the
   residual tensor-parallel all-reduce with the following RMSNorm as
@@ -613,7 +643,19 @@ static builder. Ensure:
   the `is_cuda` async workaround) is a *deliberate deferral*: CUDA-graph launch
   drift is not fixed by R1's spans alone and cannot be validated on this XPU
   host, so the hardware-validated launch-site path and the `is_cuda`-gated
-  corrections are kept as-is.
+  corrections are kept as-is. **The launch-site categories include the CUDA
+  *driver* API (`cuda_driver`: `cuLaunchKernel`/`cuLaunchKernelEx`), not just the
+  runtime API (`cuda_runtime`) and XPU (`xpu_runtime`)** — Triton launches its
+  kernels straight through the driver API, so the routed-MoE `fused_moe_kernel`
+  grouped GEMM (and other Triton kernels) have **no** `cuda_runtime` launch
+  event. Without `cuda_driver` in `_RUNTIME_CATEGORIES`, their launch-site lookup
+  misses and falls back to `External id`, which points at the enclosing
+  `vllm::moe_forward_shared` custom op's start — collapsing all the expert GEMM
+  time into `moe_forward_shared` instead of the `moe` node (symptom: "the MoE
+  after shared experts dispatched to triton_moe is missing from the graph").
+  Driver and runtime launches never share a correlation id (verified), so adding
+  `cuda_driver` doesn't double-count. See
+  `TestGraphFromTrace.test_cuda_triton_moe_experts_surfaced`.
 - **Worker thread is chosen by the module-span anchor (research R6), not raw
   cpu_op count.** `_build_raw_forest` picks the tid carrying the capture-time
   `module::` spans when present; only legacy (span-less) traces fall back to the
