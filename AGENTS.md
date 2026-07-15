@@ -690,12 +690,24 @@ static builder. Ensure:
   launch-overhead op next to it. A runtime event with no backing kernel event is
   still emitted (fallback for traces that only carry runtime events). See
   `TestGraphFromTrace.test_flashinfer_kernel_surfaced_launcher_suppressed`.
-- **FlashInfer kernels classify as the `flashinfer` backend.** FlashInfer
-  RMSNorm/fused-add-RMSNorm/attention kernels launch directly from Python (no
-  `aten`/`_C` cpu_op), so `_attribute_kernels` surfaces them as
-  `triton::kernel_cutlass_kernel_flashinfernorm...` synthetic ops. `classify_op`
-  routes any op whose name contains `flashinfer` to `Backend.FLASHINFER`
-  (checked before the Triton pattern match).
+- **FlashInfer kernels classify as the `flashinfer` backend and are named after
+  their public API frame.** FlashInfer RMSNorm/fused-add-RMSNorm/attention
+  kernels launch directly from Python (no `aten`/`_C` cpu_op), so
+  `_attribute_kernels` surfaces them as synthetic ops on the enclosing module.
+  Rather than the unreadable raw cutlass functor symbol
+  (`flashinfer::kernel_cutlass_kernel_flashinfernormkernelsfused_add_rmsnormFusedAddRMSNormKernel`),
+  the op is named after the **public FlashInfer API python frame** that launched
+  it — the outermost `flashinfer/**/__init__.py(...): <func>` frame whose
+  function name is public (no leading `_`) — so the input_layernorm norm reads
+  `flashinfer::gemma_fused_add_rmsnorm` (and `flashinfer::gemma_rmsnorm`),
+  matching the readable XPU triton names (`_gemma_fused_add_rmsnorm_kernel`).
+  `_collect_flashinfer_api_frames` gathers those frames on the worker thread and
+  `_flashinfer_api_name` picks the one enclosing each kernel launch; the
+  `flashinfer::` namespace prefix is kept so `classify_op` still routes any op
+  whose name contains `flashinfer` to `Backend.FLASHINFER` (checked before the
+  Triton pattern match). When no such API frame is found (legacy/synthetic
+  traces) it falls back to the cleaned raw kernel symbol. See
+  `TestGraphFromTrace.test_flashinfer_kernel_named_after_public_api_frame`.
 - **`vllm::` namespace ops classify as vllm-xpu-kernels.** `classify_op` maps the
   `vllm::` prefix (dispatch ops: `unified_attention_with_output`,
   `unified_kv_cache_update`, `moe_forward_shared`, `xpu_topk_topp_sampler`)

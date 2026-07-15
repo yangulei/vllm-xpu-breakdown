@@ -155,8 +155,9 @@ def _first_dtype(args: dict) -> str:
 
 
 def _collect_kernel_launches(events: list[dict], worker_tid: Any
-                             ) -> list[tuple[float, str, float]]:
-    """Collect every device kernel as ``(host_launch_ts, name, device_us)``.
+                             ) -> list[tuple[float, str, float, str | None]]:
+    """Collect every device kernel as ``(host_launch_ts, name, device_us,
+    flashinfer_api_name)``.
 
     Each device ``kernel``/``gpu_memcpy`` event is linked to the host-side
     launch call that issued it (the "flow arrow" you see in the trace viewer)
@@ -196,7 +197,13 @@ def _collect_kernel_launches(events: list[dict], worker_tid: Any
             if ext is not None:
                 ext_to_ts[ext] = evt.get("ts", 0)
 
-    launches: list[tuple[float, str, float]] = []
+    # Public FlashInfer API frames on the worker thread, so a Python-direct
+    # FlashInfer kernel can be named after its public API entrypoint (e.g.
+    # ``flashinfer/norm/__init__.py(433): gemma_fused_add_rmsnorm``) instead of
+    # the raw cutlass functor symbol.
+    fi_api_frames = _collect_flashinfer_api_frames(events, worker_tid)
+
+    launches: list[tuple[float, str, float, str | None]] = []
     for evt in events:
         cat = evt.get("cat")
         if cat not in _KERNEL_CATEGORIES:
@@ -211,17 +218,68 @@ def _collect_kernel_launches(events: list[dict], worker_tid: Any
         # backing kernel event are still emitted as a fallback.
         if cat in _RUNTIME_CATEGORIES and corr in kernel_corrs:
             continue
+        name = evt.get("name", "")
+        dur = evt.get("dur", 0) or 0
         rt = corr_to_rt.get(corr) if corr is not None else None
         if rt is not None and rt.get("tid") == worker_tid:
-            launches.append((rt.get("ts", 0), evt.get("name", ""),
-                             evt.get("dur", 0) or 0))
+            ts = rt.get("ts", 0)
+            friendly = _flashinfer_api_name(name, ts, fi_api_frames)
+            launches.append((ts, name, dur, friendly))
         else:
             # Fallback: use External id to find the issuing CPU op's timestamp
             ext = args.get("External id")
             if ext is not None and ext in ext_to_ts:
-                launches.append((ext_to_ts[ext], evt.get("name", ""),
-                                 evt.get("dur", 0) or 0))
+                ts = ext_to_ts[ext]
+                friendly = _flashinfer_api_name(name, ts, fi_api_frames)
+                launches.append((ts, name, dur, friendly))
     return launches
+
+
+def _collect_flashinfer_api_frames(events: list[dict], worker_tid: Any
+                                   ) -> list[tuple[float, float, str]]:
+    """Enclosing public FlashInfer API frames as ``(ts, end, funcname)``.
+
+    FlashInfer's public entrypoints live in ``flashinfer/**/__init__.py`` (e.g.
+    ``gemma_fused_add_rmsnorm``, ``gemma_rmsnorm``). We keep only those public
+    (non-underscore) ``__init__.py`` frames on the worker thread so a
+    Python-direct FlashInfer kernel can be named after the API that launched it
+    rather than the raw cutlass functor symbol — matching the readable XPU
+    kernel names.
+    """
+    frames: list[tuple[float, float, str]] = []
+    for evt in events:
+        if evt.get("cat") != "python_function" or evt.get("tid") != worker_tid:
+            continue
+        nm = evt.get("name", "")
+        if "flashinfer" not in nm or "__init__.py(" not in nm:
+            continue
+        func = nm.rsplit("): ", 1)[-1].strip()
+        if not func or func.startswith("_"):
+            continue
+        ts = evt.get("ts", 0)
+        frames.append((ts, ts + (evt.get("dur", 0) or 0), func))
+    return frames
+
+
+def _flashinfer_api_name(kernel_name: str, launch_ts: float,
+                         fi_api_frames: list[tuple[float, float, str]]
+                         ) -> str | None:
+    """Public FlashInfer API name for a kernel launched at ``launch_ts``.
+
+    Returns the outermost enclosing public ``__init__.py`` FlashInfer frame's
+    function name (``gemma_fused_add_rmsnorm``), or ``None`` when the kernel is
+    not a FlashInfer kernel or no such frame contains the launch.
+    """
+    if "flashinfer" not in kernel_name.lower():
+        return None
+    best: str | None = None
+    best_dur = -1.0
+    for ts, end, func in fi_api_frames:
+        if ts <= launch_ts < end:
+            dur = end - ts
+            if dur > best_dur:
+                best, best_dur = func, dur
+    return best
 
 
 # ===================================================================
@@ -295,22 +353,28 @@ def _clean_kernel_name(name: str) -> str:
     return name
 
 
-def _synthetic_op_label(name: str) -> str:
+def _synthetic_op_label(name: str, api_name: str | None = None) -> str:
     """Namespaced display label for a Python-direct device kernel (no cpu_op).
 
     FlashInfer kernels get a ``flashinfer::`` namespace (rather than
     ``triton::``, which misrepresented them as Triton-compiled); every other
-    orphan kernel keeps ``triton::``. The ``_object_at...`` object-repr tail is
-    dropped either way so the name is readable.
+    orphan kernel keeps ``triton::``. When the launching public FlashInfer API
+    name is known (``api_name``, e.g. ``gemma_fused_add_rmsnorm``) it is used in
+    place of the raw cutlass functor symbol so the label is short and matches
+    the readable XPU kernel names; otherwise the ``_object_at...`` object-repr
+    tail is dropped from the raw symbol so the name stays readable.
     """
     clean = _clean_kernel_name(name)
+    if api_name:
+        return "flashinfer::" + api_name
     if "flashinfer" in clean.lower():
         return "flashinfer::" + clean
     return "triton::" + clean
 
 
 def _attribute_kernels(roots: list[_Raw],
-                       launches: list[tuple[float, str, float]]) -> None:
+                       launches: list[tuple[float, str, float, str | None]]
+                       ) -> None:
     """Attribute every device kernel to its host launch site.
 
     * If the launch sits inside a real (non-plumbing) op — ``aten::mm``,
@@ -320,7 +384,8 @@ def _attribute_kernels(roots: list[_Raw],
       kernel is surfaced as a synthetic ``triton::<kernel>`` op on the enclosing
       module. This is how Triton-compiled kernels (RMSNorm, the lightning
       indexer, block-sparse attention) — which never emit an ``aten``/``_C``
-      ``cpu_op`` — become visible.
+      ``cpu_op`` — become visible. FlashInfer kernels are named after their
+      public API frame (``flashinfer::gemma_fused_add_rmsnorm``) when known.
     """
     # Parent map (child id → parent) for walking up to the enclosing module.
     parent: dict[int, _Raw] = {}
@@ -334,7 +399,7 @@ def _attribute_kernels(roots: list[_Raw],
     # Accumulate synthetic op device time per (module, kernel-name) so repeated
     # launches across forward passes collapse into one op node per module.
     synth: dict[tuple[int, str], _Raw] = {}
-    for ts, name, dur in launches:
+    for ts, name, dur, api_name in launches:
         node = _deepest_at(roots, ts)
         if node is None:
             continue
@@ -344,10 +409,10 @@ def _attribute_kernels(roots: list[_Raw],
         mod = _enclosing_module(node, parent)
         if mod is None:
             continue
-        key = (id(mod), _clean_kernel_name(name))
+        key = (id(mod), api_name or _clean_kernel_name(name))
         op = synth.get(key)
         if op is None:
-            op = _Raw("op", _synthetic_op_label(name), ts, 0.0)
+            op = _Raw("op", _synthetic_op_label(name, api_name), ts, 0.0)
             synth[key] = op
             mod.children.append(op)
             parent[id(op)] = mod
