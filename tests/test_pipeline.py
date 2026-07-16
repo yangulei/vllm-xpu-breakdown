@@ -2159,6 +2159,72 @@ class TestGraphFromTrace(unittest.TestCase):
         self.assertEqual(fi_op["backend"], "flashinfer")
         self.assertAlmostEqual(fi_op["device_time_us"], 4.0, places=3)
 
+    def test_flash_xpu_kernel_named_after_xattention_api_frame(self):
+        # MiniMax-M3 MSA (lightning indexer + block-sparse attend) runs on XPU
+        # via the ``flash_xpu`` (``flash_attn_2_xpu``) SYCL kernels, launched
+        # directly from the ``xattention.py`` wrappers with no aten/_C cpu_op.
+        # The raw kernel symbol (``flash_xpu::(anonymous namespace)::
+        # index_score_kernel_t``) is long and would misclassify as triton; the
+        # synthetic op must instead be named after the public xattention API
+        # frame (``flash_xpu::minimax_m3_index_score``) and classify as the
+        # ``flash_xpu`` backend.
+        from breakdown.graph_from_trace import build_graph_from_trace
+        tid = 7
+        fx_kernel = "flash_xpu::(anonymous namespace)::index_score_kernel_t"
+        events = [
+            {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
+             "ts": 0, "dur": 100, "name": "nn.Module: TinyForCausalLM_0"},
+            {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
+             "ts": 1, "dur": 98, "name": "nn.Module: TinyModel_0"},
+            {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
+             "ts": 10, "dur": 30, "name": "nn.Module: TinyDecoderLayer_0"},
+            {"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+             "ts": 11, "dur": 8, "name": "aten::linear",
+             "args": {"External id": 1, "Input Dims": [[8, 16], [48, 16]],
+                      "Input type": ["c10::BFloat16", "c10::BFloat16"]}},
+            {"ph": "X", "cat": "xpu_runtime", "tid": tid, "pid": tid,
+             "ts": 12, "dur": 0.1, "name": "urEnqueueKernelLaunch",
+             "args": {"correlation": 1, "External id": 1}},
+            {"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+             "ts": 2000, "dur": 5.0, "name": "gemm_xpu_kernel",
+             "args": {"correlation": 1}},
+            # Public xattention API frame (outer) + pybind builtin (inner) — the
+            # ``xattention.py`` wrapper name must win.
+            {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
+             "ts": 28, "dur": 8,
+             "name": ("/x/vllm/models/minimax_m3/xpu/ops/xattention.py(63): "
+                      "minimax_m3_index_score")},
+            {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
+             "ts": 29, "dur": 6,
+             "name": ("<built-in method minimax_m3_index_score of "
+                      "pybind11_builtins.pybind11_detail_function_record>")},
+            {"ph": "X", "cat": "xpu_runtime", "tid": tid, "pid": tid,
+             "ts": 30, "dur": 0.1, "name": "urEnqueueKernelLaunch",
+             "args": {"correlation": 2, "External id": 999}},
+            {"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+             "ts": 3000, "dur": 4.0, "name": fx_kernel,
+             "args": {"correlation": 2}},
+        ]
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"traceEvents": events}, f)
+            path = f.name
+        try:
+            g = build_graph_from_trace(path, self.SUMMARY, tp_size=1,
+                                       batch_size=1)
+        finally:
+            os.unlink(path)
+
+        def all_ops(node):
+            yield from node.get("ops", [])
+            for c in node.get("children", []):
+                yield from all_ops(c)
+
+        ops = list(all_ops(g["prefill"]))
+        fx_op = next(o for o in ops if "flash_xpu" in o["name"].lower())
+        self.assertEqual(fx_op["name"], "flash_xpu::minimax_m3_index_score")
+        self.assertEqual(fx_op["backend"], "flash_xpu")
+        self.assertAlmostEqual(fx_op["device_time_us"], 4.0, places=3)
+
     def test_layer_extrapolation_to_config_count(self):
         # Reduced-layer profiling captures 2 decoder layers; the config says the
         # model has 5. The unprofiled layers fold into the last decoder group.

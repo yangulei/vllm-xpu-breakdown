@@ -428,10 +428,11 @@ Classifies ops by name prefix/pattern to backends. Priority order:
 1. ccl (collective-comm: `c10d::`/`ccl::` namespaces or all_reduce/all_gather/reduce_scatter/all_to_all keywords)
 2. vllm-xpu-kernels (exact match from registry)
 3. flashinfer (op name contains `flashinfer` — FlashInfer RMSNorm/attention kernels launched directly from Python)
-4. triton (kernel name patterns)
-5. torch-xpu-ops (aten:: ops that run on XPU)
-6. cpu (fallback ops)
-7. framework (reshaping, profiler markers)
+4. flash_xpu (op name contains `flash_xpu` — MiniMax-M3 MSA xattention SYCL kernels launched directly from Python)
+5. triton (kernel name patterns)
+6. torch-xpu-ops (aten:: ops that run on XPU)
+7. cpu (fallback ops)
+8. framework (reshaping, profiler markers)
 
 CCL is checked **first** so tensor/pipeline-parallel comm calls (including
 `vllm::all_reduce`-style ops) land in their own category rather than being
@@ -446,6 +447,15 @@ fused-add-RMSNorm / attention kernels are launched straight from Python with no
 `triton::kernel_cutlass_kernel_flashinfernormkernelsrmsnormRMSNormKernel_...`).
 The embedded `flashinfer` symbol routes them to their own backend rather than
 `triton`.
+
+**flash_xpu** (MiniMax-M3 MSA / xattention) is likewise checked **before**
+Triton: the lightning-indexer and block-sparse GQA attend SYCL kernels live in
+the `flash_attn_2_xpu` (`flash_xpu`) extension and are launched straight from
+the `xattention.py` wrappers with no `aten`/`_C` cpu_op, so they surface as
+synthetic ops whose raw symbol embeds `flash_xpu` (e.g.
+`flash_xpu::(anonymous namespace)::index_score_kernel_t`,
+`flash_xpu::msa_index_topk_xpu(...)`). The embedded `flash_xpu` symbol routes
+them to their own backend rather than `triton`.
 
 ## Conventions
 
@@ -708,6 +718,30 @@ static builder. Ensure:
   Triton pattern match). When no such API frame is found (legacy/synthetic
   traces) it falls back to the cleaned raw kernel symbol. See
   `TestGraphFromTrace.test_flashinfer_kernel_named_after_public_api_frame`.
+- **xattention (MiniMax-M3 MSA) kernels classify as the `flash_xpu` backend and
+  are named after their xattention API frame.** MiniMax-M3 sparse attention on
+  XPU (the lightning indexer's block score + top-k, and the block-sparse GQA
+  attend) runs as hand-tuned SYCL kernels in the `flash_attn_2_xpu`
+  (`flash_xpu`) extension, launched directly from the `xattention.py` wrappers
+  with no `aten`/`_C` cpu_op, so `_attribute_kernels` surfaces them as synthetic
+  ops on the enclosing module (the `Indexer` / sparse-attention module). Rather
+  than the long raw SYCL symbol (`flash_xpu::(anonymous namespace)::
+  index_score_kernel_t`, `flash_xpu::msa_index_topk_xpu(at::Tensor const&, ...)::
+  {lambda...`), the op is named after the **public xattention API python frame**
+  that launched it — the outermost `xattention.py(...): <func>` frame whose
+  function name is public (no leading `_`) — so they read
+  `flash_xpu::minimax_m3_index_score`, `flash_xpu::minimax_m3_index_topk`,
+  `flash_xpu::minimax_m3_sparse_attn` (prefill) and
+  `flash_xpu::minimax_m3_index_decode`, `flash_xpu::minimax_m3_sparse_attn_decode`
+  (decode). `_collect_flash_xpu_api_frames` gathers those frames on the worker
+  thread and `_flash_xpu_api_name` picks the one enclosing each kernel launch;
+  the `flash_xpu::` namespace prefix is kept so `classify_op` routes any op whose
+  name contains `flash_xpu` to `Backend.FLASH_XPU` (checked **before** the Triton
+  pattern match, since the fallback synthetic name would otherwise misclassify
+  these SYCL kernels as `triton`). When no such API frame is found
+  (legacy/synthetic traces) it falls back to the cleaned raw kernel symbol under
+  `flash_xpu::`. See
+  `TestGraphFromTrace.test_flash_xpu_kernel_named_after_xattention_api_frame`.
 - **`vllm::` namespace ops classify as vllm-xpu-kernels.** `classify_op` maps the
   `vllm::` prefix (dispatch ops: `unified_attention_with_output`,
   `unified_kv_cache_update`, `moe_forward_shared`, `xpu_topk_topp_sampler`)

@@ -202,6 +202,11 @@ def _collect_kernel_launches(events: list[dict], worker_tid: Any
     # ``flashinfer/norm/__init__.py(433): gemma_fused_add_rmsnorm``) instead of
     # the raw cutlass functor symbol.
     fi_api_frames = _collect_flashinfer_api_frames(events, worker_tid)
+    # Public xattention API frames on the worker thread, so a Python-direct
+    # MiniMax-M3 MSA SYCL kernel can be named after its ``xattention.py``
+    # wrapper (e.g. ``minimax_m3_index_score``, ``minimax_m3_sparse_attn``)
+    # instead of the raw ``flash_xpu::(anonymous namespace)::...`` symbol.
+    fx_api_frames = _collect_flash_xpu_api_frames(events, worker_tid)
 
     launches: list[tuple[float, str, float, str | None]] = []
     for evt in events:
@@ -223,14 +228,16 @@ def _collect_kernel_launches(events: list[dict], worker_tid: Any
         rt = corr_to_rt.get(corr) if corr is not None else None
         if rt is not None and rt.get("tid") == worker_tid:
             ts = rt.get("ts", 0)
-            friendly = _flashinfer_api_name(name, ts, fi_api_frames)
+            friendly = (_flashinfer_api_name(name, ts, fi_api_frames)
+                        or _flash_xpu_api_name(name, ts, fx_api_frames))
             launches.append((ts, name, dur, friendly))
         else:
             # Fallback: use External id to find the issuing CPU op's timestamp
             ext = args.get("External id")
             if ext is not None and ext in ext_to_ts:
                 ts = ext_to_ts[ext]
-                friendly = _flashinfer_api_name(name, ts, fi_api_frames)
+                friendly = (_flashinfer_api_name(name, ts, fi_api_frames)
+                            or _flash_xpu_api_name(name, ts, fx_api_frames))
                 launches.append((ts, name, dur, friendly))
     return launches
 
@@ -275,6 +282,55 @@ def _flashinfer_api_name(kernel_name: str, launch_ts: float,
     best: str | None = None
     best_dur = -1.0
     for ts, end, func in fi_api_frames:
+        if ts <= launch_ts < end:
+            dur = end - ts
+            if dur > best_dur:
+                best, best_dur = func, dur
+    return best
+
+
+def _collect_flash_xpu_api_frames(events: list[dict], worker_tid: Any
+                                  ) -> list[tuple[float, float, str]]:
+    """Enclosing public xattention API frames as ``(ts, end, funcname)``.
+
+    The MiniMax-M3 MSA SYCL kernels (lightning indexer + block-sparse attend)
+    are launched from the thin ``xattention.py`` wrappers
+    (``minimax_m3_index_score``, ``minimax_m3_index_topk``,
+    ``minimax_m3_index_decode``, ``minimax_m3_sparse_attn``,
+    ``minimax_m3_sparse_attn_decode``). We keep only those public
+    (non-underscore) ``xattention.py`` frames on the worker thread so a
+    Python-direct ``flash_xpu`` kernel can be named after the API that launched
+    it rather than the raw ``flash_xpu::(anonymous namespace)::...`` symbol.
+    """
+    frames: list[tuple[float, float, str]] = []
+    for evt in events:
+        if evt.get("cat") != "python_function" or evt.get("tid") != worker_tid:
+            continue
+        nm = evt.get("name", "")
+        if "xattention.py(" not in nm:
+            continue
+        func = nm.rsplit("): ", 1)[-1].strip()
+        if not func or func.startswith("_"):
+            continue
+        ts = evt.get("ts", 0)
+        frames.append((ts, ts + (evt.get("dur", 0) or 0), func))
+    return frames
+
+
+def _flash_xpu_api_name(kernel_name: str, launch_ts: float,
+                        fx_api_frames: list[tuple[float, float, str]]
+                        ) -> str | None:
+    """Public xattention API name for a ``flash_xpu`` kernel at ``launch_ts``.
+
+    Returns the outermost enclosing public ``xattention.py`` frame's function
+    name (``minimax_m3_index_score``), or ``None`` when the kernel is not an
+    xattention (``flash_xpu``) kernel or no such frame contains the launch.
+    """
+    if "flash_xpu" not in kernel_name.lower():
+        return None
+    best: str | None = None
+    best_dur = -1.0
+    for ts, end, func in fx_api_frames:
         if ts <= launch_ts < end:
             dur = end - ts
             if dur > best_dur:
@@ -356,18 +412,23 @@ def _clean_kernel_name(name: str) -> str:
 def _synthetic_op_label(name: str, api_name: str | None = None) -> str:
     """Namespaced display label for a Python-direct device kernel (no cpu_op).
 
-    FlashInfer kernels get a ``flashinfer::`` namespace (rather than
+    FlashInfer kernels get a ``flashinfer::`` namespace and MiniMax-M3 MSA
+    xattention SYCL kernels get a ``flash_xpu::`` namespace (rather than
     ``triton::``, which misrepresented them as Triton-compiled); every other
-    orphan kernel keeps ``triton::``. When the launching public FlashInfer API
-    name is known (``api_name``, e.g. ``gemma_fused_add_rmsnorm``) it is used in
-    place of the raw cutlass functor symbol so the label is short and matches
-    the readable XPU kernel names; otherwise the ``_object_at...`` object-repr
-    tail is dropped from the raw symbol so the name stays readable.
+    orphan kernel keeps ``triton::``. When the launching public API name is
+    known (``api_name``, e.g. ``gemma_fused_add_rmsnorm`` /
+    ``minimax_m3_index_score``) it is used in place of the raw cutlass functor /
+    ``flash_xpu::(anonymous namespace)::...`` symbol so the label is short and
+    matches the readable API; otherwise the ``_object_at...`` object-repr tail
+    is dropped from the raw symbol so the name stays readable.
     """
     clean = _clean_kernel_name(name)
+    low = clean.lower()
+    if "flash_xpu" in low:
+        return "flash_xpu::" + (api_name or clean)
     if api_name:
         return "flashinfer::" + api_name
-    if "flashinfer" in clean.lower():
+    if "flashinfer" in low:
         return "flashinfer::" + clean
     return "triton::" + clean
 

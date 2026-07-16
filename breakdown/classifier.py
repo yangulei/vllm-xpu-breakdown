@@ -13,6 +13,7 @@ class Backend(str, Enum):
     """Dispatch backend for an operation."""
     VLLM_XPU_KERNELS = "vllm-xpu-kernels"
     FLASHINFER = "flashinfer"
+    FLASH_XPU = "flash_xpu"
     TRITON = "triton"
     TORCH_XPU_OPS = "torch-xpu-ops"
     CPU = "cpu"
@@ -52,6 +53,17 @@ def _is_ccl(name: str) -> bool:
 # ``kernel_cutlass_kernel_flashinfernormkernelsrmsnormRMSNormKernel_...``).
 _FLASHINFER_INDICATORS = (
     "flashinfer",
+)
+
+# Op name substrings that indicate xattention SYCL kernels (MiniMax-M3 MSA on
+# XPU). The lightning-indexer (block score + top-k) and block-sparse GQA attend
+# kernels live in the ``flash_attn_2_xpu`` (``flash_xpu``) extension and are
+# launched directly from Python via the ``xattention.py`` wrappers (no
+# ``aten``/``_C`` cpu_op), so they surface as synthetic kernel ops whose name
+# embeds ``flash_xpu`` (e.g. ``flash_xpu::(anonymous namespace)::
+# index_score_kernel_t``, ``flash_xpu::msa_index_topk_xpu(...)``).
+_FLASH_XPU_INDICATORS = (
+    "flash_xpu",
 )
 
 # Op name prefixes/substrings that indicate Triton-compiled kernels
@@ -244,6 +256,13 @@ def classify_op(name: str, device_type: str = "",
     for indicator in _FLASHINFER_INDICATORS:
         if indicator in low:
             return Backend.FLASHINFER, "flashinfer-kernel"
+
+    # 2b. Check for xattention SYCL kernels (MiniMax-M3 MSA on XPU) — before
+    #     Triton, since the fallback synthetic name would otherwise be
+    #     ``triton::``-prefixed while these are hand-tuned SYCL kernels.
+    for indicator in _FLASH_XPU_INDICATORS:
+        if indicator in low:
+            return Backend.FLASH_XPU, "xattention-kernel"
 
     # 3. Check for Triton kernels
     for indicator in _TRITON_INDICATORS:

@@ -27,7 +27,7 @@ _KERNEL_CATEGORIES = {"kernel", "gpu_memcpy", "xpu_op", "gpu_op", "cuda_op",
 _COMPUTE_BACKENDS = frozenset({
     "vllm-xpu-kernels", "vllm-cuda-kernels",
     "torch-xpu-ops", "torch-cuda-ops",
-    "triton", "ccl",
+    "triton", "ccl", "flashinfer", "flash_xpu",
 })
 
 
