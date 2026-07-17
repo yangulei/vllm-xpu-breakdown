@@ -450,7 +450,7 @@ The embedded `flashinfer` symbol routes them to their own backend rather than
 
 **flash_xpu** (MiniMax-M3 MSA / xattention) is likewise checked **before**
 Triton: the lightning-indexer and block-sparse GQA attend SYCL kernels live in
-the `flash_attn_2_xpu` (`flash_xpu`) extension and are launched straight from
+the `xattention._C` (`flash_xpu`) extension and are launched straight from
 the `xattention.py` wrappers with no `aten`/`_C` cpu_op, so they surface as
 synthetic ops whose raw symbol embeds `flash_xpu` (e.g.
 `flash_xpu::(anonymous namespace)::index_score_kernel_t`,
@@ -721,7 +721,7 @@ static builder. Ensure:
 - **xattention (MiniMax-M3 MSA) kernels classify as the `flash_xpu` backend and
   are named after their xattention API frame.** MiniMax-M3 sparse attention on
   XPU (the lightning indexer's block score + top-k, and the block-sparse GQA
-  attend) runs as hand-tuned SYCL kernels in the `flash_attn_2_xpu`
+  attend) runs as hand-tuned SYCL kernels in the `xattention._C`
   (`flash_xpu`) extension, launched directly from the `xattention.py` wrappers
   with no `aten`/`_C` cpu_op, so `_attribute_kernels` surfaces them as synthetic
   ops on the enclosing module (the `Indexer` / sparse-attention module). Rather

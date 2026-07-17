@@ -57,7 +57,7 @@ _FLASHINFER_INDICATORS = (
 
 # Op name substrings that indicate xattention SYCL kernels (MiniMax-M3 MSA on
 # XPU). The lightning-indexer (block score + top-k) and block-sparse GQA attend
-# kernels live in the ``flash_attn_2_xpu`` (``flash_xpu``) extension and are
+# kernels live in the ``xattention._C`` (``flash_xpu``) extension and are
 # launched directly from Python via the ``xattention.py`` wrappers (no
 # ``aten``/``_C`` cpu_op), so they surface as synthetic kernel ops whose name
 # embeds ``flash_xpu`` (e.g. ``flash_xpu::(anonymous namespace)::

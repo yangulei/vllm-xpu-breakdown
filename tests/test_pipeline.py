@@ -2161,7 +2161,7 @@ class TestGraphFromTrace(unittest.TestCase):
 
     def test_flash_xpu_kernel_named_after_xattention_api_frame(self):
         # MiniMax-M3 MSA (lightning indexer + block-sparse attend) runs on XPU
-        # via the ``flash_xpu`` (``flash_attn_2_xpu``) SYCL kernels, launched
+        # via the ``flash_xpu`` (``xattention._C``) SYCL kernels, launched
         # directly from the ``xattention.py`` wrappers with no aten/_C cpu_op.
         # The raw kernel symbol (``flash_xpu::(anonymous namespace)::
         # index_score_kernel_t``) is long and would misclassify as triton; the
