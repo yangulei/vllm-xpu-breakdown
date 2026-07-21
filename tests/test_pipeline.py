@@ -114,14 +114,25 @@ def _make_mock_trace(ops: list[dict], kernels: list[dict] | None = None) -> dict
 
 
 def _get_real_trace_file() -> str | None:
-    """Return path to the real trace file if available."""
+    """Return path to the newest *loadable* real trace file, if any.
+
+    The shared ``output/traces/`` dir may contain partial/corrupt stub files
+    (e.g. zero-length or truncated ``.json.gz`` from another in-progress run), so
+    skip any file that doesn't parse into a non-empty op list and return the
+    newest one that does.
+    """
     if not os.path.isdir(_TRACE_DIR):
         return None
     files = [os.path.join(_TRACE_DIR, f) for f in os.listdir(_TRACE_DIR)
              if f.endswith(".json") or f.endswith(".json.gz")]
-    if not files:
-        return None
-    return sorted(files, key=os.path.getmtime, reverse=True)[0]
+    for path in sorted(files, key=os.path.getmtime, reverse=True):
+        try:
+            ops = parse_trace_file(path)
+        except Exception:
+            continue
+        if ops:
+            return path
+    return None
 
 
 def _find_multilayer_trace(num_layers: int, scan_limit: int = 12):
