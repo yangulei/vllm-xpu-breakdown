@@ -1885,6 +1885,23 @@ def _build_symbol_tables(summary: dict, tp_size: int
         add("E", summary["num_experts"])
     if summary.get("moe_intermediate_size"):
         add("I_moe", summary["moe_intermediate_size"])
+    # Rope cos/sin cache length (``[max_position, rotary_dim]``). Not divided by
+    # TP (the position table is replicated per rank).
+    max_pos = summary.get("max_position_embeddings")
+    if max_pos:
+        sym_to_val.setdefault("P", max_pos)
+        val_to_sym.setdefault(max_pos, "P")
+    # DeepSeek/MiniMax-M3 sparse attention fuses the lightning-indexer's query
+    # and key projections into the qkv_proj, so its output width is the plain
+    # QKV plus ``2·(n_index_heads·index_dim)``. Register the augmented width as a
+    # distinct symbol so the sparse qkv_proj / normed-qkv shapes symbolize
+    # (``QKV_idx/TP``) instead of leaking a per-rank integer.
+    if summary.get("sparse_attention") and n_h and d:
+        n_idx = summary.get("sparse_num_index_heads")
+        idx_d = summary.get("sparse_index_dim")
+        if n_idx and idx_d:
+            qkv = (n_h + 2 * (n_kv or n_h)) * d
+            add("QKV_idx", qkv + 2 * n_idx * idx_d)
     sym_to_val["TP"] = tp_size
     return val_to_sym, sym_to_val
 
@@ -2004,6 +2021,109 @@ def _dim_is(sym: Any, value: int) -> bool:
     # Symbolic head-count dims render as "n_kv" / "n_kv/TP"; treat any n_kv label
     # as the KV-head dimension.
     return isinstance(sym, str) and sym.split("/")[0] in ("n_kv", "n_h·d_kv")
+
+
+# Concrete dims at or below this value are structural constants (k/v pair,
+# real/imag split, singleton broadcasts), not dimensions to symbolize.
+_RUNTIME_TRIVIAL_MAX = 2
+
+# Op-name substrings → the symbol base for their run-specific allocation dims.
+# Ordered: the first family whose substring appears in the op name wins.
+_RUNTIME_DIM_FAMILIES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("kv_insert", "reshape_and_cache", "kv_cache", "paged_attention",
+      "block_table", "kv_update"), "N_kv"),
+    (("moe", "expert", "silu_and_mul", "fused_moe", "topk_bias"), "M_moe"),
+)
+
+
+def _runtime_family_base(op_name: str, ndim: int) -> str:
+    """Pick the observed-symbol base for a concrete runtime dim.
+
+    ``N_kv`` for paged KV-cache allocation dims, ``M_moe`` for MoE expert-GEMM
+    routed-token rows (multi-dim activations), ``N_moe`` for the MoE block-align
+    metadata scratch buffers (1-D), and a generic ``N`` for anything else so the
+    "no concrete structural values" invariant always holds.
+    """
+    low = op_name.lower()
+    for subs, base in _RUNTIME_DIM_FAMILIES:
+        if any(s in low for s in subs):
+            if base == "M_moe" and ndim < 2:
+                # 1-D moe_align_block_size scratch (sorted-token / expert-block
+                # buffers) rather than an expert-GEMM activation row count.
+                return "N_moe"
+            return base
+    return "N"
+
+
+def _iter_ops(node: dict):
+    if not node:
+        return
+    for op in node.get("ops", []):
+        yield op
+    for c in node.get("children", []):
+        yield from _iter_ops(c)
+
+
+def _symbolize_runtime_dims(trees: list[dict | None],
+                            sym_to_val: dict[str, int]) -> None:
+    """Replace remaining concrete integer dims with observed-value symbols.
+
+    Structural/config dims are already symbolized by :func:`_build_symbol_tables`
+    and the token/context passes; what remains are run-specific allocation sizes
+    (paged KV-cache slot counts, CUDA Triton-MoE routed-token / block-align
+    buffers). Each distinct ``(base, value)`` gets a stable symbol (``N_kv``,
+    ``M_moe``, ``N_moe``, or generic ``N`` — suffixed ``2``/``3``/… when a base
+    carries several distinct values) recorded in ``sym_to_val`` so nothing
+    structural is left as a bare integer while the concrete number stays in the
+    legend. Trivial dims (``≤2``) are left untouched.
+    """
+    # Pass 1: collect distinct concrete values per family base (deterministic).
+    per_base: dict[str, set[int]] = {}
+    for tree in trees:
+        for op in _iter_ops(tree):
+            name = op.get("name", "")
+            for shp in (op.get("input_shapes") or []):
+                if not isinstance(shp, list):
+                    continue
+                ndim = len(shp)
+                for dim in shp:
+                    if isinstance(dim, int) and dim > _RUNTIME_TRIVIAL_MAX:
+                        base = _runtime_family_base(name, ndim)
+                        per_base.setdefault(base, set()).add(dim)
+
+    if not per_base:
+        return
+
+    # Assign a stable symbol to each distinct value: largest value keeps the bare
+    # base, further distinct values get numeric suffixes (sorted descending).
+    value_to_sym: dict[tuple[str, int], str] = {}
+    for base, values in per_base.items():
+        for i, val in enumerate(sorted(values, reverse=True)):
+            sym = base if i == 0 else f"{base}{i + 1}"
+            value_to_sym[(base, val)] = sym
+            sym_to_val.setdefault(sym, val)
+
+    # Pass 2: rewrite the shapes in place.
+    for tree in trees:
+        for op in _iter_ops(tree):
+            name = op.get("name", "")
+            for shp in (op.get("input_shapes") or []):
+                if not isinstance(shp, list):
+                    continue
+                ndim = len(shp)
+                for j, dim in enumerate(shp):
+                    if isinstance(dim, int) and dim > _RUNTIME_TRIVIAL_MAX:
+                        base = _runtime_family_base(name, ndim)
+                        shp[j] = value_to_sym[(base, dim)]
+            out = op.get("output_shape")
+            if isinstance(out, list):
+                ndim = len(out)
+                for j, dim in enumerate(out):
+                    if isinstance(dim, int) and dim > _RUNTIME_TRIVIAL_MAX:
+                        base = _runtime_family_base(name, ndim)
+                        key = (base, dim)
+                        if key in value_to_sym:
+                            out[j] = value_to_sym[key]
 
 
 def _forest_has_named_modules(roots: list[_Raw]) -> bool:
@@ -2151,6 +2271,14 @@ def build_graph_from_trace(
         sym_to_val["S"] = prefill_tokens
     if decode_tokens:
         sym_to_val["B"] = decode_tokens
+
+    # Symbolize any remaining concrete integer dims that aren't derivable from
+    # the model config or S/B/C — chiefly run-specific allocation sizes: the
+    # paged KV-cache slot count (``N_kv``) and the CUDA Triton-MoE routed-token /
+    # block-align scratch buffers (``M_moe`` / ``N_moe``). Each distinct value is
+    # assigned an observed-value symbol recorded in the legend so the shape reads
+    # a symbol while the concrete number stays available for tooltips/exports.
+    _symbolize_runtime_dims([prefill_tree, decode_tree], sym_to_val)
 
     total_ops = 0
     for tree in (prefill_tree, decode_tree):

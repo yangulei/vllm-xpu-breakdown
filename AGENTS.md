@@ -356,6 +356,29 @@ Op shapes use symbolic expressions for dimensions:
 - **`symbols` dict** in result contains original (undivided) values + `"TP": tp_size` (always present, even TP=1)
 - **Variable symbols** stay symbolic in exports: `S` (seq_len), `B` (batch), `C` (context_len), `TP`
 - Frontend `symTooltip()` resolves `/TP` suffix by dividing base value by TP
+- **No concrete structural dims leak.** `_build_symbol_tables` registers the
+  config-derived dims (`H`/`n_h`/`n_kv`/`d`/`I`/`I_moe`/`V`/`n_h·d`/`QKV`/`2·I`/`E`
+  + their `/TP` shards) **plus**: `P` = `max_position_embeddings` (rope cos/sin
+  cache length, **not** divided by TP — the table is replicated per rank) and,
+  for DeepSeek/MiniMax-M3-style sparse attention, `QKV_idx` =
+  `(n_h+2·n_kv)·d + 2·(sparse_num_index_heads·sparse_index_dim)` — the qkv_proj
+  fuses the lightning-indexer's q/k projections, so its output width exceeds the
+  plain `QKV` (M3: `QKV`=9216 vs `QKV_idx`=10240; per-rank `2304` vs `2560`).
+  Run-specific **allocation** dims that aren't config/S/B/C-derivable are then
+  symbolized by `_symbolize_runtime_dims` (after phase-tree build) with
+  **observed-value** symbols recorded in the legend: `N_kv` (paged KV-cache slot
+  count in `fused_minimax_m3_qknorm_rope_kv_insert` / cache ops — XPU `17286`,
+  CUDA `114848`), `M_moe` (CUDA Triton-MoE expert-GEMM routed-token rows, e.g.
+  `silu_and_mul_with_clamp` `[16384, I_moe/TP]`), and `N_moe`/`N_moe2` (1-D
+  `moe_align_block_size` sorted-token / expert-block scratch buffers). Distinct
+  values under one base are suffixed deterministically (largest keeps the bare
+  base). Trivial dims (`≤2` — the k/v-pair `2`, `0`/`1` placeholders/broadcasts)
+  are intentionally left concrete. Verified: reconstructing the four MiniMax-M3
+  `tp4` traces (XPU/CUDA × prefill/decode) leaves **no** concrete structural
+  integer `>2` in any op shape (`TestSymbolicShapeCompleteness`). Note: the
+  per-rank MoE gate_up width `2·I_moe/TP`=1536 coincidentally equals `H/TP`, so
+  it renders `H/TP` (symbolic, benign collision), as do `d`=`sparse_index_dim`=128
+  and `rotary_dim`=`n_h`=64.
 
 ### Quantization Support
 

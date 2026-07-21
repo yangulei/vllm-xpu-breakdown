@@ -2563,6 +2563,138 @@ class TestGraphFromTrace(unittest.TestCase):
             self.skipTest("no readable MiniMax-M3 trace files present")
 
 
+class TestSymbolicShapeCompleteness(unittest.TestCase):
+    """No concrete structural dims leak into symbolic shapes (MiniMax-M3)."""
+
+    # MiniMax-M3 text_config dims: hybrid dense/MoE + DeepSeek-style sparse
+    # attention (lightning indexer fused into qkv_proj) + a 1M rope cache.
+    M3_SUMMARY = {
+        "architecture": "MiniMaxM3SparseForCausalLM",
+        "hidden_size": 6144, "num_heads": 64, "num_kv_heads": 4, "head_dim": 128,
+        "intermediate_size": 12288, "moe_intermediate_size": 3072,
+        "num_experts": 128, "vocab_size": 200064,
+        "max_position_embeddings": 1048576, "num_layers": 60, "dtype": "bfloat16",
+        "sparse_attention": True, "sparse_index_dim": 128,
+        "sparse_num_index_heads": 4,
+    }
+
+    def test_config_symbols_include_sparse_qkv_and_rope_cache(self):
+        from breakdown.graph_from_trace import _build_symbol_tables
+        val_to_sym, sym_to_val = _build_symbol_tables(self.M3_SUMMARY, 4)
+        # Rope cos/sin cache length = max_position_embeddings → P (not /TP).
+        self.assertEqual(sym_to_val["P"], 1048576)
+        self.assertEqual(val_to_sym[1048576], "P")
+        # Sparse qkv_proj fuses the lightning-indexer q/k projections:
+        # QKV_idx = (n_h + 2*n_kv)*d + 2*(n_index_heads*index_dim)
+        #         = (64 + 8)*128 + 2*(4*128) = 9216 + 1024 = 10240.
+        self.assertEqual(sym_to_val["QKV_idx"], 10240)
+        self.assertEqual(val_to_sym[10240], "QKV_idx")
+        self.assertEqual(val_to_sym[2560], "QKV_idx/TP")  # per-rank at TP=4
+        # The plain (dense) QKV and its per-rank shard still resolve.
+        self.assertEqual(val_to_sym[9216], "QKV")
+        self.assertEqual(val_to_sym[2304], "QKV/TP")
+        # Head-count per-rank dims resolve (position of the leak the user saw).
+        self.assertEqual(val_to_sym[16], "n_h/TP")
+        self.assertEqual(val_to_sym[1], "n_kv/TP")
+
+    def test_runtime_dims_symbolized_with_observed_values(self):
+        from breakdown.graph_from_trace import _symbolize_runtime_dims
+        # A minimal tree carrying the run-specific allocation dims that aren't
+        # config-derivable: paged KV-cache slots, MoE routed-token rows, and the
+        # 1-D moe_align_block_size scratch buffers.
+        tree = {
+            "module_type": "Model", "ops": [], "children": [
+                {"module_type": "MiniMaxM3SparseAttention", "children": [],
+                 "ops": [{
+                     "name": "_C::fused_minimax_m3_qknorm_rope_kv_insert",
+                     "input_shapes": [["N", 2, "d", "n_kv/TP", "d"],
+                                      [17286, "d", "d"]]}]},
+                {"module_type": "TritonExperts", "children": [],
+                 "ops": [
+                     {"name": "_C::silu_and_mul_with_clamp",
+                      "input_shapes": [[16384, "I_moe/TP"]]},
+                     {"name": "_moe_C::moe_align_block_size",
+                      "input_shapes": [[32640], [255]]},
+                 ]},
+            ],
+        }
+        # Fix the placeholder above: both kv rows share the same slot count.
+        tree["children"][0]["ops"][0]["input_shapes"][0][0] = 17286
+        sym_to_val: dict = {}
+        _symbolize_runtime_dims([tree], sym_to_val)
+
+        kv_op = tree["children"][0]["ops"][0]
+        self.assertEqual(kv_op["input_shapes"][0], ["N_kv", 2, "d", "n_kv/TP", "d"])
+        self.assertEqual(kv_op["input_shapes"][1], ["N_kv", "d", "d"])
+        self.assertEqual(sym_to_val["N_kv"], 17286)
+
+        experts = tree["children"][1]["ops"]
+        # 2-D expert-GEMM row count → M_moe.
+        self.assertEqual(experts[0]["input_shapes"][0], ["M_moe", "I_moe/TP"])
+        self.assertEqual(sym_to_val["M_moe"], 16384)
+        # 1-D moe_align scratch → N_moe (largest) / N_moe2 (next), deterministic.
+        self.assertEqual(sym_to_val["N_moe"], 32640)
+        self.assertEqual(sym_to_val["N_moe2"], 255)
+        self.assertEqual(experts[1]["input_shapes"], [["N_moe"], ["N_moe2"]])
+
+    def test_trivial_dims_left_concrete(self):
+        from breakdown.graph_from_trace import _symbolize_runtime_dims
+        # The k/v-pair constant 2 (and 0/1 placeholders) must stay literal.
+        tree = {"module_type": "M", "children": [], "ops": [
+            {"name": "_C::kv_cache_update", "input_shapes": [[2], [1], [0]]}]}
+        sym_to_val: dict = {}
+        _symbolize_runtime_dims([tree], sym_to_val)
+        self.assertEqual(tree["ops"][0]["input_shapes"], [[2], [1], [0]])
+
+    def test_minimax_m3_traces_no_concrete_structural_dims(self):
+        # End-to-end over the real MiniMax-M3 traces (XPU + CUDA, prefill +
+        # decode): after reconstruction no op input shape may carry a concrete
+        # integer above the trivial threshold (2). Skipped when traces absent.
+        import glob
+        from breakdown.graph_from_trace import build_graph_from_trace, _load_trace
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        files = sorted(glob.glob(os.path.join(
+            here, "output", "traces", "vllm_trace_MiniMax-M3_*_tp4_*layers.json.gz")))
+        if not files:
+            self.skipTest("MiniMax-M3 trace files not present")
+        checked = 0
+        for f in files:
+            base = os.path.basename(f)
+            # The shared traces dir may hold partial/LFS-stub files; skip any
+            # that aren't a readable trace with events.
+            try:
+                if not _load_trace(f).get("traceEvents"):
+                    continue
+            except (OSError, ValueError):
+                continue
+            is_prefill = "prefill" in base
+            g = build_graph_from_trace(
+                f, self.M3_SUMMARY, tp_size=4,
+                batch_size=(1 if is_prefill else 32),
+                query_len=(2048 if is_prefill else 1), context_len=2048)
+
+            def concretes(node, acc):
+                if not node:
+                    return
+                for op in node.get("ops", []):
+                    for shp in (op.get("input_shapes") or []):
+                        if not isinstance(shp, list):
+                            continue
+                        for dim in shp:
+                            if isinstance(dim, int) and dim > 2:
+                                acc.append((op["name"], tuple(shp)))
+                for c in node.get("children", []):
+                    concretes(c, acc)
+
+            acc: list = []
+            concretes(g.get("prefill"), acc)
+            concretes(g.get("decode"), acc)
+            self.assertEqual(acc, [], f"{base}: concrete structural dims leaked")
+            checked += 1
+        if not checked:
+            self.skipTest("no readable MiniMax-M3 trace files present")
+
+
 class TestModuleNaming(unittest.TestCase):
     """Recover real module attribute names (q_norm/k_norm, ...) for the graph."""
 
