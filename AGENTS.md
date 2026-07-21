@@ -740,7 +740,7 @@ static builder. Ensure:
   fallback). Host launch-API events (`_RUNTIME_CATEGORIES`) are never surfaced on
   a trace that has device-kernel events — they carry no device time and are only
   launch-site locators. **Do NOT put `cuda_runtime` back into the device-kernel
-  set:** it used to be in `_KERNEL_CATEGORIES`, which meant pure host bookkeeping
+  set:** it used to be in the kernel-category set, which meant pure host bookkeeping
   calls that launch nothing (`cudaEventQuery`, `cudaStreamWaitEvent`,
   `cudaDeviceGetAttribute`, `cudaStreamIsCapturing`, `cudaEventRecord`) were
   collected as fake kernel launches (on the MiniMax-M3 CUDA decode trace ~2500

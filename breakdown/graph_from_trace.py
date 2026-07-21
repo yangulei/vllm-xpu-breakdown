@@ -58,9 +58,6 @@ from .trace_parser import _infer_device_from_trace, _infer_role, _strip_instance
 _DEVICE_KERNEL_CATEGORIES = {"kernel", "gpu_memcpy", "gpu_memset", "xpu_op",
                              "gpu_op", "cuda_op", "gpu_kernel"}
 
-# Back-compat alias (some callers/tests reference ``_KERNEL_CATEGORIES``).
-_KERNEL_CATEGORIES = _DEVICE_KERNEL_CATEGORIES
-
 # Host-side launch-API event categories (``cudaLaunchKernelExC``,
 # ``cuLaunchKernelEx``, ``urEnqueueKernelLaunch``, ...). These correlate to a
 # device kernel and are used to locate its launch site; they are not surfaced as
