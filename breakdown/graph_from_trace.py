@@ -45,9 +45,21 @@ from .trace_common import (
 )
 from .trace_parser import _infer_device_from_trace, _infer_role, _strip_instance_idx
 
-# Chrome-trace categories that carry device (GPU/XPU) kernel time.
-_KERNEL_CATEGORIES = {"kernel", "gpu_memcpy", "xpu_op", "gpu_op", "cuda_op",
-                      "cuda_runtime", "gpu_kernel"}
+# Chrome-trace categories that carry actual *device* (GPU/XPU) work — real
+# compute kernels, memcpys and memsets. Every event in one of these categories
+# must be attributed to a leaf op (that is the whole point of the reconstruction:
+# no device time is lost). Host-side launch-API events (``_RUNTIME_CATEGORIES``,
+# below) are deliberately **not** in this set: they carry no device time, they
+# only pinpoint where a kernel was launched. Historically ``cuda_runtime`` was
+# lumped in here, which caused pure host bookkeeping calls that launch nothing
+# (``cudaEventQuery``, ``cudaStreamWaitEvent``, ``cudaDeviceGetAttribute``,
+# ``cudaStreamIsCapturing``, ``cudaEventRecord``) to be mistaken for kernel
+# launches and surfaced as bogus ``triton::cudaEventQuery`` leaf ops.
+_DEVICE_KERNEL_CATEGORIES = {"kernel", "gpu_memcpy", "gpu_memset", "xpu_op",
+                             "gpu_op", "cuda_op", "gpu_kernel"}
+
+# Back-compat alias (some callers/tests reference ``_KERNEL_CATEGORIES``).
+_KERNEL_CATEGORIES = _DEVICE_KERNEL_CATEGORIES
 
 # Host-side launch-API event categories (``cudaLaunchKernelExC``,
 # ``cuLaunchKernelEx``, ``urEnqueueKernelLaunch``, ...). These correlate to a
@@ -175,33 +187,44 @@ def _first_dtype(args: dict) -> str:
 def _collect_kernel_launches(events: list[dict], worker_tid: Any
                              ) -> list[tuple[float, str, float, str | None]]:
     """Collect every device kernel as ``(host_launch_ts, name, device_us,
-    flashinfer_api_name)``.
+    friendly_api_name)``.
 
-    Each device ``kernel``/``gpu_memcpy`` event is linked to the host-side
-    launch call that issued it (the "flow arrow" you see in the trace viewer)
-    via the correlation id: ``kernel.correlation → xpu_runtime.correlation``.
-    The runtime launch event carries a timestamp on the worker thread, which is
-    exactly where the launch sits inside the module/op nesting tree. Attributing
-    kernels by this *launch site* (rather than by ``External id`` bookkeeping) is
-    robust to ``torch.compile`` — fused/compiled regions and eager kernels are
-    handled identically, because both physically launch from within the module
-    that owns them.
+    Only genuine *device* events (``_DEVICE_KERNEL_CATEGORIES`` — real
+    ``kernel``/``gpu_memcpy``/``gpu_memset``) are surfaced. Each is linked to the
+    host-side launch call that issued it (the "flow arrow" you see in the trace
+    viewer) via the correlation id: ``kernel.correlation → xpu_runtime`` /
+    ``cuda_runtime`` / ``cuda_driver``. The runtime launch event carries a
+    timestamp on the worker thread, which is exactly where the launch sits inside
+    the module/op nesting tree. Attributing kernels by this *launch site* (rather
+    than by ``External id`` bookkeeping) is robust to ``torch.compile`` —
+    fused/compiled regions and eager kernels are handled identically, because
+    both physically launch from within the module that owns them.
 
-    Fallback: when a kernel has no matching runtime event on the worker thread
-    (common for flash attention kernels launched via custom CUDA graphs or
+    Host-side launch-API events (``_RUNTIME_CATEGORIES``) are **never** surfaced
+    as launches on a trace that has real device-kernel events: they carry no
+    device time and pure bookkeeping calls (``cudaEventQuery``,
+    ``cudaStreamWaitEvent``, ...) would otherwise be mistaken for kernels. The
+    only exception is a *runtime-only* trace (no device-kernel events captured at
+    all): there the launch-API call is the sole evidence of GPU work, so an
+    actual launch call (``*Launch*`` / ``*Enqueue*``) is emitted as a fallback.
+
+    Fallback: when a device kernel has no matching runtime event on the worker
+    thread (common for flash-attention kernels launched via custom CUDA graphs or
     internal streams), we fall back to matching via ``External id`` — the kernel's
     ``External id`` links back to the CPU op that issued it, whose timestamp
     provides the launch site.
     """
     corr_to_rt: dict[int, dict] = {}
     kernel_corrs: set = set()
+    has_device_kernel = False
     for evt in events:
         cat = evt.get("cat")
         if cat in _RUNTIME_CATEGORIES:
             corr = evt.get("args", {}).get("correlation")
             if corr is not None:
                 corr_to_rt[corr] = evt
-        elif cat in _KERNEL_CATEGORIES:
+        elif cat in _DEVICE_KERNEL_CATEGORIES:
+            has_device_kernel = True
             # Correlations backed by an actual device kernel / memcpy event.
             corr = evt.get("args", {}).get("correlation")
             if corr is not None:
@@ -226,37 +249,40 @@ def _collect_kernel_launches(events: list[dict], worker_tid: Any
     # instead of the raw ``flash_xpu::(anonymous namespace)::...`` symbol.
     fx_api_frames = _collect_flash_xpu_api_frames(events, worker_tid)
 
+    def _friendly(name: str, ts: float) -> str | None:
+        return (_flashinfer_api_name(name, ts, fi_api_frames)
+                or _flash_xpu_api_name(name, ts, fx_api_frames))
+
     launches: list[tuple[float, str, float, str | None]] = []
     for evt in events:
         cat = evt.get("cat")
-        if cat not in _KERNEL_CATEGORIES:
-            continue
         args = evt.get("args", {})
         corr = args.get("correlation")
-        # A runtime launch-API event (``cudaLaunchKernelExC`` /
-        # ``urEnqueueKernelLaunch``) is host-side launch overhead for a device
-        # kernel that is itself surfaced separately. Skip it so it doesn't show
-        # up as a duplicate synthetic op (e.g. ``triton::cudaLaunchKernelExC``
-        # next to the real FlashInfer RMSNorm kernel). Runtime events with no
-        # backing kernel event are still emitted as a fallback.
-        if cat in _RUNTIME_CATEGORIES and corr in kernel_corrs:
-            continue
         name = evt.get("name", "")
         dur = evt.get("dur", 0) or 0
-        rt = corr_to_rt.get(corr) if corr is not None else None
-        if rt is not None and rt.get("tid") == worker_tid:
-            ts = rt.get("ts", 0)
-            friendly = (_flashinfer_api_name(name, ts, fi_api_frames)
-                        or _flash_xpu_api_name(name, ts, fx_api_frames))
-            launches.append((ts, name, dur, friendly))
-        else:
-            # Fallback: use External id to find the issuing CPU op's timestamp
-            ext = args.get("External id")
-            if ext is not None and ext in ext_to_ts:
+        if cat in _DEVICE_KERNEL_CATEGORIES:
+            # A real device kernel — locate its host launch site.
+            rt = corr_to_rt.get(corr) if corr is not None else None
+            if rt is not None and rt.get("tid") == worker_tid:
+                ts = rt.get("ts", 0)
+            else:
+                # Fallback: use External id to find the issuing CPU op's ts.
+                ext = args.get("External id")
+                if ext is None or ext not in ext_to_ts:
+                    continue
                 ts = ext_to_ts[ext]
-                friendly = (_flashinfer_api_name(name, ts, fi_api_frames)
-                            or _flash_xpu_api_name(name, ts, fx_api_frames))
-                launches.append((ts, name, dur, friendly))
+            launches.append((ts, name, dur, _friendly(name, ts)))
+        elif cat in _RUNTIME_CATEGORIES and not has_device_kernel:
+            # Runtime-only trace: no device-kernel events were captured, so the
+            # launch-API call is the only signal of GPU work. Emit actual launch
+            # calls (not bookkeeping) that sit on the worker thread.
+            if corr in kernel_corrs or evt.get("tid") != worker_tid:
+                continue
+            low = name.lower()
+            if "launch" not in low and "enqueue" not in low:
+                continue
+            ts = evt.get("ts", 0)
+            launches.append((ts, name, dur, _friendly(name, ts)))
     return launches
 
 
@@ -465,6 +491,14 @@ def _attribute_kernels(roots: list[_Raw],
       indexer, block-sparse attention) — which never emit an ``aten``/``_C``
       ``cpu_op`` — become visible. FlashInfer kernels are named after their
       public API frame (``flashinfer::gemma_fused_add_rmsnorm``) when known.
+    * If the launch site has **no enclosing module at all** (a module-less
+      top-level op subtree — e.g. a bare sampler/logits op that isn't part of
+      any decoder module), the kernel's device time is folded into that deepest
+      op's own time rather than **silently dropped**, so no device time is ever
+      lost. Such launch sites lie outside the reconstructed phase trees, so they
+      are not shown as phase leaves, but their time stays conserved for the op
+      breakdown / reports. Every kernel launched *inside a module subtree* — i.e.
+      every in-phase kernel — always lands on a leaf op via the two cases above.
     """
     # Parent map (child id → parent) for walking up to the enclosing module.
     parent: dict[int, _Raw] = {}
@@ -487,6 +521,11 @@ def _attribute_kernels(roots: list[_Raw],
             continue
         mod = _enclosing_module(node, parent)
         if mod is None:
+            # No enclosing module (module-less top-level op subtree). Don't drop
+            # the device time — fold it into the deepest op so it is conserved
+            # and still attributed to an op leaf.
+            if node.kind == "op":
+                node.self_dev += dur
             continue
         key = (id(mod), api_name or _clean_kernel_name(name))
         op = synth.get(key)
@@ -496,6 +535,61 @@ def _attribute_kernels(roots: list[_Raw],
             mod.children.append(op)
             parent[id(op)] = mod
         op.self_dev += dur
+
+
+def _kernel_leaf_coverage(
+    roots: list[_Raw],
+    launches: list[tuple[float, str, float, str | None]],
+) -> dict[str, float]:
+    """Read-only classifier: where does each collected device kernel land?
+
+    Mirrors :func:`_attribute_kernels` **without mutating** the forest, so it can
+    be run on the raw forest (before attribution) to verify coverage. For each
+    collected launch it decides whether the device time lands on a leaf op (a
+    real op, a module's synthetic op, or a folded module-less op) or is dropped
+    because the launch ``ts`` falls in a gap outside every worker-thread node.
+
+    Returns totals in microseconds and counts::
+
+        {"total_us", "on_leaf_us", "dropped_gap_us",
+         "n_total", "n_on_leaf", "n_dropped_gap"}
+
+    A well-formed trace has ``dropped_gap_us`` limited to kernels launched
+    *between* module forwards (warm-up / metadata prep), never to kernels
+    launched inside a kept prefill/decode step subtree.
+    """
+    parent: dict[int, _Raw] = {}
+    stack = list(roots)
+    while stack:
+        n = stack.pop()
+        for c in n.children:
+            parent[id(c)] = n
+            stack.append(c)
+
+    total = on_leaf = dropped = 0.0
+    n_total = n_leaf = n_drop = 0
+    for ts, _name, dur, _api in launches:
+        total += dur
+        n_total += 1
+        node = _deepest_at(roots, ts)
+        if node is None:
+            dropped += dur
+            n_drop += 1
+            continue
+        if node.kind == "op" and node.label not in _PLUMBING_OPS:
+            on_leaf += dur
+            n_leaf += 1
+            continue
+        mod = _enclosing_module(node, parent)
+        if mod is None:
+            # Folded into the deepest op (module-less launch site) — conserved.
+            on_leaf += dur
+            n_leaf += 1
+            continue
+        on_leaf += dur
+        n_leaf += 1
+    return {"total_us": total, "on_leaf_us": on_leaf, "dropped_gap_us": dropped,
+            "n_total": n_total, "n_on_leaf": n_leaf, "n_dropped_gap": n_drop}
 
 
 # Residual-stream ops whose shape/dtype the trace does not record on the op

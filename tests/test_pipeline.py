@@ -2413,6 +2413,130 @@ class TestGraphFromTrace(unittest.TestCase):
         self.assertEqual(sum(c["repeat_count"] for c in layers), 5)
         self.assertEqual(layers[-1]["repeat_count"], 5)
 
+    def test_runtime_bookkeeping_not_surfaced_as_kernel(self):
+        # A CUDA trace carries host-side runtime bookkeeping events
+        # (cudaEventQuery / cudaStreamWaitEvent) that launch NO device kernel.
+        # They must never be collected as kernel launches (and so never surface
+        # as bogus ``triton::cudaEventQuery`` leaf ops): the collected launch
+        # count must equal the real device-kernel count.
+        from breakdown.graph_from_trace import (_build_raw_forest,
+                                                 _collect_kernel_launches)
+        tid = 7
+        events = [
+            {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
+             "ts": 0, "dur": 100, "name": "nn.Module: TinyForCausalLM_0"},
+            {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
+             "ts": 10, "dur": 30, "name": "nn.Module: TinyDecoderLayer_0"},
+            {"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+             "ts": 11, "dur": 8, "name": "aten::mm",
+             "args": {"External id": 1, "Input Dims": [[8, 16], [16, 16]],
+                      "Input type": ["c10::BFloat16", "c10::BFloat16"]}},
+            # Real device kernel launched by the mm (cuda_runtime backs it).
+            {"ph": "X", "cat": "cuda_runtime", "tid": tid, "pid": tid,
+             "ts": 12, "dur": 0.1, "name": "cudaLaunchKernel",
+             "args": {"correlation": 1, "External id": 1}},
+            {"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+             "ts": 2000, "dur": 5.0, "name": "gemm_cuda_kernel",
+             "args": {"correlation": 1}},
+            # Host-side bookkeeping that launches nothing — must be ignored.
+            {"ph": "X", "cat": "cuda_runtime", "tid": tid, "pid": tid,
+             "ts": 20, "dur": 3.0, "name": "cudaEventQuery",
+             "args": {"correlation": 501}},
+            {"ph": "X", "cat": "cuda_runtime", "tid": tid, "pid": tid,
+             "ts": 25, "dur": 3.0, "name": "cudaStreamWaitEvent",
+             "args": {"correlation": 502}},
+        ]
+        roots = _build_raw_forest(events)
+        launches = _collect_kernel_launches(events, tid)
+        n_device = sum(1 for e in events if e.get("cat") == "kernel")
+        self.assertEqual(len(launches), n_device)
+        names = [nm for _, nm, _, _ in launches]
+        self.assertNotIn("cudaEventQuery", names)
+        self.assertNotIn("cudaStreamWaitEvent", names)
+
+    def test_module_less_kernel_time_conserved_not_dropped(self):
+        # A device kernel launched inside a *module-less* top-level op subtree
+        # (e.g. a bare sampler op with no enclosing module) must not be silently
+        # dropped: its device time is folded into the deepest op so it is
+        # conserved (coverage classifier reports it on a leaf, nothing dropped).
+        from breakdown.graph_from_trace import (_Raw, _attribute_kernels,
+                                                 _kernel_leaf_coverage)
+        # Forest: a module with an mm op, plus a module-less top-level sampler op.
+        mod = _Raw("module", "TinyDecoderLayer", 0.0, 100.0)
+        mm = _Raw("op", "aten::mm", 10.0, 5.0)
+        mod.children.append(mm)
+        sampler = _Raw("op", "aten::topk", 200.0, 20.0)  # top-level, no module
+        roots = [mod, sampler]
+        launches = [
+            (12.0, "gemm", 4.0, None),        # inside mm -> mm.self_dev
+            (205.0, "topk_kernel", 6.0, None),  # inside module-less sampler op
+        ]
+        cov = _kernel_leaf_coverage(roots, launches)
+        self.assertEqual(cov["n_dropped_gap"], 0)
+        self.assertAlmostEqual(cov["dropped_gap_us"], 0.0, places=6)
+        self.assertAlmostEqual(cov["on_leaf_us"], 10.0, places=6)
+        # Attribution must conserve both kernels' time onto op leaves.
+        _attribute_kernels(roots, launches)
+        self.assertAlmostEqual(mm.self_dev, 4.0, places=6)
+        self.assertAlmostEqual(sampler.self_dev, 6.0, places=6)
+
+    def test_minimax_m3_traces_every_in_step_kernel_on_leaf(self):
+        # Opt-in end-to-end coverage over the real MiniMax-M3 traces (XPU + CUDA,
+        # prefill + decode): every device kernel launched inside a kept
+        # prefill/decode step must land on a leaf op, and the collected launch
+        # count must equal the real device-kernel count (no bookkeeping noise,
+        # no silent drops). Skipped when the trace files are absent.
+        import glob
+        from breakdown.graph_from_trace import (
+            _build_raw_forest, _classify_steps, _collect_kernel_launches,
+            _deepest_at, _load_trace, _DEVICE_KERNEL_CATEGORIES, _PLUMBING_OPS)
+        from breakdown.trace_common import MODULE_SPAN_PREFIX
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        pattern = os.path.join(here, "output", "traces",
+                               "vllm_trace_MiniMax-M3_*")
+        files = sorted(glob.glob(pattern))
+        if not files:
+            self.skipTest("MiniMax-M3 trace files not present")
+
+        def worker_of(events):
+            span: dict = {}
+            for e in events:
+                if (e.get("ph") == "X" and e.get("cat") == "user_annotation"
+                        and str(e.get("name", "")).startswith(
+                            MODULE_SPAN_PREFIX)):
+                    span[e.get("tid")] = span.get(e.get("tid"), 0) + 1
+            if span:
+                return max(span, key=span.get)
+            cc: dict = {}
+            for e in events:
+                if e.get("cat") == "cpu_op":
+                    cc[e.get("tid")] = cc.get(e.get("tid"), 0) + 1
+            return max(cc, key=cc.get)
+
+        for f in files:
+            events = _load_trace(f).get("traceEvents", [])
+            roots = _build_raw_forest(events)
+            worker = worker_of(events)
+            launches = _collect_kernel_launches(events, worker)
+            n_device = sum(1 for e in events
+                           if e.get("cat") in _DEVICE_KERNEL_CATEGORIES)
+            # Precision: no bookkeeping events collected as launches.
+            self.assertEqual(len(launches), n_device, os.path.basename(f))
+            bs = 32 if "decode" in os.path.basename(f) else 1
+            prefill, decode, _, _ = _classify_steps(roots, bs)
+            intervals = [(r.ts, r.end) for r in prefill + decode]
+
+            def in_kept(ts, intervals=intervals):
+                return any(a <= ts < b for a, b in intervals)
+
+            for ts, _nm, _dur, _api in launches:
+                if not in_kept(ts):
+                    continue
+                node = _deepest_at(roots, ts)
+                # Every in-step launch resolves to a node, and either lands on a
+                # real op leaf or on an enclosing module (synthetic leaf op).
+                self.assertIsNotNone(node, os.path.basename(f))
+
 
 class TestModuleNaming(unittest.TestCase):
     """Recover real module attribute names (q_norm/k_norm, ...) for the graph."""

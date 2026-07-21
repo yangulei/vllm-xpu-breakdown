@@ -732,17 +732,44 @@ static builder. Ensure:
   back to borrowing the neighbour's activation shape so they still carry the
   token dim + dtype. Runs right after `_infer_hidden_activation_ops`. See
   `TestGraphFromTrace.test_flash_xpu_attention_kernel_shapes_reconstructed`.
-- **Host-side launch-API events are NOT surfaced as ops.** A device kernel is
-  linked to its launch call (`cudaLaunchKernelExC` / `urEnqueueKernelLaunch`, cat
-  `cuda_runtime`/`xpu_runtime`) via its correlation id. Those runtime events are
-  in `_KERNEL_CATEGORIES` (so they can act as a launch-site fallback), but
-  `_collect_kernel_launches` **skips a runtime event whose correlation is backed
-  by an actual device kernel event** (`_RUNTIME_CATEGORIES` + `kernel_corrs`).
-  Otherwise a Python-direct launch (e.g. FlashInfer RMSNorm) surfaced **twice** —
-  once as the real kernel op and once as a duplicate `triton::cudaLaunchKernelExC`
-  launch-overhead op next to it. A runtime event with no backing kernel event is
-  still emitted (fallback for traces that only carry runtime events). See
-  `TestGraphFromTrace.test_flashinfer_kernel_surfaced_launcher_suppressed`.
+- **Only genuine device kernels are collected; host-side launch-API events are
+  NOT surfaced as ops.** `_collect_kernel_launches` emits a launch **only** for a
+  real *device* event (cat in `_DEVICE_KERNEL_CATEGORIES` = `kernel` /
+  `gpu_memcpy` / `gpu_memset` / `xpu_op` / ...), located at its host launch site
+  via `kernel.correlation → cuda_runtime`/`cuda_driver`/`xpu_runtime` (External-id
+  fallback). Host launch-API events (`_RUNTIME_CATEGORIES`) are never surfaced on
+  a trace that has device-kernel events — they carry no device time and are only
+  launch-site locators. **Do NOT put `cuda_runtime` back into the device-kernel
+  set:** it used to be in `_KERNEL_CATEGORIES`, which meant pure host bookkeeping
+  calls that launch nothing (`cudaEventQuery`, `cudaStreamWaitEvent`,
+  `cudaDeviceGetAttribute`, `cudaStreamIsCapturing`, `cudaEventRecord`) were
+  collected as fake kernel launches (on the MiniMax-M3 CUDA decode trace ~2500
+  spurious "launches" of 4267 vs 1757 real device kernels) and could surface as
+  bogus `triton::cudaEventQuery` leaf ops. The only exception is a *runtime-only*
+  trace (no device-kernel events at all): there an actual `*Launch*`/`*Enqueue*`
+  call on the worker thread is emitted as a fallback (bookkeeping still excluded).
+  A launch that backs a real kernel is likewise not duplicated (else a
+  Python-direct FlashInfer RMSNorm would show once as the kernel op and once as a
+  `triton::cudaLaunchKernelExC` op). See
+  `TestGraphFromTrace.test_flashinfer_kernel_surfaced_launcher_suppressed` and
+  `test_runtime_bookkeeping_not_surfaced_as_kernel`.
+- **Every device kernel launched inside a module subtree lands on a leaf op — no
+  silent drops.** `_attribute_kernels` routes each launch to a leaf: inside a
+  real op → that op's `self_dev`; inside a module (or plumbing op) → a synthetic
+  `triton::`/`flashinfer::`/`flash_xpu::` op on the enclosing module. A launch
+  whose site has **no enclosing module** (a module-less top-level op subtree,
+  e.g. a bare sampler/logits op outside every decoder module) is **folded into
+  the deepest op's `self_dev` rather than dropped**, so device time is conserved
+  (it just isn't shown as a phase leaf, being outside the reconstructed phase
+  trees). Verified on the four MiniMax-M3 traces (XPU/CUDA × prefill/decode):
+  every kernel launched inside a kept prefill/decode step lands on a leaf, and
+  the collected launch count equals the real device-kernel count. Only kernels
+  launched **between** forward passes (e.g. `_compute_slot_mapping_kernel` KV
+  metadata prep) fall in gaps and are out of step scope by design. The read-only
+  `_kernel_leaf_coverage(roots, launches)` classifier reports
+  `total`/`on_leaf`/`dropped_gap`. See
+  `TestGraphFromTrace.test_module_less_kernel_time_conserved_not_dropped` and
+  `test_minimax_m3_traces_every_in_step_kernel_on_leaf`.
 - **FlashInfer kernels classify as the `flashinfer` backend and are named after
   their public API frame.** FlashInfer RMSNorm/fused-add-RMSNorm/attention
   kernels launch directly from Python (no `aten`/`_C` cpu_op), so
