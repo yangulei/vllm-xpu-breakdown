@@ -138,11 +138,29 @@ def _parse_input_dims_types(args: dict) -> tuple[list[list[int]], list[str]]:
     shapes: list[list[int]] = []
     dtypes: list[str] = []
     for i, tensor in enumerate(dims):
-        if isinstance(tensor, (list, tuple)) and tensor:
-            shape = [int(d) for d in tensor if isinstance(d, (int, float))]
-            if shape:
-                shapes.append(shape)
-                dtypes.append(_normalize_dtype(types[i] if i < len(types) else ""))
+        if not isinstance(tensor, (list, tuple)) or not tensor:
+            continue
+        raw_dt = _normalize_dtype(types[i] if i < len(types) else "")
+        # A ``TensorList`` input nests one level deeper: its "Input Dims" entry
+        # is a *list of per-tensor shape lists* rather than a single shape, e.g.
+        # ``c10d::allreduce_`` records ``[[2, 6144]]`` (a one-element list of
+        # tensors) with ``Input type`` ``'TensorList'``. Without unwrapping the
+        # container level the whole entry was dropped, so collective/foreach ops
+        # surfaced with no shape and no dtype. Surface each contained tensor's
+        # shape; the container label is not an element dtype, so leave the dtype
+        # empty for the residual-stream inference pass to fill from a neighbour.
+        if all(isinstance(t, (list, tuple)) for t in tensor):
+            list_dt = "" if raw_dt not in DTYPE_BYTES else raw_dt
+            for sub in tensor:
+                shape = [int(d) for d in sub if isinstance(d, (int, float))]
+                if shape:
+                    shapes.append(shape)
+                    dtypes.append(list_dt)
+            continue
+        shape = [int(d) for d in tensor if isinstance(d, (int, float))]
+        if shape:
+            shapes.append(shape)
+            dtypes.append(raw_dt)
     return shapes, dtypes
 
 
@@ -478,6 +496,154 @@ def _attribute_kernels(roots: list[_Raw],
             mod.children.append(op)
             parent[id(op)] = mod
         op.self_dev += dur
+
+
+# Residual-stream ops whose shape/dtype the trace does not record on the op
+# itself: tensor-parallel collectives (``c10d::allreduce_`` records its tensor
+# as a ``TensorList`` with no element dtype) and the RMSNorm/LayerNorm kernels
+# that vLLM launches straight from Python via Triton/FlashInfer (no ``cpu_op``,
+# so they surface as synthetic ``triton::``/``flashinfer::`` ops with no shape
+# at all). All of them operate on the residual hidden state ``[tokens, H]`` in
+# the model's activation dtype, so their shape/dtype can be recovered from the
+# nearest neighbouring op that *does* carry a hidden-state tensor.
+_COLLECTIVE_KEYWORDS = (
+    "allreduce", "all_reduce", "allgather", "all_gather",
+    "reduce_scatter", "reducescatter", "all_to_all", "alltoall",
+)
+
+
+def _is_hidden_state_op(label: str) -> bool:
+    """True for a residual-stream op (norm / collective) worth inferring shapes.
+
+    Restricted to norm-family and collective ops so attention kernels, ``zeros``,
+    ``item`` and other genuinely shape-less / differently-shaped ops are left
+    untouched (they must not inherit the ``[tokens, H]`` residual shape).
+    """
+    low = label.lower()
+    if ("rmsnorm" in low or "rms_norm" in low
+            or "layernorm" in low or "layer_norm" in low):
+        return True
+    return any(k in low for k in _COLLECTIVE_KEYWORDS)
+
+
+def _infer_hidden_activation_ops(roots: list[_Raw], hidden_size: int | None
+                                 ) -> None:
+    """Fill missing shape/dtype on residual-stream ops from a neighbour.
+
+    Norm kernels (Triton/FlashInfer, launched straight from Python) carry no
+    ``cpu_op`` and so no shape, and TP collectives record only a dtype-less
+    ``TensorList``. Both operate on the residual hidden state ``[tokens, H]``, so
+    for each such op missing a shape and/or a real dtype we borrow both from the
+    op nearest in execution order that carries a genuine ``[tokens, H]`` tensor
+    (2-D, trailing dim == ``hidden_size``, real dtype) — picking the nearest by
+    timestamp keeps the correct per-step token count (prefill ``S`` vs decode
+    ``B``). No-op when ``hidden_size`` is unknown or no reference exists.
+    """
+    if not hidden_size:
+        return
+    H = int(hidden_size)
+    ops: list[_Raw] = []
+    stack = list(roots)
+    while stack:
+        n = stack.pop()
+        if n.kind == "op":
+            ops.append(n)
+        stack.extend(n.children)
+
+    # Reference hidden-state tensors: (ts, [tokens, H], dtype).
+    refs: list[tuple[float, list[int], str]] = []
+    for o in ops:
+        for sh, dt in zip(o.shapes, o.dtypes):
+            if len(sh) == 2 and sh[1] == H and dt in DTYPE_BYTES:
+                refs.append((o.ts, list(sh), dt))
+                break
+    if not refs:
+        return
+
+    for o in ops:
+        need_shape = not o.shapes
+        need_dtype = not any(d in DTYPE_BYTES for d in o.dtypes)
+        if not (need_shape or need_dtype) or not _is_hidden_state_op(o.label):
+            continue
+        _ts, ref_shape, ref_dt = min(refs, key=lambda r: abs(r[0] - o.ts))
+        if need_shape:
+            o.shapes = [list(ref_shape)]
+            o.dtypes = [ref_dt]
+        else:
+            o.dtypes = [ref_dt for _ in o.shapes]
+        o.dtype = ref_dt
+
+
+# xattention (``flash_xpu``) MiniMax-M3 MSA kernels are launched straight from
+# the ``xattention.py`` wrappers with no ``cpu_op``, so they surface as synthetic
+# ``flash_xpu::`` ops with no shape at all. Their primary tensor layout is fixed
+# by the wrapper signatures: the block-sparse attend kernels take a query
+# ``[total_q, num_heads, head_dim]`` and the lightning-indexer kernels take an
+# index query ``[total_q, num_index_heads, index_head_dim]`` (``total_q`` is the
+# per-step token count — ``S`` prefill / ``B`` decode). We can therefore
+# reconstruct the shape from the model config + the step's token count.
+_FLASH_XPU_QUERY_LAYOUT = {
+    "minimax_m3_sparse_attn": "attn",
+    "minimax_m3_sparse_attn_decode": "attn",
+    "minimax_m3_index_score": "index",
+    "minimax_m3_index_decode": "index",
+}
+
+
+def _infer_attention_kernel_shapes(roots: list[_Raw], summary: dict,
+                                   tp_size: int) -> None:
+    """Reconstruct shape/dtype for shape-less ``flash_xpu`` attention kernels.
+
+    The MiniMax-M3 MSA SYCL kernels carry no ``cpu_op``, so ``_attribute_kernels``
+    surfaces them with no shape. Their primary-tensor layout is fixed by the
+    ``xattention.py`` wrapper signatures, so we rebuild it from the config
+    (per-rank ``num_heads``/``head_dim`` for the attend kernels,
+    ``sparse_num_index_heads``/``sparse_index_dim`` for the indexer kernels) and
+    the per-step token count ``total_q`` — taken as the leading dim of the
+    nearest neighbouring activation op (so prefill gets ``S`` and decode ``B``).
+    Kernels without a known layout (e.g. the indexer top-k, whose score width is
+    context-dependent) fall back to borrowing the neighbour's activation shape so
+    they at least carry the token dim + dtype. No-op without neighbour activations.
+    """
+    ops: list[_Raw] = []
+    stack = list(roots)
+    while stack:
+        n = stack.pop()
+        if n.kind == "op":
+            ops.append(n)
+        stack.extend(n.children)
+
+    # Neighbour activation references: (ts, leading token dim, first shape, dtype).
+    act_refs: list[tuple[float, int, list[int], str]] = []
+    for o in ops:
+        if o.shapes and len(o.shapes[0]) >= 2:
+            dt = next((d for d in o.dtypes if d in DTYPE_BYTES), "")
+            act_refs.append((o.ts, o.shapes[0][0], list(o.shapes[0]),
+                             dt or "bfloat16"))
+    if not act_refs:
+        return
+
+    tp = max(1, int(tp_size or 1))
+    n_h = summary.get("num_heads")
+    d = summary.get("head_dim")
+    n_idx = summary.get("sparse_num_index_heads")
+    idx_d = summary.get("sparse_index_dim")
+
+    for o in ops:
+        if o.shapes or "flash_xpu" not in o.label.lower():
+            continue
+        _ts, token, act_shape, dt = min(act_refs, key=lambda r: abs(r[0] - o.ts))
+        layout = _FLASH_XPU_QUERY_LAYOUT.get(o.label.split("::")[-1])
+        shape: list[int] | None = None
+        if layout == "attn" and n_h and d:
+            shape = [token, max(1, int(n_h) // tp), int(d)]
+        elif layout == "index" and n_idx and idx_d:
+            shape = [token, max(1, int(n_idx) // tp), int(idx_d)]
+        if shape is None:
+            shape = list(act_shape)  # fallback: representative activation
+        o.shapes = [shape]
+        o.dtypes = [dt]
+        o.dtype = dt
 
 
 # vLLM V1 runs the sampler (and similar post-processing) functionally rather
@@ -1830,6 +1996,14 @@ def build_graph_from_trace(
             _apply_ref_names(roots, ref_module_tree)
         except Exception:
             pass  # naming enrichment is best-effort
+
+    # Recover shape/dtype for residual-stream ops the trace leaves shape-less:
+    # TP collectives (dtype-less ``TensorList``) and Python-launched norm kernels
+    # (no ``cpu_op``). Borrow ``[tokens, H]`` + dtype from the nearest neighbour.
+    _infer_hidden_activation_ops(roots, summary.get("hidden_size"))
+    # Reconstruct shape/dtype for shape-less ``flash_xpu`` MSA attention kernels
+    # (also ``cpu_op``-less) from their fixed wrapper layout + config dims.
+    _infer_attention_kernel_shapes(roots, summary, tp_size)
 
     prefill_passes, decode_passes, n_pre, n_dec = _classify_steps(
         roots, batch_size)

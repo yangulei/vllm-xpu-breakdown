@@ -1579,6 +1579,98 @@ class TestGraphFromTrace(unittest.TestCase):
         # Device time is conserved under the fused node (allreduce 6 + norm 4).
         self.assertAlmostEqual(fused["total_device_time_us"], 10.0, places=2)
 
+    def test_tensorlist_collective_and_norm_kernel_shapes_recovered(self):
+        # Two residual-stream ops surface shape-less in a real XPU trace and must
+        # be recovered: (1) ``c10d::allreduce_`` records its tensor as a
+        # ``TensorList`` — ``Input Dims`` = ``[[[2, H]], [], ...]`` with
+        # ``Input type`` ``'TensorList'`` (an extra nesting level + no element
+        # dtype) — which the parser used to drop; (2) the Gemma RMSNorm runs as a
+        # Python-launched Triton kernel (no ``cpu_op``) so it has no shape at all.
+        # Both operate on the residual ``[tokens, H]`` in the activation dtype, so
+        # both must come out with shape ``[S, H]`` and dtype ``bfloat16`` inferred
+        # from the neighbouring hidden-state op.
+        from breakdown.graph_from_trace import build_graph_from_trace
+        events = []
+        ext = [0]
+        corr = [0]
+        tid = 7
+        H = self.SUMMARY["hidden_size"]
+
+        def kern(e, ts, dur, kname="g"):
+            corr[0] += 1
+            events.append({"ph": "X", "cat": "xpu_runtime", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": 0.1, "name": "l",
+                           "args": {"correlation": corr[0], "External id": e}})
+            events.append({"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+                           "ts": ts + 1000, "dur": dur, "name": kname,
+                           "args": {"correlation": corr[0]}})
+
+        def op(name, ts, dur, dims, types, kdur=0.0):
+            ext[0] += 1
+            events.append({"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+                           "ts": ts, "dur": dur, "name": name,
+                           "args": {"External id": ext[0], "Input Dims": dims,
+                                    "Input type": types}})
+            if kdur:
+                kern(ext[0], ts, kdur)
+
+        def mod(cls, idx, ts, dur):
+            events.append({"ph": "X", "cat": "python_function", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": dur,
+                           "name": f"nn.Module: {cls}_{idx}"})
+
+        # A Python-launched Triton norm kernel: a bare device kernel whose launch
+        # (xpu_runtime) sits inside the norm module, with no backing cpu_op.
+        def triton_kern(ts, dur, kname):
+            corr[0] += 1
+            events.append({"ph": "X", "cat": "xpu_runtime", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": 0.1, "name": "l",
+                           "args": {"correlation": corr[0]}})
+            events.append({"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+                           "ts": ts + 1000, "dur": dur, "name": kname,
+                           "args": {"correlation": corr[0]}})
+
+        tokens = 8
+        bf16 = ["c10::BFloat16", "c10::BFloat16"]
+        mod("TinyForCausalLM", 0, 0.0, 300)
+        mod("TinyDecoderLayer", 0, 1.0, 250)
+        # A neighbouring hidden-state op carrying the real [tokens, H] tensor.
+        op("aten::mm", 5.0, 4, [[tokens, H], [H, H]], bf16, 2.0)
+        # input_layernorm: a Triton norm kernel launched from Python, no cpu_op.
+        mod("RMSNorm", 0, 20.0, 10)
+        triton_kern(22.0, 3.0, "_gemma_rmsnorm_kernel")
+        # TP all-reduce: TensorList input (extra nesting) + no element dtype.
+        op("c10d::allreduce_", 40.0, 20,
+           [[[tokens, H]], [], [], [], [], []],
+           ["TensorList", "", "", "", "Scalar", "Scalar"], 6.0)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"traceEvents": events}, f)
+            path = f.name
+        try:
+            g = build_graph_from_trace(path, self.SUMMARY, tp_size=1,
+                                       batch_size=1)
+        finally:
+            os.unlink(path)
+
+        def all_ops(node, out):
+            out.extend(node.get("ops", []))
+            for c in node.get("children", []):
+                all_ops(c, out)
+            return out
+
+        tree = g["prefill"] or g["decode"]
+        ops = all_ops(tree, [])
+        ar = next(o for o in ops if o["name"] == "c10d::allreduce_")
+        self.assertEqual(ar["recorded_shapes"], [[tokens, H]])
+        self.assertEqual(ar["input_shapes"], [["S", "H"]])
+        self.assertEqual(ar["input_dtypes"], ["bfloat16"])
+        norm = next(o for o in ops
+                    if o["name"] == "triton::_gemma_rmsnorm_kernel")
+        self.assertEqual(norm["recorded_shapes"], [[tokens, H]])
+        self.assertEqual(norm["input_shapes"], [["S", "H"]])
+        self.assertEqual(norm["input_dtypes"], ["bfloat16"])
+
     def test_cuda_triton_moe_experts_surfaced(self):
         # On CUDA the routed MoE experts run through the Triton modular kernel
         # ``experts/triton_moe.py(198): apply`` (a python_function, not an
@@ -2224,6 +2316,84 @@ class TestGraphFromTrace(unittest.TestCase):
         self.assertEqual(fx_op["name"], "flash_xpu::minimax_m3_index_score")
         self.assertEqual(fx_op["backend"], "flash_xpu")
         self.assertAlmostEqual(fx_op["device_time_us"], 4.0, places=3)
+
+    def test_flash_xpu_attention_kernel_shapes_reconstructed(self):
+        # ``flash_xpu`` MSA kernels carry no cpu_op, so they surface shape-less.
+        # Their primary-tensor layout is fixed by the xattention.py wrappers: the
+        # block-sparse attend takes a query ``[total_q, num_heads, head_dim]`` and
+        # the lightning indexer an index query
+        # ``[total_q, num_index_heads, index_head_dim]``. The reconstruction must
+        # rebuild both from the config + the step's token count (leading dim of a
+        # neighbouring activation) — ``[S, n_h, d]`` and ``[S, n_idx, idx_d]``.
+        from breakdown.graph_from_trace import build_graph_from_trace
+        summary = dict(self.SUMMARY, head_dim=8, sparse_num_index_heads=2,
+                       sparse_index_dim=4)
+        tid = 7
+        tokens = 8
+        events = [
+            {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
+             "ts": 0, "dur": 100, "name": "nn.Module: TinyForCausalLM_0"},
+            {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
+             "ts": 5, "dur": 90, "name": "nn.Module: TinyAttention_0"},
+            # Neighbouring activation op fixing the token count (leading dim).
+            {"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+             "ts": 10, "dur": 4, "name": "aten::linear",
+             "args": {"External id": 1,
+                      "Input Dims": [[tokens, 16], [48, 16]],
+                      "Input type": ["c10::BFloat16", "c10::BFloat16"]}},
+            {"ph": "X", "cat": "xpu_runtime", "tid": tid, "pid": tid,
+             "ts": 11, "dur": 0.1, "name": "l",
+             "args": {"correlation": 1, "External id": 1}},
+            {"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+             "ts": 2000, "dur": 2.0, "name": "g", "args": {"correlation": 1}},
+            # Indexer query kernel launched from the xattention.py wrapper.
+            {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
+             "ts": 20, "dur": 6,
+             "name": ("/x/vllm/models/minimax_m3/xpu/ops/xattention.py(114): "
+                      "minimax_m3_index_decode")},
+            {"ph": "X", "cat": "xpu_runtime", "tid": tid, "pid": tid,
+             "ts": 21, "dur": 0.1, "name": "l", "args": {"correlation": 2}},
+            {"ph": "X", "cat": "kernel", "tid": 99, "pid": 0, "ts": 2100,
+             "dur": 3.0,
+             "name": "flash_xpu::(anonymous namespace)::index_score_kernel_t",
+             "args": {"correlation": 2}},
+            # Block-sparse attend query kernel from the xattention.py wrapper.
+            {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
+             "ts": 40, "dur": 6,
+             "name": ("/x/vllm/models/minimax_m3/xpu/ops/xattention.py(177): "
+                      "minimax_m3_sparse_attn_decode")},
+            {"ph": "X", "cat": "xpu_runtime", "tid": tid, "pid": tid,
+             "ts": 41, "dur": 0.1, "name": "l", "args": {"correlation": 3}},
+            {"ph": "X", "cat": "kernel", "tid": 99, "pid": 0, "ts": 2200,
+             "dur": 4.0,
+             "name": "flash_xpu::(anonymous namespace)::sparse_attn_kernel_t",
+             "args": {"correlation": 3}},
+        ]
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"traceEvents": events}, f)
+            path = f.name
+        try:
+            g = build_graph_from_trace(path, summary, tp_size=1, batch_size=1)
+        finally:
+            os.unlink(path)
+
+        def all_ops(node, out):
+            out.extend(node.get("ops", []))
+            for c in node.get("children", []):
+                all_ops(c, out)
+            return out
+
+        ops = all_ops(g["prefill"] or g["decode"], [])
+        attn = next(o for o in ops
+                    if o["name"] == "flash_xpu::minimax_m3_sparse_attn_decode")
+        self.assertEqual(attn["recorded_shapes"], [[tokens, 3, 8]])  # [S, n_h, d]
+        self.assertEqual(attn["input_shapes"], [["S", "n_h", "d"]])
+        self.assertEqual(attn["input_dtypes"], ["bfloat16"])
+        idx = next(o for o in ops
+                   if o["name"] == "flash_xpu::minimax_m3_index_decode")
+        self.assertEqual(idx["recorded_shapes"], [[tokens, 2, 4]])  # [S, n_idx, idx_d]
+        self.assertEqual(idx["input_shapes"][0][0], "S")
+        self.assertEqual(idx["input_dtypes"], ["bfloat16"])
 
     def test_layer_extrapolation_to_config_count(self):
         # Reduced-layer profiling captures 2 decoder layers; the config says the

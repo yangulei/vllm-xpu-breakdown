@@ -689,6 +689,49 @@ static builder. Ensure:
   embeds `flashinfer` → the FlashInfer backend). Real ops (`aten::mm`,
   `c10d::allreduce_`, `vllm::unified_attention_with_output`) get the kernel time
   added to themselves instead.
+- **Residual-stream ops the trace leaves shape-less are inferred from a
+  neighbour (`_infer_hidden_activation_ops`).** Two op classes carry no usable
+  shape/dtype on the op event itself: (1) TP collectives — `c10d::allreduce_`
+  records its tensor as a **`TensorList`** (`Input Dims` = `[[[2, H]], [], …]`,
+  an *extra nesting level*, with `Input type` `'TensorList'` and **no element
+  dtype**), which `_parse_input_dims_types` used to drop entirely (symptom:
+  "allreduce shape+dtype missing"); (2) the Gemma/LayerNorm RMSNorm kernels
+  vLLM launches straight from Python via Triton/FlashInfer
+  (`triton::_gemma_rmsnorm_kernel`, `triton::_gemma_fused_add_rmsnorm_kernel`)
+  have **no `cpu_op` and so no shape at all** (symptom: "MiniMAXGemmaRMSNorm
+  shape+dtype missing"). `_parse_input_dims_types` now **unwraps the TensorList
+  container** (surfacing each contained tensor's shape, dtype left empty), and
+  `_infer_hidden_activation_ops` fills any remaining shape-less norm/collective
+  op with the residual hidden state `[tokens, H]` + activation dtype **borrowed
+  from the op nearest in execution order that carries a genuine `[tokens, H]`
+  tensor** (2-D, trailing dim == `hidden_size`, real dtype). Nearest-by-`ts`
+  keeps the correct per-step token dim (prefill `S` vs decode `B`). It is
+  **restricted to norm-family + collective ops** (`_is_hidden_state_op`) so
+  attention kernels (`flash_xpu::minimax_m3_sparse_attn_decode`), `aten::zeros`,
+  `aten::item` and other differently-shaped / genuinely-input-less ops are left
+  untouched — they must NOT inherit `[tokens, H]`. Runs on the raw forest after
+  the reference-name overlay, before phase partition. See
+  `TestGraphFromTrace.test_tensorlist_collective_and_norm_kernel_shapes_recovered`.
+- **Shape-less `flash_xpu` MSA kernels are reconstructed from their wrapper
+  layout (`_infer_attention_kernel_shapes`).** The MiniMax-M3 xattention SYCL
+  kernels (`flash_xpu::minimax_m3_sparse_attn[_decode]`,
+  `minimax_m3_index_score`/`_decode`) also carry no `cpu_op`, so they surface
+  shape-less — but unlike the residual-stream ops their tensors are **not**
+  `[tokens, H]`, so `_infer_hidden_activation_ops` deliberately skips them. Their
+  primary-tensor layout is instead fixed by the `xattention.py` wrapper
+  signatures: the block-sparse **attend** kernels take a query
+  `[total_q, num_heads, head_dim]` → `[S, n_h/TP, d]`, and the lightning-**index**
+  kernels an index query `[total_q, num_index_heads, index_head_dim]` →
+  `[S, n_idx/TP, idx_d]`. `_infer_attention_kernel_shapes` rebuilds the numeric
+  shape from the config (per-rank `num_heads`/`head_dim`;
+  `sparse_num_index_heads`/`sparse_index_dim` for the indexer) with `total_q`
+  taken as the **leading dim of the nearest neighbouring activation op** (so
+  prefill gets `S`, decode `B`), then it symbolizes normally. `_FLASH_XPU_QUERY_-
+  LAYOUT` maps each kernel's API suffix to `attn`/`index`; kernels with no known
+  layout (e.g. the indexer top-k, whose score width is context-dependent) fall
+  back to borrowing the neighbour's activation shape so they still carry the
+  token dim + dtype. Runs right after `_infer_hidden_activation_ops`. See
+  `TestGraphFromTrace.test_flash_xpu_attention_kernel_shapes_reconstructed`.
 - **Host-side launch-API events are NOT surfaced as ops.** A device kernel is
   linked to its launch call (`cudaLaunchKernelExC` / `urEnqueueKernelLaunch`, cat
   `cuda_runtime`/`xpu_runtime`) via its correlation id. Those runtime events are
