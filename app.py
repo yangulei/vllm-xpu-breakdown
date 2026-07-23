@@ -283,6 +283,54 @@ _TRACE_NAME_RE = re.compile(
 )
 
 
+# Rank marker in a raw vLLM per-rank trace filename, e.g.
+#   dp0_pp0_tp0_dcp0_ep0_rank0.<id>.pt.trace.json.gz
+# The tensor-parallel rank is encoded as ``rank<N>`` (preferred) or ``tp<N>``.
+_RANK_NAME_RE = re.compile(r"rank(?P<rank>\d+)", re.IGNORECASE)
+_TP_RANK_NAME_RE = re.compile(r"(?:^|[_/])tp(?P<rank>\d+)", re.IGNORECASE)
+
+
+def _trace_rank(path: str) -> int | None:
+    """Extract the tensor-parallel rank index from a raw trace filename.
+
+    vLLM writes one trace per rank named ``…_tp<N>_…_rank<N>.<id>.pt.trace.json.gz``.
+    Returns the rank as an int (``rank<N>`` preferred, ``tp<N>`` fallback), or
+    ``None`` when no rank marker is present (e.g. a merged/descriptive name).
+    """
+    name = os.path.basename(path or "")
+    m = _RANK_NAME_RE.search(name) or _TP_RANK_NAME_RE.search(name)
+    if not m:
+        return None
+    try:
+        return int(m.group("rank"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _rank0_first(rank_files: list[str]) -> list[str]:
+    """Reorder trace files so the tensor-parallel **rank-0** file comes first.
+
+    Multi-rank traces arrive sorted by mtime (whichever rank flushed last), so
+    ``rank_files[0]`` is not necessarily rank 0. The rank-1..N allreduce (and
+    other collectives) can idle much longer than rank 0 waiting to synchronize,
+    which inflates their device time; rank 0 is the representative worker, so
+    the OP breakdown, reconstructed graph and downloadable trace are all built
+    from it. This lifts the file whose name encodes ``rank0``/``tp0`` to the
+    front (stable order otherwise). If no file carries a rank marker, the list
+    is returned unchanged.
+    """
+    if len(rank_files) <= 1:
+        return list(rank_files)
+    ranked = [(f, _trace_rank(f)) for f in rank_files]
+    if all(r is None for _, r in ranked):
+        return list(rank_files)
+    # rank-0 first; unknown ranks sorted last, otherwise stable by rank index.
+    return [f for f, _ in sorted(
+        ranked,
+        key=lambda fr: (fr[1] is None, fr[1] if fr[1] is not None else 0),
+    )]
+
+
 def _parse_trace_filename(name: str) -> dict:
     """Recover profiling config from a download-endpoint trace filename.
 
@@ -343,28 +391,18 @@ def _build_result_from_traces(
 
     Shared by the live profiler (``_run_profile``) and the trace-upload
     endpoint so both paths reconstruct the model graph and op breakdown the
-    same way. ``rank_files`` is rank-0 first; with TP>1 the remaining ranks are
-    used only to average device time.
+    same way. With TP>1, vLLM writes one trace per rank; the ranks 1..N idle
+    longer on collectives (their allreduce device time is inflated by the wait
+    to synchronize with rank 0), so **rank 0 is always used** as the
+    representative worker for the op breakdown, the reconstructed graph and the
+    downloadable trace. ``_rank0_first`` lifts the ``rank0``/``tp0`` file to the
+    front regardless of the mtime order the files arrive in; the other ranks are
+    ignored.
     """
     from breakdown.trace_parser import parse_trace_file
 
+    rank_files = _rank0_first(rank_files)
     op_dicts = parse_trace_file(rank_files[0])
-
-    # If multi-rank, average device times across ranks
-    if tp_size > 1 and len(rank_files) > 1:
-        for extra_file in rank_files[1:]:
-            extra_ops = parse_trace_file(extra_file)
-            extra_timing = {
-                (o["name"], o.get("input_shapes", "")): o.get("device_time_us", 0)
-                for o in extra_ops
-            }
-            for op in op_dicts:
-                key = (op["name"], op.get("input_shapes", ""))
-                op["device_time_us"] = (
-                    op.get("device_time_us", 0) + extra_timing.get(key, 0)
-                )
-        for op in op_dicts:
-            op["device_time_us"] = op.get("device_time_us", 0) / tp_size
 
     if not op_dicts:
         raise RuntimeError(
@@ -913,8 +951,9 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
                     ref_module_tree = None
 
         # --- Parse trace files & build the result ---
-        # With TP>1, vLLM produces one trace file per rank; each pass's
-        # ``_profiled_pass`` already returned that pass's rank-0-first files.
+        # With TP>1, vLLM produces one trace file per rank; each pass returns all
+        # of its rank files (mtime order) and ``_build_result_from_traces`` picks
+        # the rank-0 file via ``_rank0_first``.
         def _build(files: list[str], bsz: int, qlen: int | None) -> dict:
             if not files:
                 raise RuntimeError(
@@ -1060,7 +1099,9 @@ def upload_profile():
         (prefill tree + decode base), exactly like a live two-pass run — so the
         reconstructed graph has **both** phases, not decode only.
       - **Single trace** — one file (optionally several rank files for TP>1,
-        rank-0 first) reconstructs a single run; extra files average device time.
+        in any order) reconstructs a single run; the **rank-0** file is used and
+        the other ranks are ignored (rank 0 is the representative worker — see
+        ``_rank0_first``).
 
     The descriptive download filenames are self-describing
     (``…_{mode}[_prefill|_decode]_ctx{C}_in{S}_out{gen}_bs{B}_tp{TP}[_{quant}]_{N}layers``),

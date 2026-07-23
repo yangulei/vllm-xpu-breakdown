@@ -125,5 +125,43 @@ class TestTraceDownload(unittest.TestCase):
         self.assertEqual(resp.status_code, 404)
 
 
+class TestRank0Selection(unittest.TestCase):
+    """Rank 0 is always the representative worker for TP>1 traces.
+
+    Ranks 1..N idle longer on collectives (their allreduce device time is
+    inflated by the wait to synchronize with rank 0), so the OP breakdown,
+    reconstructed graph and downloadable trace must all be built from rank 0
+    regardless of the (mtime) order the per-rank files arrive in.
+    """
+
+    def test_trace_rank_from_rank_marker(self):
+        self.assertEqual(app_module._trace_rank(
+            "dp0_pp0_tp2_dcp0_ep2_rank2.178.pt.trace.json.gz"), 2)
+        self.assertEqual(app_module._trace_rank(
+            "dp0_pp0_tp0_dcp0_ep0_rank0.178.pt.trace.json.gz"), 0)
+
+    def test_trace_rank_none_for_merged_name(self):
+        self.assertIsNone(app_module._trace_rank("merged.json.gz"))
+
+    def test_rank0_first_reorders(self):
+        files = [
+            "dp0_pp0_tp2_dcp0_ep2_rank2.a.pt.trace.json.gz",
+            "dp0_pp0_tp0_dcp0_ep0_rank0.b.pt.trace.json.gz",
+            "dp0_pp0_tp3_dcp0_ep3_rank3.c.pt.trace.json.gz",
+            "dp0_pp0_tp1_dcp0_ep1_rank1.d.pt.trace.json.gz",
+        ]
+        out = app_module._rank0_first(files)
+        self.assertEqual(app_module._trace_rank(out[0]), 0)
+        self.assertEqual([app_module._trace_rank(f) for f in out], [0, 1, 2, 3])
+
+    def test_rank0_first_no_markers_unchanged(self):
+        files = ["a.json.gz", "b.json.gz"]
+        self.assertEqual(app_module._rank0_first(files), files)
+
+    def test_rank0_first_single_file(self):
+        self.assertEqual(app_module._rank0_first(["only.json.gz"]),
+                         ["only.json.gz"])
+
+
 if __name__ == "__main__":
     unittest.main()

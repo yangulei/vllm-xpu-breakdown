@@ -592,10 +592,25 @@ static builder. Ensure:
   decode pass, which by design has only decode steps → `prefill: None`) and
   silently averaged the prefill trace in as a bogus rank, so uploading the pair
   "worked for Decode only". Untagged single files (optionally several rank files)
-  still reconstruct one run and average device time. The upload path now also
+  still reconstruct one run — and, like the live path, the **rank-0 file is used
+  and the other ranks are ignored** (see the rank-0 pitfall below), not averaged.
+  The upload path now also
   threads recovered `query_len`/`context_len` into `_build_result_from_traces`
   so `C`/`S+C` symbolize (previously ignored → the Shape Matrix lost context).
   See `tests/test_upload_two_pass.py`.
+- **Rank 0 is always the representative worker for TP>1 traces (not an average).**
+  With tensor parallelism vLLM writes one trace per rank. Ranks 1..N idle much
+  longer than rank 0 on collectives — their `c10d::allreduce_` device time is
+  inflated by the wait to synchronize with rank 0 — so averaging across ranks (or
+  picking whichever rank flushed last) skews the op breakdown. `_rank0_first`
+  lifts the `rank0`/`tp0` file (parsed from the raw
+  `dp0_pp0_tp<N>_…_rank<N>.….pt.trace.json.gz` name via `_trace_rank`) to the
+  front of `rank_files`, and `_build_result_from_traces` builds the op breakdown,
+  the reconstructed graph **and** the downloadable `trace_file` from that rank-0
+  file only; the other ranks are ignored. This applies to both the live profiler
+  and the upload path, and to each pass of a two-pass run. Do NOT reintroduce
+  cross-rank device-time averaging or a mtime-based `rank_files[0]` primary.
+  See `tests/test_trace_download.py::TestRank0Selection`.
 - **The scheduler is pinned so decode runs the full batch every step.**
   `_run_profile` sets `max_num_seqs = max(prefill_batch, decode_batch)` (and
   `max_num_batched_tokens` large enough for a whole-batch prefill step) *before*
