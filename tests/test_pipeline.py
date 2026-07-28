@@ -2406,6 +2406,85 @@ class TestGraphFromTrace(unittest.TestCase):
         self.assertEqual(idx["input_shapes"][0][0], "S")
         self.assertEqual(idx["input_dtypes"], ["bfloat16"])
 
+    def test_cuda_msa_indexer_kernel_shapes_reconstructed(self):
+        # On CUDA the MiniMax-M3 MSA / lightning-indexer kernels are ``triton.jit``
+        # kernels launched straight from ``common/ops/{sparse_attn,index_topk}.py``
+        # (no cpu_op), so they surface as shape-less ``triton::`` ops — the graph
+        # and the Shape Matrix showed them with no shape at all. The layouts are
+        # fixed by the wrapper signatures, so reconstruction must rebuild
+        # ``[S, n_h/TP, d]`` for the block-sparse attend, ``[S, n_idx/TP, d]`` for
+        # the indexer block score and ``[n_idx/TP, S, K_topk]`` (int32) for the
+        # top-k block ids.
+        from breakdown.graph_from_trace import build_graph_from_trace
+        summary = dict(self.SUMMARY, hidden_size=32, num_heads=4, num_kv_heads=2,
+                       head_dim=8, sparse_attention=True,
+                       sparse_num_index_heads=2, sparse_index_dim=8,
+                       sparse_topk_blocks=6)
+        tid = 7
+        tokens = 8
+
+        def launch(corr, ts):
+            return {"ph": "X", "cat": "cuda_driver", "tid": tid, "pid": tid,
+                    "ts": ts, "dur": 0.1, "name": "cuLaunchKernelEx",
+                    "args": {"correlation": corr}}
+
+        def kern(corr, ts, name):
+            return {"ph": "X", "cat": "kernel", "tid": 99, "pid": 0, "ts": ts,
+                    "dur": 3.0, "name": name, "args": {"correlation": corr}}
+
+        events = [
+            {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
+             "ts": 0, "dur": 100, "name": "nn.Module: TinyForCausalLM_0"},
+            {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
+             "ts": 5, "dur": 90, "name": "nn.Module: TinyAttention_0"},
+            # Residual hidden-state op fixing the step's token count.
+            {"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+             "ts": 10, "dur": 4, "name": "aten::linear",
+             "args": {"External id": 1,
+                      "Input Dims": [[tokens, 32], [48, 32]],
+                      "Input type": ["c10::BFloat16", "c10::BFloat16"]}},
+            launch(1, 11),
+            kern(1, 2000, "g"),
+            # A weight transpose: its leading dim is a model dim, not the token
+            # count — it must NOT be picked as the token reference.
+            {"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+             "ts": 14, "dur": 1, "name": "aten::t",
+             "args": {"External id": 2, "Input Dims": [[48, 32]],
+                      "Input type": ["c10::BFloat16"]}},
+            launch(5, 20), kern(5, 2100, "_gqa_sparse_fwd_kernel"),
+            launch(6, 30), kern(6, 2200, "_index_block_score_kernel"),
+            launch(7, 40), kern(7, 2300, "_topk_index_kernel"),
+        ]
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"traceEvents": events}, f)
+            path = f.name
+        try:
+            g = build_graph_from_trace(path, summary, tp_size=2, batch_size=1)
+        finally:
+            os.unlink(path)
+
+        def all_ops(node, out):
+            out.extend(node.get("ops", []))
+            for c in node.get("children", []):
+                all_ops(c, out)
+            return out
+
+        ops = {o["name"]: o for o in all_ops(g["prefill"] or g["decode"], [])}
+        attn = ops["triton::_gqa_sparse_fwd_kernel"]
+        self.assertEqual(attn["recorded_shapes"], [[tokens, 2, 8]])
+        self.assertEqual(attn["input_shapes"], [["S", "n_h/TP", "d"]])
+        self.assertEqual(attn["input_dtypes"], ["bfloat16"])
+        score = ops["triton::_index_block_score_kernel"]
+        self.assertEqual(score["recorded_shapes"], [[tokens, 1, 8]])
+        self.assertEqual(score["input_shapes"], [["S", "n_idx/TP", "d"]])
+        topk = ops["triton::_topk_index_kernel"]
+        self.assertEqual(topk["recorded_shapes"], [[1, tokens, 6]])
+        self.assertEqual(topk["input_shapes"], [["n_idx/TP", "S", "K_topk"]])
+        self.assertEqual(topk["input_dtypes"], ["int32"])
+        # Symbols carry the concrete values so the Shape Matrix can resolve them.
+        self.assertEqual(g["symbols"]["n_idx"], 2)
+        self.assertEqual(g["symbols"]["K_topk"], 6)
+
     def test_layer_extrapolation_to_config_count(self):
         # Reduced-layer profiling captures 2 decoder layers; the config says the
         # model has 5. The unprofiled layers fold into the last decoder group.

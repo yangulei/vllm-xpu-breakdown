@@ -372,7 +372,10 @@ Op shapes use symbolic expressions for dimensions:
   `silu_and_mul_with_clamp` `[16384, I_moe/TP]`), and `N_moe`/`N_moe2` (1-D
   `moe_align_block_size` sorted-token / expert-block scratch buffers). Distinct
   values under one base are suffixed deterministically (largest keeps the bare
-  base). Trivial dims (`≤2` — the k/v-pair `2`, `0`/`1` placeholders/broadcasts)
+  base). The reconstructed MSA-indexer dims are symbolized just before that by
+  `_symbolize_msa_dims` as `n_idx`/`n_idx/TP` (`sparse_num_index_heads`) and
+  `K_topk` (`sparse_topk_blocks`) — they must not fall through to the generic
+  observed-value symbols, nor to the colliding `n_kv/TP` / `n_h/TP`. Trivial dims (`≤2` — the k/v-pair `2`, `0`/`1` placeholders/broadcasts)
   are intentionally left concrete. Verified: reconstructing the four MiniMax-M3
   `tp4` traces (XPU/CUDA × prefill/decode) leaves **no** concrete structural
   integer `>2` in any op shape (`TestSymbolicShapeCompleteness`). Note: the
@@ -750,26 +753,53 @@ static builder. Ensure:
   untouched — they must NOT inherit `[tokens, H]`. Runs on the raw forest after
   the reference-name overlay, before phase partition. See
   `TestGraphFromTrace.test_tensorlist_collective_and_norm_kernel_shapes_recovered`.
-- **Shape-less `flash_xpu` MSA kernels are reconstructed from their wrapper
-  layout (`_infer_attention_kernel_shapes`).** The MiniMax-M3 xattention SYCL
-  kernels (`flash_xpu::minimax_m3_sparse_attn[_decode]`,
-  `minimax_m3_index_score`/`_decode`) also carry no `cpu_op`, so they surface
-  shape-less — but unlike the residual-stream ops their tensors are **not**
-  `[tokens, H]`, so `_infer_hidden_activation_ops` deliberately skips them. Their
-  primary-tensor layout is instead fixed by the `xattention.py` wrapper
-  signatures: the block-sparse **attend** kernels take a query
-  `[total_q, num_heads, head_dim]` → `[S, n_h/TP, d]`, and the lightning-**index**
-  kernels an index query `[total_q, num_index_heads, index_head_dim]` →
-  `[S, n_idx/TP, idx_d]`. `_infer_attention_kernel_shapes` rebuilds the numeric
-  shape from the config (per-rank `num_heads`/`head_dim`;
-  `sparse_num_index_heads`/`sparse_index_dim` for the indexer) with `total_q`
-  taken as the **leading dim of the nearest neighbouring activation op** (so
-  prefill gets `S`, decode `B`), then it symbolizes normally. `_FLASH_XPU_QUERY_-
-  LAYOUT` maps each kernel's API suffix to `attn`/`index`; kernels with no known
-  layout (e.g. the indexer top-k, whose score width is context-dependent) fall
-  back to borrowing the neighbour's activation shape so they still carry the
-  token dim + dtype. Runs right after `_infer_hidden_activation_ops`. See
-  `TestGraphFromTrace.test_flash_xpu_attention_kernel_shapes_reconstructed`.
+- **Shape-less MiniMax-M3 MSA / indexer kernels are reconstructed from their
+  wrapper layout — on CUDA as well as XPU (`_infer_attention_kernel_shapes`).**
+  The sparse-attention and lightning-indexer kernels carry no `cpu_op` on
+  **either** backend — XPU runs `xattention._C` SYCL kernels launched from
+  `xattention.py` (`flash_xpu::minimax_m3_sparse_attn[_decode]`,
+  `minimax_m3_index_score`/`_decode`/`_topk`), CUDA runs `triton.jit` kernels
+  launched from `models/minimax_m3/common/ops/{sparse_attn,index_topk}.py`
+  (`triton::_gqa_sparse_{fwd,decode}_kernel`, `_merge_topk_attn_out_kernel`,
+  `_index_block_score_kernel`, `_decode_index_score_kernel`,
+  `_topk_index[_partial|_merge]_kernel`) — so they surface shape-less. Unlike
+  the residual-stream ops their tensors are **not** `[tokens, H]`, so
+  `_infer_hidden_activation_ops` deliberately skips them. Their primary-tensor
+  layout is instead fixed by the wrapper signatures: the block-sparse **attend**
+  kernels take a query `[total_q, num_heads, head_dim]` → `[S, n_h/TP, d]`, the
+  lightning-**index** kernels an index query
+  `[total_q, num_index_heads, index_head_dim]` → `[S, n_idx/TP, idx_d]`, and the
+  indexer **top-k** kernels the block-id tensor `[n_idx/TP, total_q, topk]` →
+  `[n_idx/TP, S, K_topk]` (int32; only the top-k width is config-derivable —
+  the score width depends on the runtime max seq len).
+  `_infer_attention_kernel_shapes` rebuilds the numeric shape from the config
+  (per-rank `num_heads`/`head_dim`; `sparse_num_index_heads`/`sparse_index_dim`;
+  `sparse_topk_blocks`) with `total_q` taken from the **nearest neighbouring
+  residual hidden-state op** (2-D, trailing dim == `hidden_size`), so prefill
+  gets `S` and decode `B`. That token reference **excludes weight-plumbing ops**
+  (`_WEIGHT_PLUMBING_OPS` = `t`/`transpose`/`permute`/`detach`): a weight is also
+  `[out_features, H]`, so an `aten::t` on one otherwise handed the kernels the
+  weight's out-features as their row count (`[n_h·d/TP, n_idx/TP, d]` instead of
+  `[B, …]`). `_MSA_KERNEL_LAYOUTS` maps kernel-name **substrings** to
+  `topk`/`attn`/`index` so it is device-agnostic (`topk` is probed first because
+  the XPU API name `minimax_m3_index_topk` also contains the `index` prefix);
+  `flash_xpu` ops with no recognised layout still fall back to borrowing the
+  neighbour's activation shape. Runs right after `_infer_hidden_activation_ops`.
+  See `TestGraphFromTrace.test_flash_xpu_attention_kernel_shapes_reconstructed`
+  and `test_cuda_msa_indexer_kernel_shapes_reconstructed`.
+- **The MSA indexer dims get dedicated symbols (`_symbolize_msa_dims`).** Plain
+  value→symbol mapping gets three of the reconstructed indexer dims wrong on M3:
+  the index-head count equals `num_kv_heads` (renders `n_kv/TP`), the top-k block
+  count (16) equals `n_h/TP` at TP=4 (renders `n_h/TP` — and would then wrongly
+  **scale with TP** in the Shape Matrix sweep), and the top-k tensors are
+  token-major on their **second** axis where the token count can collide with a
+  config dim (`S`=2048=`n_h·d/TP`) and lose its `S`/`B` symbol. `_symbolize_msa_-
+  dims` rewrites all three to `n_idx`/`n_idx/TP`, `K_topk` and the phase token
+  symbol, guarded by each op's `recorded_shapes` so only the reconstructed
+  tensors are touched. Runs after the phase trees are built and **before**
+  `_symbolize_runtime_dims` (so those dims don't get a meaningless observed-value
+  symbol). Relatedly, `_symbolize` now also recognises the token dim at a
+  **non-leading** position when the value isn't a known config dim.
 - **Only genuine device kernels are collected; host-side launch-API events are
   NOT surfaced as ops.** `_collect_kernel_launches` emits a launch **only** for a
   real *device* event (cat in `_DEVICE_KERNEL_CATEGORIES` = `kernel` /

@@ -665,36 +665,67 @@ def _infer_hidden_activation_ops(roots: list[_Raw], hidden_size: int | None
         o.dtype = ref_dt
 
 
-# xattention (``flash_xpu``) MiniMax-M3 MSA kernels are launched straight from
-# the ``xattention.py`` wrappers with no ``cpu_op``, so they surface as synthetic
-# ``flash_xpu::`` ops with no shape at all. Their primary tensor layout is fixed
-# by the wrapper signatures: the block-sparse attend kernels take a query
-# ``[total_q, num_heads, head_dim]`` and the lightning-indexer kernels take an
-# index query ``[total_q, num_index_heads, index_head_dim]`` (``total_q`` is the
-# per-step token count — ``S`` prefill / ``B`` decode). We can therefore
-# reconstruct the shape from the model config + the step's token count.
-_FLASH_XPU_QUERY_LAYOUT = {
-    "minimax_m3_sparse_attn": "attn",
-    "minimax_m3_sparse_attn_decode": "attn",
-    "minimax_m3_index_score": "index",
-    "minimax_m3_index_decode": "index",
-}
+# MiniMax-M3 MSA (sparse attention + lightning indexer) kernels are launched
+# straight from Python with no ``cpu_op`` on **both** backends — XPU dispatches
+# hand-tuned SYCL kernels from the ``xattention.py`` wrappers (surfacing as
+# ``flash_xpu::<api>`` ops), CUDA dispatches ``triton.jit`` kernels from
+# ``models/minimax_m3/common/ops/{sparse_attn,index_topk}.py`` (surfacing as
+# ``triton::<kernel>`` ops). Either way they carry no shape at all.
+#
+# Their primary tensor layout is fixed by the wrapper signatures, so it can be
+# rebuilt from the model config + the step's token count (``total_q`` — ``S``
+# prefill / ``B`` decode):
+#   ``attn``  — block-sparse GQA attend query/output ``[total_q, n_h, d]``
+#   ``index`` — lightning-indexer query ``[total_q, n_idx, idx_d]``
+#   ``topk``  — indexer top-k block ids ``[n_idx, total_q, topk_blocks]``
+# Matching is by substring on the op's base name so it is device-agnostic;
+# ``topk`` is probed first because the XPU API name ``minimax_m3_index_topk``
+# also contains the ``index`` family's prefix.
+_MSA_KERNEL_LAYOUTS: tuple[tuple[tuple[str, ...], str], ...] = (
+    # indexer top-k (XPU: minimax_m3_index_topk; CUDA: _topk_index[_partial
+    # |_merge]_kernel)
+    (("index_topk", "topk_index"), "topk"),
+    # block-sparse GQA attend (XPU: minimax_m3_sparse_attn[_decode];
+    # CUDA: _gqa_sparse_{fwd,decode}_kernel + _merge_topk_attn_out_kernel)
+    (("sparse_attn", "gqa_sparse", "merge_topk_attn"), "attn"),
+    # lightning-indexer block score (XPU: minimax_m3_index_score /
+    # minimax_m3_index_decode; CUDA: _index_block_score / _decode_index_score)
+    (("index_score", "index_block_score", "index_decode"), "index"),
+)
+
+
+# Ops that merely re-view a *weight* tensor. A weight is ``[out_features, H]``,
+# i.e. shaped exactly like a residual hidden state, so these must be excluded
+# when inferring a step's token count from a neighbouring ``[tokens, H]`` op.
+_WEIGHT_PLUMBING_OPS = {"t", "transpose", "permute", "detach"}
+
+
+def _msa_kernel_layout(op_label: str) -> str | None:
+    """Return the MSA primary-tensor layout for an op label, if it is one."""
+    base = op_label.split("::")[-1].lower()
+    for subs, layout in _MSA_KERNEL_LAYOUTS:
+        if any(s in base for s in subs):
+            return layout
+    return None
 
 
 def _infer_attention_kernel_shapes(roots: list[_Raw], summary: dict,
                                    tp_size: int) -> None:
-    """Reconstruct shape/dtype for shape-less ``flash_xpu`` attention kernels.
+    """Reconstruct shape/dtype for shape-less MiniMax-M3 MSA / indexer kernels.
 
-    The MiniMax-M3 MSA SYCL kernels carry no ``cpu_op``, so ``_attribute_kernels``
-    surfaces them with no shape. Their primary-tensor layout is fixed by the
-    ``xattention.py`` wrapper signatures, so we rebuild it from the config
-    (per-rank ``num_heads``/``head_dim`` for the attend kernels,
-    ``sparse_num_index_heads``/``sparse_index_dim`` for the indexer kernels) and
-    the per-step token count ``total_q`` — taken as the leading dim of the
-    nearest neighbouring activation op (so prefill gets ``S`` and decode ``B``).
-    Kernels without a known layout (e.g. the indexer top-k, whose score width is
-    context-dependent) fall back to borrowing the neighbour's activation shape so
-    they at least carry the token dim + dtype. No-op without neighbour activations.
+    The MSA sparse-attention and lightning-indexer kernels carry no ``cpu_op`` on
+    either backend (XPU ``flash_xpu`` SYCL kernels launched from
+    ``xattention.py``; CUDA ``triton.jit`` kernels launched from
+    ``common/ops/{sparse_attn,index_topk}.py``), so ``_attribute_kernels``
+    surfaces them with no shape at all. Their primary-tensor layout is fixed by
+    the wrapper signatures, so we rebuild it from the config (per-rank
+    ``num_heads``/``head_dim`` for the attend kernels,
+    ``sparse_num_index_heads``/``sparse_index_dim`` for the indexer kernels,
+    ``sparse_topk_blocks`` for the top-k block ids) and the per-step token count
+    ``total_q`` — taken as the leading dim of the nearest neighbouring activation
+    op (so prefill gets ``S`` and decode ``B``). Kernels with no known layout
+    fall back to borrowing the neighbour's activation shape so they at least
+    carry the token dim + dtype. No-op without neighbour activations.
     """
     ops: list[_Raw] = []
     stack = list(roots)
@@ -706,30 +737,56 @@ def _infer_attention_kernel_shapes(roots: list[_Raw], summary: dict,
 
     # Neighbour activation references: (ts, leading token dim, first shape, dtype).
     act_refs: list[tuple[float, int, list[int], str]] = []
+    tok_refs: list[tuple[float, int]] = []
+    H = summary.get("hidden_size")
     for o in ops:
-        if o.shapes and len(o.shapes[0]) >= 2:
-            dt = next((d for d in o.dtypes if d in DTYPE_BYTES), "")
-            act_refs.append((o.ts, o.shapes[0][0], list(o.shapes[0]),
-                             dt or "bfloat16"))
+        if not o.shapes or len(o.shapes[0]) < 2:
+            continue
+        dt = next((d for d in o.dtypes if d in DTYPE_BYTES), "")
+        shp = list(o.shapes[0])
+        act_refs.append((o.ts, shp[0], shp, dt or "bfloat16"))
+        # Token-count references are restricted to genuine residual hidden
+        # states: a ``[tokens, H]`` tensor on an op that isn't weight plumbing.
+        # A weight is also ``[out_features, H]``, so an ``aten::t`` on one would
+        # otherwise hand the MSA kernels the weight's out-features as their row
+        # count (the symptom: ``[n_h·d/TP, n_idx/TP, d]`` instead of ``[B, ...]``).
+        if (H and len(shp) == 2 and shp[1] == int(H)
+                and o.label.split("::")[-1].lower() not in _WEIGHT_PLUMBING_OPS):
+            tok_refs.append((o.ts, shp[0]))
     if not act_refs:
         return
+    if not tok_refs:  # hidden size unknown / no hidden-state op — best effort
+        tok_refs = [(ts, tok) for ts, tok, _shp, _dt in act_refs]
 
     tp = max(1, int(tp_size or 1))
     n_h = summary.get("num_heads")
     d = summary.get("head_dim")
     n_idx = summary.get("sparse_num_index_heads")
     idx_d = summary.get("sparse_index_dim")
+    topk_blocks = summary.get("sparse_topk_blocks")
 
     for o in ops:
-        if o.shapes or "flash_xpu" not in o.label.lower():
+        if o.shapes:
             continue
-        _ts, token, act_shape, dt = min(act_refs, key=lambda r: abs(r[0] - o.ts))
-        layout = _FLASH_XPU_QUERY_LAYOUT.get(o.label.split("::")[-1])
+        layout = _msa_kernel_layout(o.label)
+        # ``flash_xpu`` ops with no recognised layout still get the neighbour
+        # fallback (the whole namespace is MSA); other ops are left untouched.
+        if layout is None and "flash_xpu" not in o.label.lower():
+            continue
+        _ts, _tok, act_shape, dt = min(act_refs, key=lambda r: abs(r[0] - o.ts))
+        token = min(tok_refs, key=lambda r: abs(r[0] - o.ts))[1]
         shape: list[int] | None = None
         if layout == "attn" and n_h and d:
             shape = [token, max(1, int(n_h) // tp), int(d)]
         elif layout == "index" and n_idx and idx_d:
             shape = [token, max(1, int(n_idx) // tp), int(idx_d)]
+        elif layout == "topk" and n_idx and topk_blocks:
+            # The top-k kernels read a ``[n_idx, total_q, max_block]`` score and
+            # write ``[n_idx, total_q, topk]`` block ids. Only the top-k width is
+            # config-derivable (``max_block`` depends on the runtime max seq len),
+            # so report the block-id tensor — int32, not the activation dtype.
+            shape = [max(1, int(n_idx) // tp), token, int(topk_blocks)]
+            dt = "int32"
         if shape is None:
             shape = list(act_shape)  # fallback: representative activation
         o.shapes = [shape]
@@ -1659,7 +1716,15 @@ def _build_phase_tree(roots: list[_Raw], n_steps: int,
 
 def _symbolize(shape: list[int], symbols_val: dict[int, str],
                token_symbol: str, token_val: int) -> list:
-    """Replace known dimension values with symbol names."""
+    """Replace known dimension values with symbol names.
+
+    The token dim (``S`` prefill / ``B`` decode) is recognised at the leading
+    position (where it always wins over a coincidental config-value match) and
+    also at any later position when the value isn't a known config dim — some
+    tensors are token-major only on their second axis (the MSA indexer's
+    ``[n_idx, total_q, ...]`` score / top-k tensors), and leaving those as a bare
+    integer would hand them a meaningless observed-value symbol later.
+    """
     out: list = []
     for i, dim in enumerate(shape):
         if not isinstance(dim, int):
@@ -1668,6 +1733,8 @@ def _symbolize(shape: list[int], symbols_val: dict[int, str],
             out.append(token_symbol)
         elif dim in symbols_val:
             out.append(symbols_val[dim])
+        elif token_val and dim == token_val:
+            out.append(token_symbol)
         else:
             out.append(dim)
     return out
@@ -2030,6 +2097,10 @@ _RUNTIME_TRIVIAL_MAX = 2
 # Op-name substrings → the symbol base for their run-specific allocation dims.
 # Ordered: the first family whose substring appears in the op name wins.
 _RUNTIME_DIM_FAMILIES: tuple[tuple[tuple[str, ...], str], ...] = (
+    # MiniMax-M3 sparse-attention indexer top-k block count (config
+    # ``sparse_topk_blocks``); probed first so it isn't absorbed by the MoE
+    # family via a ``topk`` substring.
+    (("index_topk", "topk_index"), "K_topk"),
     (("kv_insert", "reshape_and_cache", "kv_cache", "paged_attention",
       "block_table", "kv_update"), "N_kv"),
     (("moe", "expert", "silu_and_mul", "fused_moe", "topk_bias"), "M_moe"),
@@ -2062,6 +2133,62 @@ def _iter_ops(node: dict):
         yield op
     for c in node.get("children", []):
         yield from _iter_ops(c)
+
+
+def _symbolize_msa_dims(trees: list[tuple[dict | None, str, int]],
+                        sym_to_val: dict[str, int],
+                        summary: dict, tp_size: int) -> None:
+    """Give the MiniMax-M3 MSA indexer dims their own symbols.
+
+    The shapes reconstructed by :func:`_infer_attention_kernel_shapes` contain
+    three dims that plain value→symbol mapping gets wrong, because M3's config
+    makes them collide with unrelated model dims:
+
+    * the **index-head count** (``sparse_num_index_heads``) equals
+      ``num_kv_heads``, so it renders ``n_kv``/``n_kv/TP``;
+    * the **top-k block count** (``sparse_topk_blocks``, 16) can equal a sharded
+      head count (``n_h/TP`` = 64/4 at TP=4), so it renders ``n_h/TP`` — which
+      would then wrongly scale with TP in the Shape Matrix sweep;
+    * the top-k tensors are **token-major on their second axis**
+      (``[n_idx, total_q, topk]``), where the token count can collide with a
+      config dim (``S`` = 2048 = ``n_h·d/TP``) and lose its ``S``/``B`` symbol.
+
+    All three are rewritten in place to the right symbol (``n_idx``/``n_idx/TP``,
+    ``K_topk``, and the phase's token symbol) using each op's ``recorded_shapes``
+    to confirm the concrete value. Runs after the phase trees are built (so the
+    numeric shapes are already symbolized) and before
+    :func:`_symbolize_runtime_dims`.
+    """
+    n_idx = summary.get("sparse_num_index_heads")
+    topk_blocks = summary.get("sparse_topk_blocks")
+    if not summary.get("sparse_attention") or not n_idx:
+        return
+    tp = max(1, int(tp_size or 1))
+    if int(n_idx) % tp:
+        return  # per-rank index-head count isn't a clean n_idx/TP shard
+    n_idx_sym = "n_idx/TP" if tp > 1 else "n_idx"
+    for tree, token_symbol, token_val in trees:
+        for op in _iter_ops(tree):
+            layout = _msa_kernel_layout(op.get("name", ""))
+            if layout not in ("index", "topk"):
+                continue
+            head_pos = 1 if layout == "index" else 0
+            n_idx_rank = max(1, int(n_idx) // tp)
+            recorded = op.get("recorded_shapes") or []
+            for i, shp in enumerate(op.get("input_shapes") or []):
+                if not isinstance(shp, list) or len(shp) != 3:
+                    continue
+                rec = recorded[i] if i < len(recorded) else []
+                if len(rec) != 3 or rec[head_pos] != n_idx_rank:
+                    continue  # not the reconstructed indexer tensor
+                shp[head_pos] = n_idx_sym
+                sym_to_val.setdefault("n_idx", int(n_idx))
+                if layout == "topk":
+                    if token_val and rec[1] == token_val:
+                        shp[1] = token_symbol
+                    if topk_blocks and rec[2] == int(topk_blocks):
+                        shp[2] = "K_topk"
+                        sym_to_val.setdefault("K_topk", int(topk_blocks))
 
 
 def _symbolize_runtime_dims(trees: list[dict | None],
@@ -2278,6 +2405,9 @@ def build_graph_from_trace(
     # block-align scratch buffers (``M_moe`` / ``N_moe``). Each distinct value is
     # assigned an observed-value symbol recorded in the legend so the shape reads
     # a symbol while the concrete number stays available for tooltips/exports.
+    _symbolize_msa_dims([(prefill_tree, "S", prefill_tokens),
+                         (decode_tree, "B", decode_tokens)],
+                        sym_to_val, summary, tp_size)
     _symbolize_runtime_dims([prefill_tree, decode_tree], sym_to_val)
 
     total_ops = 0
