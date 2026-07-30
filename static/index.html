@@ -82,6 +82,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 .tab-btn.active::after { content: ''; position: absolute; bottom: -2px; left: 0; right: 0;
                           height: 2px; background: var(--accent); }
 .tab-btn:hover { color: var(--accent); }
+.perf-table th, .perf-table td { padding: 5px 10px; vertical-align: top; }
 .tab-content.hidden { display: none; }
 
 /* Model Graph */
@@ -195,6 +196,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
   <div class="tab-bar">
     <button class="tab-btn active" id="tab-btn-graph" onclick="switchTab('graph')">Model Graph</button>
     <button class="tab-btn" id="tab-btn-matrix" onclick="switchTab('matrix')">Shape Matrix</button>
+    <button class="tab-btn" id="tab-btn-perf" onclick="switchTab('perf')">Perf &amp; Targets</button>
   </div>
 
   <!-- Tab: Model Graph (profiling) -->
@@ -411,6 +413,63 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
           📥 Download Shape Matrix
         </button>
         <span id="sm-status" style="font-size:12px;color:#666"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Tab: Perf & Targets (benchmark the swept shapes, rank what to optimize) -->
+  <div id="tab-perf" class="tab-content hidden">
+    <div class="card">
+      <h2>🎯 Perf Pipeline &amp; Optimization Targets</h2>
+      <p style="font-size:12px;color:#666;margin-bottom:16px">
+        Benchmarks every dispatched op at the swept shapes (via xpu-perf/micro_perf) and ranks
+        the ops by the <b>end-to-end time an optimization would actually recover</b> —
+        calls&nbsp;×&nbsp;latency, roofline headroom, and provider gap. The sweep is taken from the
+        <b>Shape Matrix</b> tab. Everything here also runs headless:
+        <code>python -m breakdown.perf all --matrix &lt;m.xlsx&gt;</code>.
+      </p>
+
+      <div class="controls-row" style="margin-bottom:12px">
+        <div class="control-group">
+          <label>Devices</label>
+          <input id="perf-devices" type="text" value="0" style="width:90px">
+        </div>
+        <div class="control-group">
+          <label>Collective devices</label>
+          <input id="perf-ccl-devices" type="text" value="0,1,2,3" style="width:110px">
+        </div>
+        <div class="control-group">
+          <label>Groups</label>
+          <input id="perf-groups" type="text" value="compute,msa,collective" style="width:200px">
+        </div>
+        <div class="control-group">
+          <label>Target util</label>
+          <input id="perf-target-util" type="number" step="0.05" min="0.1" max="1"
+                 value="0.8" style="width:80px">
+        </div>
+        <div class="control-group">
+          <label><input id="perf-smoke" type="checkbox" checked> Screening tier</label>
+        </div>
+      </div>
+
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="btn btn-primary" id="perf-emit-btn" onclick="perfEmit()">1 · Emit workloads</button>
+        <button class="btn" id="perf-run-btn" onclick="perfRun()">2 · Run benchmark</button>
+        <button class="btn" id="perf-rank-btn" onclick="perfRank()">3 · Rank targets</button>
+        <button class="btn" onclick="perfDownloadReport()">📥 Report</button>
+        <select id="perf-run-select" onchange="perfLoadTargets()" style="font-size:12px;padding:6px"></select>
+        <span id="perf-status" style="font-size:12px;color:#666"></span>
+      </div>
+
+      <div id="perf-progress" style="font-size:12px;color:#666;margin-top:10px;
+           max-height:150px;overflow:auto;font-family:monospace"></div>
+    </div>
+
+    <div class="card">
+      <h2>Ranked targets</h2>
+      <div id="perf-summary" style="font-size:12px;color:#666;margin-bottom:10px"></div>
+      <div style="overflow:auto">
+        <table id="perf-targets" class="perf-table" style="width:100%;border-collapse:collapse;font-size:12px"></table>
       </div>
     </div>
   </div>
@@ -1115,59 +1174,242 @@ function downloadTrace(phase) {
 }
 
 // ---- Tabs ----
+const TABS = ['graph', 'matrix', 'perf'];
 function switchTab(name) {
-  const isGraph = name === 'graph';
-  document.getElementById('tab-graph').classList.toggle('hidden', !isGraph);
-  document.getElementById('tab-matrix').classList.toggle('hidden', isGraph);
-  document.getElementById('tab-btn-graph').classList.toggle('active', isGraph);
-  document.getElementById('tab-btn-matrix').classList.toggle('active', !isGraph);
+  TABS.forEach(t => {
+    const pane = document.getElementById('tab-' + t);
+    const btn = document.getElementById('tab-btn-' + t);
+    if (pane) pane.classList.toggle('hidden', t !== name);
+    if (btn) btn.classList.toggle('active', t === name);
+  });
+  if (name === 'perf') refreshPerfRuns();
+}
+
+
+// ---- Perf pipeline: benchmark the swept shapes, rank what to optimize ----
+let PERF_RUN_ID = null;
+
+const PERF_ACTION_STYLE = {
+  optimize_kernel: ['#c0392b', 'open a kernel session'],
+  switch_provider: ['#8e44ad', 'free win — change the dispatch'],
+  at_roofline: ['#27ae60', 'done — no structural headroom left'],
+  tune_config: ['#7f8c8d', 'library/collective — tune config, not kernel'],
+};
+
+function perfStatus(msg) {
+  document.getElementById('perf-status').textContent = msg || '';
+}
+
+async function refreshPerfRuns() {
+  const sel = document.getElementById('perf-run-select');
+  const resp = await fetch('/api/perf/runs');
+  const data = await resp.json().catch(() => ({ runs: [] }));
+  const runs = data.runs || [];
+  sel.innerHTML = runs.length
+    ? runs.map(r => `<option value="${r.run_id}">${r.run_id}</option>`).join('')
+    : '<option value="">(no runs yet)</option>';
+  if (PERF_RUN_ID) sel.value = PERF_RUN_ID;
+  else if (runs.length) PERF_RUN_ID = runs[0].run_id;
+}
+
+async function perfEmit() {
+  const payload = buildSweepPayload();
+  if (!payload) return;
+  payload.smoke = document.getElementById('perf-smoke').checked;
+  const btn = document.getElementById('perf-emit-btn');
+  btn.disabled = true;
+  perfStatus('Emitting workloads…');
+  try {
+    // the sweep is profile-derived, so make sure a matching run exists first
+    await ensureProfileForMatrix(payload.model_id, payload.quantization,
+                                 document.getElementById('perf-status'));
+    const resp = await fetch('/api/perf/workloads', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) throw new Error(data.error || resp.statusText);
+    PERF_RUN_ID = data.run_id;
+    const cases = data.coverage.mapped_micro_perf_cases;
+    const total = Object.values(cases)
+      .reduce((a, g) => a + Object.values(g).reduce((x, y) => x + y, 0), 0);
+    perfStatus(`run ${data.run_id}: ${total} cases, 0 unmapped ops`);
+    await refreshPerfRuns();
+  } catch (e) {
+    perfStatus('');
+    alert('Emit failed: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function perfRun() {
+  const runId = document.getElementById('perf-run-select').value || PERF_RUN_ID;
+  if (!runId) { alert('Emit workloads first'); return; }
+  const btn = document.getElementById('perf-run-btn');
+  btn.disabled = true;
+  document.getElementById('perf-progress').textContent = '';
+  try {
+    const resp = await fetch('/api/perf/run', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        run_id: runId,
+        devices: document.getElementById('perf-devices').value.trim(),
+        ccl_devices: document.getElementById('perf-ccl-devices').value.trim(),
+        groups: document.getElementById('perf-groups').value.trim()
+          .split(',').map(s => s.trim()).filter(Boolean),
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok || !data.ok) throw new Error(data.error || resp.statusText);
+    await perfPollRun();
+  } catch (e) {
+    alert('Run failed: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function perfEsc(t) {
+  return String(t).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+}
+
+async function perfPollRun() {
+  const progress = document.getElementById('perf-progress');
+  for (;;) {
+    const st = await (await fetch('/api/perf/status')).json();
+    const plan = st.timeout_plan || {};
+    const done = (st.ops || []).map(o => o.op);
+    const pending = Object.keys(plan).filter(op => !done.includes(op));
+    const lines = (st.ops || []).map(o => {
+      // A kernel that rejects a legitimate shape is the actionable result of a
+      // run, so per-case errors are listed, not folded into the op's status.
+      const errs = (o.errors || []).map(e =>
+        `<div style="margin-left:1.6em;color:#c0392b">! ${perfEsc(e)}</div>`).join('');
+      const failed = o.failed_cases
+        ? ` <span style="color:#c0392b">${o.failed_cases} case error(s)</span>` : '';
+      return `${o.ok ? '✅' : '❌'} ${perfEsc(o.op)} [${o.group}] `
+           + `${o.cases} cases ${o.seconds}s/${o.timeout || '?'}s${failed}`
+           + `${o.error && !(o.errors || []).includes(o.error) ? ' — ' + perfEsc(o.error) : ''}`
+           + errs;
+    });
+    if (st.status === 'running' && pending.length) {
+      const eta = pending.reduce((t, op) => t + (plan[op].estimated_s || 0), 0);
+      lines.push(`<span style="opacity:.6">⏳ ${pending.length} op(s) queued, `
+               + `~${Math.round(eta / 60)} min estimated</span>`);
+    }
+    progress.innerHTML = lines.join('<br>');
+    perfStatus(`benchmarking… ${(st.ops || []).length} ops done`);
+    if (st.status !== 'running') {
+      perfStatus(st.status === 'error' ? ('run failed: ' + st.error)
+                                       : 'benchmark finished');
+      return;
+    }
+    await new Promise(r => setTimeout(r, 2000));
+  }
+}
+
+async function perfRank() {
+  const runId = document.getElementById('perf-run-select').value || PERF_RUN_ID;
+  if (!runId) { alert('Emit workloads first'); return; }
+  perfStatus('Ranking…');
+  const util = document.getElementById('perf-target-util').value;
+  const resp = await fetch(
+    `/api/perf/targets?run_id=${encodeURIComponent(runId)}&refresh=1&target_util=${util}`);
+  const data = await resp.json();
+  if (!resp.ok || !data.ok) { perfStatus(''); alert('Rank failed: ' + (data.error || '')); return; }
+  renderPerfTargets(data.targets);
+  perfStatus('ranked');
+}
+
+async function perfLoadTargets() {
+  const runId = document.getElementById('perf-run-select').value;
+  if (!runId) return;
+  PERF_RUN_ID = runId;
+  const resp = await fetch(`/api/perf/targets?run_id=${encodeURIComponent(runId)}`);
+  const data = await resp.json();
+  if (resp.ok && data.ok) renderPerfTargets(data.targets);
+  else { document.getElementById('perf-targets').innerHTML = ''; perfStatus(data.error || ''); }
+}
+
+function perfDownloadReport() {
+  const runId = document.getElementById('perf-run-select').value || PERF_RUN_ID;
+  if (!runId) { alert('No run selected'); return; }
+  window.location.href = '/api/perf/report?run_id=' + encodeURIComponent(runId);
+}
+
+function renderPerfTargets(doc) {
+  const summary = document.getElementById('perf-summary');
+  const pts = Object.entries(doc.operating_points || {})
+    .map(([p, v]) => `${p}: seq=${v.seq_len} ctx=${v.ctx_len} bs=${v.batch_size}`)
+    .join(' · ');
+  summary.innerHTML =
+    `<b>${doc.device}</b> (${doc.sku}: ${doc.peaks.bw_gbs} GB/s, ${doc.peaks.tflops} TFLOPS, ` +
+    `target util ${(doc.target_util * 100).toFixed(0)}%) — e2e op time ` +
+    `${(doc.e2e_us_total / 1000).toFixed(2)} ms/step<br>${pts}`;
+
+  const head = `<tr style="text-align:left;border-bottom:2px solid #ddd">
+    <th>#</th><th>op</th><th>provider</th><th>e2e µs</th><th>share</th>
+    <th>util</th><th>bound</th><th>save µs</th><th>action</th><th>kernel</th></tr>`;
+  const rows = (doc.targets || []).map(t => {
+    const [color, hint] = PERF_ACTION_STYLE[t.action] || ['#333', ''];
+    const shape = (t.top_shapes || [])[0];
+    const cmd = shape ? shape.bench_cmd.replace(/"/g, '&quot;') : '';
+    return `<tr style="border-bottom:1px solid #eee">
+      <td>${t.rank}</td>
+      <td><b>${t.op}</b></td>
+      <td>${t.dispatched_provider}${t.action === 'switch_provider'
+        ? ' → <b>' + t.best_provider + '</b>' : ''}</td>
+      <td style="text-align:right">${t.e2e_us.toFixed(1)}</td>
+      <td style="text-align:right">${(t.share_of_e2e * 100).toFixed(1)}%</td>
+      <td style="text-align:right">${(t.roofline.util * 100).toFixed(0)}%</td>
+      <td>${t.roofline.bound}</td>
+      <td style="text-align:right">${t.savings_us.total.toFixed(1)}</td>
+      <td><span title="${hint}" style="color:${color};font-weight:600">${t.action}</span></td>
+      <td>${t.kernel && t.kernel.kernel_dir ? t.kernel.kernel_dir : '—'}
+        ${cmd ? `<button class="btn" style="font-size:10px;padding:2px 6px;margin-left:6px"
+           onclick="navigator.clipboard.writeText(&quot;${cmd}&quot;)">copy bench</button>` : ''}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('perf-targets').innerHTML = head + rows;
 }
 
 // ---- Shape Matrix Export ----
+// The sweep inputs are shared by the Shape Matrix export and the Perf pipeline
+// (which consumes the same rows in-process instead of re-reading the .xlsx).
+function nums(id, minVal) {
+  return document.getElementById(id).value.trim()
+    .split(',').map(s => parseInt(s.trim())).filter(n => n >= minVal);
+}
+
+function buildSweepPayload() {
+  const modelId = document.getElementById('model-input').value.trim();
+  if (!modelId) { alert('Enter a model ID first'); return null; }
+  const tpSizes = nums('sm-tp-sizes', 1);
+  if (tpSizes.length === 0) { alert('Enter valid TP sizes'); return null; }
+  // Quantization: the sweep is grounded in a profiling run, so the run must
+  // have used the same quantization for the derived shapes/dtypes/memory to be
+  // valid. null = no quantization (BF16).
+  const q = document.getElementById('sm-quant-select').value;
+  return {
+    model_id: modelId,
+    tp_sizes: tpSizes,
+    prefill_seq_lens: nums('sm-prefill-seq-lens', 0),
+    prefill_ctx_lens: nums('sm-prefill-ctx-lens', 0),
+    prefill_batch_sizes: nums('sm-prefill-batch-sizes', 1),
+    decode_ctx_lens: nums('sm-decode-ctx-lens', 0),
+    decode_batch_sizes: nums('sm-decode-batch-sizes', 1),
+    quantization: (q === 'auto' || q === 'none') ? null : q,
+  };
+}
+
 async function downloadShapeMatrix() {
   const btn = document.getElementById('sm-download-btn');
   const status = document.getElementById('sm-status');
 
-  const modelId = document.getElementById('model-input').value.trim();
-  if (!modelId) { alert('Enter a model ID first'); return; }
-
-  // Parse TP sizes
-  const tpText = document.getElementById('sm-tp-sizes').value.trim();
-  const tpSizes = tpText.split(',').map(s => parseInt(s.trim())).filter(n => n > 0);
-  if (tpSizes.length === 0) { alert('Enter valid TP sizes'); return; }
-
-  // Prefill settings
-  const prefillSeqLens = document.getElementById('sm-prefill-seq-lens').value.trim()
-    .split(',').map(s => parseInt(s.trim())).filter(n => n >= 0);
-  const prefillCtxLens = document.getElementById('sm-prefill-ctx-lens').value.trim()
-    .split(',').map(s => parseInt(s.trim())).filter(n => n >= 0);
-  const prefillBatchSizes = document.getElementById('sm-prefill-batch-sizes').value.trim()
-    .split(',').map(s => parseInt(s.trim())).filter(n => n > 0);
-
-  // Decode settings
-  const decodeCtxLens = document.getElementById('sm-decode-ctx-lens').value.trim()
-    .split(',').map(s => parseInt(s.trim())).filter(n => n >= 0);
-  const decodeBatchSizes = document.getElementById('sm-decode-batch-sizes').value.trim()
-    .split(',').map(s => parseInt(s.trim())).filter(n => n > 0);
-
-  // Quantization: the Shape Matrix is grounded in a profiling run, so the run
-  // must have used the same quantization for the derived shapes/dtypes/memory
-  // to be valid. null = no quantization (BF16).
-  const smQuant = (() => {
-    const q = document.getElementById('sm-quant-select').value;
-    return (q === 'auto' || q === 'none') ? null : q;
-  })();
-
-  const payload = {
-    model_id: modelId,
-    tp_sizes: tpSizes,
-    prefill_seq_lens: prefillSeqLens,
-    prefill_ctx_lens: prefillCtxLens,
-    prefill_batch_sizes: prefillBatchSizes,
-    decode_ctx_lens: decodeCtxLens,
-    decode_batch_sizes: decodeBatchSizes,
-    quantization: smQuant,
-  };
+  const payload = buildSweepPayload();
+  if (!payload) return;
+  const modelId = payload.model_id;
 
   btn.disabled = true;
 

@@ -46,6 +46,18 @@ Flask web app (`app.py`) + static SPA (`static/index.html`) backed by a `breakdo
 
 **Query Len / Context Len profiling (Method 1 / APC):** `_run_profile` builds exact-length synthetic token prompts (`_make_token_ids`) instead of a fixed text prompt. `query_len` = new prefill tokens (`S`); `context_len` (floored to `block_size`) is pre-computed in an un-profiled warm pass and served from the prefix cache (`enable_prefix_caching=True`) during the profiled run, so the profiled prefill sees `S` new tokens attending to a `context_len`-token KV. Warm the context prefix alone first, warm kernels with distinct query seeds, and profile with yet another seed (`900000+b`) so profiled queries are never cache-hit; each batch item gets a distinct query over a shared context. A cache miss (`outputs[0].num_cached_tokens < ctx_aligned`) is surfaced as `cache_hit_note`. `start_profile` bumps `max_model_len` to `context+query+max_tokens`. Absent `query_len` → legacy text-prompt path.
 
+**Perf pipeline (`breakdown/perf/`)** — the Shape Matrix rows feed an op map
+(micro_perf op + arguments per dispatched op), a runner that invokes
+xpu-perf/micro_perf **one op per process**, and a ranker that scores ops by
+calls × latency × roofline headroom (plus a faster-provider "free win" check),
+producing `output/perf/<run_id>/opt_targets.json` for the `xpu-kernel-optimizer`
+skill. Runs headless via `python -m breakdown.perf {emit,run,rank,bench,all}`.
+xpu-perf is invoked, never vendored. Emission drops only *impossible* shapes
+(a 0-sized extent → `coverage.invalid_cases`); a kernel that rejects a real
+shape is reported per case (`OpResult.failed_cases`/`errors`), not hidden. Each
+op's timeout is sized from its estimated runtime (`breakdown/perf/estimate.py`,
+`--timeout auto`) because micro_perf only flushes its results when an op ends.
+
 **Backend classification priority:** ccl (collective-comm: `c10d::`/`ccl::` or all_reduce/all_gather/reduce_scatter/all_to_all) > vllm-xpu-kernels (exact match from registry) > flashinfer (name contains `flashinfer`) > triton (name patterns) > torch-xpu-ops (aten:: on XPU) > cpu > framework
 
 ## Key Conventions
@@ -69,6 +81,8 @@ The model graph is reconstructed from the trace, so no static builder is needed:
 
 1. Add op name to `ALL_VLLM_XPU_OPS` set in `breakdown/registry.py`
 2. If the op has a unique classification pattern, update `breakdown/classifier.py`
+3. To benchmark it, add an adapter in `breakdown/perf/op_map/{xpu,cuda}.py` and,
+   if it has editable kernel source, an entry in `breakdown/perf/kernel_sources.json`
 
 ## API Endpoints
 
@@ -81,6 +95,13 @@ The model graph is reconstructed from the trace, so no static builder is needed:
 | `/api/profile/result` | GET | Fetch profiling result (ops + reconstructed graph) |
 | `/api/profile/trace` | GET | Download raw trace file |
 | `/api/export/shape-matrix` | POST | Export config-driven shape sweep to Excel |
+| `/api/perf/workloads` | POST | Sweep the profiled graph into micro_perf workloads |
+| `/api/perf/run` | POST | Benchmark a run's workloads (async) |
+| `/api/perf/status` | GET | Poll the benchmark run |
+| `/api/perf/runs` | GET | List perf runs |
+| `/api/perf/targets` | GET | Ranked optimization targets (`opt_targets.json`) |
+| `/api/perf/report` | GET | Download a run's merged report workbook |
+| `/api/perf/history` | GET | Perf history / two-run regression diff |
 
 
 <!-- headroom:rtk-instructions -->

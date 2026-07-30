@@ -57,6 +57,21 @@ from breakdown.model_info import (
     summarize_config,
 )
 from breakdown.registry import ALL_VLLM_XPU_OPS
+from breakdown.perf import (
+    bench_case as perf_bench_case,  # noqa: F401  (exposed for the CLI docs)
+    devices as perf_devices,
+    estimate as perf_estimate,
+    history as perf_history,
+    matrix_reader as perf_matrix_reader,
+    op_map as perf_op_map,
+    rank as perf_rank,
+    reports as perf_reports,
+    runner as perf_runner,
+    shape_matrix,
+    shape_matrix_xlsx,
+    store as perf_store,
+    workloads as perf_workloads_mod,
+)
 
 app = Flask(__name__, static_folder="static")
 
@@ -1394,434 +1409,68 @@ def download_trace():
     )
 
 
-# Roles whose 2nd input tensor (index 1) is a weight matrix
-_WEIGHT_ROLES = {
-    "qkv_proj", "o_proj", "gate_up_proj", "down_proj",
-    "expert_gate_up", "expert_down",
-    "shared_expert_gate_up", "shared_expert_down",
-    "q_compress", "q_decompress", "kv_compress",
-    "router_gate", "lm_head", "vl_projector",
-    "vit_qkv_proj", "vit_o_proj", "vit_mlp_up", "vit_mlp_down",
-    "patch_embed", "mlp_up", "mlp_down",
-}
+from breakdown.shape_derive import (  # noqa: F401  (re-exported for tests)
+    _MAX_MATRIX_ROWS,
+    _WEIGHT_ROLES,
+    _bytes_to_dtype,
+    _config_symbols,
+    _flatten_graph_nodes,
+    _format_op_shape_with_dtypes,
+    _partially_resolve_dim,
+    _profile_op_memory,
+    _resolve_shape_ints,
+    _validate_derived_shapes,
+)
 
 
-def _bytes_to_dtype(nbytes: int) -> str:
-    """Convert byte count to short dtype name."""
-    return {4: "fp32", 2: "bf16", 1: "fp8"}.get(nbytes, f"{nbytes * 8}bit")
-
-
-def _quant_dtype_name(quant: str | None) -> str | None:
-    """Map quantization method to weight dtype short name."""
-    if not quant or quant == "None":
+def _norm_quant(q: object) -> str | None:
+    """Normalize a quantization selection: "", "auto", "none" → None."""
+    if not q or str(q).lower() in ("auto", "none"):
         return None
-    names = {
-        "fp8": "fp8", "gptq": "int4", "gptq_marlin": "int4",
-        "awq": "int4", "awq_marlin": "int4", "marlin": "int4",
-        "squeezellm": "int4", "bitsandbytes": "nf4", "gguf": "q4",
-        "int4": "int4", "int8": "int8",
-    }
-    return names.get(quant.lower(), quant.lower())
+    return str(q).lower()
 
 
-def _get_tensor_dtype(tensor_idx: int, role: str,
-                      graph_cfg: dict) -> str:
-    """Get the dtype label for a specific tensor in an op.
+def _profile_template_for(model_id: str, quantization: object = None
+                          ) -> tuple[dict, dict | None, str | None]:
+    """The latest completed profile graph, validated against a request.
 
-    Mirrors the frontend getOpDtypes logic: weight tensors (index 1) of
-    projection ops use the weight dtype; everything else uses activation dtype.
+    Returns ``(template, profile_settings, error)``; ``error`` is a
+    user-facing message when the state cannot serve this model/quantization.
+    Shared by the Shape Matrix export and the ``/api/perf/*`` pipeline.
     """
-    act_dtype = _bytes_to_dtype(graph_cfg.get("dtype_bytes", 2))
-    quant = graph_cfg.get("quantization")
-    if quant:
-        w_dtype = _quant_dtype_name(quant) or _bytes_to_dtype(
-            graph_cfg.get("weight_dtype_bytes", 2)
-        )
-    else:
-        w_dtype = act_dtype
+    with _profile_lock:
+        state_status = _profile_state["status"]
+        state_model = _profile_state.get("model_id")
+        state_result = _profile_state.get("result")
+        profile_settings = _profile_state.get("settings")
+    if state_status != "done" or not state_result:
+        return {}, None, (
+            "The Shape Matrix is derived from a profiling run, but no "
+            "completed run is available. Run a profile first.")
+    template = state_result.get("graph")
+    if not template or not (template.get("prefill") or template.get("decode")):
+        return {}, None, ("The latest profile has no reconstructed graph to "
+                          "derive shapes from.")
+    if state_model and state_model != model_id:
+        return {}, None, (f"Latest profile is for '{state_model}', not "
+                          f"'{model_id}'. Profile that model or switch the "
+                          "model ID.")
 
-    if tensor_idx == 1 and role in _WEIGHT_ROLES:
-        return w_dtype
-    return act_dtype
-
-
-def _flatten_graph_nodes(node: dict, depth: int = 0,
-                         rows: list | None = None,
-                         parent_repeat: int = 1) -> list[dict]:
-    """Flatten a hierarchical graph tree into rows for the hierarchy sheet."""
-    if rows is None:
-        rows = []
-
-    # Effective repeat = own repeat_count × parent's repeat
-    own_repeat = node.get("repeat_count", 1)
-    effective_repeat = own_repeat * parent_repeat
-
-    # Add module row
-    rows.append({
-        "depth": depth,
-        "name": node.get("name", ""),
-        "path": node.get("path", ""),
-        "module_type": node.get("module_type", ""),
-        "repeat_count": own_repeat,
-        "effective_repeat": effective_repeat,
-        "total_memory": node.get("total_memory", 0),
-        "total_flops": node.get("total_flops", 0),
-        "total_ai": node.get("total_ai", 0),
-        "ops": node.get("ops", []),
-    })
-
-    # Recurse into children
-    for child in node.get("children", []):
-        _flatten_graph_nodes(child, depth + 1, rows, effective_repeat)
-
-    return rows
-
-
-# ---- Shape Matrix Export (single model, multi-config sweep) ----
-
-# Max total rows to prevent excessive memory/time
-_MAX_MATRIX_ROWS = 50000
-
-
-def _format_op_shape_with_dtypes(
-    op: dict, symbols: dict[str, int], graph_cfg: dict,
-    recorded_dtypes: list[str] | None = None,
-) -> str:
-    """Format op shapes as concrete values with per-tensor dtypes.
-
-    Example: "[128, 2560, bf16] × [2560, 6144, fp8]"
-    Resolves symbolic dims (including composite like "S+C") via the symbols dict.
-
-    When ``recorded_dtypes`` is given (the real per-tensor dtypes captured in the
-    profiling trace, aligned with ``op["input_shapes"]``), it takes precedence
-    over the config-driven ``_get_tensor_dtype`` heuristic so the exported dtype
-    is exactly what the op actually ran.
-    """
-    op_shapes = op.get("input_shapes", [])
-    if not op_shapes:
-        return "—"
-    role = op.get("role", "")
-    parts = []
-    for shape_idx, shape in enumerate(op_shapes):
-        if isinstance(shape, list):
-            tensor_dtype = None
-            if recorded_dtypes and shape_idx < len(recorded_dtypes):
-                tensor_dtype = _friendly_dtype(recorded_dtypes[shape_idx])
-            if not tensor_dtype:
-                tensor_dtype = _get_tensor_dtype(shape_idx, role, graph_cfg)
-            dims = []
-            for dim in shape:
-                dims.append(str(_resolve_dim(dim, symbols)))
-            if tensor_dtype:
-                dims.append(tensor_dtype)
-            parts.append("[" + ", ".join(dims) + "]")
-        else:
-            parts.append(str(_resolve_dim(shape, symbols)))
-    return " × ".join(parts)
-
-
-def _safe_arithmetic_eval(expr: str) -> int:
-    """Safely evaluate a simple arithmetic expression (integers, +, -, *, /).
-
-    Only allows integer literals and the operators +, -, *, /.
-    Division is performed as integer (floor) division.
-    Raises ValueError for anything else.
-    """
-    import ast
-
-    # Normalize "/" to "//" for integer division in eval
-    expr = expr.replace("//", "/").replace("/", "//")
-
-    tree = ast.parse(expr, mode="eval")
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Expression):
-            continue
-        if isinstance(node, ast.BinOp):
-            if not isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv)):
-                raise ValueError(f"Unsupported operator: {type(node.op).__name__}")
-        elif isinstance(node, ast.UnaryOp):
-            if not isinstance(node.op, (ast.USub, ast.UAdd)):
-                raise ValueError(f"Unsupported unary op: {type(node.op).__name__}")
-        elif isinstance(node, (ast.Constant,)):
-            if not isinstance(node.value, (int, float)):
-                raise ValueError(f"Non-numeric constant: {node.value}")
-        elif not isinstance(node, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv,
-                                   ast.USub, ast.UAdd)):
-            raise ValueError(f"Unsupported node: {type(node).__name__}")
-    return int(eval(compile(tree, "<dim>", "eval")))  # noqa: S307
-
-
-def _resolve_dim(dim, symbols: dict[str, int]):
-    """Resolve a dimension value to a concrete integer if possible."""
-    if isinstance(dim, int):
-        return dim
-    if isinstance(dim, str):
-        # Direct lookup
-        if dim in symbols:
-            return symbols[dim]
-        # Try evaluating composite expressions like "S+C", "2·I"
-        # Replace symbol names with their values and evaluate
-        expr = dim
-        # Sort by length descending to avoid partial replacements
-        for name in sorted(symbols.keys(), key=len, reverse=True):
-            expr = expr.replace(name, str(symbols[name]))
-        # Replace middle-dot with *
-        expr = expr.replace("·", "*")
-        try:
-            return _safe_arithmetic_eval(expr)
-        except (ValueError, SyntaxError, ZeroDivisionError, OverflowError):
-            return dim
-    return dim
-
-
-# Config-dependent variable symbols that should stay symbolic
-_VARIABLE_SYMS = {"S", "B", "C", "TP"}
-
-
-def _is_variable_composite(expr: str) -> bool:
-    """Check if an expression is composed entirely of variable symbols.
-
-    Handles both additive (S+C) and multiplicative (B·S) composites.
-    """
-    # Split on + and · to get individual parts
-    parts = expr.replace("·", "+").split("+")
-    return all(p.strip() in _VARIABLE_SYMS for p in parts)
-
-
-def _partially_resolve_dim(dim, symbols: dict[str, int],
-                           full_symbols: dict[str, int] | None = None,
-                           tp_divided: set[str] | None = None):
-    """Resolve dim keeping only S/B/C/TP symbolic, resolving all else to numbers.
-
-    Model constants from config.json are shown as numbers. When a dimension
-    contains "/TP", it's shown as "value/TP" using the full undivided config
-    value from the symbols dict.
-
-    The full_symbols and tp_divided params are accepted for backwards
-    compatibility but ignored — the graph now embeds /TP directly in shapes
-    and symbols already contain original (undivided) values.
-    """
-    if isinstance(dim, (int, float)):
-        return str(int(dim))
-
-    s = str(dim)
-
-    # Pure variable symbol → keep as-is
-    if s in _VARIABLE_SYMS:
-        return s
-
-    # Composite of only variable symbols (e.g. "S+C", "B·S") → keep as-is
-    if _is_variable_composite(s):
-        return s
-
-    # Handle "/TP" suffix: resolve the base part, keep /TP
-    if s.endswith("/TP"):
-        base = s[:-3]  # strip "/TP"
-        resolved_base = _resolve_constant_expr(base, symbols)
-        return f"{resolved_base}/TP"
-
-    # Check if s is a known symbol directly (handles names with · like "n_h·D_qh")
-    if s in symbols:
-        return str(symbols[s])
-
-    # Check for multiply composites containing a variable (e.g., "B·S·K")
-    if "·" in s:
-        parts = s.split("·")
-        has_variable = any(p in _VARIABLE_SYMS for p in parts)
-        if has_variable:
-            # Partially resolve: keep variable parts, resolve constants
-            resolved_parts = []
-            for p in parts:
-                if p in _VARIABLE_SYMS:
-                    resolved_parts.append(p)
-                elif p in symbols:
-                    resolved_parts.append(str(symbols[p]))
-                elif p.isdigit():
-                    resolved_parts.append(p)
-                else:
-                    resolved_parts.append(p)
-            return "·".join(resolved_parts)
-        else:
-            # All parts are constants — compute product
-            product = 1
-            for p in parts:
-                val = symbols.get(p)
-                if val is not None:
-                    product *= val
-                elif p.isdigit():
-                    product *= int(p)
-            return str(product)
-
-    # Pure constant — fully resolve
-    if s in symbols:
-        return str(symbols[s])
-    resolved = _resolve_dim(s, symbols)
-    return str(resolved)
-
-
-def _resolve_constant_expr(expr: str, symbols: dict[str, int]) -> str:
-    """Resolve a constant expression (no variables) to its numeric value.
-
-    Handles symbols like "QKV", "n_h·d", "2·I", and plain numbers.
-    """
-    if expr in symbols:
-        return str(symbols[expr])
-    if "·" in expr:
-        parts = expr.split("·")
-        product = 1
-        for p in parts:
-            val = symbols.get(p)
-            if val is not None:
-                product *= val
-            elif p.isdigit():
-                product *= int(p)
-            else:
-                return expr  # can't resolve
-        return str(product)
-    if expr.isdigit():
-        return expr
-    return expr
-
-
-# ---- Profile-derived Shape Matrix helpers ----
-
-_FRIENDLY_DTYPE = {
-    "bfloat16": "bf16", "bf16": "bf16",
-    "float16": "fp16", "fp16": "fp16",
-    "float32": "fp32", "float": "fp32", "fp32": "fp32",
-    "float8_e4m3fn": "fp8e4m3", "float8_e5m2": "fp8e5m2", "fp8": "fp8",
-    "int8": "int8", "uint8": "uint8",
-    "int64": "i64", "int32": "i32", "int16": "i16", "long": "i64", "int": "i32",
-    "bool": "bool",
-}
-
-
-def _friendly_dtype(name: str) -> str:
-    """Short display name for a recorded trace dtype ('bfloat16' → 'bf16')."""
-    if not name:
-        return ""
-    return _FRIENDLY_DTYPE.get(name.lower(), name.lower())
-
-
-def _prod_ints(shape) -> int:
-    p = 1
-    for d in shape:
-        if isinstance(d, int):
-            p *= d
-        else:
-            return 0
-    return p
-
-
-_MM_OP_BASES = {"mm", "addmm", "linear", "matmul", "bmm", "_scaled_mm",
-                "fp8_gemm", "fp4_gemm", "int4_gemm_w4a16", "int4_gemm_w4a8"}
-
-
-def _profile_op_memory(op_name: str, shapes: list[list[int]],
-                       dtypes: list[str], act_bytes: int) -> int:
-    """Estimate op memory using the *recorded per-tensor* dtypes.
-
-    Reads are sized per input tensor with its own dtype (so an fp8/int4 weight
-    counts 1 byte while a bf16 activation counts 2) — more accurate than a
-    single global dtype for quantized ops. The write (output) is sized at the
-    activation dtype. Falls back to 0 when shapes aren't concrete.
-    """
-    if not shapes:
-        return 0
-    reads = 0
-    for i, s in enumerate(shapes):
-        n = _prod_ints(s)
-        if n == 0:
-            return 0
-        b = dtype_size(dtypes[i]) if i < len(dtypes) and dtypes[i] else act_bytes
-        reads += n * b
-    base = op_name.split("::")[-1].lower()
-    if (base in _MM_OP_BASES and len(shapes) >= 2
-            and len(shapes[0]) >= 2 and len(shapes[1]) >= 2):
-        out = _prod_ints(shapes[0][:-1]) * shapes[1][-1]
-    else:
-        out = _prod_ints(shapes[0])
-    return reads + out * act_bytes
-
-
-def _config_symbols(base_symbols: dict[str, int], cfg: dict) -> dict[str, int]:
-    """Return a copy of a profile graph's symbol table with the config
-    variables (S/B/C/S+C/TP) overridden for one matrix configuration.
-
-    Config *constants* (H, I, n_h·d, V, ...) are kept as-is so the op template's
-    symbolic shapes resolve to this configuration's concrete dims.
-    """
-    sym = dict(base_symbols)
-    if cfg["phase"] == "prefill":
-        s_val = int(cfg["seq_len"])
-    else:
-        s_val = 1  # decode advances each sequence by one token
-    c_val = int(cfg.get("ctx_len") or 0)
-    sym["S"] = s_val
-    sym["B"] = int(cfg["batch_size"])
-    sym["C"] = c_val
-    sym["S+C"] = s_val + c_val
-    sym["TP"] = int(cfg["tp_size"])
-    return sym
-
-
-def _resolve_shape_ints(input_shapes, symbols: dict[str, int]) -> list[list[int]]:
-    """Resolve an op's (symbolic) input shapes to concrete integer tensor shapes.
-
-    Only fully-resolvable tensor (list) shapes with all-integer dims are kept;
-    scalars and shapes with a dim that can't be resolved to an int are dropped,
-    so ``estimate_memory``/``estimate_flops`` see a clean ``list[list[int]]``.
-    """
-    out: list[list[int]] = []
-    for shape in input_shapes or []:
-        if not isinstance(shape, list):
-            continue
-        dims = [_resolve_dim(d, symbols) for d in shape]
-        if all(isinstance(d, int) for d in dims):
-            out.append(dims)
-    return out
-
-
-def _validate_derived_shapes(template: dict) -> dict:
-    """Round-trip check that the symbolic derivation reproduces reality.
-
-    Resolving each op's symbolic ``input_shapes`` at the *profiled* config (the
-    template's own ``symbols``) must reproduce the numeric shape recorded in the
-    trace (``recorded_shapes``). Context-annotated KV dims (``C`` / ``S+C``) are
-    excluded because the context is deliberately added, not recorded; dims that
-    don't resolve to an int are skipped (can't compare). Returns counts + a few
-    mismatch examples for the Info sheet.
-    """
-    syms = template.get("symbols", {})
-    total = matched = 0
-    examples: list[str] = []
-    for phase in ("prefill", "decode"):
-        tree = template.get(phase)
-        if not tree:
-            continue
-        for node in _flatten_graph_nodes(tree):
-            for op in node["ops"]:
-                recorded = op.get("recorded_shapes")
-                sym = op.get("input_shapes")
-                if not recorded or not sym:
-                    continue
-                for rec, ss in zip(recorded, sym):
-                    if not isinstance(ss, list) or not isinstance(rec, list):
-                        continue
-                    if any(isinstance(d, str) and d in ("C", "S+C") for d in ss):
-                        continue  # deliberately context-annotated KV row
-                    resolved = [_resolve_dim(d, syms) for d in ss]
-                    if not all(isinstance(d, int) for d in resolved):
-                        continue  # unresolved dim — nothing to compare
-                    total += 1
-                    if resolved == list(rec):
-                        matched += 1
-                    elif len(examples) < 6:
-                        examples.append(
-                            f"{op.get('name', '')} {ss}\u2192{resolved} vs {rec}")
-    return {"total": total, "matched": matched,
-            "mismatched": total - matched, "examples": examples}
-
+    # The derived shapes/dtypes/memory are only valid for the quantization the
+    # run actually used, so the requested quantization must match the profiled
+    # one.
+    requested_quant = _norm_quant(quantization)
+    profiled_quant = _norm_quant(
+        (profile_settings or {}).get("quantization")
+        if profile_settings else
+        template.get("config", {}).get("quantization")
+    )
+    if requested_quant != profiled_quant:
+        return {}, None, (
+            f"Latest profile used quantization '{profiled_quant or 'none'}', "
+            f"not '{requested_quant or 'none'}'. Re-profile with the requested "
+            "quantization or change the selection.")
+    return template, profile_settings, None
 
 @app.route("/api/export/shape-matrix", methods=["POST"])
 def export_shape_matrix():
@@ -1844,339 +1493,312 @@ def export_shape_matrix():
     caller profiles at each TP it needs; S/B/C are parametric from one profile.
     The frontend ensures a matching profile exists (reusing the latest run or
     launching a fresh one) before calling this endpoint.
-    """
-    from openpyxl import Workbook
-    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-    from openpyxl.utils import get_column_letter
 
+    The rows themselves are built by :mod:`breakdown.perf.shape_matrix`; this
+    endpoint only validates the request and serializes. ``/api/perf/*`` consumes
+    the same rows in-process, without going through Excel.
+    """
     data = request.json or {}
 
     model_id = data.get("model_id")
     if not model_id:
         return jsonify({"ok": False, "error": "No model_id specified"}), 400
 
-    # Prefill settings
-    prefill_seq_lens = data.get("prefill_seq_lens",
-                                [128, 256, 512, 1024, 2048, 4096, 8192])
-    prefill_ctx_lens = data.get("prefill_ctx_lens", [0, 8192])
-    prefill_batch_sizes = data.get("prefill_batch_sizes", [1])
-
-    # Decode settings (seq_len always 1)
-    decode_ctx_lens = data.get("decode_ctx_lens", [8192])
-    decode_batch_sizes = data.get("decode_batch_sizes",
-                                  [1, 2, 4, 8, 16, 32, 64, 128])
-
-    # TP sizes
-    tp_sizes = data.get("tp_sizes", [1, 2, 4, 8])
+    sweep = {k: data.get(k, v) for k, v in shape_matrix.DEFAULT_SWEEP.items()}
 
     # Validate inputs
-    if not isinstance(prefill_seq_lens, list) or not prefill_seq_lens:
-        return jsonify({"ok": False,
-                        "error": "prefill_seq_lens must be a non-empty list"}), 400
-    if not isinstance(tp_sizes, list) or not tp_sizes:
-        return jsonify({"ok": False,
-                        "error": "tp_sizes must be a non-empty list"}), 400
-    if not isinstance(decode_ctx_lens, list) or not decode_ctx_lens:
-        return jsonify({"ok": False,
-                        "error": "decode_ctx_lens must be a non-empty list"}), 400
-    if not isinstance(decode_batch_sizes, list) or not decode_batch_sizes:
-        return jsonify({"ok": False,
-                        "error": "decode_batch_sizes must be a non-empty list"}), 400
+    for key in ("prefill_seq_lens", "tp_sizes", "decode_ctx_lens",
+                "decode_batch_sizes"):
+        if not isinstance(sweep[key], list) or not sweep[key]:
+            return jsonify({"ok": False,
+                            "error": f"{key} must be a non-empty list"}), 400
 
-    # Build list of all configurations to sweep (always both phases)
-    configs: list[dict] = []
-    for seq in prefill_seq_lens:
-        for ctx in prefill_ctx_lens:
-            for bs in prefill_batch_sizes:
-                for tp in tp_sizes:
-                    configs.append({
-                        "phase": "prefill", "seq_len": seq, "ctx_len": ctx,
-                        "batch_size": bs, "tp_size": tp,
-                    })
-    for ctx in decode_ctx_lens:
-        for bs in decode_batch_sizes:
-            for tp in tp_sizes:
-                configs.append({
-                    "phase": "decode", "seq_len": 1, "ctx_len": ctx,
-                    "batch_size": bs, "tp_size": tp,
-                })
-
+    configs = shape_matrix.build_configs(**sweep)
     if not configs:
         return jsonify({"ok": False,
                         "error": "No configurations generated."}), 400
 
-    # Grab the latest reconstructed graph as the op template (real dispatched ops
-    # with symbolic shapes) and validate it matches the requested model. The
-    # frontend guarantees a matching completed run exists before calling here.
-    with _profile_lock:
-        state_status = _profile_state["status"]
-        state_model = _profile_state.get("model_id")
-        state_result = _profile_state.get("result")
-        profile_settings = _profile_state.get("settings")
-    if state_status != "done" or not state_result:
-        return jsonify({
-            "ok": False,
-            "error": "The Shape Matrix is derived from a profiling run, but no "
-                     "completed run is available. Run a profile first.",
-        }), 400
-    profile_template = state_result.get("graph")
-    if not profile_template or not (profile_template.get("prefill")
-                                    or profile_template.get("decode")):
-        return jsonify({
-            "ok": False,
-            "error": "The latest profile has no reconstructed graph to "
-                     "derive shapes from.",
-        }), 400
-    if state_model and state_model != model_id:
-        return jsonify({
-            "ok": False,
-            "error": f"Latest profile is for '{state_model}', not '{model_id}'. "
-                     "Profile that model or switch the model ID.",
-        }), 400
+    template, profile_settings, err = _profile_template_for(model_id,
+                                                            data.get("quantization"))
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
 
-    # The derived shapes/dtypes/memory are only valid for the quantization the
-    # run actually used, so the requested quantization must match the profiled
-    # one. Normalize "", "auto", "none" → None (no quantization).
-    def _norm_quant(q: object) -> str | None:
-        if not q or str(q).lower() in ("auto", "none"):
-            return None
-        return str(q).lower()
-
-    requested_quant = _norm_quant(data.get("quantization"))
-    profiled_quant = _norm_quant(
-        (profile_settings or {}).get("quantization")
-        if profile_settings else
-        profile_template.get("config", {}).get("quantization")
-    )
-    if requested_quant != profiled_quant:
+    estimated_rows = shape_matrix.estimate_row_count(template, configs)
+    if estimated_rows > shape_matrix.MAX_MATRIX_ROWS:
         return jsonify({
             "ok": False,
-            "error": f"Latest profile used quantization "
-                     f"'{profiled_quant or 'none'}', not "
-                     f"'{requested_quant or 'none'}'. Re-profile with the "
-                     "requested quantization or change the selection.",
-        }), 400
-
-    pdtype_bytes = profile_template.get("config", {}).get("dtype_bytes", 2)
-
-    # Estimate row count (configs × ~ops_per_config) for the limit guard.
-    test_tree = profile_template.get("prefill") or profile_template.get("decode")
-    test_ops_count = 0
-    if test_tree:
-        for node in _flatten_graph_nodes(test_tree):
-            test_ops_count += len(node["ops"])
-    estimated_rows = len(configs) * test_ops_count
-    if estimated_rows > _MAX_MATRIX_ROWS:
-        return jsonify({
-            "ok": False,
-            "error": f"Too many rows ({estimated_rows}). Max is {_MAX_MATRIX_ROWS}. "
+            "error": f"Too many rows ({estimated_rows}). Max is "
+                     f"{shape_matrix.MAX_MATRIX_ROWS}. "
                      "Reduce seq_lens, batch_sizes, ctx_lens, or tp_sizes."
         }), 400
 
-    # Build flat table data
-    wb = Workbook()
-
-    header_font = Font(bold=True, size=10, color="FFFFFF")
-    header_fill = PatternFill(start_color="1A1A2E", end_color="1A1A2E",
-                              fill_type="solid")
-    thin_border = Border(bottom=Side(style="thin", color="E0E0E0"))
-
-    # Sheet name: use model short name (last part of model_id)
-    model_short = model_id.split("/")[-1] if "/" in model_id else model_id
-    # Sanitize for Excel sheet name (max 31 chars, no special chars)
-    sheet_name = model_short[:31].replace("[", "").replace("]", "")
-
-    ws = wb.active
-    ws.title = sheet_name
-
-    headers = [
-        "Phase", "Seq Len", "Ctx Len", "Batch Size", "TP",
-        "Module", "Op Name", "Backend", "Layers",
-        "Symbolic Shape", "Shape",
-        "Memory (bytes)", "FLOPs", "AI",
-    ]
-    for col, hdr in enumerate(headers, 1):
-        c = ws.cell(1, col, hdr)
-        c.font = header_font
-        c.fill = header_fill
-        c.alignment = Alignment(horizontal="center")
-
-    row = 2
-    graph_cfg = profile_template.get("config", {})
-    base_symbols = profile_template.get("symbols", {})
-    for cfg in configs:
-        tree = profile_template.get(cfg["phase"])
-        if not tree:
-            continue
-        symbols = _config_symbols(base_symbols, cfg)
-
-        flat_nodes = _flatten_graph_nodes(tree)
-        for node_info in flat_nodes:
-            effective_repeat = node_info.get("effective_repeat", 1)
-            for op in node_info["ops"]:
-                # Prefer the real per-tensor dtypes recorded in the trace.
-                recorded_dtypes = op.get("input_dtypes")
-                shape_str = _format_op_shape_with_dtypes(
-                    op, symbols, graph_cfg, recorded_dtypes=recorded_dtypes)
-
-                # Symbolic shape: keep only config variables (S, B, C, TP)
-                # symbolic, resolve model constants to numbers.
-                sym_shapes = op.get("input_shapes", [])
-                if sym_shapes:
-                    sym_parts = []
-                    for s in sym_shapes:
-                        if isinstance(s, list):
-                            dims = [_partially_resolve_dim(d, symbols)
-                                    for d in s]
-                            sym_parts.append("[" + ", ".join(dims) + "]")
-                        else:
-                            sym_parts.append(
-                                _partially_resolve_dim(s, symbols))
-                    symbolic_str = " × ".join(sym_parts)
-                else:
-                    symbolic_str = "—"
-
-                # Recompute Memory/FLOPs from this config's resolved shapes so
-                # every row is self-consistent; Memory uses the recorded
-                # per-tensor dtypes for accuracy.
-                resolved = _resolve_shape_ints(sym_shapes, symbols)
-                op_name = op.get("name", "")
-                if recorded_dtypes:
-                    mem_bytes = _profile_op_memory(
-                        op_name, resolved, recorded_dtypes, pdtype_bytes)
-                else:
-                    mem_bytes = estimate_memory(op_name, resolved, pdtype_bytes)
-                flops = estimate_flops(op_name, resolved)
-                ai = round(flops / mem_bytes, 2) if mem_bytes > 0 else 0
-
-                # Merge module path and op role into single column
-                path = node_info["path"]
-                role = op.get("role", "")
-                module_col = f"{path}.{role}" if role else path
-
-                ws.cell(row, 1, cfg["phase"])
-                ws.cell(row, 2, cfg["seq_len"])
-                ws.cell(row, 3, cfg["ctx_len"])
-                ws.cell(row, 4, cfg["batch_size"])
-                ws.cell(row, 5, cfg["tp_size"])
-                ws.cell(row, 6, module_col)
-                ws.cell(row, 7, op.get("name", ""))
-                ws.cell(row, 8, op.get("backend", ""))
-                ws.cell(row, 9, effective_repeat)
-                ws.cell(row, 10, symbolic_str)
-                ws.cell(row, 11, shape_str)
-                ws.cell(row, 12, mem_bytes)
-                ws.cell(row, 13, flops)
-                ws.cell(row, 14, ai)
-
-                for c in range(1, len(headers) + 1):
-                    ws.cell(row, c).border = thin_border
-                row += 1
-
-    # AutoFit column widths by sampling header + first/last 100 data rows
-    sample_rows = list(range(1, min(row, 102)))  # header + first 100
-    if row > 202:
-        sample_rows += list(range(row - 100, row))  # last 100
-    elif row > 102:
-        sample_rows += list(range(102, row))
-    for col_idx in range(1, len(headers) + 1):
-        max_len = 0
-        col_letter = get_column_letter(col_idx)
-        for r in sample_rows:
-            val = ws.cell(r, col_idx).value
-            if val is not None:
-                max_len = max(max_len, len(str(val)))
-        ws.column_dimensions[col_letter].width = min(max_len + 2, 80)
-
-    ws.freeze_panes = "A2"
-    if row > 2:
-        ws.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{row - 1}"
-
-    # Provenance / caveats sheet so the optimization engineers know exactly
-    # which profiling run the shapes were grounded in.
-    info = wb.create_sheet("Info")
-    ps = profile_settings or {}
-    pcfg = profile_template.get("config", {})
-    info_rows = [
-        ("Shape source", "profile-derived (grounded in a profiling run)"),
-        ("Model", model_id),
-        ("Profiled query_len (S)", ps.get("query_len")),
-        ("Profiled context_len (C)", ps.get("context_len")),
-        ("Profiled decode batch (B)", ps.get("decode_batch_size")),
-        ("Profiled TP", pcfg.get("tp_size", ps.get("tp_size"))),
-        ("Profiled quantization", pcfg.get("quantization")),
-        ("Profiled mode", ps.get("mode")),
-        ("", ""),
-        ("How rows are derived",
-         "The profile contributes the accurate op set, real recorded "
-         "shapes and backends. Shapes are re-resolved per config "
-         "(S/B/C/TP). Memory/FLOPs are then analytic functions of "
-         "(op, shape, dtype), recomputed per config — NOT measured values."),
-        ("Memory/FLOPs are estimates",
-         "Heuristic (op+shape) estimates, not measured; e.g. attention "
-         "FLOPs are not modeled. Only the op set and shapes come from the "
-         "trace. Measured device time is intentionally not in this sweep."),
-        ("Caveat — op set / TP",
-         "The op set (TP collectives, MoE routing, chunked-prefill splits) "
-         "is fixed at the profiled config. Profile at each TP you need — "
-         "sweeping TP only divides /TP dims, it does not add comm ops that "
-         "weren't profiled."),
-        ("Context (C) is parametric",
-         "No need to profile per context. One base profile with any "
-         "non-zero context captures C as S+C on the prefill attention KV "
-         "rows; every other context length is then derived by resolving C. "
-         "A base profile with context=0 leaves KV rows as S, so context "
-         "can't be derived — profile with a small non-zero context."),
-        ("Caveat — timing",
-         "Device time is valid only at the profiled point and is not "
-         "included in this sweep; rows carry shapes/memory/FLOPs only."),
-    ]
-    # Round-trip validation: re-resolving each op's symbolic shape at the
-    # profiled config must reproduce the shape actually recorded in the
-    # trace — a self-consistency proof for the derivation machinery.
-    vres = _validate_derived_shapes(profile_template)
-    if vres["total"]:
-        pct = 100.0 * vres["matched"] / vres["total"]
-        info_rows.append((
-            "Shape validation",
-            f"{vres['matched']}/{vres['total']} op input shapes "
-            f"({pct:.1f}%) re-resolve at the profiled config to exactly the "
-            "shape recorded in the trace (context-annotated KV rows "
-            "excluded). This validates the symbolic derivation.",
-        ))
-        if vres["mismatched"]:
-            info_rows.append((
-                "Validation mismatches",
-                f"{vres['mismatched']} mismatched. Examples: "
-                + " | ".join(vres["examples"]),
-            ))
-    for r_idx, (k, v) in enumerate(info_rows, 1):
-        kc = info.cell(r_idx, 1, k)
-        kc.font = Font(bold=True, size=10)
-        kc.alignment = Alignment(vertical="top")
-        vc = info.cell(r_idx, 2, "" if v is None else str(v))
-        vc.alignment = Alignment(wrap_text=True, vertical="top")
-    info.column_dimensions["A"].width = 26
-    info.column_dimensions["B"].width = 90
-
-    # Write to buffer
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
+    rows = shape_matrix.build_rows(template, configs)
+    info_rows = shape_matrix.build_info_rows(model_id, template,
+                                             profile_settings)
+    payload = shape_matrix_xlsx.write_workbook(
+        rows, info_rows, shape_matrix_xlsx.sheet_name_for(model_id))
 
     model_name = model_id.replace("/", "_")
     # Tag with the quantization method, or the model's concrete activation dtype
     # (e.g. bf16/fp16) when the run is unquantized — never a bare "none".
+    pcfg = template.get("config", {})
     quant_tag = pcfg.get("quantization") or _bytes_to_dtype(
         pcfg.get("dtype_bytes", 2)
     )
     filename = f"vllm_xpu_shape_matrix_{model_name}_{quant_tag}.xlsx"
 
     return Response(
-        buf.getvalue(),
+        payload,
         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+
+# ---------------------------------------------------------------------------
+# Perf pipeline (/api/perf/*): shapes -> benchmarks -> ranked targets
+#
+# The web layer only wraps breakdown.perf; every stage also runs headless via
+# ``python -m breakdown.perf``. Benchmark runs are long, so they use the same
+# async job + lock pattern as profiling.
+# ---------------------------------------------------------------------------
+_perf_state: dict[str, Any] = {
+    "status": "idle",     # idle | running | done | error
+    "run_id": None,
+    "error": None,
+    "ops": [],            # per-op progress
+    "timeout_plan": {},   # op -> estimated runtime / budget, why
+    "result": None,
+}
+_perf_lock = threading.Lock()
+
+
+def _perf_model_config(model_id: str) -> perf_op_map.ModelConfig:
+    """Structural config for the op map, from the same summarizer the graph uses."""
+    try:
+        cfg = fetch_model_config(model_id)
+        return perf_op_map.ModelConfig.from_config_summary(
+            summarize_config(cfg))
+    except Exception as exc:  # noqa: BLE001 - config fetch is best-effort
+        logger.warning("perf: falling back to default ModelConfig (%s)", exc)
+        return perf_op_map.ModelConfig()
+
+
+@app.route("/api/perf/workloads", methods=["POST"])
+def perf_workloads():
+    """Sweep the profiled graph into micro_perf workloads for a new perf run."""
+    data = request.json or {}
+    model_id = data.get("model_id")
+    if not model_id:
+        return jsonify({"ok": False, "error": "No model_id specified"}), 400
+
+    template, _settings, err = _profile_template_for(model_id,
+                                                     data.get("quantization"))
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+
+    sweep = {k: data.get(k, v) for k, v in shape_matrix.DEFAULT_SWEEP.items()}
+    tp_sizes = sweep.get("tp_sizes") or [1]
+    configs = shape_matrix.build_configs(**sweep)
+    if shape_matrix.estimate_row_count(template, configs) > \
+            shape_matrix.MAX_MATRIX_ROWS:
+        return jsonify({"ok": False, "error": "Sweep too large - reduce it"}), 400
+
+    dispatch = data.get("dispatch", "xpu")
+    backend = data.get("backend", "INTEL" if dispatch == "xpu" else "GPU")
+    rows = shape_matrix.build_rows(template, configs)
+    oprows = perf_matrix_reader.rows_to_oprows(rows)
+    row_filter = (perf_workloads_mod.RowFilter.smoke(tp=set(tp_sizes))
+                  if data.get("smoke") else None)
+    buckets, coverage = perf_workloads_mod.emit(
+        oprows, _perf_model_config(model_id), dispatch, row_filter)
+
+    run_id = data.get("run_id") or perf_store.make_run_id(
+        model_id, int(tp_sizes[0]), backend)
+    paths = perf_store.run_paths(run_id).ensure()
+    perf_workloads_mod.write(buckets, coverage, paths.workloads)
+    with open(paths.coverage, "w") as fh:
+        json.dump(coverage.to_dict(), fh, indent=2)
+    # keep the matrix next to the run: it is the only artifact that cannot be
+    # regenerated without re-profiling on the GPU
+    with open(paths.matrix, "wb") as fh:
+        fh.write(shape_matrix_xlsx.write_workbook(
+            rows, shape_matrix.build_info_rows(model_id, template, _settings),
+            shape_matrix_xlsx.sheet_name_for(model_id)))
+    perf_store.RunMeta(run_id=run_id, model_id=model_id, backend=backend,
+                       dispatch=dispatch, tp=int(tp_sizes[0]),
+                       smoke=bool(data.get("smoke")),
+                       sweep={**sweep, "matrix": paths.matrix}).write(paths)
+
+    return jsonify({
+        "ok": coverage.ok, "run_id": run_id, "rows": len(rows),
+        "coverage": coverage.to_dict(),
+        "error": (None if coverage.ok else
+                  f"unmapped ops: {sorted(coverage.unmapped_breakdown_ops)}"),
+    }), (200 if coverage.ok else 400)
+
+
+#: Fallback per-op timeout when a run has no estimate to size one from.
+PERF_DEFAULT_TIMEOUT = 3600
+
+
+def _perf_timeouts(paths, backend: str, timeout: Any) -> tuple[dict, dict, int]:
+    """Per-op benchmark budgets: ``"auto"`` sizes each op from its estimate."""
+    if timeout not in (None, "", "auto"):
+        try:
+            return {}, {}, int(timeout)
+        except (TypeError, ValueError):
+            pass
+    try:
+        timeouts, detail = perf_estimate.plan_for_run(
+            paths.workloads, perf_root=perf_store.perf_root(), backend=backend)
+        return timeouts, detail, PERF_DEFAULT_TIMEOUT
+    except Exception as exc:  # noqa: BLE001 - never block a run on estimation
+        logger.warning("perf: timeout estimation failed (%s)", exc)
+        return {}, {}, PERF_DEFAULT_TIMEOUT
+
+
+def _run_perf_benchmark(run_id: str, backend: str, devices_arg: str,
+                        ccl_devices: str | None, groups: list[str],
+                        tasks: list[str] | None, timeout: Any) -> None:
+    paths = perf_store.run_paths(run_id)
+    try:
+        def progress(op_result):
+            with _perf_lock:
+                _perf_state["ops"].append(asdict(op_result))
+
+        timeouts, detail, fallback = _perf_timeouts(paths, backend, timeout)
+        with _perf_lock:
+            _perf_state["timeout_plan"] = detail
+        result = perf_runner.run(
+            paths.workloads, paths.reports, backend=backend,
+            devices_arg=devices_arg, ccl_devices=ccl_devices, groups=groups,
+            tasks=tasks, timeout=fallback, timeouts=timeouts,
+            cache_dir=paths.cache, on_op=progress)
+        with _perf_lock:
+            _perf_state["status"] = "done"
+            _perf_state["result"] = result.to_dict()
+    except Exception as exc:  # noqa: BLE001 - surfaced to the client
+        logger.exception("perf run failed")
+        with _perf_lock:
+            _perf_state["status"] = "error"
+            _perf_state["error"] = str(exc)
+
+
+@app.route("/api/perf/run", methods=["POST"])
+def perf_run():
+    """Benchmark a run's workloads. Non-blocking — poll /api/perf/status."""
+    data = request.json or {}
+    run_id = data.get("run_id")
+    if not run_id:
+        return jsonify({"ok": False, "error": "run_id is required"}), 400
+    paths = perf_store.run_paths(run_id)
+    if not os.path.isdir(paths.workloads):
+        return jsonify({"ok": False,
+                        "error": f"no workloads for run {run_id}"}), 400
+    with _perf_lock:
+        if _perf_state["status"] == "running":
+            return jsonify({"ok": False,
+                            "error": "A benchmark run is already in progress"}), 409
+        _perf_state.update({"status": "running", "run_id": run_id,
+                            "error": None, "ops": [], "timeout_plan": {},
+                            "result": None})
+
+    meta = perf_store.read_meta(paths)
+    thread = threading.Thread(
+        target=_run_perf_benchmark,
+        args=(run_id, data.get("backend") or meta.get("backend") or "INTEL",
+              str(data.get("devices", "0")), data.get("ccl_devices"),
+              data.get("groups") or list(perf_workloads_mod.GROUPS),
+              data.get("tasks"), data.get("timeout", "auto")),
+        daemon=True)
+    thread.start()
+    return jsonify({"ok": True, "status": "running", "run_id": run_id})
+
+
+@app.route("/api/perf/status")
+def perf_status():
+    with _perf_lock:
+        return jsonify({"ok": True, **{k: v for k, v in _perf_state.items()
+                                       if k != "result"},
+                        "result": _perf_state["result"]})
+
+
+@app.route("/api/perf/runs")
+def perf_runs():
+    return jsonify({"ok": True, "runs": perf_store.list_runs()})
+
+
+@app.route("/api/perf/targets")
+def perf_targets():
+    """The ranked optimization targets of a run (recomputed with ?refresh=1)."""
+    run_id = request.args.get("run_id") or (
+        perf_store.list_runs()[0]["run_id"] if perf_store.list_runs() else None)
+    if not run_id:
+        return jsonify({"ok": False, "error": "no perf runs yet"}), 404
+    paths = perf_store.run_paths(run_id)
+    meta = perf_store.read_meta(paths)
+    if request.args.get("refresh") not in ("1", "true") and \
+            os.path.isfile(paths.targets):
+        with open(paths.targets) as fh:
+            return jsonify({"ok": True, "run_id": run_id, "targets": json.load(fh)})
+
+    matrix = (meta.get("sweep") or {}).get("matrix") or paths.matrix
+    if not os.path.isfile(matrix):
+        return jsonify({"ok": False,
+                        "error": f"run {run_id} has no shape matrix"}), 400
+    backend = meta.get("backend") or "INTEL"
+    records = perf_reports.records(backend, paths.reports)
+    if not records:
+        return jsonify({"ok": False,
+                        "error": f"run {run_id} has no benchmark reports"}), 400
+    rc = perf_rank.RankConfig(
+        dispatch=meta.get("dispatch") or "xpu", tp=meta.get("tp"),
+        target_util=float(request.args.get(
+            "target_util", perf_rank.DEFAULT_TARGET_UTIL)),
+        top=int(request.args.get("top", 0)), backend=backend,
+        provenance={"run_id": run_id, "commits": meta.get("commits") or {}})
+    doc = perf_rank.rank(perf_matrix_reader.read_matrix(matrix), records,
+                         _perf_model_config(meta.get("model_id") or ""), rc)
+    with open(paths.targets, "w") as fh:
+        json.dump(doc, fh, indent=2)
+    try:
+        conn = perf_history.connect(
+            perf_history.db_path(perf_store.perf_root()))
+        perf_history.ingest(conn, meta or {"run_id": run_id}, records, doc)
+    except Exception as exc:  # noqa: BLE001 - history is best-effort
+        logger.warning("perf history ingest failed: %s", exc)
+    return jsonify({"ok": True, "run_id": run_id, "targets": doc})
+
+
+@app.route("/api/perf/report")
+def perf_report():
+    """Download a run's merged report workbook (built on demand)."""
+    run_id = request.args.get("run_id")
+    if not run_id:
+        return jsonify({"ok": False, "error": "run_id is required"}), 400
+    paths = perf_store.run_paths(run_id)
+    meta = perf_store.read_meta(paths)
+    if not os.path.isdir(paths.reports):
+        return jsonify({"ok": False, "error": "run has no reports"}), 400
+    perf_reports.merge([f"{meta.get('backend') or 'INTEL'}={paths.reports}"],
+                       out=paths.merged, log=lambda *a: None)
+    return send_file(paths.merged, as_attachment=True,
+                     download_name=f"{run_id}_reports.xlsx")
+
+
+@app.route("/api/perf/history")
+def perf_history_api():
+    """Runs in the history db, or a per-shape diff of two runs."""
+    conn = perf_history.connect(perf_history.db_path(perf_store.perf_root()))
+    base, new = request.args.get("base"), request.args.get("new")
+    if base and new:
+        return jsonify({"ok": True, "base": base, "new": new,
+                        "changes": perf_history.compare(
+                            conn, base, new,
+                            float(request.args.get("threshold", 0.10)))})
+    return jsonify({"ok": True, "runs": perf_history.runs(conn)})
+
 
 
 if __name__ == "__main__":

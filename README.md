@@ -145,6 +145,49 @@ context can't be derived.) Memory/FLOPs remain analytic estimates (op+shape),
 not measured.
 
 
+## Perf Pipeline — what to optimize next
+
+The Shape Matrix says *what runs at which shapes*; the perf pipeline says
+**which kernel is worth a session**. It benchmarks every dispatched op at the
+swept shapes through [xpu-perf/micro_perf](https://github.com/bytedance/xpu-perf)
+and ranks the ops by the end-to-end time an optimization would actually recover:
+
+| signal | source | why it matters |
+|---|---|---|
+| calls x latency | Shape Matrix `Layers` at one operating point | a 10 us op in 57 layers beats a 500 us op that runs once |
+| roofline headroom | `io_bytes`/`calc_flops` vs the SKU peaks | an op already at >=80 % of peak is `at_roofline` - don't spend a session on it |
+| provider gap | best vs actually-dispatched provider | a faster existing provider is a **free win** (`switch_provider`), not a kernel rewrite |
+
+Use the **Perf & Targets** tab, or run it headless:
+
+```bash
+# one command: emit workloads -> benchmark (one op per process) -> rank -> merge -> store
+python -m breakdown.perf all --matrix output/perf/<run>/matrix.xlsx \
+    --model-id MiniMaxAI/MiniMax-M3 --tp 4 --devices 0 --ccl-devices 0,1,2,3 --smoke
+
+# or stage by stage
+python -m breakdown.perf emit --matrix m.xlsx --model-id ... --smoke
+python -m breakdown.perf run  --run-id <id> --devices 0
+python -m breakdown.perf rank --run-id <id>
+python -m breakdown.perf bench --op msa_sparse_attn --provider all --case '{...}'
+python -m breakdown.perf history --compare <base-run> <new-run>
+```
+
+`--smoke` is a screening tier (a few shapes per op) - enough to rank targets in
+minutes; run the full sweep only for the ops that come out on top.
+
+Output is `output/perf/<run_id>/opt_targets.json`, the versioned handoff for the
+`xpu-kernel-optimizer` skill: each target carries the kernel directory and
+files, build/test commands, the baseline latency, the roofline bound, and a
+ready-to-run `bench_cmd` / `profile_cmd` for the shapes that dominate. Every run
+also records the git commit of each component that can move a number
+(kernel repos, xpu-perf, this tool), and its cases are stored in
+`output/perf/history.sqlite` so regressions are detectable across kernel bumps.
+
+Requires an `xpu-perf` checkout (`$XPU_PERF_HOME`, or a sibling `xpu-perf/`
+directory) plus its micro_perf requirements. The upstream project is invoked,
+never vendored: new op schemas and vendor implementations are contributed there.
+
 ## Comparing Eager vs Compiled
 
 ```bash
@@ -159,6 +202,21 @@ run_profile.py          CLI entry point — standalone profiling + reports
 static/index.html       Interactive frontend (SPA, vanilla JS)
 breakdown/
   graph_from_trace.py   Profile-first graph reconstruction (from torch profiler trace)
+  shape_derive.py       Symbolic shape resolution (shared by the export + perf pipeline)
+  perf/                 Perf pipeline: shapes -> benchmarks -> ranked targets
+    shape_matrix.py       Graph + config sweep -> matrix rows (the export serializes these)
+    shape_matrix_xlsx.py  Excel serialization of those rows
+    matrix_reader.py      Rows / .xlsx -> normalized OpRow records
+    op_map/               Shape-Matrix op -> micro_perf op case (xpu + cuda dispatch)
+    workloads.py          Rows -> micro_perf workload JSON + coverage report
+    estimate.py           Per-case cost -> estimated runtime -> per-op timeout
+    runner.py             Runs xpu-perf/micro_perf, one op per process
+    bench_case.py         One op-case in its own process (bench / unitrace / isolate)
+    reports.py            Report trees -> records + merged workbook
+    rank.py               calls x latency x roofline -> opt_targets.json
+    store.py              output/perf/<run_id>/ layout + run provenance
+    history.py            SQLite perf history + regression detection
+    cli.py                python -m breakdown.perf {emit,run,rank,bench,report,history,all}
   module_hooks.py       Capture-time module-name spans (forward hooks; research R1)
   module_naming.py      Fallback name overlay from named_modules() (legacy/upload traces)
   model_info.py         HuggingFace model config fetching & summarization
@@ -174,6 +232,10 @@ tests/
   test_pipeline.py            Unit tests (incl. graph reconstruction; requires torch)
   test_module_spans.py        Capture-time module-span emission + reconstruction tests
   test_shape_matrix_export.py Shape Matrix Export endpoint tests
+  test_perf_workloads.py      Perf pipeline: rows -> op map -> workloads
+  test_perf_rank.py           Ranking, runner isolation, perf history
+  test_perf_estimate.py       Shape gating, runtime estimation, adaptive timeouts
+  test_perf_api.py            /api/perf/* endpoints
   test_real_profile.py        Integration test (requires GPU)
 ```
 
