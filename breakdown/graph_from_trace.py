@@ -124,6 +124,69 @@ def _normalize_dtype(t: Any) -> str:
     return name
 
 
+def _parse_input_args(args: dict) -> list[dict]:
+    """Full ordered argument slots of a ``cpu_op``, for benchmark replay.
+
+    Unlike :func:`_parse_input_dims_types` — which keeps only the tensor
+    operands, because that is all the shape/memory analysis needs — this keeps
+    **every** slot in its original position, so
+    :mod:`breakdown.bench` can rebuild the call: which slot is a tensor (with
+    its dims/dtype/strides), which is a ``TensorList``, and which is a scalar /
+    ``None`` (with the value the profiler recorded in ``Concrete Inputs``).
+
+    Slot kinds: ``tensor`` | ``tensorlist`` | ``scalar`` | ``none``.
+    """
+    dims = args.get("Input Dims")
+    if not isinstance(dims, (list, tuple)):
+        return []
+    types = args.get("Input type")
+    types = types if isinstance(types, (list, tuple)) else []
+    strides = args.get("Input Strides")
+    strides = strides if isinstance(strides, (list, tuple)) else []
+    concrete = args.get("Concrete Inputs")
+    concrete = concrete if isinstance(concrete, (list, tuple)) else []
+
+    def at(seq, i):
+        return seq[i] if i < len(seq) else None
+
+    def ints(v) -> list[int]:
+        if not isinstance(v, (list, tuple)):
+            return []
+        return [int(d) for d in v if isinstance(d, (int, float))]
+
+    out: list[dict] = []
+    for i, entry in enumerate(dims):
+        raw_t = at(types, i)
+        dt = _normalize_dtype(raw_t)
+        st = at(strides, i)
+        val = at(concrete, i)
+        val = "" if val is None else str(val)
+        if isinstance(entry, (list, tuple)) and entry and all(
+                isinstance(x, (list, tuple)) for x in entry):
+            # TensorList: one nesting level deeper (c10d::allreduce_, foreach).
+            elem_dt = dt if dt in DTYPE_BYTES else ""
+            items = []
+            for j, sub in enumerate(entry):
+                items.append({
+                    "dims": ints(sub), "dtype": elem_dt,
+                    "strides": ints(at(st, j) if isinstance(st, (list, tuple))
+                                    else None),
+                })
+            out.append({"kind": "tensorlist", "items": items})
+        elif isinstance(entry, (list, tuple)) and entry:
+            out.append({"kind": "tensor", "dims": ints(entry), "dtype": dt,
+                        "strides": ints(st)})
+        elif dt in DTYPE_BYTES:
+            # A 0-dim tensor: empty dims but a real dtype token.
+            out.append({"kind": "tensor", "dims": [], "dtype": dt,
+                        "strides": []})
+        elif raw_t:
+            out.append({"kind": "scalar", "type": str(raw_t), "value": val})
+        else:
+            out.append({"kind": "none", "value": val})
+    return out
+
+
 def _parse_input_dims_types(args: dict) -> tuple[list[list[int]], list[str]]:
     """Extract numeric input shapes and per-tensor dtypes, kept aligned.
 
@@ -387,7 +450,8 @@ class _Raw:
     """A node in the raw trace nesting tree (a module or a leaf op)."""
 
     __slots__ = ("kind", "label", "ts", "end", "dur", "ext", "shapes",
-                 "dtype", "dtypes", "children", "self_dev", "sub_dev", "attr_name")
+                 "dtype", "dtypes", "children", "self_dev", "sub_dev",
+                 "attr_name", "arg_slots")
 
     def __init__(self, kind: str, label: str, ts: float, dur: float):
         self.kind = kind          # "module" or "op"
@@ -403,6 +467,7 @@ class _Raw:
         self.self_dev = 0.0       # device us launched directly by this op
         self.sub_dev = 0.0        # device us of this node + all descendants
         self.attr_name = ""       # real module attribute name (q_norm, ...)
+        self.arg_slots: list[dict] = []  # full ordered call args (replay)
 
 
 def _deepest_at(roots: list[_Raw], ts: float) -> _Raw | None:
@@ -944,6 +1009,7 @@ def _build_raw_forest(events: list[dict]) -> list[_Raw]:
             a = e.get("args", {})
             n.ext = a.get("External id")
             n.shapes, n.dtypes = _parse_input_dims_types(a)
+            n.arg_slots = _parse_input_args(a)
             n.dtype = next((d for d in n.dtypes if d in DTYPE_BYTES), "")
             nodes.append(n)
 
@@ -1516,6 +1582,7 @@ def _finalize_node(
             "output_shape": out_shape,
             "recorded_shapes": [list(s) for s in shapes],
             "input_dtypes": list(raw.dtypes),
+            "input_args": [dict(s) for s in raw.arg_slots],
             "memory_bytes": mem,
             "flops": flops,
             "ai": round(flops / mem, 2) if mem > 0 else 0,

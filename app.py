@@ -57,20 +57,16 @@ from breakdown.model_info import (
     summarize_config,
 )
 from breakdown.registry import ALL_VLLM_XPU_OPS
-from breakdown.perf import (
-    bench_case as perf_bench_case,  # noqa: F401  (exposed for the CLI docs)
-    devices as perf_devices,
-    estimate as perf_estimate,
-    history as perf_history,
-    matrix_reader as perf_matrix_reader,
-    op_map as perf_op_map,
-    rank as perf_rank,
-    reports as perf_reports,
-    runner as perf_runner,
-    shape_matrix,
-    shape_matrix_xlsx,
-    store as perf_store,
-    workloads as perf_workloads_mod,
+from breakdown import shape_matrix, shape_matrix_xlsx
+from breakdown.bench import (
+    devices as bench_devices,
+    history as bench_history,
+    rank as bench_rank,
+    reports as bench_reports,
+    resolve as bench_resolve,
+    runner as bench_runner,
+    spec as bench_spec,
+    store as bench_store,
 )
 
 app = Flask(__name__, static_folder="static")
@@ -1494,7 +1490,7 @@ def export_shape_matrix():
     The frontend ensures a matching profile exists (reusing the latest run or
     launching a fresh one) before calling this endpoint.
 
-    The rows themselves are built by :mod:`breakdown.perf.shape_matrix`; this
+    The rows themselves are built by :mod:`breakdown.shape_matrix`; this
     endpoint only validates the request and serializes. ``/api/perf/*`` consumes
     the same rows in-process, without going through Excel.
     """
@@ -1556,37 +1552,30 @@ def export_shape_matrix():
 
 
 # ---------------------------------------------------------------------------
-# Perf pipeline (/api/perf/*): shapes -> benchmarks -> ranked targets
+# Benchmark pipeline (/api/bench/*): profile -> replay -> ranked targets
 #
-# The web layer only wraps breakdown.perf; every stage also runs headless via
-# ``python -m breakdown.perf``. Benchmark runs are long, so they use the same
+# The web layer only wraps breakdown.bench; every stage also runs headless via
+# ``python -m breakdown.bench``. Benchmark runs are long, so they use the same
 # async job + lock pattern as profiling.
 # ---------------------------------------------------------------------------
-_perf_state: dict[str, Any] = {
+_bench_state: dict[str, Any] = {
     "status": "idle",     # idle | running | done | error
     "run_id": None,
     "error": None,
     "ops": [],            # per-op progress
-    "timeout_plan": {},   # op -> estimated runtime / budget, why
     "result": None,
 }
-_perf_lock = threading.Lock()
+_bench_lock = threading.Lock()
 
 
-def _perf_model_config(model_id: str) -> perf_op_map.ModelConfig:
-    """Structural config for the op map, from the same summarizer the graph uses."""
-    try:
-        cfg = fetch_model_config(model_id)
-        return perf_op_map.ModelConfig.from_config_summary(
-            summarize_config(cfg))
-    except Exception as exc:  # noqa: BLE001 - config fetch is best-effort
-        logger.warning("perf: falling back to default ModelConfig (%s)", exc)
-        return perf_op_map.ModelConfig()
+@app.route("/api/bench/plan", methods=["POST"])
+def bench_plan():
+    """Sweep the profiled graph into replay cases for a new benchmark run.
 
-
-@app.route("/api/perf/workloads", methods=["POST"])
-def perf_workloads():
-    """Sweep the profiled graph into micro_perf workloads for a new perf run."""
+    The op set and the operands come from the profile, so this endpoint needs a
+    completed profiling run for the requested model/quantization - the same
+    precondition the Shape Matrix export has.
+    """
     data = request.json or {}
     model_id = data.get("model_id")
     if not model_id:
@@ -1604,201 +1593,196 @@ def perf_workloads():
             shape_matrix.MAX_MATRIX_ROWS:
         return jsonify({"ok": False, "error": "Sweep too large - reduce it"}), 400
 
-    dispatch = data.get("dispatch", "xpu")
-    backend = data.get("backend", "INTEL" if dispatch == "xpu" else "GPU")
     rows = shape_matrix.build_rows(template, configs)
-    oprows = perf_matrix_reader.rows_to_oprows(rows)
-    row_filter = (perf_workloads_mod.RowFilter.smoke(tp=set(tp_sizes))
-                  if data.get("smoke") else None)
-    buckets, coverage = perf_workloads_mod.emit(
-        oprows, _perf_model_config(model_id), dispatch, row_filter)
+    device = data.get("device") or bench_devices.detect_device()
+    cases, coverage = bench_spec.build_cases(rows, device=device)
 
-    run_id = data.get("run_id") or perf_store.make_run_id(
-        model_id, int(tp_sizes[0]), backend)
-    paths = perf_store.run_paths(run_id).ensure()
-    perf_workloads_mod.write(buckets, coverage, paths.workloads)
-    with open(paths.coverage, "w") as fh:
-        json.dump(coverage.to_dict(), fh, indent=2)
-    # keep the matrix next to the run: it is the only artifact that cannot be
-    # regenerated without re-profiling on the GPU
-    with open(paths.matrix, "wb") as fh:
-        fh.write(shape_matrix_xlsx.write_workbook(
-            rows, shape_matrix.build_info_rows(model_id, template, _settings),
-            shape_matrix_xlsx.sheet_name_for(model_id)))
-    perf_store.RunMeta(run_id=run_id, model_id=model_id, backend=backend,
-                       dispatch=dispatch, tp=int(tp_sizes[0]),
-                       smoke=bool(data.get("smoke")),
-                       sweep={**sweep, "matrix": paths.matrix}).write(paths)
+    run_id = data.get("run_id") or bench_store.make_run_id(
+        model_id, int(tp_sizes[0]), device)
+    paths = bench_store.run_paths(run_id).ensure()
+    bench_runner.write_cases(cases, paths.cases)
 
-    return jsonify({
-        "ok": coverage.ok, "run_id": run_id, "rows": len(rows),
-        "coverage": coverage.to_dict(),
-        "error": (None if coverage.ok else
-                  f"unmapped ops: {sorted(coverage.unmapped_breakdown_ops)}"),
-    }), (200 if coverage.ok else 400)
+    # Classify before benchmarking, so the plan can say what will *not* be
+    # measured - and why - instead of the run silently omitting it.
+    status: dict[str, Any] = {}
+    for case in cases:
+        if case.op not in status:
+            st, detail = bench_resolve.classify(case.op, case.args)
+            status[case.op] = {"status": st, "detail": detail,
+                               "backend": case.backend}
+    by_status: dict[str, list] = {}
+    for op, st in status.items():
+        by_status.setdefault(st["status"], []).append(op)
+    coverage.update({"op_status": status, "ops_by_status": by_status,
+                     "device": device, "sweep": configs})
+    bench_store.write_json(paths.plan, coverage)
+    bench_store.RunMeta(
+        run_id=run_id, model_id=model_id, device=device, tp=int(tp_sizes[0]),
+        device_name=bench_devices.device_name(device),
+        sku=bench_devices.sku_for_device(bench_devices.device_name(device)),
+        smoke=bool(data.get("smoke")),
+        sweep={**sweep, "configs": len(configs)}).write(paths)
 
-
-#: Fallback per-op timeout when a run has no estimate to size one from.
-PERF_DEFAULT_TIMEOUT = 3600
+    return jsonify({"ok": True, "run_id": run_id, "rows": len(rows),
+                    "cases": len(cases), "coverage": coverage})
 
 
-def _perf_timeouts(paths, backend: str, timeout: Any) -> tuple[dict, dict, int]:
-    """Per-op benchmark budgets: ``"auto"`` sizes each op from its estimate."""
-    if timeout not in (None, "", "auto"):
-        try:
-            return {}, {}, int(timeout)
-        except (TypeError, ValueError):
-            pass
+def _run_bench(run_id: str, device: str, budget: float,
+               ops: list[str] | None) -> None:
+    paths = bench_store.run_paths(run_id)
     try:
-        timeouts, detail = perf_estimate.plan_for_run(
-            paths.workloads, perf_root=perf_store.perf_root(), backend=backend)
-        return timeouts, detail, PERF_DEFAULT_TIMEOUT
-    except Exception as exc:  # noqa: BLE001 - never block a run on estimation
-        logger.warning("perf: timeout estimation failed (%s)", exc)
-        return {}, {}, PERF_DEFAULT_TIMEOUT
+        cases = [bench_spec.BenchCase.from_dict(c)
+                 for c in json.load(open(paths.cases))]
 
-
-def _run_perf_benchmark(run_id: str, backend: str, devices_arg: str,
-                        ccl_devices: str | None, groups: list[str],
-                        tasks: list[str] | None, timeout: Any) -> None:
-    paths = perf_store.run_paths(run_id)
-    try:
         def progress(op_result):
-            with _perf_lock:
-                _perf_state["ops"].append(asdict(op_result))
+            with _bench_lock:
+                _bench_state["ops"].append(asdict(op_result))
 
-        timeouts, detail, fallback = _perf_timeouts(paths, backend, timeout)
-        with _perf_lock:
-            _perf_state["timeout_plan"] = detail
-        result = perf_runner.run(
-            paths.workloads, paths.reports, backend=backend,
-            devices_arg=devices_arg, ccl_devices=ccl_devices, groups=groups,
-            tasks=tasks, timeout=fallback, timeouts=timeouts,
-            cache_dir=paths.cache, on_op=progress)
-        with _perf_lock:
-            _perf_state["status"] = "done"
-            _perf_state["result"] = result.to_dict()
+        result = bench_runner.run(cases, paths, device, budget=budget, ops=ops,
+                                  on_op=progress)
+        with _bench_lock:
+            _bench_state["status"] = "done"
+            _bench_state["result"] = result.to_dict()
     except Exception as exc:  # noqa: BLE001 - surfaced to the client
-        logger.exception("perf run failed")
-        with _perf_lock:
-            _perf_state["status"] = "error"
-            _perf_state["error"] = str(exc)
+        logger.exception("bench run failed")
+        with _bench_lock:
+            _bench_state["status"] = "error"
+            _bench_state["error"] = str(exc)
 
 
-@app.route("/api/perf/run", methods=["POST"])
-def perf_run():
-    """Benchmark a run's workloads. Non-blocking — poll /api/perf/status."""
+@app.route("/api/bench/run", methods=["POST"])
+def bench_run():
+    """Replay a run's cases. Non-blocking - poll /api/bench/status."""
     data = request.json or {}
     run_id = data.get("run_id")
     if not run_id:
         return jsonify({"ok": False, "error": "run_id is required"}), 400
-    paths = perf_store.run_paths(run_id)
-    if not os.path.isdir(paths.workloads):
+    paths = bench_store.run_paths(run_id)
+    if not os.path.isfile(paths.cases):
         return jsonify({"ok": False,
-                        "error": f"no workloads for run {run_id}"}), 400
-    with _perf_lock:
-        if _perf_state["status"] == "running":
+                        "error": f"no cases for run {run_id}"}), 400
+    with _bench_lock:
+        if _bench_state["status"] == "running":
             return jsonify({"ok": False,
                             "error": "A benchmark run is already in progress"}), 409
-        _perf_state.update({"status": "running", "run_id": run_id,
-                            "error": None, "ops": [], "timeout_plan": {},
-                            "result": None})
+        _bench_state.update({"status": "running", "run_id": run_id,
+                             "error": None, "ops": [], "result": None})
 
-    meta = perf_store.read_meta(paths)
+    meta = bench_store.read_meta(paths)
     thread = threading.Thread(
-        target=_run_perf_benchmark,
-        args=(run_id, data.get("backend") or meta.get("backend") or "INTEL",
-              str(data.get("devices", "0")), data.get("ccl_devices"),
-              data.get("groups") or list(perf_workloads_mod.GROUPS),
-              data.get("tasks"), data.get("timeout", "auto")),
+        target=_run_bench,
+        args=(run_id, data.get("device") or meta.get("device")
+              or bench_devices.detect_device(),
+              float(data.get("budget", 0.5)), data.get("ops")),
         daemon=True)
     thread.start()
     return jsonify({"ok": True, "status": "running", "run_id": run_id})
 
 
-@app.route("/api/perf/status")
-def perf_status():
-    with _perf_lock:
-        return jsonify({"ok": True, **{k: v for k, v in _perf_state.items()
-                                       if k != "result"},
-                        "result": _perf_state["result"]})
+@app.route("/api/bench/status")
+def bench_status():
+    with _bench_lock:
+        return jsonify({"ok": True, **dict(_bench_state)})
 
 
-@app.route("/api/perf/runs")
-def perf_runs():
-    return jsonify({"ok": True, "runs": perf_store.list_runs()})
+@app.route("/api/bench/runs")
+def bench_runs():
+    return jsonify({"ok": True, "runs": bench_store.list_runs()})
 
 
-@app.route("/api/perf/targets")
-def perf_targets():
-    """The ranked optimization targets of a run (recomputed with ?refresh=1)."""
-    run_id = request.args.get("run_id") or (
-        perf_store.list_runs()[0]["run_id"] if perf_store.list_runs() else None)
+@app.route("/api/bench/results")
+def bench_results():
+    """A run's measured cases, enriched with utilization and the traced time."""
+    run_id = request.args.get("run_id")
+    runs = bench_store.list_runs()
+    run_id = run_id or (runs[0]["run_id"] if runs else None)
     if not run_id:
-        return jsonify({"ok": False, "error": "no perf runs yet"}), 404
-    paths = perf_store.run_paths(run_id)
-    meta = perf_store.read_meta(paths)
+        return jsonify({"ok": False, "error": "no benchmark runs yet"}), 404
+    paths = bench_store.run_paths(run_id)
+    meta = bench_store.read_meta(paths)
+    records = bench_store.read_results(paths.results)
+    peaks = bench_devices.peaks(meta.get("sku") or bench_devices.DEFAULT_SKU)
+    rich = bench_reports.enrich(records, peaks)
+    return jsonify({"ok": True, "run_id": run_id,
+                    "summary": bench_reports.summarize(rich),
+                    "coverage": bench_reports.coverage(rich),
+                    "records": rich})
+
+
+@app.route("/api/bench/targets")
+def bench_targets():
+    """The ranked optimization targets of a run (recomputed with ?refresh=1)."""
+    runs = bench_store.list_runs()
+    run_id = request.args.get("run_id") or (runs[0]["run_id"] if runs else None)
+    if not run_id:
+        return jsonify({"ok": False, "error": "no benchmark runs yet"}), 404
+    paths = bench_store.run_paths(run_id)
+    meta = bench_store.read_meta(paths)
     if request.args.get("refresh") not in ("1", "true") and \
             os.path.isfile(paths.targets):
         with open(paths.targets) as fh:
-            return jsonify({"ok": True, "run_id": run_id, "targets": json.load(fh)})
+            return jsonify({"ok": True, "run_id": run_id,
+                            "targets": json.load(fh)})
 
-    matrix = (meta.get("sweep") or {}).get("matrix") or paths.matrix
-    if not os.path.isfile(matrix):
-        return jsonify({"ok": False,
-                        "error": f"run {run_id} has no shape matrix"}), 400
-    backend = meta.get("backend") or "INTEL"
-    records = perf_reports.records(backend, paths.reports)
+    records = bench_store.read_results(paths.results)
     if not records:
         return jsonify({"ok": False,
-                        "error": f"run {run_id} has no benchmark reports"}), 400
-    rc = perf_rank.RankConfig(
-        dispatch=meta.get("dispatch") or "xpu", tp=meta.get("tp"),
+                        "error": f"run {run_id} has no benchmark results"}), 400
+    rc = bench_rank.RankConfig(
         target_util=float(request.args.get(
-            "target_util", perf_rank.DEFAULT_TARGET_UTIL)),
-        top=int(request.args.get("top", 0)), backend=backend,
+            "target_util", bench_rank.DEFAULT_TARGET_UTIL)),
+        tp=meta.get("tp"), top=int(request.args.get("top", 0)),
+        run_id=run_id,
         provenance={"run_id": run_id, "commits": meta.get("commits") or {}})
-    doc = perf_rank.rank(perf_matrix_reader.read_matrix(matrix), records,
-                         _perf_model_config(meta.get("model_id") or ""), rc)
-    with open(paths.targets, "w") as fh:
-        json.dump(doc, fh, indent=2)
     try:
-        conn = perf_history.connect(
-            perf_history.db_path(perf_store.perf_root()))
-        perf_history.ingest(conn, meta or {"run_id": run_id}, records, doc)
+        doc = bench_rank.rank(records, rc)
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    bench_store.write_json(paths.targets, doc)
+    try:
+        conn = bench_history.connect(
+            bench_history.db_path(bench_store.bench_root()))
+        bench_history.ingest(conn, meta or {"run_id": run_id}, records, doc)
     except Exception as exc:  # noqa: BLE001 - history is best-effort
-        logger.warning("perf history ingest failed: %s", exc)
+        logger.warning("bench history ingest failed: %s", exc)
     return jsonify({"ok": True, "run_id": run_id, "targets": doc})
 
 
-@app.route("/api/perf/report")
-def perf_report():
-    """Download a run's merged report workbook (built on demand)."""
+@app.route("/api/bench/report")
+def bench_report():
+    """Download a run's report workbook (built on demand)."""
     run_id = request.args.get("run_id")
     if not run_id:
         return jsonify({"ok": False, "error": "run_id is required"}), 400
-    paths = perf_store.run_paths(run_id)
-    meta = perf_store.read_meta(paths)
-    if not os.path.isdir(paths.reports):
-        return jsonify({"ok": False, "error": "run has no reports"}), 400
-    perf_reports.merge([f"{meta.get('backend') or 'INTEL'}={paths.reports}"],
-                       out=paths.merged, log=lambda *a: None)
-    return send_file(paths.merged, as_attachment=True,
-                     download_name=f"{run_id}_reports.xlsx")
+    paths = bench_store.run_paths(run_id)
+    records = bench_store.read_results(paths.results)
+    if not records:
+        return jsonify({"ok": False, "error": "run has no results"}), 400
+    meta = bench_store.read_meta(paths)
+    targets = None
+    if os.path.isfile(paths.targets):
+        with open(paths.targets) as fh:
+            targets = json.load(fh)
+    bench_reports.write_workbook(
+        records, paths.report,
+        bench_devices.peaks(meta.get("sku") or bench_devices.DEFAULT_SKU),
+        targets)
+    return send_file(paths.report, as_attachment=True,
+                     download_name=f"{run_id}_bench.xlsx")
 
 
-@app.route("/api/perf/history")
-def perf_history_api():
+@app.route("/api/bench/history")
+def bench_history_api():
     """Runs in the history db, or a per-shape diff of two runs."""
-    conn = perf_history.connect(perf_history.db_path(perf_store.perf_root()))
+    conn = bench_history.connect(
+        bench_history.db_path(bench_store.bench_root()))
     base, new = request.args.get("base"), request.args.get("new")
     if base and new:
         return jsonify({"ok": True, "base": base, "new": new,
-                        "changes": perf_history.compare(
+                        "changes": bench_history.compare(
                             conn, base, new,
                             float(request.args.get("threshold", 0.10)))})
-    return jsonify({"ok": True, "runs": perf_history.runs(conn)})
-
+    return jsonify({"ok": True, "runs": bench_history.runs(conn)})
 
 
 if __name__ == "__main__":

@@ -3,9 +3,9 @@
 
 One row per (Phase, Seq Len, Ctx Len, Batch Size, TP, Module, Op). The rows are
 the *pipeline's* data structure - the ``.xlsx`` export
-(:mod:`breakdown.perf.shape_matrix_xlsx`) is one serialization of them, and
-:mod:`breakdown.perf.workloads` consumes them directly, so no benchmark run has
-to round-trip through a spreadsheet.
+(:mod:`breakdown.shape_matrix_xlsx`) is one serialization of them, and
+:mod:`breakdown.bench.spec` consumes them directly, so no benchmark run has to
+round-trip through a spreadsheet.
 
 The profile contributes the accurate op set, recorded shapes/dtypes and
 backends; Memory/FLOPs are analytic functions of (op, shape, dtype) recomputed
@@ -152,9 +152,14 @@ def build_rows(template: dict, configs: list[dict]) -> list[dict[str, Any]]:
                     "Memory (bytes)": mem_bytes,
                     "FLOPs": flops,
                     "AI": ai,
-                    # kept out of the export, used by the op map
+                    # kept out of the export, used by the replay benchmark
                     "_resolved_shapes": resolved,
                     "_input_dtypes": list(recorded_dtypes or []),
+                    "_input_args": op.get("input_args") or [],
+                    "_recorded_shapes": op.get("recorded_shapes") or [],
+                    "_device_time_us": op.get("device_time_us", 0),
+                    "_op_role": role,
+                    "_module_type": node_info.get("module_type", ""),
                 })
     return rows
 

@@ -46,17 +46,24 @@ Flask web app (`app.py`) + static SPA (`static/index.html`) backed by a `breakdo
 
 **Query Len / Context Len profiling (Method 1 / APC):** `_run_profile` builds exact-length synthetic token prompts (`_make_token_ids`) instead of a fixed text prompt. `query_len` = new prefill tokens (`S`); `context_len` (floored to `block_size`) is pre-computed in an un-profiled warm pass and served from the prefix cache (`enable_prefix_caching=True`) during the profiled run, so the profiled prefill sees `S` new tokens attending to a `context_len`-token KV. Warm the context prefix alone first, warm kernels with distinct query seeds, and profile with yet another seed (`900000+b`) so profiled queries are never cache-hit; each batch item gets a distinct query over a shared context. A cache miss (`outputs[0].num_cached_tokens < ctx_aligned`) is surfaced as `cache_hit_note`. `start_profile` bumps `max_model_len` to `context+query+max_tokens`. Absent `query_len` → legacy text-prompt path.
 
-**Perf pipeline (`breakdown/perf/`)** — the Shape Matrix rows feed an op map
-(micro_perf op + arguments per dispatched op), a runner that invokes
-xpu-perf/micro_perf **one op per process**, and a ranker that scores ops by
-calls × latency × roofline headroom (plus a faster-provider "free win" check),
-producing `output/perf/<run_id>/opt_targets.json` for the `xpu-kernel-optimizer`
-skill. Runs headless via `python -m breakdown.perf {emit,run,rank,bench,all}`.
-xpu-perf is invoked, never vendored. Emission drops only *impossible* shapes
-(a 0-sized extent → `coverage.invalid_cases`); a kernel that rejects a real
-shape is reported per case (`OpResult.failed_cases`/`errors`), not hidden. Each
-op's timeout is sized from its estimated runtime (`breakdown/perf/estimate.py`,
-`--timeout auto`) because micro_perf only flushes its results when an op ends.
+**Replay benchmark (`breakdown/bench/`)** — the Shape Matrix rows become
+**replay cases**: the trace records each op's dispatch name, per-tensor
+shapes/dtypes/strides and its non-tensor argument values, so the benchmark
+**re-invokes the op vLLM actually dispatched** (`torch.ops.<ns>.<op>`, or the
+recorded Python API frame for Triton/FlashInfer/SYCL-extension kernels) instead
+of benchmarking a substitute. There is no adapter table: coverage follows the
+profile. Each op is replayed in its own process (a bad shape can wedge the
+device), collectives are replayed on `TP` peer ranks with rank 0 recorded, and
+a ranker scores ops by calls × latency × roofline headroom, producing
+`output/bench/<run_id>/targets.json` for the `xpu-kernel-optimizer` skill. Runs
+headless via `python -m breakdown.bench {plan,run,rank,report,case,history,all}`.
+Integer/index operands are **never** filled randomly — an op without a
+registered synthesizer is reported, not guessed. Context-bound wrappers
+(`vllm::unified_attention_with_output`) are refused with a reason; the kernels
+they launch are benchmarked as their own ops. Timing repeats the kernel inside
+a device-event window and subtracts the measured empty-window cost, because that
+floor (~60-90 us on Level Zero) dwarfs a small kernel. The old `breakdown/perf/`
+op-map + xpu-perf/micro_perf shell-out was removed; do not reintroduce it.
 
 **Backend classification priority:** ccl (collective-comm: `c10d::`/`ccl::` or all_reduce/all_gather/reduce_scatter/all_to_all) > vllm-xpu-kernels (exact match from registry) > flashinfer (name contains `flashinfer`) > triton (name patterns) > torch-xpu-ops (aten:: on XPU) > cpu > framework
 
@@ -81,8 +88,10 @@ The model graph is reconstructed from the trace, so no static builder is needed:
 
 1. Add op name to `ALL_VLLM_XPU_OPS` set in `breakdown/registry.py`
 2. If the op has a unique classification pattern, update `breakdown/classifier.py`
-3. To benchmark it, add an adapter in `breakdown/perf/op_map/{xpu,cuda}.py` and,
-   if it has editable kernel source, an entry in `breakdown/perf/kernel_sources.json`
+3. Benchmarking needs no adapter. Add an input synthesizer
+   (`breakdown/bench/inputs.py` / `recipes/`) if it takes an index tensor, a
+   `resolve.PYTHON_API` entry if it is launched straight from Python, and an
+   entry in `breakdown/bench/kernel_sources.json` if it has editable source
 
 ## API Endpoints
 
@@ -95,13 +104,14 @@ The model graph is reconstructed from the trace, so no static builder is needed:
 | `/api/profile/result` | GET | Fetch profiling result (ops + reconstructed graph) |
 | `/api/profile/trace` | GET | Download raw trace file |
 | `/api/export/shape-matrix` | POST | Export config-driven shape sweep to Excel |
-| `/api/perf/workloads` | POST | Sweep the profiled graph into micro_perf workloads |
-| `/api/perf/run` | POST | Benchmark a run's workloads (async) |
-| `/api/perf/status` | GET | Poll the benchmark run |
-| `/api/perf/runs` | GET | List perf runs |
-| `/api/perf/targets` | GET | Ranked optimization targets (`opt_targets.json`) |
-| `/api/perf/report` | GET | Download a run's merged report workbook |
-| `/api/perf/history` | GET | Perf history / two-run regression diff |
+| `/api/bench/plan` | POST | Sweep the profiled graph into replay cases |
+| `/api/bench/run` | POST | Replay a run's cases (async) |
+| `/api/bench/status` | GET | Poll the benchmark run |
+| `/api/bench/runs` | GET | List bench runs |
+| `/api/bench/results` | GET | Measured cases + summary + coverage |
+| `/api/bench/targets` | GET | Ranked optimization targets (`targets.json`) |
+| `/api/bench/report` | GET | Download a run's report workbook |
+| `/api/bench/history` | GET | Benchmark history / two-run regression diff |
 
 
 <!-- headroom:rtk-instructions -->

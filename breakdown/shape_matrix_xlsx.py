@@ -1,17 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 """Excel serialization of Shape Matrix rows (the human/offline exchange format).
 
-Kept apart from :mod:`breakdown.perf.shape_matrix` so the pipeline itself never
+Kept apart from :mod:`breakdown.shape_matrix` so the pipeline itself never
 depends on openpyxl formatting, and so a matrix produced on one box can be
 carried to another (e.g. the CUDA reference machine) and re-read with
-:mod:`breakdown.perf.matrix_reader`.
+the benchmark pipeline.
 """
 from __future__ import annotations
 
 import io
 from typing import Any, Sequence
 
-from breakdown.perf.shape_matrix import MATRIX_HEADERS
+from breakdown.shape_matrix import MATRIX_HEADERS
 
 
 def sheet_name_for(model_id: str) -> str:

@@ -196,7 +196,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
   <div class="tab-bar">
     <button class="tab-btn active" id="tab-btn-graph" onclick="switchTab('graph')">Model Graph</button>
     <button class="tab-btn" id="tab-btn-matrix" onclick="switchTab('matrix')">Shape Matrix</button>
-    <button class="tab-btn" id="tab-btn-perf" onclick="switchTab('perf')">Perf &amp; Targets</button>
+    <button class="tab-btn" id="tab-btn-perf" onclick="switchTab('perf')">Benchmark &amp; Targets</button>
   </div>
 
   <!-- Tab: Model Graph (profiling) -->
@@ -417,52 +417,53 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
     </div>
   </div>
 
-  <!-- Tab: Perf & Targets (benchmark the swept shapes, rank what to optimize) -->
+  <!-- Tab: Benchmark & Targets (replay the dispatched ops, rank what to optimize) -->
   <div id="tab-perf" class="tab-content hidden">
     <div class="card">
-      <h2>🎯 Perf Pipeline &amp; Optimization Targets</h2>
+      <h2>🎯 Replay Benchmark &amp; Optimization Targets</h2>
       <p style="font-size:12px;color:#666;margin-bottom:16px">
-        Benchmarks every dispatched op at the swept shapes (via xpu-perf/micro_perf) and ranks
-        the ops by the <b>end-to-end time an optimization would actually recover</b> —
-        calls&nbsp;×&nbsp;latency, roofline headroom, and provider gap. The sweep is taken from the
-        <b>Shape Matrix</b> tab. Everything here also runs headless:
-        <code>python -m breakdown.perf all --matrix &lt;m.xlsx&gt;</code>.
+        Re-invokes <b>the ops vLLM actually dispatched</b> — same kernel, same shapes and dtypes,
+        rebuilt from the trace — and ranks them by the
+        <b>end-to-end time an optimization would actually recover</b>
+        (calls&nbsp;×&nbsp;latency&nbsp;×&nbsp;roofline headroom). Each op is replayed in its own
+        process, so a kernel that rejects a shape costs only its own results. The sweep comes
+        from the <b>Shape Matrix</b> tab. Everything here also runs headless:
+        <code>python -m breakdown.bench all --trace &lt;trace&gt; --model &lt;id&gt;</code>.
       </p>
 
       <div class="controls-row" style="margin-bottom:12px">
         <div class="control-group">
-          <label>Devices</label>
-          <input id="perf-devices" type="text" value="0" style="width:90px">
+          <label>Device</label>
+          <input id="perf-device" type="text" value="" placeholder="auto" style="width:90px">
         </div>
         <div class="control-group">
-          <label>Collective devices</label>
-          <input id="perf-ccl-devices" type="text" value="0,1,2,3" style="width:110px">
+          <label>Budget / case (s)</label>
+          <input id="perf-budget" type="number" step="0.1" min="0.05" value="0.5"
+                 style="width:90px">
         </div>
         <div class="control-group">
-          <label>Groups</label>
-          <input id="perf-groups" type="text" value="compute,msa,collective" style="width:200px">
+          <label>Ops (blank = all)</label>
+          <input id="perf-ops" type="text" value="" style="width:220px">
         </div>
         <div class="control-group">
           <label>Target util</label>
           <input id="perf-target-util" type="number" step="0.05" min="0.1" max="1"
                  value="0.8" style="width:80px">
         </div>
-        <div class="control-group">
-          <label><input id="perf-smoke" type="checkbox" checked> Screening tier</label>
-        </div>
       </div>
 
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-        <button class="btn btn-primary" id="perf-emit-btn" onclick="perfEmit()">1 · Emit workloads</button>
-        <button class="btn" id="perf-run-btn" onclick="perfRun()">2 · Run benchmark</button>
-        <button class="btn" id="perf-rank-btn" onclick="perfRank()">3 · Rank targets</button>
-        <button class="btn" onclick="perfDownloadReport()">📥 Report</button>
-        <select id="perf-run-select" onchange="perfLoadTargets()" style="font-size:12px;padding:6px"></select>
+        <button class="btn btn-primary" id="perf-emit-btn" onclick="benchPlan()">1 · Plan cases</button>
+        <button class="btn" id="perf-run-btn" onclick="benchRun()">2 · Replay</button>
+        <button class="btn" id="perf-rank-btn" onclick="benchRank()">3 · Rank targets</button>
+        <button class="btn" onclick="benchDownloadReport()">📥 Report</button>
+        <select id="perf-run-select" onchange="benchLoadTargets()" style="font-size:12px;padding:6px"></select>
         <span id="perf-status" style="font-size:12px;color:#666"></span>
       </div>
 
+      <div id="perf-coverage" style="font-size:12px;color:#666;margin-top:10px"></div>
       <div id="perf-progress" style="font-size:12px;color:#666;margin-top:10px;
-           max-height:150px;overflow:auto;font-family:monospace"></div>
+           max-height:180px;overflow:auto;font-family:monospace"></div>
     </div>
 
     <div class="card">
@@ -1186,23 +1187,29 @@ function switchTab(name) {
 }
 
 
-// ---- Perf pipeline: benchmark the swept shapes, rank what to optimize ----
+// ---- Replay benchmark: re-invoke the dispatched ops, rank what to optimize ----
 let PERF_RUN_ID = null;
 
 const PERF_ACTION_STYLE = {
   optimize_kernel: ['#c0392b', 'open a kernel session'],
-  switch_provider: ['#8e44ad', 'free win — change the dispatch'],
   at_roofline: ['#27ae60', 'done — no structural headroom left'],
   tune_config: ['#7f8c8d', 'library/collective — tune config, not kernel'],
+  check_cost_model: ['#e67e22',
+    'utilization above peak — the analytic FLOPs/bytes overstate this op\'s traffic, '
+    + 'so its headroom cannot be trusted'],
 };
 
 function perfStatus(msg) {
   document.getElementById('perf-status').textContent = msg || '';
 }
 
+function perfEsc(t) {
+  return String(t).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+}
+
 async function refreshPerfRuns() {
   const sel = document.getElementById('perf-run-select');
-  const resp = await fetch('/api/perf/runs');
+  const resp = await fetch('/api/bench/runs');
   const data = await resp.json().catch(() => ({ runs: [] }));
   const runs = data.runs || [];
   sel.innerHTML = runs.length
@@ -1212,135 +1219,143 @@ async function refreshPerfRuns() {
   else if (runs.length) PERF_RUN_ID = runs[0].run_id;
 }
 
-async function perfEmit() {
+// What the plan says will NOT be measured, and why — shown before an hour of
+// benchmarking rather than discovered afterwards.
+function renderCoverage(cov) {
+  const el = document.getElementById('perf-coverage');
+  const by = cov.ops_by_status || {};
+  const order = ['replayable', 'collective', 'not_replayable', 'skipped', 'unresolved'];
+  const color = {
+    replayable: '#27ae60', collective: '#2980b9', not_replayable: '#7f8c8d',
+    skipped: '#7f8c8d', unresolved: '#c0392b',
+  };
+  el.innerHTML = order.filter(k => by[k]).map(k => {
+    const ops = by[k].slice().sort();
+    const detail = ops.map(op => {
+      const d = (cov.op_status[op] || {}).detail || '';
+      return `${perfEsc(op)}${d ? ' — ' + perfEsc(d) : ''}`;
+    }).join('\n');
+    return `<span title="${detail.replace(/"/g, '&quot;')}"
+      style="color:${color[k]};margin-right:14px">${k}: <b>${ops.length}</b></span>`;
+  }).join('') + `<span style="margin-left:8px">${cov.cases} cases / ${cov.ops} ops</span>`;
+}
+
+async function benchPlan() {
   const payload = buildSweepPayload();
   if (!payload) return;
-  payload.smoke = document.getElementById('perf-smoke').checked;
+  const dev = document.getElementById('perf-device').value.trim();
+  if (dev) payload.device = dev;
   const btn = document.getElementById('perf-emit-btn');
   btn.disabled = true;
-  perfStatus('Emitting workloads…');
+  perfStatus('Planning replay cases…');
   try {
-    // the sweep is profile-derived, so make sure a matching run exists first
+    // the case set is profile-derived, so make sure a matching run exists first
     await ensureProfileForMatrix(payload.model_id, payload.quantization,
                                  document.getElementById('perf-status'));
-    const resp = await fetch('/api/perf/workloads', {
+    const resp = await fetch('/api/bench/plan', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
     const data = await resp.json();
     if (!resp.ok || !data.ok) throw new Error(data.error || resp.statusText);
     PERF_RUN_ID = data.run_id;
-    const cases = data.coverage.mapped_micro_perf_cases;
-    const total = Object.values(cases)
-      .reduce((a, g) => a + Object.values(g).reduce((x, y) => x + y, 0), 0);
-    perfStatus(`run ${data.run_id}: ${total} cases, 0 unmapped ops`);
+    renderCoverage(data.coverage);
+    perfStatus(`run ${data.run_id}: ${data.cases} cases from ${data.rows} rows`);
     await refreshPerfRuns();
   } catch (e) {
     perfStatus('');
-    alert('Emit failed: ' + e.message);
+    alert('Plan failed: ' + e.message);
   } finally {
     btn.disabled = false;
   }
 }
 
-async function perfRun() {
+async function benchRun() {
   const runId = document.getElementById('perf-run-select').value || PERF_RUN_ID;
-  if (!runId) { alert('Emit workloads first'); return; }
+  if (!runId) { alert('Plan the cases first'); return; }
   const btn = document.getElementById('perf-run-btn');
   btn.disabled = true;
   document.getElementById('perf-progress').textContent = '';
   try {
-    const resp = await fetch('/api/perf/run', {
+    const ops = document.getElementById('perf-ops').value.trim();
+    const resp = await fetch('/api/bench/run', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         run_id: runId,
-        devices: document.getElementById('perf-devices').value.trim(),
-        ccl_devices: document.getElementById('perf-ccl-devices').value.trim(),
-        groups: document.getElementById('perf-groups').value.trim()
-          .split(',').map(s => s.trim()).filter(Boolean),
+        device: document.getElementById('perf-device').value.trim() || null,
+        budget: parseFloat(document.getElementById('perf-budget').value) || 0.5,
+        ops: ops ? ops.split(',').map(s => s.trim()).filter(Boolean) : null,
       }),
     });
     const data = await resp.json();
     if (!resp.ok || !data.ok) throw new Error(data.error || resp.statusText);
-    await perfPollRun();
+    await benchPollRun();
   } catch (e) {
-    alert('Run failed: ' + e.message);
+    alert('Replay failed: ' + e.message);
   } finally {
     btn.disabled = false;
   }
 }
 
-function perfEsc(t) {
-  return String(t).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
-}
-
-async function perfPollRun() {
+async function benchPollRun() {
   const progress = document.getElementById('perf-progress');
   for (;;) {
-    const st = await (await fetch('/api/perf/status')).json();
-    const plan = st.timeout_plan || {};
-    const done = (st.ops || []).map(o => o.op);
-    const pending = Object.keys(plan).filter(op => !done.includes(op));
+    const st = await (await fetch('/api/bench/status')).json();
     const lines = (st.ops || []).map(o => {
-      // A kernel that rejects a legitimate shape is the actionable result of a
-      // run, so per-case errors are listed, not folded into the op's status.
-      const errs = (o.errors || []).map(e =>
-        `<div style="margin-left:1.6em;color:#c0392b">! ${perfEsc(e)}</div>`).join('');
-      const failed = o.failed_cases
-        ? ` <span style="color:#c0392b">${o.failed_cases} case error(s)</span>` : '';
-      return `${o.ok ? '✅' : '❌'} ${perfEsc(o.op)} [${o.group}] `
-           + `${o.cases} cases ${o.seconds}s/${o.timeout || '?'}s${failed}`
-           + `${o.error && !(o.errors || []).includes(o.error) ? ' — ' + perfEsc(o.error) : ''}`
-           + errs;
+      // Per-op statuses are listed rather than folded away: an op that needs a
+      // synthesizer, or a kernel that rejected a real shape, is the actionable
+      // result of a run.
+      const st_ = Object.entries(o.statuses || {})
+        .map(([k, v]) => `${k}:${v}`).join(' ');
+      return `${o.ok ? '✅' : '❌'} ${perfEsc(o.op)} `
+           + `${o.measured}/${o.cases} cases ${o.seconds}s/${o.timeout || '?'}s `
+           + `<span style="opacity:.7">${perfEsc(st_)}</span>`
+           + `${o.error ? ' <span style="color:#c0392b">' + perfEsc(o.error) + '</span>' : ''}`;
     });
-    if (st.status === 'running' && pending.length) {
-      const eta = pending.reduce((t, op) => t + (plan[op].estimated_s || 0), 0);
-      lines.push(`<span style="opacity:.6">⏳ ${pending.length} op(s) queued, `
-               + `~${Math.round(eta / 60)} min estimated</span>`);
-    }
     progress.innerHTML = lines.join('<br>');
-    perfStatus(`benchmarking… ${(st.ops || []).length} ops done`);
+    perfStatus(`replaying… ${(st.ops || []).length} ops done`);
     if (st.status !== 'running') {
       perfStatus(st.status === 'error' ? ('run failed: ' + st.error)
-                                       : 'benchmark finished');
+                                       : 'replay finished');
       return;
     }
     await new Promise(r => setTimeout(r, 2000));
   }
 }
 
-async function perfRank() {
+async function benchRank() {
   const runId = document.getElementById('perf-run-select').value || PERF_RUN_ID;
-  if (!runId) { alert('Emit workloads first'); return; }
+  if (!runId) { alert('Plan the cases first'); return; }
   perfStatus('Ranking…');
   const util = document.getElementById('perf-target-util').value;
   const resp = await fetch(
-    `/api/perf/targets?run_id=${encodeURIComponent(runId)}&refresh=1&target_util=${util}`);
+    `/api/bench/targets?run_id=${encodeURIComponent(runId)}&refresh=1&target_util=${util}`);
   const data = await resp.json();
   if (!resp.ok || !data.ok) { perfStatus(''); alert('Rank failed: ' + (data.error || '')); return; }
   renderPerfTargets(data.targets);
   perfStatus('ranked');
 }
 
-async function perfLoadTargets() {
+async function benchLoadTargets() {
   const runId = document.getElementById('perf-run-select').value;
   if (!runId) return;
   PERF_RUN_ID = runId;
-  const resp = await fetch(`/api/perf/targets?run_id=${encodeURIComponent(runId)}`);
+  const resp = await fetch(`/api/bench/targets?run_id=${encodeURIComponent(runId)}`);
   const data = await resp.json();
   if (resp.ok && data.ok) renderPerfTargets(data.targets);
   else { document.getElementById('perf-targets').innerHTML = ''; perfStatus(data.error || ''); }
 }
 
-function perfDownloadReport() {
+function benchDownloadReport() {
   const runId = document.getElementById('perf-run-select').value || PERF_RUN_ID;
   if (!runId) { alert('No run selected'); return; }
-  window.location.href = '/api/perf/report?run_id=' + encodeURIComponent(runId);
+  window.location.href = '/api/bench/report?run_id=' + encodeURIComponent(runId);
 }
 
 function renderPerfTargets(doc) {
   const summary = document.getElementById('perf-summary');
   const pts = Object.entries(doc.operating_points || {})
+    .filter(([, v]) => v)
     .map(([p, v]) => `${p}: seq=${v.seq_len} ctx=${v.ctx_len} bs=${v.batch_size}`)
     .join(' · ');
   summary.innerHTML =
@@ -1349,21 +1364,28 @@ function renderPerfTargets(doc) {
     `${(doc.e2e_us_total / 1000).toFixed(2)} ms/step<br>${pts}`;
 
   const head = `<tr style="text-align:left;border-bottom:2px solid #ddd">
-    <th>#</th><th>op</th><th>provider</th><th>e2e µs</th><th>share</th>
-    <th>util</th><th>bound</th><th>save µs</th><th>action</th><th>kernel</th></tr>`;
+    <th>#</th><th>op</th><th>backend</th><th>e2e µs</th><th>share</th>
+    <th>util</th><th>bound</th><th>replay/traced</th><th>save µs</th>
+    <th>action</th><th>kernel</th></tr>`;
   const rows = (doc.targets || []).map(t => {
     const [color, hint] = PERF_ACTION_STYLE[t.action] || ['#333', ''];
     const shape = (t.top_shapes || [])[0];
     const cmd = shape ? shape.bench_cmd.replace(/"/g, '&quot;') : '';
+    // The profile's own device time for the same op+shape is the run's
+    // built-in fidelity check: a replay far off it is not a valid baseline.
+    const ratio = shape && shape.replay_vs_traced != null
+      ? shape.replay_vs_traced.toFixed(2) : '—';
+    const flags = (t.flags || []).join(' ');
     return `<tr style="border-bottom:1px solid #eee">
       <td>${t.rank}</td>
-      <td><b>${t.op}</b></td>
-      <td>${t.dispatched_provider}${t.action === 'switch_provider'
-        ? ' → <b>' + t.best_provider + '</b>' : ''}</td>
+      <td><b>${perfEsc(t.op)}</b>${flags
+        ? ` <span title="${perfEsc(flags)}" style="color:#e67e22">⚠</span>` : ''}</td>
+      <td>${perfEsc(t.backend || '—')}</td>
       <td style="text-align:right">${t.e2e_us.toFixed(1)}</td>
       <td style="text-align:right">${(t.share_of_e2e * 100).toFixed(1)}%</td>
       <td style="text-align:right">${(t.roofline.util * 100).toFixed(0)}%</td>
       <td>${t.roofline.bound}</td>
+      <td style="text-align:right">${ratio}</td>
       <td style="text-align:right">${t.savings_us.total.toFixed(1)}</td>
       <td><span title="${hint}" style="color:${color};font-weight:600">${t.action}</span></td>
       <td>${t.kernel && t.kernel.kernel_dir ? t.kernel.kernel_dir : '—'}

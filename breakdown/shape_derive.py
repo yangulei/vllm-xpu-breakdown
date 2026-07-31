@@ -4,9 +4,10 @@
 Everything here is pure: it turns a reconstructed graph's symbolic shapes plus a
 config point (S/B/C/TP) into concrete dims, dtypes, memory and FLOPs. It is
 deliberately free of Flask and of torch so both ``app.py`` and
-``breakdown.perf`` (which must import on a machine with no GPU) can use it.
+``breakdown.shape_matrix`` (which must import on a machine with no GPU) can
+use it.
 
-Extracted verbatim from ``app.py`` - see ``breakdown/perf/shape_matrix.py`` for
+Extracted verbatim from ``app.py`` - see ``breakdown/shape_matrix.py`` for
 the row builder that consumes it.
 """
 from __future__ import annotations

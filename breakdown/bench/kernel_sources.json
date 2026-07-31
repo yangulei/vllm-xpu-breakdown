@@ -1,0 +1,173 @@
+{
+  "_comment": [
+    "Where each dispatched op's kernel lives, so the ranker can emit a ready-to-use",
+    "handoff for the xpu-kernel-optimizer skill.",
+    "Lookup order: an 'ops' entry for the exact dispatch name first, then 'backends'",
+    "keyed by the trace's backend classification.",
+    "Paths are relative to the workspace root (the parent of this repo)."
+  ],
+  "backends": {
+    "vllm-xpu-kernels": {
+      "repo": "vllm-xpu-kernels",
+      "kernel_dir": "vllm-xpu-kernels/csrc",
+      "files": [
+        "csrc/**/*.cpp",
+        "csrc/**/*.h"
+      ],
+      "language": "sycl",
+      "build_cmd": "cd vllm-xpu-kernels && MAX_JOBS=16 pip install --no-build-isolation -v -e . --no-deps",
+      "test_cmd": "cd vllm-xpu-kernels && pytest tests -v",
+      "notes": "Add -DFA2_KERNELS_ENABLED=False when not touching attention (large build-time saver)."
+    },
+    "flash_xpu": {
+      "repo": "applications.ai.gpu.deepklox",
+      "kernel_dir": "applications.ai.gpu.deepklox/csrc",
+      "files": [
+        "csrc/**/*.cpp",
+        "csrc/**/*.h"
+      ],
+      "language": "sycl",
+      "build_cmd": "cd applications.ai.gpu.deepklox && GPU_ARCHS=native uv pip install --no-build-isolation -e . -v",
+      "test_cmd": "cd applications.ai.gpu.deepklox && python -m pytest tests -v",
+      "notes": "Build MSA-only (XATTENTION_ENABLED_KERNELS=msa); =all can device-lost the box."
+    },
+    "triton": {
+      "repo": "vllm-xpu",
+      "kernel_dir": "vllm-xpu/vllm",
+      "files": [
+        "**/*triton*.py"
+      ],
+      "language": "triton",
+      "build_cmd": "cd vllm-xpu && VLLM_USE_PRECOMPILED=1 uv pip install -e . --torch-backend=auto",
+      "test_cmd": null
+    },
+    "torch-xpu-ops": {
+      "repo": "torch-xpu-ops",
+      "kernel_dir": "torch-xpu-ops",
+      "files": [
+        "src/**/*.cpp"
+      ],
+      "language": "aten",
+      "build_cmd": null,
+      "test_cmd": null,
+      "notes": "ATen fallback - usually the fix is to dispatch elsewhere, not to edit ATen."
+    },
+    "ccl": {
+      "repo": "-",
+      "kernel_dir": "-",
+      "files": [],
+      "language": "ccl",
+      "build_cmd": null,
+      "test_cmd": null,
+      "notes": "oneCCL collective - tune env/topology, not kernel source."
+    },
+    "flashinfer": {
+      "repo": "flashinfer",
+      "kernel_dir": "flashinfer",
+      "files": [
+        "csrc/**/*.cu",
+        "flashinfer/**/*.py"
+      ],
+      "language": "cuda",
+      "notes": "FlashInfer kernels are launched straight from Python; the editable surface is the JIT/AOT csrc."
+    },
+    "vllm-cuda-kernels": {
+      "repo": "vllm",
+      "kernel_dir": "vllm/csrc",
+      "files": [
+        "csrc/**/*.cu",
+        "csrc/**/*.cuh"
+      ],
+      "language": "cuda",
+      "build_cmd": "cd vllm && pip install --no-build-isolation -v -e .",
+      "test_cmd": "cd vllm && pytest tests/kernels -v"
+    }
+  },
+  "ops": {
+    "_C::silu_and_mul_with_clamp": {
+      "files": [
+        "csrc/activation.cpp"
+      ],
+      "test_cmd": "cd vllm-xpu-kernels && pytest tests/test_activation.py -v"
+    },
+    "_C::swigluoai_and_mul": {
+      "files": [
+        "csrc/activation.cpp"
+      ],
+      "test_cmd": "cd vllm-xpu-kernels && pytest tests/test_activation.py -v"
+    },
+    "_C::rms_norm": {
+      "files": [
+        "csrc/layernorm.cpp"
+      ],
+      "test_cmd": "cd vllm-xpu-kernels && pytest tests/test_layernorm.py -v"
+    },
+    "_C::fused_add_rms_norm": {
+      "files": [
+        "csrc/layernorm.cpp"
+      ],
+      "test_cmd": "cd vllm-xpu-kernels && pytest tests/test_layernorm.py -v"
+    },
+    "_C::fused_minimax_m3_qknorm_rope_kv_insert": {
+      "files": [
+        "csrc/fused_minimax_m3_qknorm_rope_kv_insert.cpp",
+        "csrc/fused_qknorm_rope.cpp"
+      ],
+      "test_cmd": "cd vllm-xpu-kernels && pytest tests/test_fused_qknorm_rope.py -v"
+    },
+    "_moe_C::topk_sigmoid": {
+      "files": [
+        "csrc/topk_per_row.cpp"
+      ],
+      "test_cmd": "cd vllm-xpu-kernels && pytest tests/test_topk.py -v"
+    },
+    "_xpu_C::cutlass_grouped_gemm_interface": {
+      "files": [
+        "csrc/xpu/**",
+        "csrc/moe/**"
+      ],
+      "test_cmd": "cd vllm-xpu-kernels && pytest tests/test_moe.py -v"
+    },
+    "vllm::unified_kv_cache_update": {
+      "files": [
+        "csrc/cache.cpp"
+      ],
+      "test_cmd": "cd vllm-xpu-kernels && pytest tests/test_cache.py -v"
+    },
+    "flash_xpu::minimax_m3_sparse_attn": {
+      "files": [
+        "csrc/msa/msa_sparse_attn.cpp",
+        "csrc/msa/msa.h"
+      ],
+      "test_cmd": "cd applications.ai.gpu.deepklox && python -m pytest tests/test_msa.py -v"
+    },
+    "flash_xpu::minimax_m3_sparse_attn_decode": {
+      "files": [
+        "csrc/msa/msa_sparse_attn.cpp",
+        "csrc/msa/msa.h"
+      ],
+      "test_cmd": "cd applications.ai.gpu.deepklox && python -m pytest tests/test_msa.py -v"
+    },
+    "flash_xpu::minimax_m3_index_score": {
+      "files": [
+        "csrc/msa/msa_index_score.cpp",
+        "csrc/msa/msa.h"
+      ],
+      "test_cmd": "cd applications.ai.gpu.deepklox && python -m pytest tests/test_msa.py -v"
+    },
+    "flash_xpu::minimax_m3_index_decode": {
+      "files": [
+        "csrc/msa/msa_index_decode.cpp",
+        "csrc/msa/msa.h"
+      ],
+      "test_cmd": "cd applications.ai.gpu.deepklox && python -m pytest tests/test_msa.py -v"
+    },
+    "flash_xpu::minimax_m3_index_topk": {
+      "files": [
+        "csrc/msa/msa_topk.cpp",
+        "csrc/msa/msa.h"
+      ],
+      "test_cmd": "cd applications.ai.gpu.deepklox && python -m pytest tests/test_msa.py -v"
+    }
+  }
+}

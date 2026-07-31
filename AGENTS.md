@@ -35,20 +35,24 @@ chat.py                   — Interactive chat with profiling
 breakdown/
   graph_from_trace.py     — Profile-first graph reconstruction from a trace
   shape_derive.py         — Symbolic shape/dtype/memory resolution (torch-free, shared)
-  perf/                   — Perf pipeline: shapes → benchmarks → ranked targets
-    shape_matrix.py       — Graph + config sweep → matrix rows (the export serializes them)
-    shape_matrix_xlsx.py  — Excel serialization of matrix rows
-    matrix_reader.py      — Rows / .xlsx → OpRow records
-    op_map/{xpu,cuda}.py  — Shape-Matrix op → micro_perf op case, per dispatch
-    workloads.py          — Rows → micro_perf workload JSON + coverage + cost
-    estimate.py           — Case cost → estimated runtime → per-op timeout
-    runner.py             — Invokes xpu-perf/micro_perf, one op per process
-    bench_case.py         — One op-case per process (bench / unitrace / isolate)
-    reports.py            — Report trees → records + merged workbook
-    rank.py               — calls × latency × roofline → opt_targets.json
-    store.py              — output/perf/<run_id>/ layout + provenance
+  shape_matrix.py         — Graph + config sweep → matrix rows (the export serializes them)
+  shape_matrix_xlsx.py    — Excel serialization of matrix rows
+  bench/                  — Replay benchmark: dispatched ops → measured → ranked targets
+    spec.py               — Matrix rows → BenchCase replay specs (+ skip/dedup rules)
+    resolve.py            — Dispatch name → callable + schema (PYTHON_API for kernel ops)
+    inputs.py             — Schema-driven operand materialization + synthesizer registry
+    recipes/{common,xpu,cuda}.py — Per-op overrides, output args, skip reasons
+    timing.py             — Device-event windows, overhead subtraction, operand restore
+    worker.py             — Benchmark one op in its own process → results.jsonl
+    runner.py             — Orchestration, per-op timeouts, incremental run_result.json
+    collective.py         — Multi-rank replay of c10d ops (rank 0 is recorded)
+    estimate.py           — Roofline utilization + per-op time budgets
+    rank.py               — calls × latency × roofline headroom → targets.json
+    reports.py            — results.jsonl → summary / coverage / workbook
+    store.py              — output/bench/<run_id>/ layout + provenance
     history.py            — SQLite history + regression detection
-    cli.py                — python -m breakdown.perf …
+    kernel_sources.json   — op/backend → repo, files, build and test commands
+    cli.py                — python -m breakdown.bench {plan,run,rank,report,case,history,all}
   module_hooks.py         — Capture-time module-name spans (forward hooks)
   module_naming.py        — Fallback: recover names from named_modules() overlay
   model_info.py           — HuggingFace config fetcher/summarizer + min_profile_layers
@@ -68,10 +72,11 @@ scripts/
 tests/
   test_pipeline.py              — Unit tests (requires torch)
   test_shape_matrix_export.py   — Shape Matrix Export endpoint tests
-  test_perf_workloads.py        — Perf: rows → op map → workloads (no GPU)
-  test_perf_rank.py             — Perf: ranking, runner isolation, history (no GPU)
-  test_perf_estimate.py         — Perf: shape gating, runtime estimate, timeouts (no GPU)
-  test_perf_api.py              — /api/perf/* endpoints (no GPU)
+  test_bench_spec.py            — Bench: rows → replay cases, skip/dedup (no GPU)
+  test_bench_resolve.py         — Bench: dispatch resolution + operand building (no GPU)
+  test_bench_rank.py            — Bench: ranking, timing plan, budgets, history (no GPU)
+  test_bench_api.py             — /api/bench/* endpoints (no GPU)
+  test_bench_replay.py          — Bench: end-to-end replay on a real device (GPU)
   test_profile_reduced_layers.py
   test_real_profile.py          — Integration test (requires GPU)
 ```
@@ -98,8 +103,9 @@ pytest tests/test_pipeline.py -v
 # Shape Matrix Export tests (no GPU required)
 pytest tests/test_shape_matrix_export.py -v
 
-# Perf pipeline tests (no GPU, no xpu-perf checkout required)
-pytest tests/test_perf_workloads.py tests/test_perf_rank.py tests/test_perf_api.py -v
+# Replay benchmark tests (no GPU required)
+pytest tests/test_bench_spec.py tests/test_bench_resolve.py \
+       tests/test_bench_rank.py tests/test_bench_api.py -v
 
 # Full integration (requires Intel XPU hardware)
 pytest tests/ -v
@@ -470,82 +476,124 @@ validation summary. Filename is
   Note: memory/FLOPs are still analytic estimates — only the op set, shapes,
   dtypes and backends come from the trace.
 
-### Perf Pipeline (`breakdown/perf/`)
+### Replay Benchmark (`breakdown/bench/`)
 
 Answers the question the Shape Matrix cannot: **which kernel is worth an
-optimization session**. Stages: rows (`shape_matrix`) → micro_perf cases
-(`op_map`) → workload JSON (`workloads`) → benchmarks (`runner`, invoking
-xpu-perf, budgeted by `estimate`) → ranked targets (`rank`) → history
-(`history`). Every stage runs
-headless (`python -m breakdown.perf`); `/api/perf/*` and the **Perf & Targets**
-tab are wrappers.
+optimization session**. It does so by **re-invoking the ops vLLM actually
+dispatched** rather than benchmarking substitutes in an external suite. Stages:
+rows (`shape_matrix`) → replay cases (`spec`) → measured cases (`worker`/
+`runner`, budgeted by `estimate`) → ranked targets (`rank`) → history
+(`history`). Every stage runs headless (`python -m breakdown.bench`);
+`/api/bench/*` and the **Benchmark & Targets** tab are wrappers.
 
+> The old `breakdown/perf/` pipeline (op-map adapters + a shell-out to
+> `$XPU_PERF_HOME/projects/micro_perf/launch.py`) was **removed**. Do not
+> reintroduce an op→micro_perf adapter table, a workloads JSON emission, or an
+> `xpu-perf` dependency: coverage is now a property of the profile, not of a
+> hand-maintained mapping.
+
+- **Replay, not re-implementation.** The trace records each op's dispatch name,
+  per-tensor shapes/dtypes/strides and the concrete values of its non-tensor
+  arguments (`Concrete Inputs`), so `resolve` maps the name to
+  `torch.ops.<ns>.<op>` and `inputs` materializes the recorded operands. Every
+  op the profile dispatched is benchmarkable — on XPU and CUDA alike — without
+  writing an adapter for it.
 - **The rows are the transport, not the .xlsx.** `shape_matrix.build_rows`
-  returns the matrix as dicts; the export merely serializes them and the perf
-  pipeline consumes them in-process. Do **not** reintroduce a
-  graph → xlsx → pandas → workloads round-trip (it is slower, and it made the
-  benchmark unreproducible whenever the spreadsheet was lost).
-- **`op_map` is the sibling of `classifier`.** `classifier.py` says which
-  backend runs an op; `op_map` says which micro_perf op benchmarks it, with
-  which arguments. Both describe the same dispatch — when adding an op, update
-  the registry/classifier **and** the op map, or the op lands in the coverage
-  report as *unmapped* (which fails the emission).
-- **Unmapped ⇒ error, never an approximation.** An approximated op silently
-  corrupts the ranking; `coverage.json` must show `0 unmapped`.
-- **Drop impossible shapes, report impossible kernels.** Emission drops only
-  cases with a 0-sized extent (a shape-derivation artefact — they are counted in
-  `coverage.invalid_cases`). A *kernel* limit is never gated away: e.g. the M3
-  sparse-attention kernel tiles a fixed 16-head GQA group, which TP > num_kv_heads
-  cannot satisfy — that is a legitimate workload the run must report as failing so
-  the kernel gets fixed. Per-case failures are counted in `OpResult.failed_cases`
-  / `errors` and do **not** fail the op: the shapes that did run are still data.
-- **Timeouts are estimated, not guessed (`estimate.py`).** micro_perf writes its
-  jsonl only when an op ends, so a timeout destroys everything that op had
-  measured. Each op's budget is `work / (peak × achieved util)` per case — the
-  util coming from a *measured* record of that op when one exists — times
-  micro_perf's per-case iteration budget, plus a per-case overhead calibrated
-  from previous runs' wall time. `--timeout auto` (the default) uses it;
-  `--timeout <n>` pins it. `run_result.json` is rewritten after every op so a
-  killed run still says what completed.
-- **`ModelConfig` comes from `summarize_config`.** The structural side-input the
-  adapters need (experts, top-k, sparse block size) is derived by the same
-  summarizer the graph uses — do not hand-copy a config summary next to a matrix.
-- **Ranking = calls × latency × roofline headroom, plus the provider gap.**
-  Calls come from the `Layers` column (how many modules dispatch the op at the
-  chosen operating point), so a small op in 57 layers outranks a large one that
-  runs once. Utilization is measured against the SKU peaks in `devices.py`
-  (BMG: 456 GB/s, 98.3 TFLOPS bf16); at or above `target_util` (default 80 %)
-  the op is `at_roofline` and is **not** a target. A provider faster than the
-  dispatched one is `switch_provider` — a free win to harvest before any kernel
-  work. Ops with no editable kernel source (oneDNN/ATen/collectives) are
-  `tune_config`.
-- **`opt_targets.json` is a versioned contract** (`schema_version`) consumed by
-  the `xpu-kernel-optimizer` skill: kernel dir/files, build/test commands,
-  baseline latency, roofline bound, and `bench_cmd`/`profile_cmd` per dominant
-  shape. Changing a field's meaning requires bumping the version.
-  `perf/kernel_sources.json` maps provider/op → repo, files, build and test
-  command; **add an entry when a new op is benchmarked**, otherwise its target
-  degrades to `tune_config` with no source.
-- **One op per process, always.** A single unhandled provider exception aborts
-  an entire `--task all` micro_perf run, and a bad kernel can take the device
-  down; `runner.run` launches each op separately and contains failures. Report
-  directories must live **outside** the workload tree (the launcher parses every
-  json under `--task_dir`).
-- **Persistent kernel caches.** `runner.bench_env` pins
+  returns the matrix as dicts carrying `_input_args` (the full ordered argument
+  slots); the export merely serializes them and `bench.spec` consumes them
+  in-process. Do **not** reintroduce a graph → xlsx → pandas round-trip: the
+  spreadsheet drops the non-tensor arguments, so a run built from it cannot
+  replay anything.
+- **The schema selects the overload; the slots select the schema.**
+  `aten::add`'s *default* overload is `(Scalar a, Scalar b)` — no tensors at
+  all. `resolve._overload` scores overloads against the recorded slot profile
+  (argument count, tensor count), and keyword-only schema arguments (`*, Scalar
+  alpha=1`) are passed as keywords. Picking by name would call the wrong kernel
+  or fail outright.
+- **An integer tensor is an index until proven otherwise.** A random
+  `slot_mapping` makes a paged-KV kernel scatter across the whole cache; a
+  random `rows_per_expert` makes a grouped GEMM read past its input. So
+  `inputs` **refuses** to fill an integer operand without a registered
+  synthesizer (`MissingSynthesizer`), and the case is reported as
+  `needs_synthesizer`. Never relax this into a zeros/random default.
+- **Some arguments are outputs the schema does not mark.**
+  `_moe_C::remap_hidden_states` takes `rows_per_expert` as an argument but
+  *accumulates into it with atomics*; reusing it across calls grows the offsets
+  until the scatter writes out of bounds and takes the device down
+  (`UR_RESULT_ERROR_DEVICE_LOST`, no traceback). `recipes.outputs(...)` declares
+  such arguments so they are allocated zeroed, reset between windows, and
+  measured **one call per timed window** (`SINGLE_REP`).
+- **Context-bound wrappers are refused, with the reason.**
+  `vllm::unified_attention_with_output` / `moe_forward_shared` read the KV cache
+  and metadata out of vLLM's forward context and cannot be invoked standalone.
+  They are reported (`not_replayable`) rather than approximated — the kernels
+  they launch are separate ops in the graph and are benchmarked on their own.
+- **Timing subtracts a measured floor and repeats inside the window.** An empty
+  device-event window costs ~60–90 µs on Level Zero, an order of magnitude more
+  than a small elementwise kernel; a one-call-per-window loop measures the timer.
+  `timing.measure` repeats the kernel `reps` times between one event pair,
+  subtracts the calibrated empty-window cost and divides. Operand restoration
+  and cache flushing happen *between* windows, never inside one.
+- **Operands are allocated in their target dtype.** Building a several-hundred-MB
+  `lm_head` weight in fp32 and casting doubles the allocation and dominates the
+  case's wall time (it timed out the worker before this was fixed).
+- **One op per process, always.** A replayed kernel runs with synthesized
+  operands, so a shape it cannot handle does not merely raise: it can abort the
+  process or wedge the device so every *subsequent* op in it fails with a
+  device-lost error. `runner` launches each op separately; results stream to
+  `results.jsonl` case by case and `run_result.json` is rewritten after every op,
+  so a run killed midway still says what completed.
+- **Collectives run on the ranks they were profiled with.** `bench.collective`
+  launches `world_size = TP` peers and records **rank 0** (ranks 1..N-1 absorb
+  the wait to synchronize and report inflated times — the same reason the
+  profile itself uses rank 0). Two hard-won rules: every rank must run an
+  **identical, fixed** iteration schedule (a per-rank adaptive probe
+  desynchronizes them and the transport runs out of resources), and the ranks
+  must run with the **persistent SYCL cache disabled** — `SYCL_CACHE_PERSISTENT`
+  makes oneCCL segfault with no Python traceback. Fewer devices than the
+  profiled TP is reported as `needs_ranks`, never measured on fewer ranks.
+- **Persistent kernel caches for everything else.** `worker.bench_env` pins
   `SYCL_CACHE_PERSISTENT`/`SYCL_CACHE_DIR`/`TRITON_CACHE_DIR` under
-  `output/perf/.cache`; without them every run re-pays AOT/JIT on each op's
-  first case, which dominates a short sweep and poisons the first measurement.
+  `output/bench/.cache`; without them every worker re-pays AOT/JIT on its first
+  case, which dominates a short sweep and poisons the first measurement.
 - **Never source `setvars.sh` under `set -u`.** oneAPI's script reads unset
   variables, so a `set -u` shell dies silently (exit 127, no output) at that
-  line. The runner therefore sets only the cache variables and expects oneAPI to
-  be sourced by the calling shell.
-- **xpu-perf is invoked, never vendored** (`$XPU_PERF_HOME` or a sibling
-  checkout). Op schemas and vendor implementations are contributed upstream;
-  the orchestration and ranking live here.
-- **Artifacts are owned.** Everything lands in `output/perf/<run_id>/` with a
-  `run.json` recording the git commit of every component that can move a number,
-  and cases are ingested into `output/perf/history.sqlite` so a regression can be
-  attributed to a kernel bump (`/api/perf/history?base=&new=`).
+  line. The runner sets only the cache variables and expects oneAPI to be
+  sourced by the calling shell.
+- **Timeouts are estimated, not guessed (`estimate.py`).**
+  `startup + cases × (budget + per-case overhead) + operand bytes / alloc rate`,
+  times a safety factor, with `startup` and the per-case overhead **calibrated
+  from previous runs' wall time**.
+- **Ranking = calls × latency × roofline headroom.** Calls come from the
+  `Layers` count (how many modules dispatch the op at the chosen operating
+  point), so a small op in 57 layers outranks a large one that runs once.
+  Utilization is measured against the SKU peaks in `devices.py` (BMG: 456 GB/s,
+  98.3 TFLOPS bf16); at or above `target_util` (default 80 %) the op is
+  `at_roofline` and is **not** a target. Ops with no editable kernel source
+  (oneDNN/ATen/collectives) are `tune_config`. There is deliberately **no**
+  `switch_provider` signal — replay measures the kernel that ran, so there is no
+  second implementation to compare against.
+- **Two honesty checks the ranking must keep.** (1) *Fidelity*: a case measured
+  at the profiled shape carries the trace's own `device_time_us`; a replay far
+  faster than it means the arguments do not reproduce the model's work, and the
+  target is flagged instead of trusted. (2) *Cost model*: Memory/FLOPs are
+  analytic estimates — an embedding or a paged-KV insert is charged for the
+  whole table it *could* read — so a utilization above `MAX_CREDIBLE_UTIL` is
+  reported as `check_cost_model`, never silently retired as `at_roofline`.
+- **`targets.json` is a versioned contract** (`schema_version`, now **2** for
+  the replay model: provider fields removed, ops keyed by dispatch name,
+  `traced_device_time_us` added) consumed by the `xpu-kernel-optimizer` skill:
+  kernel dir/files, build/test commands, baseline latency, roofline bound and
+  `bench_cmd`/`profile_cmd` per dominant shape. Changing a field's meaning
+  requires bumping the version. `bench/kernel_sources.json` maps op/backend →
+  repo, files, build and test command; **add an entry when a new op is
+  benchmarked**, otherwise its target degrades to `tune_config` with no source.
+- **Artifacts are owned.** Everything lands in `output/bench/<run_id>/`
+  (`cases.json`, `plan.json`, `results.jsonl`, `run_result.json`, `logs/`,
+  `targets.json`, `report.xlsx`) with a `run.json` recording the git commit of
+  every component that can move a number, and cases are ingested into
+  `output/bench/history.sqlite` so a regression can be attributed to a kernel
+  bump (`/api/bench/history?base=&new=`).
 
 ### Op Classification (`classifier.py`)
 
@@ -604,10 +652,18 @@ static builder. Ensure:
 
 1. Add the op name to `breakdown/registry.py` `ALL_VLLM_XPU_OPS` set
 2. If the op has a unique classification pattern, update `breakdown/classifier.py`
-3. If the op should be benchmarked, add an adapter in
-   `breakdown/perf/op_map/{xpu,cuda}.py` (an unmapped dispatched op fails the
-   workload emission) and, if it has editable kernel source, an entry in
-   `breakdown/perf/kernel_sources.json` so its target carries build/test commands
+3. **Benchmarking needs no adapter** — the replay engine resolves the dispatch
+   name and rebuilds the recorded operands. What it may need:
+   - an **input synthesizer** if the op takes an integer/index tensor whose name
+     isn't already covered (`breakdown/bench/inputs.py` or
+     `breakdown/bench/recipes/`) — otherwise the case is reported as
+     `needs_synthesizer`, never randomly filled;
+   - a `recipes.outputs(...)` declaration if an argument is really an *output*
+     the schema doesn't mark (especially one accumulated with atomics);
+   - a `resolve.PYTHON_API` entry if it's a kernel launched straight from Python
+     (Triton / FlashInfer / a SYCL extension) with no dispatcher op;
+   - an entry in `breakdown/bench/kernel_sources.json` if it has editable kernel
+     source, so its target carries build/test commands
 
 ## API Endpoints
 
@@ -621,13 +677,14 @@ static builder. Ensure:
 | `/api/profile/result` | GET | Fetch profiling result (ops + reconstructed graph) |
 | `/api/profile/trace` | GET | Download raw trace file (two-pass runs: `?pass=prefill\|decode`; default = decode) |
 | `/api/export/shape-matrix` | POST | Export profile-derived multi-config shape sweep to Excel |
-| `/api/perf/workloads` | POST | Sweep the profiled graph into micro_perf workloads (creates a perf run) |
-| `/api/perf/run` | POST | Benchmark a run's workloads (async — poll `/api/perf/status`) |
-| `/api/perf/status` | GET | Poll the benchmark run (per-op progress) |
-| `/api/perf/runs` | GET | List perf runs under `output/perf/` |
-| `/api/perf/targets` | GET | Ranked optimization targets (`?run_id=`, `?refresh=1`, `?target_util=`) |
-| `/api/perf/report` | GET | Download a run's merged report workbook |
-| `/api/perf/history` | GET | Runs in the history db, or `?base=&new=` per-shape diff |
+| `/api/bench/plan` | POST | Sweep the profiled graph into replay cases (creates a bench run) |
+| `/api/bench/run` | POST | Replay a run's cases (async — poll `/api/bench/status`) |
+| `/api/bench/status` | GET | Poll the benchmark run (per-op progress) |
+| `/api/bench/runs` | GET | List bench runs under `output/bench/` |
+| `/api/bench/results` | GET | A run's measured cases + summary + coverage |
+| `/api/bench/targets` | GET | Ranked optimization targets (`?run_id=`, `?refresh=1`, `?target_util=`) |
+| `/api/bench/report` | GET | Download a run's report workbook |
+| `/api/bench/history` | GET | Runs in the history db, or `?base=&new=` per-shape diff |
 
 ## Common Pitfalls
 
