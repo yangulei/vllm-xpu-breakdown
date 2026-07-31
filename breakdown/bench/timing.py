@@ -67,15 +67,26 @@ def _sync(device: str) -> None:
 
 
 def _event_pair(device: str):
+    """A timing event pair, or ``(None, None)`` when the backend has none.
+
+    CPU (and some accelerator builds) expose an ``Event`` class that takes no
+    timing argument; falling back to wall-clock timing there is correct, and
+    must not raise out of the measurement.
+    """
     import torch
+    if device == "cpu":
+        return None, None
     mod = getattr(torch, device, None)
     ev = getattr(mod, "Event", None) if mod is not None else None
     if ev is None:
         return None, None
     try:
         return ev(enable_timing=True), ev(enable_timing=True)
-    except TypeError:                      # pragma: no cover - older backends
-        return ev(True), ev(True)
+    except Exception:                      # noqa: BLE001 - backend-specific
+        try:
+            return ev(True), ev(True)
+        except Exception:                  # noqa: BLE001
+            return None, None
 
 
 class CacheFlusher:
@@ -124,10 +135,21 @@ def make_restorer(mutated: list[Any]) -> Callable[[], None] | None:
     return restore
 
 
-def probe(call: Callable[[], Any], device: str) -> float:
-    """One timed call after a warmup, in seconds - sets the window sizing."""
+def probe(call: Callable[[], Any], device: str,
+          restore: Callable[[], None] | None = None) -> float:
+    """One timed call after a warmup, in seconds - sets the window sizing.
+
+    ``restore`` runs before *every* probe call. Without it the probe is the one
+    place an accumulating op (``remap_hidden_states``, whose ``rows_per_expert``
+    grows with atomics) would run twice un-reset - exactly what the op's
+    single-call-per-window recipe exists to prevent.
+    """
+    if restore:
+        restore()
     call()
     _sync(device)
+    if restore:
+        restore()
     t0 = time.perf_counter()
     call()
     _sync(device)
@@ -210,7 +232,7 @@ def measure(fn: Callable[..., Any], args: list[Any], device: str,
 
     if reps is None or windows is None:
         try:
-            secs = probe(call, device)
+            secs = probe(call, device, restore)
         except Exception as exc:           # noqa: BLE001
             m.ok = False
             m.error = f"{type(exc).__name__}: {exc}"

@@ -98,6 +98,17 @@ class TestRank(unittest.TestCase):
         self.assertEqual(doc["operating_points"]["decode"]["batch_size"], 32)
         self.assertEqual(doc["targets"][0]["e2e_us"], 20.0)
 
+    def test_a_sweep_invariant_case_is_ranked_at_every_point_it_covers(self):
+        # measured once at bs=1 but valid for bs=32 as well
+        invariant = _rec("moe_grouped_gemm", 100.0, nbytes=1_000,
+                         batch_size=1,
+                         points=[["decode", 1, 2048, 1], ["decode", 1, 2048, 32]])
+        varying = _rec("per_token_op", 10.0, nbytes=1_000, batch_size=32,
+                       points=[["decode", 1, 2048, 32]])
+        doc = rank.rank([invariant, varying, dict(varying)])
+        self.assertEqual(doc["operating_points"]["decode"]["batch_size"], 32)
+        self.assertIn("moe_grouped_gemm", [t["op"] for t in doc["targets"]])
+
     def test_ranking_without_any_measurement_is_an_error_not_an_empty_table(self):
         with self.assertRaises(ValueError):
             rank.rank([_rec("op", 1.0, status="failed")])

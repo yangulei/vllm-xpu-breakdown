@@ -108,17 +108,28 @@ def run(cases: list[BenchCase], paths: store.RunPaths, device: str,
                 if want is None or op in want}
 
     run_env = bench_env(paths.cache, env)
-    run_env.setdefault("PYTHONPATH", os.path.dirname(os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__)))))
+    # The worker is launched from the repo root so ``breakdown`` is importable.
+    # Prepend rather than setdefault: a dev shell usually already exports
+    # PYTHONPATH, and using *its* value as the working directory either raises
+    # FileNotFoundError (multi-entry) or leaves the repo off the import path.
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+    inherited = run_env.get("PYTHONPATH")
+    run_env["PYTHONPATH"] = (f"{repo_root}{os.pathsep}{inherited}"
+                             if inherited else repo_root)
     budgets = timeouts or estimate.plan(
         {op: len(cs) for op, cs in selected.items()}, budget, paths.root,
         alloc_bytes={op: sum(_operand_bytes(c) for c in cs)
                      for op, cs in selected.items()})
 
     res = RunResult(device=device, run_dir=paths.dir, started=time.time())
-    # A fresh results file per run: appending to a previous one would mix two
-    # kernel versions under the same run id.
-    open(paths.results, "w").close()
+    # Re-running a subset of ops must not delete the rest of the run's
+    # measurements: only a full run starts from an empty results file, and a
+    # partial one drops just the selected ops' previous records.
+    if want is None or set(selected) >= set(grouped):
+        open(paths.results, "w").close()
+    else:
+        _drop_records(paths.results, set(selected))
 
     for op, op_cases in selected.items():
         t0 = time.time()
@@ -143,7 +154,7 @@ def run(cases: list[BenchCase], paths: store.RunPaths, device: str,
             try:
                 proc = subprocess.run(cmd, env=run_env, capture_output=True,
                                       text=True, timeout=timeout,
-                                      cwd=run_env["PYTHONPATH"])
+                                      cwd=repo_root)
                 out = (proc.stdout or "") + (proc.stderr or "")
                 if proc.returncode not in (0, 2):
                     error = _last_error(out) or f"exit {proc.returncode}"
@@ -219,6 +230,27 @@ def _append(path: str, records: list[dict[str, Any]]) -> None:
     with open(path, "a") as fh:
         for r in records:
             fh.write(json.dumps(r) + "\n")
+
+
+def _drop_records(path: str, ops: set[str]) -> None:
+    """Remove previous records of ``ops``, keeping every other op's results."""
+    if not os.path.isfile(path):
+        return
+    kept = []
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                if json.loads(line).get("op") in ops:
+                    continue
+            except ValueError:
+                continue
+            kept.append(line)
+    with open(path, "w") as fh:
+        for line in kept:
+            fh.write(line + "\n")
 
 
 def _operand_bytes(case: BenchCase) -> float:

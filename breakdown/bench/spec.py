@@ -56,6 +56,12 @@ class BenchCase:
     seq_len: Any = None
     ctx_len: Any = None
     batch_size: Any = None
+    #: every ``(phase, seq_len, ctx_len, batch_size)`` this case stands for.
+    #: An op whose operands do not depend on a swept dimension produces the
+    #: *same* case at several sweep points; keeping only the first point would
+    #: make the ranking's operating-point filter drop it entirely (the MoE
+    #: grouped GEMM disappeared from the targets this way).
+    points: list = field(default_factory=list)
     tp: int = 1
     module: str = ""
     module_type: str = ""
@@ -249,6 +255,8 @@ def build_cases(rows: list[dict[str, Any]], device: str = "xpu",
             traced_comparable=comparable,
         )
         case.case_id = case_signature(case.op, case.args)
+        case.points = [[case.phase, case.seq_len, case.ctx_len,
+                        case.batch_size]]
         if not dedup:
             cases[f"{case.case_id}:{len(cases)}"] = case
             continue
@@ -257,6 +265,8 @@ def build_cases(rows: list[dict[str, Any]], device: str = "xpu",
             cases[case.case_id] = case
         else:
             prev.layers = max(prev.layers, case.layers)
+            if case.points[0] not in prev.points:
+                prev.points.append(case.points[0])
             if case.traced_comparable and not prev.traced_comparable:
                 prev.traced_device_time_us = case.traced_device_time_us
                 prev.traced_comparable = True

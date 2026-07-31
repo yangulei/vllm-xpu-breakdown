@@ -100,11 +100,28 @@ def _point_of(rec: dict) -> tuple:
     return (rec.get("seq_len"), rec.get("ctx_len"), rec.get("batch_size"))
 
 
+def _points_of(rec: dict, phase: str) -> list[tuple]:
+    """Every sweep point this record stands for, within ``phase``.
+
+    A case whose operands do not depend on a swept dimension is measured once
+    and represents several points (``BenchCase.points``). Matching only its
+    stored coordinates would drop it from every operating point but the first -
+    which silently removed the MoE grouped GEMM, the dominant kernel, from the
+    ranking.
+    """
+    pts = rec.get("points") or []
+    out = [tuple(p[1:]) for p in pts
+           if isinstance(p, (list, tuple)) and len(p) == 4 and p[0] == phase]
+    if out:
+        return out
+    return [_point_of(rec)] if rec.get("phase") == phase else []
+
+
 def pick_point(records: list[dict], phase: str,
                want: tuple | None = None) -> tuple | None:
     """The operating point to rank at: the requested one, else the busiest."""
-    pts = Counter(_point_of(r) for r in records
-                  if r.get("phase") == phase and r.get("status") == "ok")
+    pts = Counter(p for r in records if r.get("status") == "ok"
+                  for p in _points_of(r, phase))
     if not pts:
         return None
     if want is not None:
@@ -154,30 +171,30 @@ def rank(records: Iterable[dict], rc: RankConfig | None = None,
     op_flags: dict[str, list[str]] = defaultdict(list)
 
     for r in recs:
-        ph = r.get("phase")
-        if ph not in rc.phases or points.get(ph) is None:
-            continue
-        if _point_of(r) != points[ph]:
-            continue
-        op = r["op"]
-        calls = max(int(r.get("layers") or 1), 1)
-        lat = float(r.get("latency_us") or 0)
-        weighted = lat * calls
-        op_time[op][ph] += weighted
-        op_backend[op][r.get("backend") or ""] += 1
-        util, bound = estimate.utilization(lat, float(r.get("flops") or 0),
-                                           float(r.get("bytes") or 0), peaks)
-        op_util[op].append((weighted, util, bound))
-        ratio, note = _fidelity(r)
-        if note:
-            op_flags[op].append(note)
-        op_cases[op].append({
-            "phase": ph, "calls": calls, "shape": r.get("shape"),
-            "latency_us": round(lat, 3), "weighted_us": round(weighted, 1),
-            "traced_device_time_us": r.get("traced_device_time_us"),
-            "replay_vs_traced": round(ratio, 3) if ratio else None,
-            "case_id": r.get("case_id"),
-        })
+        for ph in rc.phases:
+            if points.get(ph) is None:
+                continue
+            if points[ph] not in _points_of(r, ph):
+                continue
+            op = r["op"]
+            calls = max(int(r.get("layers") or 1), 1)
+            lat = float(r.get("latency_us") or 0)
+            weighted = lat * calls
+            op_time[op][ph] += weighted
+            op_backend[op][r.get("backend") or ""] += 1
+            util, bound = estimate.utilization(lat, float(r.get("flops") or 0),
+                                               float(r.get("bytes") or 0), peaks)
+            op_util[op].append((weighted, util, bound))
+            ratio, note = _fidelity(r)
+            if note:
+                op_flags[op].append(note)
+            op_cases[op].append({
+                "phase": ph, "calls": calls, "shape": r.get("shape"),
+                "latency_us": round(lat, 3), "weighted_us": round(weighted, 1),
+                "traced_device_time_us": r.get("traced_device_time_us"),
+                "replay_vs_traced": round(ratio, 3) if ratio else None,
+                "case_id": r.get("case_id"),
+            })
 
     if not op_time:
         raise ValueError(

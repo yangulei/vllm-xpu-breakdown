@@ -58,6 +58,7 @@ def _record(case: BenchCase, status: str, m: timing.Measurement | None = None,
         "seq_len": case.seq_len,
         "ctx_len": case.ctx_len,
         "batch_size": case.batch_size,
+        "points": case.points,
         "tp": case.tp,
         "module": case.module,
         "role": case.role,
@@ -110,10 +111,15 @@ def run_case(case: BenchCase, device: str,
                        detail=traceback.format_exc(limit=3))
 
     single = recipes.SINGLE_REP.get(case.op)
-    m = timing.measure(res.fn, call.args, device, kwargs=call.kwargs,
-                       mutated=call.mutated, budget=budget,
-                       reps=1 if single else None,
-                       flush_cache=flush_cache)
+    try:
+        m = timing.measure(res.fn, call.args, device, kwargs=call.kwargs,
+                           mutated=call.mutated, budget=budget,
+                           reps=1 if single else None,
+                           flush_cache=flush_cache)
+    except Exception as exc:               # noqa: BLE001 - a case never kills
+        return _record(case, "failed",     # the op's remaining cases
+                       error=f"{type(exc).__name__}: {exc}",
+                       detail=traceback.format_exc(limit=3))
     if single and m.ok:
         m.notes.append(f"one call per timed window: {single}")
     if not m.ok:
@@ -126,16 +132,15 @@ def run_op(cases: Iterable[BenchCase], device: str, out_path: str,
            flush_cache: bool = True) -> list[dict[str, Any]]:
     """Benchmark every case of one op, appending each result as it lands."""
     records: list[dict[str, Any]] = []
-    with open(out_path, "a") as fh:
-        for case in cases:
-            rec = run_case(case, device, budget=budget, flush_cache=flush_cache)
-            records.append(rec)
+    for case in cases:
+        rec = run_case(case, device, budget=budget, flush_cache=flush_cache)
+        records.append(rec)
+        with open(out_path, "a") as fh:
             fh.write(json.dumps(rec) + "\n")
-            fh.flush()
-            # An op's cases can each hold hundreds of megabytes of operands (an
-            # lm_head weight); without releasing them the worker OOMs partway
-            # through its own sweep.
-            _release(device)
+        # An op's cases can each hold hundreds of megabytes of operands (an
+        # lm_head weight); without releasing them the worker OOMs partway
+        # through its own sweep.
+        _release(device)
     return records
 
 

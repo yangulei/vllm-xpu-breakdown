@@ -537,6 +537,20 @@ rows (`shape_matrix`) → replay cases (`spec`) → measured cases (`worker`/
 - **Operands are allocated in their target dtype.** Building a several-hundred-MB
   `lm_head` weight in fp32 and casting doubles the allocation and dominates the
   case's wall time (it timed out the worker before this was fixed).
+- **A case may stand for several sweep points.** An op whose operands do not
+  depend on a swept dimension produces the *identical* case at several points,
+  so `build_cases` de-duplicates it — but it records **every** point it covers
+  (`BenchCase.points`). Ranking matches on membership: keying on the single
+  stored point dropped the MoE grouped GEMM (the dominant kernel) from the
+  targets whenever the operating point was not the first one swept.
+- **A partial re-run must not delete the run.** `bench run --ops <one>` (and the
+  UI's Ops box) re-measures a subset against an existing run id; the runner
+  truncates `results.jsonl` only for a full run and otherwise drops just the
+  selected ops' previous records.
+- **The worker is launched from the repo root, with the repo *prepended* to any
+  inherited `PYTHONPATH`.** A dev shell usually exports one already; using it as
+  the working directory raised `FileNotFoundError` (multi-entry) or produced
+  workers that could not import `breakdown` — failing every op, not just one.
 - **One op per process, always.** A replayed kernel runs with synthesized
   operands, so a shape it cannot handle does not merely raise: it can abort the
   process or wedge the device so every *subsequent* op in it fails with a

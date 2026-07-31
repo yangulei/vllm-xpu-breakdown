@@ -71,6 +71,16 @@ class TestBuildCases(unittest.TestCase):
         self.assertEqual(len(cases), 1)
         self.assertEqual(cases[0].layers, 57)
 
+    def test_a_deduped_case_records_every_sweep_point_it_stands_for(self):
+        # An op whose operands don't depend on the swept dimension is measured
+        # once but belongs to *both* points; keeping only the first would drop
+        # it from the ranking at every other operating point.
+        cases, _ = build_cases([_row(**{"Batch Size": 1}),
+                                _row(**{"Batch Size": 32})])
+        self.assertEqual(len(cases), 1)
+        self.assertEqual(cases[0].points,
+                         [["decode", 1, 2048, 1], ["decode", 1, 2048, 32]])
+
     def test_reconstructed_ops_without_slots_fall_back_to_shapes(self):
         row = _row(**{"Op Name": "triton::_gemma_rmsnorm_kernel",
                       "_input_args": [],
