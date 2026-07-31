@@ -156,6 +156,7 @@ ranks the ops by the end-to-end time an optimization would actually recover:
 |---|---|---|
 | calls x latency | Shape Matrix `Layers` at one operating point | a 10 us op in 57 layers beats a 500 us op that runs once |
 | roofline headroom | analytic bytes/FLOPs vs the SKU peaks | an op already at >=80 % of peak is `at_roofline` - don't spend a session on it |
+| which roof | the op's arithmetic intensity vs the machine balance | compute- or memory-bound is a property of the op, not of how the kernel did; a cache-resident op is measured against cache bandwidth, not DRAM |
 | replay vs traced | the profile's own device time for the same op+shape | a replay far off the profiled time is not a valid baseline, and is flagged |
 
 Because the benchmark *is* the dispatched op, coverage follows the profile:
@@ -177,9 +178,17 @@ python -m breakdown.bench case   --run <id> --case-id <id>     # re-run one shap
 python -m breakdown.bench history --base <run> --new <run>
 ```
 
+Attention, the KV-cache write and the sampler are benchmarked too. The first
+two are context-bound only at the *dispatcher* level: one layer down the kernel
+takes the paged KV cache, the block table and the sequence metadata as plain
+arguments, so the benchmark rebuilds that context (own blocks per sequence,
+`cu_seqlens_q` / `seqused_k` for the swept point) instead of refusing the
+heaviest op in the model.
+
 The plan reports up front what will **not** be measured and why — collectives
-needing more ranks, context-bound dispatch wrappers, ops whose index operands
-have no synthesizer — so nothing is silently omitted.
+needing more ranks, dispatch wrappers with no context-free entry point (the
+fused MoE forward), ops whose index operands have no synthesizer — so nothing
+is silently omitted.
 
 Output is `output/bench/<run_id>/targets.json`, the versioned handoff for the
 `xpu-kernel-optimizer` skill: each target carries the kernel directory and
@@ -215,11 +224,12 @@ breakdown/
     resolve.py            Dispatch name -> callable + schema (overload from the slots)
     inputs.py             Schema-driven operands + index-synthesizer registry
     recipes/              Per-op overrides, output args, skip reasons (xpu + cuda)
+                          + attention.py: paged attention / KV write, context-free
     timing.py             Device-event windows, overhead subtraction, operand restore
     worker.py             Benchmark one op in its own process -> results.jsonl
     runner.py             Orchestration, per-op timeouts, incremental run_result.json
     collective.py         Multi-rank replay of c10d ops (rank 0 is recorded)
-    estimate.py           Roofline utilization + per-op time budgets
+    estimate.py           Roofline (AI-based bound, DRAM/cache roof) + time budgets
     rank.py               calls x latency x roofline headroom -> targets.json
     reports.py            results.jsonl -> summary / coverage / workbook
     store.py              output/bench/<run_id>/ layout + run provenance

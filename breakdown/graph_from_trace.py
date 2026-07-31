@@ -2019,6 +2019,10 @@ def _build_symbol_tables(summary: dict, tp_size: int
         add("E", summary["num_experts"])
     if summary.get("moe_intermediate_size"):
         add("I_moe", summary["moe_intermediate_size"])
+        # The MoE gate_up projection is the two halves fused, exactly like the
+        # dense ``2·I``; without this the width falls through to an
+        # observed-value symbol and reads as a meaningless ``N``.
+        add("2·I_moe", 2 * summary["moe_intermediate_size"])
     # Rope cos/sin cache length (``[max_position, rotary_dim]``). Not divided by
     # TP (the position table is replicated per rank).
     max_pos = summary.get("max_position_embeddings")
@@ -2114,14 +2118,24 @@ def _is_attention_op(op: dict) -> bool:
             or op.get("role") == "attention")
 
 
-def _annotate_attention_kv(node: dict, n_kv: int | None) -> None:
-    """Rewrite attention key/value row lengths from ``S`` to ``S+C``.
+def _annotate_attention_kv(node: dict, n_kv: int | None,
+                           token_sym: str = "S",
+                           kv_sym: str = "S+C",
+                           kv_rows: int = 0, n_seqs: int = 1,
+                           dtype_bytes: int = 2) -> None:
+    """Rewrite attention key/value row lengths to the KV the call really reads.
 
     Paged/prefix-cached attention only records the *new* tokens as the op's
     key/value inputs (``[S, n_kv, d]``); the cached context never appears as a
     tensor dim. To make the attended context visible, the key/value input rows
-    (and the KV-shaped inputs generally) have their leading ``S`` replaced with
-    the symbolic full KV length ``S+C``. Query/output rows (``[S, n_h, d]``) are
+    (and the KV-shaped inputs generally) have their leading token symbol
+    replaced with the KV length the call actually reads: ``S+C`` for the single
+    prefill sequence, and ``B·C`` for a decode step, where each of the ``B``
+    sequences reads its own ``C``-token context (so the *total* KV traffic is
+    ``B·C``, which is what the memory estimate needs; ``estimate_flops`` divides
+    it back by the sequence count so each query is only charged for its own
+    context). Leaving decode at a bare ``B`` left the heaviest op in the model
+    looking like it read a few kilobytes. Query/output rows (``[S, n_h, d]``) are
     left untouched — there are still ``S`` query positions producing ``S``
     outputs. Key/value rows are identified by their second dim being the KV-head
     count (GQA); when heads are indistinguishable (MHA) the canonical vLLM
@@ -2131,21 +2145,54 @@ def _annotate_attention_kv(node: dict, n_kv: int | None) -> None:
         if not _is_attention_op(op):
             continue
         shapes = op.get("input_shapes") or []
+        rewritten: list[int] = []
         kv_by_heads = False
         if n_kv:
             for i, row in enumerate(shapes):
                 if (isinstance(row, list) and len(row) >= 2
-                        and row[0] == "S" and _dim_is(row[1], n_kv)):
-                    row[0] = "S+C"
+                        and row[0] == token_sym and _dim_is(row[1], n_kv)):
+                    row[0] = kv_sym
+                    rewritten.append(i)
                     kv_by_heads = True
         if not kv_by_heads:
             # Fall back to vLLM arg order: inputs[1] = key, inputs[2] = value.
             for i in (1, 2):
                 if (i < len(shapes) and isinstance(shapes[i], list)
-                        and shapes[i] and shapes[i][0] == "S"):
-                    shapes[i][0] = "S+C"
+                        and shapes[i] and shapes[i][0] == token_sym):
+                    shapes[i][0] = kv_sym
+                    rewritten.append(i)
+        _recost_attention_op(op, rewritten, kv_rows, n_seqs, dtype_bytes)
     for child in node.get("children", []):
-        _annotate_attention_kv(child, n_kv)
+        _annotate_attention_kv(child, n_kv, token_sym, kv_sym, kv_rows,
+                               n_seqs, dtype_bytes)
+
+
+def _recost_attention_op(op: dict, rewritten: list[int], kv_rows: int,
+                         n_seqs: int, dtype_bytes: int) -> None:
+    """Recompute an attention op's analytic cost once its KV rows are known.
+
+    ``_finalize_node`` costs every op while the tree is being built, i.e. from
+    the *recorded* KV rows - the new tokens only. For attention that is the
+    whole point of the annotation above: the call really reads ``context+query``
+    (prefill) or ``batch x context`` (decode) KV rows. Without this the graph
+    view charged prefill attention ~65x too little work at a 2048-token context.
+    """
+    recorded = op.get("recorded_shapes") or []
+    if not rewritten or not kv_rows or not recorded:
+        return
+    numeric = [list(s) for s in recorded]
+    for i in rewritten:
+        if i < len(numeric) and numeric[i]:
+            numeric[i][0] = int(kv_rows)
+    from .shape_derive import _profile_op_memory
+
+    dtypes = op.get("input_dtypes") or []
+    mem = (_profile_op_memory(op["name"], numeric, dtypes, dtype_bytes)
+           if dtypes else estimate_memory(op["name"], numeric, dtype_bytes))
+    flops = estimate_flops(op["name"], numeric, n_seqs=max(n_seqs, 1))
+    op["memory_bytes"] = mem
+    op["flops"] = flops
+    op["ai"] = round(flops / mem, 2) if mem > 0 else 0
 
 
 def _dim_is(sym: Any, value: int) -> bool:
@@ -2256,6 +2303,78 @@ def _symbolize_msa_dims(trees: list[tuple[dict | None, str, int]],
                     if topk_blocks and rec[2] == int(topk_blocks):
                         shp[2] = "K_topk"
                         sym_to_val.setdefault("K_topk", int(topk_blocks))
+
+
+def _symbolize_moe_routed_rows(trees: list[tuple[dict | None, str, int]],
+                               sym_to_val: dict[str, int],
+                               summary: dict) -> None:
+    """Symbolize the MoE routed-token row count as ``topk·S`` / ``topk·B``.
+
+    An MoE block expands every token into ``num_experts_per_tok`` routed rows,
+    so the permuted hidden states, the grouped-GEMM ``M`` and the gather
+    destination are all ``tokens × topk`` rows. That value is not a config
+    constant, so it used to fall through to :func:`_symbolize_runtime_dims`,
+    which freezes it at the value it happened to have while profiling.
+
+    Freezing it is not a cosmetic problem: the Shape Matrix and the replay
+    benchmark sweep ``S``/``B``, so the token operand scaled while the routed
+    operand did not, and the two stopped describing the same call. The kernels
+    then rejected their own recorded shapes — ``remap_hidden_states`` with
+    *"remapped_hidden_states must be [num_rows * TopK, hidden_size]"* and the
+    MoE grouped GEMM (the dominant kernel of an MoE model) with
+    *"ptr_A.size(1) must match ptr_B.size(1)"*.
+
+    Emitting the **expression** keeps the relationship: ``_resolve_dim``
+    evaluates ``topk·S`` against whatever ``S`` the configuration sweeps to.
+    """
+    topk = summary.get("num_experts_per_tok")
+    if not summary.get("num_experts") or not topk or topk < 2:
+        return
+    sym_to_val.setdefault("topk", int(topk))
+    for tree, token_sym, token_val in trees:
+        if not tree or not token_val:
+            continue
+        target = int(token_val) * int(topk)
+        expr = f"topk·{token_sym}"
+        for op in _iter_ops(tree):
+            for shp in (op.get("input_shapes") or []):
+                if isinstance(shp, list):
+                    _rewrite_routed(shp, target, expr, token_sym, int(topk))
+            out = op.get("output_shape")
+            if isinstance(out, list):
+                _rewrite_routed(out, target, expr, token_sym, int(topk))
+
+
+def _rewrite_routed(shape: list, target: int, expr: str, token_sym: str,
+                    topk: int) -> None:
+    """``tokens×topk`` → ``topk·S``; the per-token expert axis → ``topk``.
+
+    The router rule is applied **first** and its axis is then excluded from the
+    routed-rows rule. Otherwise a profile whose token count is 1 (a decode pass
+    at batch 1) makes ``tokens × topk == topk``, so the router's ``[tokens,
+    topk]`` operand matches the routed-rows rule and becomes ``[B, topk·B]`` -
+    an expert fan-out that *scales with the swept batch*, which is exactly the
+    bug this pass exists to prevent.
+
+    The router rule is deliberately narrow - a bare ``8`` is far too common to
+    map globally - and fires only on the ``[tokens, topk]`` router outputs
+    (``topk_ids`` / ``topk_weights``), the only place the expert fan-out appears
+    as its own axis.
+    """
+    router_axis = -1
+    if (len(shape) == 2 and shape[0] == token_sym
+            and isinstance(shape[1], int) and shape[1] == topk):
+        shape[1] = "topk"
+        router_axis = 1
+    for j, dim in enumerate(shape):
+        if j == router_axis or not isinstance(dim, int) or dim != target:
+            continue
+        if target == topk and not (j == 0 and len(shape) > 1):
+            # tokens == 1 makes the two rules numerically indistinguishable;
+            # routed rows are always a *row count*, so only the leading axis of
+            # a multi-dim operand is safe to claim.
+            continue
+        shape[j] = expr
 
 
 def _symbolize_runtime_dims(trees: list[dict | None],
@@ -2423,17 +2542,27 @@ def build_graph_from_trace(
     prefill_tokens = max((_pass_token_dim(p) for p in prefill_passes), default=0)
     decode_tokens = max((_pass_token_dim(p) for p in decode_passes), default=0)
 
-    # Symbolize the prefix-cached context length as ``C`` (and the full attended
-    # KV length ``context+query`` as ``S+C``) so attention KV dims read
-    # ``C`` / ``S+C`` instead of a bare number. ``context_len`` is already floored
-    # to a KV-block boundary by the caller. Assigned directly (not setdefault) so
-    # the context dim wins over any coincidental config-value collision.
+    # Register the prefix-cached context length as ``C`` (and the full attended
+    # KV length ``context+query`` as ``S+C``) in the symbol legend. ``context_len``
+    # is already floored to a KV-block boundary by the caller.
+    #
+    # The value→symbol direction uses ``setdefault``, so a **config structural
+    # dim always wins over the context length**. Paged attention never records
+    # the context as a tensor dim (the cached KV lives in the block cache), so
+    # nothing in the trace legitimately *is* ``C``; ``_annotate_attention_kv``
+    # writes the ``S+C`` KV rows explicitly instead. Letting ``C`` overwrite a
+    # config value is therefore never right and is actively destructive when the
+    # two collide: Qwen3-30B-A3B has ``hidden_size == 2048`` and the default
+    # profiling context is also 2048, so every ``H`` dim symbolized to ``C`` and
+    # then swept with the *context* in the Shape Matrix / benchmark — hidden
+    # dims became 0 at ctx=0 (``rms_norm`` divided by zero and took the worker
+    # down with SIGFPE; the MoE grouped GEMM rejected its operands).
     ctx = int(context_len) if context_len else 0
     if ctx > 0:
-        val_to_sym[ctx] = "C"
+        val_to_sym.setdefault(ctx, "C")
         sym_to_val["C"] = ctx
         if prefill_tokens:
-            val_to_sym[ctx + prefill_tokens] = "S+C"
+            val_to_sym.setdefault(ctx + prefill_tokens, "S+C")
             sym_to_val["S+C"] = ctx + prefill_tokens
 
     prefill_tree = _build_phase_tree(
@@ -2459,7 +2588,18 @@ def build_graph_from_trace(
     # full attended KV length ``S+C`` so the graph shows the query attending
     # ``context+query`` keys (the query/output rows stay ``S``).
     if ctx > 0 and prefill_tokens and prefill_tree:
-        _annotate_attention_kv(prefill_tree, n_kv=summary.get("num_kv_heads"))
+        # one prefill sequence attending context+query keys
+        _annotate_attention_kv(prefill_tree, n_kv=summary.get("num_kv_heads"),
+                               kv_rows=ctx + prefill_tokens, n_seqs=1,
+                               dtype_bytes=dtype_bytes)
+        _recompute_totals(prefill_tree)
+    if ctx > 0 and decode_tokens and decode_tree:
+        # B sequences each attending their own context
+        _annotate_attention_kv(decode_tree, n_kv=summary.get("num_kv_heads"),
+                               token_sym="B", kv_sym="B·C",
+                               kv_rows=ctx * decode_tokens,
+                               n_seqs=decode_tokens, dtype_bytes=dtype_bytes)
+        _recompute_totals(decode_tree)
 
     if prefill_tokens:
         sym_to_val["S"] = prefill_tokens
@@ -2475,6 +2615,9 @@ def build_graph_from_trace(
     _symbolize_msa_dims([(prefill_tree, "S", prefill_tokens),
                          (decode_tree, "B", decode_tokens)],
                         sym_to_val, summary, tp_size)
+    _symbolize_moe_routed_rows([(prefill_tree, "S", prefill_tokens),
+                                (decode_tree, "B", decode_tokens)],
+                               sym_to_val, summary)
     _symbolize_runtime_dims([prefill_tree, decode_tree], sym_to_val)
 
     total_ops = 0

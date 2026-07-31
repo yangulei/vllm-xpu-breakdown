@@ -58,9 +58,16 @@ a ranker scores ops by calls × latency × roofline headroom, producing
 `output/bench/<run_id>/targets.json` for the `xpu-kernel-optimizer` skill. Runs
 headless via `python -m breakdown.bench {plan,run,rank,report,case,history,all}`.
 Integer/index operands are **never** filled randomly — an op without a
-registered synthesizer is reported, not guessed. Context-bound wrappers
-(`vllm::unified_attention_with_output`) are refused with a reason; the kernels
-they launch are benchmarked as their own ops. Timing repeats the kernel inside
+registered synthesizer is reported, not guessed. A context-bound wrapper with a
+**context-free kernel entry point** is replayed through it — attention and the
+KV-cache write rebuild a paged KV cache + block table + sequence metadata
+(`bench/recipes/attention.py`), so the heaviest op in the model is measured
+rather than refused; a wrapper with no such entry point (`vllm::moe_forward*`)
+is still reported with a reason, and the kernels it launches are benchmarked as
+their own ops. The roofline classifies an op as compute- or memory-bound by its
+**arithmetic intensity vs the machine balance** (not by whichever utilization
+came out larger), and charges a cache-resident op to the last-level-cache
+bandwidth instead of DRAM. Timing repeats the kernel inside
 a device-event window and subtracts the measured empty-window cost, because that
 floor (~60-90 us on Level Zero) dwarfs a small kernel. The old `breakdown/perf/`
 op-map + xpu-perf/micro_perf shell-out was removed; do not reintroduce it.

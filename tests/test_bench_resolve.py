@@ -54,8 +54,19 @@ class TestResolve(unittest.TestCase):
 
     def test_context_bound_wrapper_is_refused_with_a_reason(self):
         with self.assertRaises(resolve.NotReplayable) as cm:
-            resolve.resolve("vllm::unified_attention_with_output")
-        self.assertIn("forward context", str(cm.exception))
+            resolve.resolve("vllm::moe_forward_shared")
+        self.assertIn("benchmarked as their own ops", str(cm.exception))
+
+    def test_attention_resolves_through_its_context_free_entry_point(self):
+        # The dispatcher op reads the KV cache and the metadata from vLLM's
+        # forward context, but the kernel underneath takes both as plain
+        # arguments - so attention, normally the heaviest op in the profile, is
+        # replayed rather than refused.
+        self.assertEqual(
+            resolve.classify("vllm::unified_attention_with_output")[0],
+            "replayable")
+        self.assertEqual(
+            resolve.classify("vllm::unified_kv_cache_update")[0], "replayable")
 
     def test_unknown_op_raises_rather_than_guessing(self):
         with self.assertRaises(resolve.ResolveError):
@@ -158,3 +169,93 @@ class TestScalarParsing(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@requires_torch
+class TestAttentionRecipe(unittest.TestCase):
+    """The paged-attention replay rebuilds the context the wrapper would read."""
+
+    def _case(self, phase, tokens, ctx, batch, n_h=32, n_kv=4, d=128):
+        return BenchCase(
+            op="vllm::unified_attention_with_output", device="cpu",
+            phase=phase, seq_len=tokens, ctx_len=ctx, batch_size=batch,
+            args=[_t([tokens, n_h, d]), _t([tokens, n_kv, d]),
+                  _t([tokens, n_kv, d]), _t([tokens, n_h, d])])
+
+    def _call(self, case):
+        from breakdown.bench.recipes import attention
+        return attention._paged_attention(case, None, "cpu")
+
+    def test_prefill_builds_one_sequence_over_the_cached_context(self):
+        call = self._call(self._case("prefill", 128, 8192, 1))
+        kw = call.kwargs
+        # the paged cache holds context+query for the sequence, in NHD layout
+        self.assertEqual(list(kw["k"].shape[1:]), [16, 4, 128])
+        self.assertEqual(kw["max_seqlen_q"], 128)
+        self.assertEqual(kw["max_seqlen_k"], 8192 + 128)
+        self.assertEqual(kw["seqused_k"].tolist(), [8320])
+        self.assertEqual(kw["cu_seqlens_q"].tolist(), [0, 128])
+        self.assertTrue(kw["causal"])
+
+    def test_decode_gives_every_sequence_its_own_blocks(self):
+        # A shared block table would turn the paged gather into a cache hit and
+        # understate the kernel by a large factor.
+        call = self._call(self._case("decode", 8, 1024, 8))
+        table = call.kwargs["block_table"]
+        self.assertEqual(list(table.shape), [8, 65])
+        self.assertEqual(len(set(table.flatten().tolist())), table.numel())
+        self.assertEqual(call.kwargs["seqused_k"].tolist(), [1025] * 8)
+
+    def test_an_operating_point_that_cannot_fit_is_refused_not_attempted(self):
+        # Without the guard this becomes a multi-terabyte allocation that hangs
+        # the worker instead of reporting a case that does not fit.
+        from breakdown.bench.inputs import ArgBuildError
+        from breakdown.bench.recipes import attention
+
+        case = self._case("decode", 1024, 10_000_000, 1024)
+        with self.assertRaises(ArgBuildError) as cm:
+            attention._paged_attention(case, None, "cpu")
+        self.assertIn("KV cache", str(cm.exception))
+
+    def test_kv_cache_write_scatters_each_token_to_its_own_slot(self):
+        from breakdown.bench.recipes import attention
+
+        case = self._case("prefill", 4, 32, 1)
+        case.op = "vllm::unified_kv_cache_update"
+        call = attention._kv_cache_update(case, None, "cpu")
+        slots = call.args[4].tolist()
+        self.assertEqual(slots, [32, 33, 34, 35])
+        self.assertEqual(len(set(slots)), len(slots))
+        self.assertEqual(call.args[5], "auto")
+
+
+@requires_torch
+class TestSamplerRecipe(unittest.TestCase):
+    def test_sampler_is_replayed_rather_than_skipped(self):
+        # Nothing about the sampler is context-bound: the "generator state" it
+        # is handed is a two-element philox (seed, offset) CPU tensor.
+        self.assertNotIn("vllm::xpu_topk_topp_sampler", recipes.SKIP_REASONS)
+        case = BenchCase(op="vllm::xpu_topk_topp_sampler", device="cpu",
+                         phase="decode", batch_size=32,
+                         args=[{"kind": "tensor", "dims": [32],
+                                "dtype": "long int"},
+                               {"kind": "none", "value": ""},
+                               {"kind": "tensor", "dims": [32, 151936],
+                                "dtype": "float"},
+                               {"kind": "none", "value": ""},
+                               {"kind": "none", "value": ""},
+                               {"kind": "none", "value": ""},
+                               {"kind": "tensor", "dims": [2],
+                                "dtype": "long int"},
+                               {"kind": "scalar", "type": "Scalar",
+                                "value": "1."}])
+        call = recipes.OVERRIDES["vllm::xpu_topk_topp_sampler"](case, None,
+                                                                "cpu")
+        random_sampled, to_return, logits, k, p, mode, seeds, lam = call.args
+        self.assertEqual(list(logits.shape), [32, 151936])
+        self.assertEqual(list(random_sampled.shape), [32])
+        self.assertEqual(str(seeds.device), "cpu")
+        self.assertEqual(list(seeds.shape), [2])
+        self.assertIsNone(to_return)
+        self.assertEqual(mode, "raw_logprobs")
+        self.assertEqual(lam, 1.0)

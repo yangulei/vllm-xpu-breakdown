@@ -420,7 +420,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
   <!-- Tab: Benchmark & Targets (replay the dispatched ops, rank what to optimize) -->
   <div id="tab-perf" class="tab-content hidden">
     <div class="card">
-      <h2>🎯 Replay Benchmark &amp; Optimization Targets</h2>
+      <h2>🎯 Benchmark &amp; Optimization Targets</h2>
       <p style="font-size:12px;color:#666;margin-bottom:16px">
         Re-invokes <b>the ops vLLM actually dispatched</b> — same kernel, same shapes and dtypes,
         rebuilt from the trace — and ranks them by the
@@ -454,7 +454,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
         <button class="btn btn-primary" id="perf-emit-btn" onclick="benchPlan()">1 · Plan cases</button>
-        <button class="btn" id="perf-run-btn" onclick="benchRun()">2 · Replay</button>
+        <button class="btn" id="perf-run-btn" onclick="benchRun()">2 · Benchmark</button>
         <button class="btn" id="perf-rank-btn" onclick="benchRank()">3 · Rank targets</button>
         <button class="btn" onclick="benchDownloadReport()">📥 Report</button>
         <select id="perf-run-select" onchange="benchLoadTargets()" style="font-size:12px;padding:6px"></select>
@@ -1291,7 +1291,7 @@ async function benchRun() {
     if (!resp.ok || !data.ok) throw new Error(data.error || resp.statusText);
     await benchPollRun();
   } catch (e) {
-    alert('Replay failed: ' + e.message);
+    alert('Benchmark failed: ' + e.message);
   } finally {
     btn.disabled = false;
   }
@@ -1359,7 +1359,9 @@ function renderPerfTargets(doc) {
     .map(([p, v]) => `${p}: seq=${v.seq_len} ctx=${v.ctx_len} bs=${v.batch_size}`)
     .join(' · ');
   summary.innerHTML =
-    `<b>${doc.device}</b> (${doc.sku}: ${doc.peaks.bw_gbs} GB/s, ${doc.peaks.tflops} TFLOPS, ` +
+    `<b>${doc.device}</b> (${doc.sku}: ${doc.peaks.bw_gbs} GB/s DRAM` +
+    (doc.peaks.cache_bw_gbs ? ` / ${doc.peaks.cache_bw_gbs} GB/s cache` : '') +
+    `, ${doc.peaks.tflops} TFLOPS, ` +
     `target util ${(doc.target_util * 100).toFixed(0)}%) — e2e op time ` +
     `${(doc.e2e_us_total / 1000).toFixed(2)} ms/step<br>${pts}`;
 
@@ -1384,7 +1386,14 @@ function renderPerfTargets(doc) {
       <td style="text-align:right">${t.e2e_us.toFixed(1)}</td>
       <td style="text-align:right">${(t.share_of_e2e * 100).toFixed(1)}%</td>
       <td style="text-align:right">${(t.roofline.util * 100).toFixed(0)}%</td>
-      <td>${t.roofline.bound}</td>
+      <td title="${t.roofline.bound === 'memory'
+          ? 'measured against the ' + (t.roofline.memory_level === 'cache'
+              ? 'last-level-cache bandwidth (this op&#39;s footprint is cache-resident)'
+              : 'DRAM bandwidth')
+          : 'arithmetic intensity is at or above the machine balance (' +
+            (t.roofline.ridge_ai || 0) + ' flop/byte)'}">${t.roofline.bound}${
+        t.roofline.memory_level === 'cache' && t.roofline.bound === 'memory'
+          ? ' <span style="color:#888">($)</span>' : ''}</td>
       <td style="text-align:right">${ratio}</td>
       <td style="text-align:right">${t.savings_us.total.toFixed(1)}</td>
       <td><span title="${hint}" style="color:${color};font-weight:600">${t.action}</span></td>

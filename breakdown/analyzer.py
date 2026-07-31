@@ -19,6 +19,13 @@ DTYPE_BYTES: dict[str, int] = {
     "int4": 1,  # packed, but use 0.5 effectively
     "int32": 4, "int64": 8, "int16": 2,
     "bool": 1,
+    # The profiler records ``Input type`` with C++ type names, so an index
+    # tensor arrives as ``long int``, not ``int64``. Without these it fell back
+    # to 2 bytes and every index/position operand was undercounted 4x.
+    "long int": 8, "long": 8, "long long": 8, "unsigned long": 8,
+    "int": 4, "unsigned int": 4, "short": 2, "unsigned short": 2,
+    "char": 1, "signed char": 1, "unsigned char": 1, "byte": 1,
+    "double": 8, "float64": 8,
 }
 
 
@@ -170,8 +177,14 @@ def estimate_memory(op_name: str, shapes: list[list[int]],
     return 0
 
 
-def estimate_flops(op_name: str, shapes: list[list[int]]) -> int:
-    """Estimate FLOPs for an operation based on its type and shapes."""
+def estimate_flops(op_name: str, shapes: list[list[int]],
+                   n_seqs: int = 1) -> int:
+    """Estimate FLOPs for an operation based on its type and shapes.
+
+    ``n_seqs`` is the number of independent sequences the call covers. It only
+    matters for attention, where the key/value rows are the *total* KV read
+    across the batch while each query attends only its own sequence's keys.
+    """
     if not shapes:
         return 0
 
@@ -200,6 +213,15 @@ def estimate_flops(op_name: str, shapes: list[list[int]]) -> int:
             K = shapes[1][1] if isinstance(shapes[1][1], int) else 1
             N = shapes[2][1] if isinstance(shapes[2][1], int) else 1
             return 2 * M * K * N + M * N  # matmul + add
+
+    # Grouped (MoE expert) GEMM: A [M, K] x B [E, K, N] -> D [M, N]. Every row
+    # goes through exactly one expert, so the work is a plain M*K*N - the
+    # expert count multiplies the *weights read*, not the arithmetic. Without
+    # this the dominant kernel of an MoE model had zero FLOPs, hence an
+    # arithmetic intensity of 0 and an unconditional "memory-bound" verdict.
+    if "grouped_gemm" in base:
+        if (len(shapes) >= 2 and len(shapes[0]) == 2 and len(shapes[1]) == 3):
+            return 2 * shapes[0][0] * shapes[0][1] * shapes[1][2]
 
     if base == "matmul":
         if len(shapes) >= 2 and shapes[0] and shapes[1]:
@@ -240,7 +262,46 @@ def estimate_flops(op_name: str, shapes: list[list[int]]) -> int:
         n = _prod(shapes[0])
         return n * 10  # rough estimate
 
+    # Attention. The dispatched op carries [tokens, heads, head_dim] query and
+    # [kv_tokens, kv_heads, head_dim] key/value operands (the key/value rows
+    # already rewritten to the full attended length ``S+C`` by the graph
+    # reconstruction), which is everything the two matmuls need:
+    # QK^T and PV are each ``2 * q_tokens * kv_tokens * n_heads * head_dim``.
+    # Without this, attention - normally the single most expensive op in the
+    # profile - had *zero* analytic work, so its roofline bound came out
+    # "unknown" and it was ranked as if it had 100 % headroom.
+    if _is_attention(base):
+        return _attention_flops(shapes, n_seqs)
+
     return 0
+
+
+_ATTENTION_BASES = ("unified_attention", "flash_attn", "paged_attention",
+                    "sparse_attn", "attention_with_output")
+
+
+def _is_attention(base: str) -> bool:
+    return any(k in base for k in _ATTENTION_BASES)
+
+
+def _attention_flops(shapes: list[list[int]], n_seqs: int = 1) -> int:
+    """QK^T + PV for a [tokens, heads, head_dim] attention call.
+
+    Causality is deliberately *not* discounted: a decode step attends the whole
+    cached context (no masking at all), and for a prefill over a long cached
+    context the masked fraction is small. Halving it would understate the op
+    the ranking cares most about.
+    """
+    q = next((s for s in shapes if len(s) == 3), None)
+    if q is None:
+        return 0
+    kv = next((s for s in shapes[1:] if len(s) == 3), q)
+    tokens, heads, dim = q[0], q[1], q[2]
+    # Decode reads ``batch x context`` KV rows in total, but each of the batch's
+    # queries attends only its own context - dividing by the sequence count is
+    # what keeps a batched decode from being charged ``batch`` times its work.
+    kv_per_seq = kv[0] / max(n_seqs, 1)
+    return int(2 * 2 * tokens * kv_per_seq * heads * dim)
 
 
 def _shape_key(shapes_raw: list[list[int]]) -> str:

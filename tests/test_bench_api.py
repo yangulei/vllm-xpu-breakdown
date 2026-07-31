@@ -45,6 +45,11 @@ def _graph():
                        [["S", "n_h/TP", "d"]], [[128, 32, 80]], ["bfloat16"],
                        [{"kind": "tensor", "dims": [128, 32, 80],
                          "dtype": "bfloat16"}],
+                       backend="vllm-xpu-kernels"),
+                    op("vllm::moe_forward_shared", "moe",
+                       [["S", "H"]], [[128, 2560]], ["bfloat16"],
+                       [{"kind": "tensor", "dims": [128, 2560],
+                         "dtype": "bfloat16"}],
                        backend="vllm-xpu-kernels")],
         }],
     }
@@ -102,13 +107,15 @@ class TestPlan(BenchApiTest):
         self.assertTrue(data["ok"])
         cov = data["coverage"]
         self.assertGreaterEqual(data["cases"], 1)
-        # the context-bound attention wrapper must be reported, not silently
+        # attention is context-bound at the dispatcher level but has a
+        # context-free kernel entry point, so it is planned as replayable
+        self.assertEqual(
+            cov["op_status"]["vllm::unified_attention_with_output"]["status"],
+            "replayable")
+        # a wrapper with no such entry point is still reported, never silently
         # dropped - its kernels are benchmarked as their own ops
-        self.assertIn("vllm::unified_attention_with_output",
+        self.assertIn("vllm::moe_forward_shared",
                       cov["ops_by_status"].get("not_replayable", []))
-        self.assertIn("forward context",
-                      cov["op_status"]["vllm::unified_attention_with_output"]
-                      ["detail"])
 
     def test_plan_needs_a_model_id(self):
         resp = self.client.post("/api/bench/plan", data=json.dumps({}),

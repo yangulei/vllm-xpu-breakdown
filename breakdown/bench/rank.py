@@ -9,7 +9,10 @@ latency table cannot say what is worth a session; two signals together can:
    that runs once.
 2. **roofline headroom** - the measured latency against the device peaks, using
    the op's analytic FLOPs / bytes. An op at or above ``target_util`` is
-   ``at_roofline``: it is dropped *before* a session is spent on it.
+   ``at_roofline``: it is dropped *before* a session is spent on it. Which roof
+   applies is decided by the op's *arithmetic intensity* against the machine
+   balance, and a cache-resident op is charged to cache bandwidth rather than
+   DRAM (see :mod:`breakdown.bench.estimate`).
 
 There is deliberately no third "faster provider" signal. Replay measures the
 kernel vLLM actually dispatched - there is no second implementation to compare
@@ -38,7 +41,12 @@ from breakdown.bench import devices, estimate
 #:
 #: v2 - replay model: ``provider``/``switch_provider`` removed, ops keyed by
 #: dispatch name, ``traced_device_time_us`` added.
-SCHEMA_VERSION = 2
+#: v3 - roofline: ``roofline.bound`` now comes from the op's arithmetic
+#: intensity against the machine balance (not from whichever utilization was
+#: larger), and a cache-resident op is measured against the last-level-cache
+#: bandwidth - ``roofline.memory_level`` says which roof was used, alongside
+#: the new ``cache_bw_gbs`` / ``cache_bytes`` / ``ridge_ai`` fields.
+SCHEMA_VERSION = 3
 
 #: Fraction of the roofline treated as "done" - above it, only a redesign helps.
 DEFAULT_TARGET_UTIL = 0.8
@@ -53,7 +61,9 @@ FIDELITY_FLOOR = 0.25
 #: whole table it *could* read, not the handful of rows it touches), so a
 #: 350x-of-peak number means the cost model is wrong for that op, not that the
 #: kernel is done. Such ops are reported as ``check_cost_model`` rather than
-#: silently retired as ``at_roofline``.
+#: silently retired as ``at_roofline``. This is now the *last* resort: an op
+#: that merely ran out of a cache is no longer flagged here, because the
+#: cache-bandwidth roof explains it (:func:`estimate.effective_bw_gbs`).
 MAX_CREDIBLE_UTIL = 1.2
 
 _KERNEL_SOURCES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -158,8 +168,9 @@ def rank(records: Iterable[dict], rc: RankConfig | None = None,
     device = Counter(r.get("device") for r in recs).most_common(1)[0][0]
     sku = rc.sku or devices.sku_for_device(devices.device_name(device))
     peak = devices.peaks(sku)
-    peaks = {"bw_gbs": rc.peak_bw_gbs or peak["bw_gbs"],
-             "tflops": rc.peak_tflops or peak["tflops"]}
+    peaks = dict(peak)
+    peaks["bw_gbs"] = rc.peak_bw_gbs or peak["bw_gbs"]
+    peaks["tflops"] = rc.peak_tflops or peak["tflops"]
     sources = kernel_sources or load_kernel_sources()
 
     points = {ph: pick_point(recs, ph, rc.points.get(ph)) for ph in rc.phases}
@@ -167,7 +178,7 @@ def rank(records: Iterable[dict], rc: RankConfig | None = None,
         lambda: defaultdict(float))
     op_cases: dict[str, list[dict]] = defaultdict(list)
     op_backend: dict[str, Counter] = defaultdict(Counter)
-    op_util: dict[str, list[tuple[float, float, str]]] = defaultdict(list)
+    op_util: dict[str, list[tuple[float, float, str, str]]] = defaultdict(list)
     op_flags: dict[str, list[str]] = defaultdict(list)
 
     for r in recs:
@@ -182,9 +193,10 @@ def rank(records: Iterable[dict], rc: RankConfig | None = None,
             weighted = lat * calls
             op_time[op][ph] += weighted
             op_backend[op][r.get("backend") or ""] += 1
-            util, bound = estimate.utilization(lat, float(r.get("flops") or 0),
-                                               float(r.get("bytes") or 0), peaks)
-            op_util[op].append((weighted, util, bound))
+            util, bound, level = estimate.utilization_detail(
+                lat, float(r.get("flops") or 0), float(r.get("bytes") or 0),
+                peaks)
+            op_util[op].append((weighted, util, bound, level))
             ratio, note = _fidelity(r)
             if note:
                 op_flags[op].append(note)
@@ -210,9 +222,10 @@ def rank(records: Iterable[dict], rc: RankConfig | None = None,
     for op in op_time:
         t = total(op)
         uw = op_util[op]
-        wsum = sum(w for w, _, _ in uw) or 1.0
-        util = sum(w * u for w, u, _ in uw) / wsum
-        bound = Counter(b for _, _, b in uw).most_common(1)[0][0]
+        wsum = sum(w for w, _, _, _ in uw) or 1.0
+        util = sum(w * u for w, u, _, _ in uw) / wsum
+        bound = Counter(b for _, _, b, _ in uw).most_common(1)[0][0]
+        level = Counter(l for _, _, _, l in uw).most_common(1)[0][0]
         backend = (op_backend[op].most_common(1)[0][0]
                    if op_backend[op] else "")
         info = kernel_info(sources, op, backend)
@@ -222,10 +235,11 @@ def rank(records: Iterable[dict], rc: RankConfig | None = None,
         save = t * headroom if (buildable and credible) else 0.0
         if not credible:
             action = "check_cost_model"
+            roof = ("cache" if level == "cache" else "DRAM")
             op_flags[op].append(
-                f"roofline utilization {util * 100:.0f}% exceeds peak - the "
-                f"analytic FLOPs/bytes for this op overstate the traffic it "
-                f"really does, so its headroom cannot be trusted")
+                f"roofline utilization {util * 100:.0f}% exceeds the {roof} "
+                f"{bound} peak - the analytic FLOPs/bytes for this op overstate "
+                f"the traffic it really does, so its headroom cannot be trusted")
         elif util >= rc.target_util:
             action = "at_roofline"
         elif buildable:
@@ -241,8 +255,12 @@ def rank(records: Iterable[dict], rc: RankConfig | None = None,
             "phase_us": {ph: round(op_time[op][ph], 1) for ph in rc.phases},
             "calls": sum(c["calls"] for c in op_cases[op]),
             "roofline": {"util": round(util, 3), "bound": bound,
+                         "memory_level": level,
                          "peak_bw_gbs": peaks["bw_gbs"],
                          "peak_tflops": peaks["tflops"],
+                         "cache_bw_gbs": peaks.get("cache_bw_gbs", 0.0),
+                         "cache_bytes": peaks.get("cache_bytes", 0.0),
+                         "ridge_ai": round(estimate.ridge_ai(peaks), 2),
                          "target_util": rc.target_util},
             "savings_us": {"optimize_kernel": round(save, 1),
                            "total": round(save, 1)},
@@ -300,11 +318,22 @@ def _shape_entry(op: str, case: dict, rc: RankConfig) -> dict[str, Any]:
     }
 
 
+def _bound_label(roofline: dict[str, Any]) -> str:
+    """``memory`` on the cache roof reads ``mem/$`` so the roof is visible."""
+    bound = roofline.get("bound") or ""
+    if bound == "memory" and roofline.get("memory_level") == "cache":
+        return "mem/$"
+    return bound
+
+
 def format_table(doc: dict[str, Any]) -> str:
     """The ranking as a console table."""
     out = [
         f"device      : {doc['device']} / {doc['sku']}  (peaks "
-        f"{doc['peaks']['bw_gbs']:.0f} GB/s, {doc['peaks']['tflops']:.1f} "
+        f"{doc['peaks']['bw_gbs']:.0f} GB/s DRAM"
+        + (f" / {doc['peaks']['cache_bw_gbs']:.0f} GB/s cache"
+           if doc['peaks'].get('cache_bw_gbs') else "")
+        + f", {doc['peaks']['tflops']:.1f} "
         f"TFLOPS, target util {doc['target_util']:.0%})",
     ]
     for phase, p in doc["operating_points"].items():
@@ -321,7 +350,8 @@ def format_table(doc: dict[str, Any]) -> str:
         out.append(
             f"{t['rank']:>2} {t['op'][:44]:<44}{t['backend'][:18]:<18}"
             f"{t['e2e_us']:>10.1f}{t['share_of_e2e'] * 100:>6.1f}%"
-            f"{t['roofline']['util'] * 100:>5.0f}% {t['roofline']['bound']:<8}"
+            f"{t['roofline']['util'] * 100:>5.0f}% "
+            f"{_bound_label(t['roofline']):<8}"
             f"{t['savings_us']['total']:>9.1f}  {t['action']}{flag}")
     flagged = [t for t in doc["targets"] if t["flags"]]
     if flagged:

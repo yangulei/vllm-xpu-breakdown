@@ -26,6 +26,7 @@ COLUMNS = [
     ("traced_device_time_us", "Traced (us)"),
     ("replay_vs_traced", "Replay/Traced"),
     ("util", "Util"), ("bound", "Bound"),
+    ("memory_level", "Roof"), ("ai", "AI (flop/byte)"),
     ("layers", "Layers"), ("weighted_us", "Weighted (us)"),
     ("seq_len", "Seq Len"), ("ctx_len", "Ctx Len"),
     ("batch_size", "Batch"), ("tp", "TP"),
@@ -45,11 +46,14 @@ def enrich(records: Iterable[dict], peaks: dict[str, float] | None = None
         lat = float(r.get("latency_us") or 0)
         calls = max(int(r.get("layers") or 1), 1)
         if lat > 0:
-            util, bound = estimate.utilization(
+            util, bound, level = estimate.utilization_detail(
                 lat, float(r.get("flops") or 0), float(r.get("bytes") or 0),
                 peaks)
             r["util"] = round(util, 3)
             r["bound"] = bound
+            r["memory_level"] = level
+            r["ai"] = round(estimate.op_ai(float(r.get("flops") or 0),
+                                           float(r.get("bytes") or 0)), 3)
             r["weighted_us"] = round(lat * calls, 1)
         traced = float(r.get("traced_device_time_us") or 0)
         if traced > 0 and lat > 0 and r.get("traced_comparable"):
@@ -135,6 +139,7 @@ def write_workbook(records: list[dict], path: str,
                 "Rank": t["rank"], "Op": t["op"], "Backend": t["backend"],
                 "e2e (us)": t["e2e_us"], "Share": t["share_of_e2e"],
                 "Util": t["roofline"]["util"], "Bound": t["roofline"]["bound"],
+                "Roof": t["roofline"].get("memory_level", ""),
                 "Savings (us)": t["savings_us"]["total"],
                 "Action": t["action"],
                 "Kernel dir": (t.get("kernel") or {}).get("kernel_dir", ""),

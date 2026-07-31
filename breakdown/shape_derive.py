@@ -348,6 +348,50 @@ def _prod_ints(shape) -> int:
 _MM_OP_BASES = {"mm", "addmm", "linear", "matmul", "bmm", "_scaled_mm",
                 "fp8_gemm", "fp4_gemm", "int4_gemm_w4a16", "int4_gemm_w4a8"}
 
+#: Ops that *index into a table* rather than stream it. ``(table operand index,
+#: operand whose element count is the number of rows looked up)``.
+#:
+#: Charging these for the whole table is not a rounding error: an embedding is
+#: charged for the entire vocabulary matrix and a RoPE call for the entire
+#: ``[max_position, head_dim]`` cos/sin cache, when both touch only one row per
+#: token. That produced "utilization 37000 % of peak" - a number that says
+#: nothing about the kernel and pushed the op into ``check_cost_model`` instead
+#: of giving it an honest roofline.
+_TABLE_LOOKUP_OPS: dict[str, tuple[int, int]] = {
+    "embedding": (0, 1),          # (weight [V, H], indices [T])
+    "rotary_embedding": (3, 0),   # (cos_sin_cache [P, d], positions [T])
+}
+
+
+def _lookup_reads(base: str, shapes: list[list[int]], dtypes: list[str],
+                  act_bytes: int) -> int | None:
+    """Bytes a table-lookup op really reads, or ``None`` if the rule doesn't fit."""
+    spec = _TABLE_LOOKUP_OPS.get(base)
+    if spec is None:
+        return None
+    t_i, i_i = spec
+    if t_i >= len(shapes) or i_i >= len(shapes):
+        return None
+    table, index = shapes[t_i], shapes[i_i]
+    if len(table) < 2:
+        return None
+    rows = _prod_ints(index)
+    if rows <= 0 or rows >= table[0]:
+        return None                  # touches (at least) the whole table anyway
+    row_bytes = _prod_ints(table[1:]) * (
+        dtype_size(dtypes[t_i]) if t_i < len(dtypes) and dtypes[t_i]
+        else act_bytes)
+    total = rows * row_bytes
+    for i, s in enumerate(shapes):
+        if i == t_i:
+            continue
+        n = _prod_ints(s)
+        if n <= 0:
+            continue
+        total += n * (dtype_size(dtypes[i]) if i < len(dtypes) and dtypes[i]
+                      else act_bytes)
+    return total
+
 
 def _profile_op_memory(op_name: str, shapes: list[list[int]],
                        dtypes: list[str], act_bytes: int) -> int:
@@ -360,14 +404,26 @@ def _profile_op_memory(op_name: str, shapes: list[list[int]],
     """
     if not shapes:
         return 0
+    base = op_name.split("::")[-1].lower()
+    lookup = _lookup_reads(base, shapes, dtypes, act_bytes)
+    if lookup is not None:
+        # The gathered rows are also what gets written back.
+        return lookup + _prod_ints(shapes[_TABLE_LOOKUP_OPS[base][1]]) * \
+            _prod_ints(shapes[_TABLE_LOOKUP_OPS[base][0]][1:]) * act_bytes
     reads = 0
     for i, s in enumerate(shapes):
         n = _prod_ints(s)
         if n == 0:
-            return 0
+            # A genuinely empty operand costs nothing; it must not zero the
+            # whole estimate. vLLM's attention op is dispatched with an empty
+            # ``kv_cache_dummy_dep`` tensor purely to order it against the KV
+            # write, and aborting here left the heaviest op in the profile with
+            # no analytic cost at all (roofline bound "unknown", 100 % apparent
+            # headroom). Unresolvable shapes never reach here - they are dropped
+            # by ``_resolve_shape_ints`` before this point.
+            continue
         b = dtype_size(dtypes[i]) if i < len(dtypes) and dtypes[i] else act_bytes
         reads += n * b
-    base = op_name.split("::")[-1].lower()
     if (base in _MM_OP_BASES and len(shapes) >= 2
             and len(shapes[0]) >= 2 and len(shapes[1]) >= 2):
         out = _prod_ints(shapes[0][:-1]) * shapes[1][-1]
@@ -440,7 +496,8 @@ def _validate_derived_shapes(template: dict) -> dict:
                 for rec, ss in zip(recorded, sym):
                     if not isinstance(ss, list) or not isinstance(rec, list):
                         continue
-                    if any(isinstance(d, str) and d in ("C", "S+C") for d in ss):
+                    if any(isinstance(d, str) and d in ("C", "S+C", "B·C")
+                           for d in ss):
                         continue  # deliberately context-annotated KV row
                     resolved = [_resolve_dim(d, syms) for d in ss]
                     if not all(isinstance(d, int) for d in resolved):

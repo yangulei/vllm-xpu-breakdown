@@ -26,7 +26,12 @@ def _rec(op, latency, layers=1, flops=0.0, nbytes=0.0, phase="decode",
     return r
 
 
+#: A DRAM-only roofline: no cache roof, so a case is always charged to DRAM.
 PEAKS = {"bw_gbs": 456.0, "tflops": 98.3}
+
+#: The real BMG roofline, cache roof included.
+CACHE_PEAKS = {"bw_gbs": 456.0, "tflops": 98.3,
+               "cache_bytes": 18 * 1024 ** 2, "cache_bw_gbs": 1200.0}
 
 
 class TestUtilization(unittest.TestCase):
@@ -36,10 +41,42 @@ class TestUtilization(unittest.TestCase):
         self.assertEqual(bound, "memory")
         self.assertAlmostEqual(util, 0.5, places=2)
 
-    def test_the_binding_roof_is_whichever_is_higher(self):
-        util, bound = estimate.utilization(1.0, 98.3e6, 1.0, PEAKS)
+    def test_the_bound_comes_from_arithmetic_intensity_not_the_measurement(self):
+        # Machine balance is 98.3e12 / 456e9 = 215 flop/byte. An op above it is
+        # compute-bound *however well or badly the kernel ran* - the old
+        # "whichever utilization is larger" rule labelled a GEMM running at 30 %
+        # of peak FLOPS "memory-bound" and a pure gather "compute-bound".
+        ridge = estimate.ridge_ai(PEAKS)
+        self.assertAlmostEqual(ridge, 98.3e12 / 456e9, places=3)
+
+        # A GEMM: AI well above the ridge, but only a third of peak FLOPS.
+        flops, nbytes = 300.0 * 1e6, 1e6
+        util, bound = estimate.utilization(10.0, flops, nbytes, PEAKS)
         self.assertEqual(bound, "compute")
+        self.assertAlmostEqual(util, (flops / 10e-6) / 98.3e12, places=3)
+
+        # A gather: two bytes of traffic per flop, far below the ridge.
+        util, bound = estimate.utilization(1.0, 1_000.0, 456_000, PEAKS)
+        self.assertEqual(bound, "memory")
         self.assertAlmostEqual(util, 1.0, places=2)
+
+    def test_a_cache_resident_op_is_measured_against_the_cache_roof(self):
+        # 1 MB fits the 18 MB LLC; the benchmark repeats the kernel on the same
+        # operands inside one window, so it is served by the cache. Charging it
+        # to DRAM produced "300 % of peak" nonsense.
+        nbytes = 1024 ** 2
+        util, bound, level = estimate.utilization_detail(
+            1.0, 0.0, nbytes, CACHE_PEAKS)
+        self.assertEqual((bound, level), ("memory", "cache"))
+        self.assertAlmostEqual(util, (nbytes / 1e-6) / 1200e9, places=3)
+        # ... and would have been reported as >2x of the DRAM peak.
+        self.assertGreater(estimate.utilization(1.0, 0.0, nbytes, PEAKS)[0], 2.0)
+
+    def test_an_op_larger_than_the_cache_is_charged_to_dram(self):
+        nbytes = 64 * 1024 ** 2
+        _, bound, level = estimate.utilization_detail(1.0, 0.0, nbytes,
+                                                      CACHE_PEAKS)
+        self.assertEqual((bound, level), ("memory", "dram"))
 
 
 class TestRank(unittest.TestCase):
@@ -53,8 +90,8 @@ class TestRank(unittest.TestCase):
         self.assertEqual(doc["engine"], "replay")
 
     def test_an_op_at_the_roofline_is_not_a_target(self):
-        # 1 us at 456 GB/s = 456e3 bytes; 410e3 is ~90 % of peak.
-        recs = [_rec("saturated", 1.0, layers=1, nbytes=410_000)]
+        # 1 us at the 1200 GB/s cache roof = 1.2e6 bytes; 1.1e6 is ~90 % of it.
+        recs = [_rec("saturated", 1.0, layers=1, nbytes=1_100_000)]
         doc = rank.rank(recs)
         t = doc["targets"][0]
         self.assertEqual(t["action"], "at_roofline")
@@ -78,7 +115,7 @@ class TestRank(unittest.TestCase):
         # The analytic bytes charge an embedding for the whole table it could
         # read; the resulting 300x-of-peak "utilization" must not retire the op
         # as done.
-        recs = [_rec("aten::embedding", 1.0, nbytes=456_000_00 * 30)]
+        recs = [_rec("aten::embedding", 1.0, nbytes=456_000_00 * 300)]
         doc = rank.rank(recs)
         t = doc["targets"][0]
         self.assertEqual(t["action"], "check_cost_model")
@@ -154,12 +191,18 @@ class TestEstimate(unittest.TestCase):
         self.assertEqual(bound, "memory")
         self.assertAlmostEqual(us, 1.0, places=2)
 
+    def test_roofline_bound_uses_the_cache_roof_when_it_applies(self):
+        us, bound = estimate.roofline_bound_us(0.0, 1_200_000, CACHE_PEAKS)
+        self.assertEqual(bound, "memory")
+        self.assertAlmostEqual(us, 1.0, places=2)
+
 
 class TestReports(unittest.TestCase):
     def test_enrich_adds_utilization_and_the_fidelity_ratio(self):
         rich = reports.enrich([_rec("op", 2.0, nbytes=456_000, traced=4.0,
                                     comparable=True)], PEAKS)[0]
         self.assertAlmostEqual(rich["util"], 0.5, places=2)
+        self.assertEqual(rich["memory_level"], "dram")
         self.assertAlmostEqual(rich["replay_vs_traced"], 0.5, places=2)
 
     def test_coverage_lists_what_was_not_measured_and_why(self):
@@ -195,3 +238,57 @@ class TestHistory(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAnalyticCostModel(unittest.TestCase):
+    """The roofline is only as honest as the FLOPs/bytes it is fed."""
+
+    def test_attention_has_analytic_work(self):
+        # Attention is normally the heaviest op in the profile. With no cost
+        # model it had zero FLOPs and zero bytes, so its bound came out
+        # "unknown" and it was ranked as if it had 100 % headroom.
+        from breakdown.analyzer import estimate_flops
+
+        # decode: 32 queries, 32x2048 total KV rows, 32 heads x 128
+        flops = estimate_flops("vllm::unified_attention_with_output",
+                               [[32, 32, 128], [65536, 4, 128],
+                                [65536, 4, 128], [32, 32, 128], [0]],
+                               n_seqs=32)
+        # each of the 32 queries attends its own 2048-token context
+        self.assertEqual(flops, 2 * 2 * 32 * 2048 * 32 * 128)
+
+    def test_an_empty_operand_does_not_zero_the_memory_estimate(self):
+        # vLLM dispatches attention with an empty kv_cache_dummy_dep tensor
+        # purely to order it against the KV write.
+        from breakdown.shape_derive import _profile_op_memory
+
+        with_dummy = _profile_op_memory(
+            "vllm::unified_attention_with_output",
+            [[32, 32, 128], [65536, 4, 128], [0]],
+            ["bfloat16", "bfloat16", "bfloat16"], 2)
+        self.assertGreater(with_dummy, 65536 * 4 * 128 * 2)
+
+    def test_a_table_lookup_is_charged_for_the_rows_it_reads(self):
+        # Charging an embedding for the whole vocabulary matrix produced a
+        # "37000 % of peak" utilization that said nothing about the kernel.
+        from breakdown.shape_derive import _profile_op_memory
+
+        few = _profile_op_memory("aten::embedding", [[151936, 2560], [32]],
+                                 ["bfloat16", "long int"], 2)
+        self.assertLess(few, 151936 * 2560 * 2 / 100)
+        self.assertGreaterEqual(few, 32 * 2560 * 2)
+
+        rope = _profile_op_memory(
+            "_C::rotary_embedding",
+            [[32], [32, 4096], [32, 1024], [262144, 128]],
+            ["long int", "bfloat16", "bfloat16", "bfloat16"], 2)
+        self.assertLess(rope, 262144 * 128 * 2 / 100)
+
+    def test_a_full_table_read_is_left_alone(self):
+        from breakdown.shape_derive import _profile_op_memory
+
+        # more indices than rows: the whole table really is streamed
+        self.assertEqual(
+            _profile_op_memory("aten::embedding", [[8, 4], [64]],
+                               ["bfloat16", "long int"], 2),
+            8 * 4 * 2 + 64 * 8 + 8 * 4 * 2)

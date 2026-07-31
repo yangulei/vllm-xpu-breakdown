@@ -86,6 +86,7 @@ def build_args(case, resolved: Resolved, device: str):
 
 
 from breakdown.bench.recipes import common  # noqa: E402,F401  (registers)
+from breakdown.bench.recipes import attention  # noqa: E402,F401
 from breakdown.bench.recipes import cuda  # noqa: E402,F401
 from breakdown.bench.recipes import xpu  # noqa: E402,F401
 

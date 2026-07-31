@@ -1983,21 +1983,24 @@ class TestGraphFromTrace(unittest.TestCase):
         mod("TinyForCausalLM", 0, 400)
         mod("TinyAttention", 5, 80)
         op("aten::mm", 6, 4, [[8, 16], [16, 48]], 5.0)  # 8 query tokens => S
-        # attention: context dim 64 => C, total kv 72 => S+C
+        # attention: context dim 100 => C, total kv 108 => S+C. (100 is chosen
+        # not to collide with a config dim - a colliding value must resolve to
+        # the config symbol, see test_config_dim_wins_over_a_colliding_context.)
         op("vllm::unified_attention_with_output", 10, 4,
-           [[8, 48], [64, 16], [72, 16]], 3.0)
+           [[8, 48], [100, 16], [108, 16]], 3.0)
 
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump({"traceEvents": events}, f)
             path = f.name
         try:
             g = build_graph_from_trace(path, self.SUMMARY, tp_size=1,
-                                       batch_size=1, query_len=8, context_len=64)
+                                       batch_size=1, query_len=8,
+                                       context_len=100)
         finally:
             os.unlink(path)
 
-        self.assertEqual(g["symbols"]["C"], 64)
-        self.assertEqual(g["symbols"]["S+C"], 72)
+        self.assertEqual(g["symbols"]["C"], 100)
+        self.assertEqual(g["symbols"]["S+C"], 108)
 
         def _find_attn(node):
             for o in node.get("ops", []):
@@ -2075,6 +2078,209 @@ class TestGraphFromTrace(unittest.TestCase):
         self.assertEqual(shapes[2][0], "S+C")     # value
         self.assertEqual(shapes[3][0], "S")       # output
         self.assertEqual(g["symbols"]["S+C"], 72)
+
+    def test_config_dim_wins_over_a_colliding_context(self):
+        # Qwen3-30B-A3B has hidden_size == 2048 and the default profiling
+        # context is also 2048. The context used to overwrite the config symbol
+        # for that value, so every hidden dim symbolized as C and was then swept
+        # with the *context* by the Shape Matrix / benchmark: hidden dims
+        # collapsed to 0 at ctx=0 (rms_norm divided by zero and killed its
+        # worker with SIGFPE, the MoE grouped GEMM rejected its operands).
+        # Paged attention never records the context as a tensor dim, so a
+        # config dim must always win.
+        from breakdown.graph_from_trace import build_graph_from_trace
+        events, ext, tid, midx = [], [0], 7, [0]
+
+        def op(name, ts, dur, shapes):
+            ext[0] += 1
+            events.append({"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+                           "ts": ts, "dur": dur, "name": name,
+                           "args": {"External id": ext[0], "Input Dims": shapes,
+                                    "Input type": ["c10::BFloat16"]}})
+
+        def mod(cls, ts, dur):
+            events.append({"ph": "X", "cat": "python_function", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": dur,
+                           "name": f"nn.Module: {cls}_{midx[0]}"})
+            midx[0] += 1
+
+        summary = dict(self.SUMMARY)          # hidden_size = 16
+        mod("TinyForCausalLM", 0, 400)
+        mod("TinyAttention", 5, 80)
+        op("aten::mm", 6, 4, [[8, 16], [16, 48]])
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"traceEvents": events}, f)
+            path = f.name
+        try:
+            # context == hidden_size: the collision that broke Qwen3-30B-A3B.
+            g = build_graph_from_trace(path, summary, tp_size=1, batch_size=1,
+                                       query_len=8, context_len=16)
+        finally:
+            os.unlink(path)
+
+        self.assertEqual(g["symbols"]["C"], 16)
+
+        def _find(node, name):
+            for o in node.get("ops", []):
+                if o["name"] == name:
+                    return o
+            for c in node.get("children", []):
+                r = _find(c, name)
+                if r:
+                    return r
+            return None
+
+        mm = _find(g["prefill"], "aten::mm")
+        self.assertIsNotNone(mm)
+        self.assertEqual(mm["input_shapes"][0], ["S", "H"])
+        self.assertEqual(mm["input_shapes"][1][0], "H")
+
+    def test_moe_routed_rows_scale_with_the_token_dim(self):
+        # An MoE block expands every token into num_experts_per_tok routed rows,
+        # so the permuted hidden states and the grouped GEMM's M are tokens*topk.
+        # Frozen at the profiled value (an observed-value symbol) they stopped
+        # matching the token operand as soon as the Shape Matrix swept S, and
+        # the kernels rejected their own shapes ("remapped_hidden_states must be
+        # [num_rows * TopK, hidden_size]").
+        from breakdown.graph_from_trace import build_graph_from_trace
+        events, ext, tid, midx = [], [0], 7, [0]
+
+        def op(name, ts, dur, shapes, types=None):
+            ext[0] += 1
+            events.append({"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+                           "ts": ts, "dur": dur, "name": name,
+                           "args": {"External id": ext[0], "Input Dims": shapes,
+                                    "Input type": types
+                                    or ["c10::BFloat16"] * len(shapes)}})
+
+        def mod(cls, ts, dur):
+            events.append({"ph": "X", "cat": "python_function", "tid": tid,
+                           "pid": tid, "ts": ts, "dur": dur,
+                           "name": f"nn.Module: {cls}_{midx[0]}"})
+            midx[0] += 1
+
+        summary = dict(self.SUMMARY)
+        summary.update({"num_experts": 8, "num_experts_per_tok": 4,
+                        "moe_intermediate_size": 12})
+        mod("TinyForCausalLM", 0, 400)
+        mod("TinyMoE", 5, 80)
+        op("aten::mm", 6, 4, [[8, 16], [16, 48]])          # 8 tokens => S
+        # routed rows = 8 * 4 = 32; the gate_up width is 2*12 = 24
+        op("_moe_C::remap_hidden_states", 10, 4, [[8, 16], [32, 16], [8, 4]])
+        op("_xpu_C::cutlass_grouped_gemm_interface", 15, 4,
+           [[32, 16], [8, 16, 24], [32, 24]])
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump({"traceEvents": events}, f)
+            path = f.name
+        try:
+            g = build_graph_from_trace(path, summary, tp_size=1, batch_size=1,
+                                       query_len=8)
+        finally:
+            os.unlink(path)
+
+        def _find(node, name):
+            for o in node.get("ops", []):
+                if o["name"] == name:
+                    return o
+            for c in node.get("children", []):
+                r = _find(c, name)
+                if r:
+                    return r
+            return None
+
+        remap = _find(g["prefill"], "_moe_C::remap_hidden_states")
+        gemm = _find(g["prefill"], "_xpu_C::cutlass_grouped_gemm_interface")
+        self.assertEqual(remap["input_shapes"][1], ["topk·S", "H"])
+        self.assertEqual(remap["input_shapes"][2], ["S", "topk"])
+        self.assertEqual(gemm["input_shapes"][0], ["topk·S", "H"])
+        self.assertEqual(gemm["input_shapes"][2][0], "topk·S")
+        # the fused gate_up width is a config constant, not an observed value
+        self.assertEqual(gemm["input_shapes"][1][2], "2·I_moe")
+        self.assertEqual(g["symbols"]["topk"], 4)
+
+        # and it re-resolves at a *different* sweep point, which is the point
+        from breakdown.shape_derive import _resolve_shape_ints
+        syms = dict(g["symbols"], S=64)
+        resolved = _resolve_shape_ints(gemm["input_shapes"], syms)
+        self.assertEqual(resolved[0][0], 64 * 4)
+
+    def test_router_axis_is_not_swept_when_the_profile_ran_one_token(self):
+        # A decode pass at batch 1 makes tokens*topk == topk, so the routed-rows
+        # rule would match the router's own [tokens, topk] operand and turn the
+        # expert fan-out into topk*B - a width that scales with the swept batch,
+        # which is the very bug the pass exists to prevent.
+        from breakdown.graph_from_trace import _symbolize_moe_routed_rows
+
+        summary = {"num_experts": 8, "num_experts_per_tok": 4}
+        tree = {
+            "name": "moe", "module_type": "MoE", "path": "moe",
+            "repeat_count": 1, "children": [],
+            "ops": [{"name": "_moe_C::remap_hidden_states",
+                     "input_shapes": [["B", "H"], [4, "H"], ["B", 4]],
+                     "output_shape": None}],
+        }
+        syms: dict = {}
+        _symbolize_moe_routed_rows([(tree, "B", 1)], syms, summary)
+        shapes = tree["ops"][0]["input_shapes"]
+        self.assertEqual(shapes[2], ["B", "topk"])       # not ["B", "topk·B"]
+        self.assertEqual(shapes[1], ["topk·B", "H"])     # routed rows still scale
+
+    def test_graph_attention_flops_account_for_the_cached_context(self):
+        # Ops are costed while the tree is built, i.e. from the recorded KV rows
+        # (the new tokens only). Attention really reads context+query, so its
+        # cost has to be recomputed once the KV rows are annotated - otherwise a
+        # 2048-token context understates the heaviest op ~65x.
+        from breakdown.graph_from_trace import _annotate_attention_kv
+
+        op = {"name": "vllm::unified_attention_with_output",
+              "input_shapes": [["S", "n_h", "d"], ["S", "n_kv", "d"],
+                               ["S", "n_kv", "d"], ["S", "n_h", "d"]],
+              "recorded_shapes": [[8, 4, 16], [8, 1, 16], [8, 1, 16],
+                                  [8, 4, 16]],
+              "input_dtypes": ["bfloat16"] * 4,
+              "flops": 0, "memory_bytes": 0, "ai": 0}
+        node = {"ops": [op], "children": []}
+        _annotate_attention_kv(node, n_kv=1, kv_rows=8 + 64, n_seqs=1,
+                               dtype_bytes=2)
+        self.assertEqual(op["input_shapes"][1][0], "S+C")
+        self.assertEqual(op["flops"], 2 * 2 * 8 * 72 * 4 * 16)
+        self.assertGreater(op["memory_bytes"], 0)
+
+    def test_prefill_attention_flops_are_not_divided_by_the_batch(self):
+        # The sequence divisor exists for decode's B·C KV rows; a prefill row is
+        # already per-sequence (S+C), so dividing it would understate attention
+        # by exactly the prefill batch size.
+        from breakdown.analyzer import estimate_flops
+        from breakdown import shape_matrix
+
+        shapes = [[8, 4, 16], [72, 1, 16], [72, 1, 16], [8, 4, 16]]
+        one_seq = estimate_flops("vllm::unified_attention_with_output",
+                                 shapes, n_seqs=1)
+        self.assertEqual(one_seq, 2 * 2 * 8 * 72 * 4 * 16)
+
+        template = {
+            "prefill": {"name": "attn", "module_type": "Attention",
+                        "path": "attn", "repeat_count": 1, "children": [],
+                        "ops": [{"name": "vllm::unified_attention_with_output",
+                                 "input_shapes": [["S", "n_h", "d"],
+                                                  ["S+C", "n_kv", "d"],
+                                                  ["S+C", "n_kv", "d"],
+                                                  ["S", "n_h", "d"]],
+                                 "input_dtypes": ["bfloat16"] * 4,
+                                 "role": "attention"}]},
+            "decode": None,
+            "symbols": {"n_h": 4, "n_kv": 1, "d": 16, "S": 8, "C": 64,
+                        "S+C": 72, "B": 1, "TP": 1},
+            "config": {"tp_size": 1, "dtype_bytes": 2, "num_layers": 1},
+        }
+        cfgs = shape_matrix.build_configs(
+            prefill_seq_lens=[8], prefill_ctx_lens=[64],
+            prefill_batch_sizes=[4], decode_ctx_lens=[], decode_batch_sizes=[],
+            tp_sizes=[1])
+        rows = shape_matrix.build_rows(template, cfgs)
+        self.assertEqual(rows[0]["FLOPs"], one_seq)
 
     def test_empty_trace(self):
         from breakdown.graph_from_trace import build_graph_from_trace

@@ -102,8 +102,16 @@ class TestReplayOnDevice(unittest.TestCase):
         self.assertEqual(rec["status"], "ok", rec.get("error"))
         self.assertEqual(rec["reps"], 1)
 
-    def test_context_bound_wrapper_is_reported_not_measured(self):
+    def test_attention_is_measured_through_its_context_free_entry_point(self):
+        # The dispatcher op is context-bound, but the kernel underneath takes
+        # the paged cache and the sequence metadata as plain arguments - so the
+        # heaviest op in the model is measured, not refused.
         rec = self._run("vllm::unified_attention_with_output")
+        self.assertEqual(rec["status"], "ok", rec.get("error"))
+        self.assertGreater(rec["latency_us"], 0)
+
+    def test_a_wrapper_with_no_entry_point_is_reported_not_measured(self):
+        rec = self._run("vllm::moe_forward_shared")
         self.assertEqual(rec["status"], "not_replayable")
         self.assertTrue(rec["detail"])
 

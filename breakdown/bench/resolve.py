@@ -18,10 +18,16 @@ Two things are not plain dispatcher ops:
   Those resolve through :data:`PYTHON_API` to the wrapper function.
 * **Context-bound wrappers.** ``vllm::unified_attention_with_output`` takes a
   ``layer_name`` and reads the KV cache and attention metadata out of vLLM's
-  *forward context*; it cannot be invoked standalone. Rather than measure
-  something wrong, those are refused with an explicit reason
-  (:data:`NOT_REPLAYABLE`) and reported in the plan - the kernels they launch
-  are separate ops in the graph and are benchmarked on their own.
+  *forward context*; the dispatcher op cannot be invoked standalone. Where the
+  wrapper has a **context-free kernel entry point** (the paged FlashAttention
+  varlen call, the KV-cache write), it is replayed through that entry point with
+  a synthesized paged KV cache - see
+  :mod:`breakdown.bench.recipes.attention`; :data:`PYTHON_API` is consulted
+  *before* :data:`NOT_REPLAYABLE` precisely so such an entry point wins. A
+  wrapper with no context-free entry point (the fused MoE dispatch) is still
+  refused with an explicit reason (:data:`NOT_REPLAYABLE`) and reported in the
+  plan - the kernels it launches are separate ops in the graph and are
+  benchmarked on their own.
 
 Nothing is guessed: an unknown op raises :class:`ResolveError`.
 """
@@ -55,14 +61,14 @@ REGISTRAR_MODULES: dict[str, tuple[str, ...]] = {
 #: Ops that cannot be invoked outside a live vLLM forward pass, with the reason
 #: reported in the plan. These are dispatch *wrappers*: the kernels they launch
 #: are separate ops in the reconstructed graph and are benchmarked directly.
+#:
+#: An entry here is only reached when the op has **no** :data:`PYTHON_API`
+#: entry; attention and the KV-cache write do have one (their kernels take the
+#: cache and the sequence metadata as plain arguments), so they are replayed
+#: rather than refused.
 NOT_REPLAYABLE: dict[str, str] = {
-    "vllm::unified_attention_with_output":
-        "reads KV cache + attention metadata from vLLM's forward context; the "
-        "attention kernels it launches are benchmarked as their own ops",
     "vllm::unified_attention":
         "reads KV cache + attention metadata from vLLM's forward context",
-    "vllm::unified_kv_cache_update":
-        "writes into the paged KV cache registered in the forward context",
     "vllm::moe_forward_shared":
         "fused MoE dispatch wrapper; its router/expert/shared-expert kernels "
         "are benchmarked as their own ops",
@@ -75,6 +81,17 @@ NOT_REPLAYABLE: dict[str, str] = {
 #: ``(module, attribute)``; the reconstruction already named the op after this
 #: frame, so the mapping is a plain lookup rather than a heuristic.
 PYTHON_API: dict[str, tuple[str, str]] = {
+    # Context-bound wrappers replayed through their context-free kernel entry
+    # point. ``fa_utils`` re-exports the platform's implementation (the
+    # vllm-xpu-kernels varlen FlashAttention on XPU, vllm_flash_attn on CUDA),
+    # so this one mapping covers both devices. The paged KV cache, block table
+    # and sequence metadata the wrapper would have read from the forward
+    # context are synthesized by
+    # :mod:`breakdown.bench.recipes.attention`.
+    "vllm::unified_attention_with_output":
+        ("vllm.v1.attention.backends.fa_utils", "flash_attn_varlen_func"),
+    "vllm::unified_kv_cache_update":
+        ("vllm.v1.attention.backends.fa_utils", "reshape_and_cache_flash"),
     # MiniMax-M3 xattention (SYCL, XPU)
     "flash_xpu::minimax_m3_index_score":
         ("vllm.model_executor.models.minimax_m3.xattention", "minimax_m3_index_score"),
@@ -253,8 +270,8 @@ def resolve(op: str, slots: list[dict] | None = None) -> Resolved:
     wrappers and :class:`ResolveError` for anything genuinely unknown - never a
     silent fallback, because a wrong callable measures a wrong kernel.
     """
-    if op in NOT_REPLAYABLE:
-        raise NotReplayable(NOT_REPLAYABLE[op])
+    # PYTHON_API first: an op listed there has a context-free entry point, which
+    # beats a NOT_REPLAYABLE refusal for the same dispatch name.
     if op in PYTHON_API:
         mod_name, attr = PYTHON_API[op]
         try:
@@ -265,6 +282,8 @@ def resolve(op: str, slots: list[dict] | None = None) -> Resolved:
         if fn is None:
             raise ResolveError(f"{mod_name} has no attribute {attr}")
         return Resolved(op=op, fn=fn, kind="python_api")
+    if op in NOT_REPLAYABLE:
+        raise NotReplayable(NOT_REPLAYABLE[op])
 
     ns, name = split_name(op)
     if ns in ("triton", "flashinfer", "flash_xpu"):
@@ -310,7 +329,7 @@ def classify(op: str, slots: list[dict] | None = None) -> tuple[str, str]:
     ``status`` is ``replayable`` | ``not_replayable`` | ``unresolved`` |
     ``collective``.
     """
-    if op in NOT_REPLAYABLE:
+    if op in NOT_REPLAYABLE and op not in PYTHON_API:
         return "not_replayable", NOT_REPLAYABLE[op]
     from breakdown.bench import recipes
 

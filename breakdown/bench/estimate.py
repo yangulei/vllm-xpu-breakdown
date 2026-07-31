@@ -17,6 +17,19 @@ The roofline helpers here serve a second purpose: turning an op's analytic
 work (FLOPs / bytes) into the *lower bound* a measurement should respect. A
 replayed latency below the roofline bound means the replay did not do the work
 (an early-exit kernel, an empty index map), which the report flags.
+
+Two properties of that roofline are deliberate:
+
+* **The bound comes from arithmetic intensity, not from the measurement.** An
+  op is compute-bound iff its AI (FLOP/byte) is at or above the machine balance
+  ``peak FLOPS / peak bandwidth``. Comparing the two achieved utilizations and
+  taking the larger - the previous rule - labels a GEMM that ran at 30 % of
+  peak FLOPS "memory-bound" and a pure-gather kernel "compute-bound".
+* **A cache-resident op is measured against cache bandwidth.** The benchmark
+  repeats a kernel on the same operands inside one timed window, so an op whose
+  footprint fits in the last-level cache legitimately exceeds the DRAM peak.
+  Charging it to DRAM produced "utilization 300 % of peak" warnings that said
+  nothing about the kernel; the honest roof is the cache one.
 """
 from __future__ import annotations
 
@@ -37,6 +50,72 @@ MAX_TIMEOUT_S = 7200
 ALLOC_BYTES_PER_S = 2e9
 
 
+def cache_resident(nbytes: float, peaks: dict[str, float]) -> bool:
+    """Does this op's working set fit in the device's last-level cache?
+
+    ``nbytes`` is the op's analytic traffic, which for a single replayed call is
+    also its footprint (each operand is read once). The benchmark repeats a
+    kernel inside one timed window on the *same* operands, so an op whose
+    footprint fits in cache is served by the cache on every repetition after the
+    first - and is bounded by cache bandwidth, not DRAM bandwidth.
+    """
+    cap = float(peaks.get("cache_bytes") or 0)
+    return bool(cap) and 0 < nbytes <= cap
+
+
+def effective_bw_gbs(nbytes: float, peaks: dict[str, float]
+                     ) -> tuple[float, str]:
+    """``(bandwidth roof GB/s, which memory level)`` for this op's footprint.
+
+    A kernel whose operands are cache-resident routinely exceeds the DRAM peak;
+    measuring it against DRAM produced "utilization 300 % of peak" warnings that
+    said nothing about the kernel. The right roof for such an op is the
+    last-level-cache bandwidth (see :data:`breakdown.bench.devices.SKU_PEAKS`).
+    """
+    cbw = float(peaks.get("cache_bw_gbs") or 0)
+    if cbw and cache_resident(nbytes, peaks):
+        return cbw, "cache"
+    return float(peaks["bw_gbs"]), "dram"
+
+
+def ridge_ai(peaks: dict[str, float], bw_gbs: float | None = None) -> float:
+    """Machine balance in FLOP/byte: the roofline's ridge point.
+
+    An op with a higher arithmetic intensity than this is compute-bound, one
+    below it is memory-bound. That comparison - **not** "whichever utilization
+    number comes out larger" - is what defines the bound.
+    """
+    bw = float(bw_gbs if bw_gbs is not None else peaks["bw_gbs"])
+    if bw <= 0:
+        return 0.0
+    return (float(peaks["tflops"]) * 1e12) / (bw * 1e9)
+
+
+def op_ai(flops: float, nbytes: float) -> float:
+    """The op's arithmetic intensity in FLOP/byte."""
+    if nbytes <= 0:
+        return float("inf") if flops > 0 else 0.0
+    return flops / nbytes
+
+
+def bound_of(flops: float, nbytes: float,
+             peaks: dict[str, float]) -> tuple[str, str]:
+    """``(bound, memory level)`` from the op's AI against the machine balance.
+
+    The previous rule compared the two *utilizations* and took the larger, which
+    mislabels ops systematically: a GEMM measured below peak FLOPS came out
+    "memory" and a bandwidth-starved gather came out "compute". The bound is a
+    property of the op and the machine, not of how well the kernel did.
+    """
+    bw, level = effective_bw_gbs(nbytes, peaks)
+    if flops <= 0:
+        return ("memory" if nbytes > 0 else "unknown"), level
+    if nbytes <= 0:
+        return "compute", level
+    return ("compute" if op_ai(flops, nbytes) >= ridge_ai(peaks, bw)
+            else "memory"), level
+
+
 def kernel_seconds(flops: float, nbytes: float, peak_tflops: float,
                    peak_bw_gbs: float, util: float = 0.5) -> float:
     """Roofline runtime of one case at ``util`` of peak."""
@@ -48,23 +127,44 @@ def kernel_seconds(flops: float, nbytes: float, peak_tflops: float,
 
 def roofline_bound_us(flops: float, nbytes: float,
                       peaks: dict[str, float]) -> tuple[float, str]:
-    """``(fastest possible microseconds, bound)`` at 100 % of peak."""
+    """``(fastest possible microseconds, bound)`` at 100 % of peak.
+
+    The memory term uses the roof the op's footprint actually sees (cache or
+    DRAM), so a cache-resident kernel is not told it beat the speed of light.
+    """
+    bound, _ = bound_of(flops, nbytes, peaks)
+    bw, _ = effective_bw_gbs(nbytes, peaks)
     t_c = (flops / (peaks["tflops"] * 1e12)) if flops > 0 else 0.0
-    t_m = (nbytes / (peaks["bw_gbs"] * 1e9)) if nbytes > 0 else 0.0
-    if t_c >= t_m:
-        return t_c * 1e6, "compute"
-    return t_m * 1e6, "memory"
+    t_m = (nbytes / (bw * 1e9)) if nbytes > 0 else 0.0
+    return ((t_c if bound == "compute" else t_m) * 1e6), bound
 
 
 def utilization(latency_us: float, flops: float, nbytes: float,
                 peaks: dict[str, float]) -> tuple[float, str]:
-    """``(achieved fraction of peak, which roof)`` for a measured case."""
+    """``(achieved fraction of the relevant roof, which roof)``.
+
+    The roof is selected by the op's arithmetic intensity (see :func:`bound_of`)
+    and, for a memory-bound op, by whether its footprint is cache-resident.
+    """
+    util, bound, _ = utilization_detail(latency_us, flops, nbytes, peaks)
+    return util, bound
+
+
+def utilization_detail(latency_us: float, flops: float, nbytes: float,
+                       peaks: dict[str, float]) -> tuple[float, str, str]:
+    """``(utilization, bound, memory level)`` for a measured case."""
+    bound, level = bound_of(flops, nbytes, peaks)
     if latency_us <= 0:
-        return 0.0, "unknown"
+        return 0.0, bound, level
     secs = latency_us / 1e6
-    u_c = (flops / secs) / (peaks["tflops"] * 1e12) if flops > 0 else 0.0
-    u_m = (nbytes / secs) / (peaks["bw_gbs"] * 1e9) if nbytes > 0 else 0.0
-    return (u_c, "compute") if u_c >= u_m else (u_m, "memory")
+    if bound == "compute":
+        peak = float(peaks["tflops"]) * 1e12
+        return ((flops / secs) / peak if peak > 0 else 0.0), bound, level
+    if bound == "memory":
+        bw, level = effective_bw_gbs(nbytes, peaks)
+        roof = bw * 1e9
+        return ((nbytes / secs) / roof if roof > 0 else 0.0), bound, level
+    return 0.0, bound, level
 
 
 def op_timeout(n_cases: int, budget_s: float,

@@ -42,6 +42,7 @@ breakdown/
     resolve.py            — Dispatch name → callable + schema (PYTHON_API for kernel ops)
     inputs.py             — Schema-driven operand materialization + synthesizer registry
     recipes/{common,xpu,cuda}.py — Per-op overrides, output args, skip reasons
+    recipes/attention.py    — Paged attention / KV-cache write replayed context-free
     timing.py             — Device-event windows, overhead subtraction, operand restore
     worker.py             — Benchmark one op in its own process → results.jsonl
     runner.py             — Orchestration, per-op timeouts, incremental run_result.json
@@ -523,11 +524,37 @@ rows (`shape_matrix`) → replay cases (`spec`) → measured cases (`worker`/
   (`UR_RESULT_ERROR_DEVICE_LOST`, no traceback). `recipes.outputs(...)` declares
   such arguments so they are allocated zeroed, reset between windows, and
   measured **one call per timed window** (`SINGLE_REP`).
-- **Context-bound wrappers are refused, with the reason.**
-  `vllm::unified_attention_with_output` / `moe_forward_shared` read the KV cache
-  and metadata out of vLLM's forward context and cannot be invoked standalone.
-  They are reported (`not_replayable`) rather than approximated — the kernels
-  they launch are separate ops in the graph and are benchmarked on their own.
+- **A context-bound wrapper is replayed through its context-free kernel entry
+  point when it has one (`recipes/attention.py`).** `vllm::unified_attention_-
+  with_output` and `vllm::unified_kv_cache_update` take a `layer_name` and pull
+  the KV cache, block table and sequence metadata out of vLLM's *forward
+  context*, so the **dispatcher op** cannot be called standalone — but what the
+  wrapper hides is the context, not the kernel. One level down,
+  `fa_utils.flash_attn_varlen_func` / `reshape_and_cache_flash` (the
+  vllm-xpu-kernels SYCL kernels on XPU, vllm_flash_attn on CUDA) take exactly
+  that context as plain arguments, so `resolve.PYTHON_API` maps both ops there
+  (**checked before `NOT_REPLAYABLE`**) and a recipe rebuilds the context: a
+  paged `[num_blocks, block_size, n_kv, d]` NHD cache holding `context+query`
+  for every sequence, `cu_seqlens_q` / `seqused_k` for the swept operating
+  point, and vLLM's own `softmax_scale`/`causal`. Attention is normally the
+  heaviest op in the profile; refusing it left it unmeasured and therefore
+  un-rankable. Two invariants: **every sequence gets its own blocks** (a shared
+  block table turns the paged gather into a cache hit and understates the
+  kernel by a large factor), and an operating point whose cache would not fit
+  device memory is **refused with a reason** rather than attempted (the
+  allocation would hang the worker instead of failing it). The block size is
+  engine configuration, not an operand, so it is explicit —
+  `DEFAULT_KV_BLOCK_SIZE` = 16, override with `BREAKDOWN_BENCH_KV_BLOCK_SIZE`.
+  A wrapper with **no** context-free entry point (`vllm::moe_forward[_shared]`)
+  is still reported `not_replayable` — the kernels it launches are separate ops
+  in the graph and are benchmarked on their own.
+- **Nothing about the sampler is context-bound.**
+  `vllm::xpu_topk_topp_sampler` used to be skipped as needing "a generator and
+  per-request metadata". It does not: its schema is all plain values, and the
+  "generator state" is the philox `(seed, offset)` pair as a two-element **CPU**
+  int64 tensor — the one thing the generic (device-allocating) builder cannot
+  produce, hence the recipe in `recipes/xpu.py`. It runs over the full `[B, V]`
+  logits every decode step, so it belongs in the ranking.
 - **Timing subtracts a measured floor and repeats inside the window.** An empty
   device-event window costs ~60–90 µs on Level Zero, an order of magnitude more
   than a small elementwise kernel; a one-call-per-window loop measures the timer.
@@ -581,22 +608,56 @@ rows (`shape_matrix`) → replay cases (`spec`) → measured cases (`worker`/
 - **Ranking = calls × latency × roofline headroom.** Calls come from the
   `Layers` count (how many modules dispatch the op at the chosen operating
   point), so a small op in 57 layers outranks a large one that runs once.
-  Utilization is measured against the SKU peaks in `devices.py` (BMG: 456 GB/s,
-  98.3 TFLOPS bf16); at or above `target_util` (default 80 %) the op is
+  Utilization is measured against the SKU peaks in `devices.py` (BMG: 456 GB/s
+  DRAM, 98.3 TFLOPS bf16); at or above `target_util` (default 80 %) the op is
   `at_roofline` and is **not** a target. Ops with no editable kernel source
   (oneDNN/ATen/collectives) are `tune_config`. There is deliberately **no**
   `switch_provider` signal — replay measures the kernel that ran, so there is no
   second implementation to compare against.
+- **The bound comes from arithmetic intensity, and a cache-resident op is
+  charged to cache bandwidth (`estimate.py`).** Two rules, both deliberate:
+  (1) an op is **compute-bound iff its AI (FLOP/byte) is at or above the machine
+  balance** `peak FLOPS / peak bandwidth` (`estimate.ridge_ai`, ~215 flop/byte
+  on BMG). The old rule compared the two *achieved* utilizations and took the
+  larger, which labelled a GEMM running at 30 % of peak FLOPS "memory-bound"
+  and a pure gather "compute-bound" — the bound is a property of the op and the
+  machine, not of how well the kernel did. (2) The benchmark repeats a kernel
+  on the **same operands** inside one timed window, so an op whose footprint
+  fits the last-level cache is served by the cache and legitimately exceeds the
+  DRAM peak; `estimate.effective_bw_gbs` measures it against
+  `SKU_PEAKS[...]["cache_bw_gbs"]` instead (BMG: 18 MB at ~1.2 TB/s, *measured*
+  on an Arc Pro B60 with a bf16 copy sweep). Before this, such ops were reported
+  as "utilization 300 % of peak", a number that said nothing about the kernel.
+  `roofline.memory_level` records which roof was used (the console table shows
+  `mem/$`).
+- **The roofline is only as honest as the FLOPs/bytes it is fed
+  (`analyzer.py` / `shape_derive.py`).** Three cost-model rules earn their keep:
+  attention has an explicit FLOPs model (`2·2·q·kv·heads·dim`, with
+  `estimate_flops(..., n_seqs=batch)` dividing the batch's *total* KV rows back
+  down so each query is charged only for its own context) — without it the
+  heaviest op had zero analytic work, so its bound came out `unknown` and it
+  ranked as if it had 100 % headroom; an **empty operand contributes 0 bytes
+  rather than zeroing the estimate** (vLLM dispatches attention with an empty
+  `kv_cache_dummy_dep` purely to order it against the KV write); and a
+  **table-lookup op is charged for the rows it reads** (`_TABLE_LOOKUP_OPS`:
+  `aten::embedding`, `_C::rotary_embedding`), not for the whole vocabulary
+  matrix / cos-sin cache, which is what produced "37000 % of peak". Relatedly,
+  `DTYPE_BYTES` knows the profiler's **C++ type names** (`long int` → 8), or
+  every index/position operand is undercounted 4x.
 - **Two honesty checks the ranking must keep.** (1) *Fidelity*: a case measured
   at the profiled shape carries the trace's own `device_time_us`; a replay far
   faster than it means the arguments do not reproduce the model's work, and the
   target is flagged instead of trusted. (2) *Cost model*: Memory/FLOPs are
-  analytic estimates — an embedding or a paged-KV insert is charged for the
-  whole table it *could* read — so a utilization above `MAX_CREDIBLE_UTIL` is
-  reported as `check_cost_model`, never silently retired as `at_roofline`.
-- **`targets.json` is a versioned contract** (`schema_version`, now **2** for
-  the replay model: provider fields removed, ops keyed by dispatch name,
-  `traced_device_time_us` added) consumed by the `xpu-kernel-optimizer` skill:
+  analytic estimates, so a utilization above `MAX_CREDIBLE_UTIL` is reported as
+  `check_cost_model`, never silently retired as `at_roofline`. This is now the
+  *last* resort: an op that merely ran out of a cache is explained by the cache
+  roof, and the common table-lookup overcounts are fixed at the source, so a
+  `check_cost_model` flag means a genuinely unmodelled op.
+- **`targets.json` is a versioned contract** (`schema_version`, now **3**: v2
+  was the replay model — provider fields removed, ops keyed by dispatch name,
+  `traced_device_time_us` added — and v3 the roofline change: `roofline.bound`
+  now comes from arithmetic intensity, with `memory_level` / `cache_bw_gbs` /
+  `cache_bytes` / `ridge_ai` added) consumed by the `xpu-kernel-optimizer` skill:
   kernel dir/files, build/test commands, baseline latency, roofline bound and
   `bench_cmd`/`profile_cmd` per dominant shape. Changing a field's meaning
   requires bumping the version. `bench/kernel_sources.json` maps op/backend →
@@ -675,7 +736,10 @@ static builder. Ensure:
    - a `recipes.outputs(...)` declaration if an argument is really an *output*
      the schema doesn't mark (especially one accumulated with atomics);
    - a `resolve.PYTHON_API` entry if it's a kernel launched straight from Python
-     (Triton / FlashInfer / a SYCL extension) with no dispatcher op;
+     (Triton / FlashInfer / a SYCL extension) with no dispatcher op — or if it
+     is a **context-bound wrapper with a context-free kernel entry point**, in
+     which case add a `recipes.override` that rebuilds the context (see
+     `recipes/attention.py`); `PYTHON_API` is consulted before `NOT_REPLAYABLE`;
    - an entry in `breakdown/bench/kernel_sources.json` if it has editable kernel
      source, so its target carries build/test commands
 
@@ -702,6 +766,43 @@ static builder. Ensure:
 
 ## Common Pitfalls
 
+- **A config structural dim always beats the context length in the symbol
+  table.** `build_graph_from_trace` registers `C` = `context_len` (and `S+C`)
+  with **`setdefault`** on the value→symbol map, so a config dim wins a
+  collision. It used to assign directly, on the theory that "the context dim
+  wins over any coincidental config-value collision" — the opposite of what is
+  right. Paged attention *never* records the context as a tensor dim (the
+  cached KV lives in the block cache; `_annotate_attention_kv` writes the KV
+  rows explicitly), so nothing in the trace legitimately *is* `C`, while a
+  collision is destructive: Qwen3-30B-A3B has `hidden_size == 2048` and the
+  default profiling context is also 2048, so every `H` dim symbolized to `C`
+  and was then swept **with the context** by the Shape Matrix and the
+  benchmark. At `ctx=0` hidden dims became **0** — `_C::rms_norm` divided by
+  zero and killed its worker with SIGFPE (exit -8), and the MoE grouped GEMM
+  rejected its own operands. See
+  `TestGraphFromTrace.test_config_dim_wins_over_a_colliding_context`.
+- **Dims derived from the token count must be symbolized as *expressions*, not
+  frozen values (`_symbolize_moe_routed_rows`).** An MoE block expands every
+  token into `num_experts_per_tok` routed rows, so the permuted hidden states,
+  the grouped GEMM's `M` and the gather destination are all `tokens × topk`.
+  As a plain observed-value symbol (`M_moe`) that dim froze at whatever it was
+  while profiling, so as soon as the Shape Matrix swept `S` the token operand
+  scaled and the routed operand did not — and the kernels rejected their own
+  shapes (`remapped_hidden_states must be [num_rows * TopK, hidden_size]`,
+  `ptr_A.size(1) must match ptr_B.size(1)`). They are now `topk·S` / `topk·B`,
+  which `_resolve_dim` evaluates at each swept point; the per-token expert axis
+  of the router outputs (`[tokens, topk]`) becomes `topk`, and the fused MoE
+  gate_up width is registered as the config constant `2·I_moe`. Run this pass
+  **before** `_symbolize_runtime_dims`, which would otherwise freeze the value
+  first. See `TestGraphFromTrace.test_moe_routed_rows_scale_with_the_token_dim`.
+- **Decode attention reads `B·C` KV rows, not `B`.** `_annotate_attention_kv`
+  is applied to the decode tree too (with `token_sym="B"`, `kv_sym="B·C"`):
+  each of the `B` sequences reads its own `C`-token context, so the *total* KV
+  traffic is `B·C` — which is what the memory estimate needs, and what a
+  replayed decode attention actually moves. `estimate_flops` divides it back by
+  the sequence count so no query is charged for another sequence's context.
+  Left at a bare `B`, the heaviest op in the model looked like it read a few
+  kilobytes (util 0 %, bound `unknown`).
 - **Query Len / Context Len drive a real prefix-cached prefill (Method 1 / APC).**
   Profiling no longer runs a fixed text prompt. `_run_profile` builds
   exact-length synthetic token prompts (`_make_token_ids`): `query_len` new

@@ -132,7 +132,14 @@ def build_rows(template: dict, configs: list[dict]) -> list[dict[str, Any]]:
                         op_name, resolved, recorded_dtypes, pdtype_bytes)
                 else:
                     mem_bytes = estimate_memory(op_name, resolved, pdtype_bytes)
-                flops = estimate_flops(op_name, resolved)
+                # Attention's key/value rows are the whole batch's KV read in
+                # *decode* (``B·C``); in prefill they are the single sequence's
+                # ``S+C``, which carries no batch factor. Dividing a prefill row
+                # by the batch would understate the heaviest op by exactly the
+                # batch size.
+                n_seqs = (int(cfg.get("batch_size") or 1)
+                          if cfg["phase"] == "decode" else 1)
+                flops = estimate_flops(op_name, resolved, n_seqs=n_seqs)
                 ai = round(flops / mem_bytes, 2) if mem_bytes > 0 else 0
 
                 path = node_info["path"]
