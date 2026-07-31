@@ -1,18 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 """Turn a run's ``results.jsonl`` into a readable workbook.
 
-Three sheets, in the order a reader needs them:
+Sheets, in the order a reader needs them:
 
 ``Summary``   one row per op: e2e weight, utilization, action, coverage.
-``Cases``     every measured case, with the profile's device time beside the
-              replayed latency - the run's own fidelity check.
+``<op>``      **one sheet per op** with every case measured for it - a single
+              flat Cases sheet mixed dozens of ops with different shape
+              vocabularies into one table, which is unreadable exactly when it
+              matters (comparing a kernel's own shapes against each other).
 ``Coverage``  what was *not* measured and why (collectives without ranks,
               context-bound wrappers, ops needing a synthesizer), because a
               silent omission is the one failure mode a benchmark cannot afford.
+``Targets``   the ranking, and one sheet per phase when the run ranked prefill
+              and decode separately.
 """
 from __future__ import annotations
 
 import os
+import re
 from collections import Counter, defaultdict
 from typing import Any, Iterable
 
@@ -25,8 +30,9 @@ COLUMNS = [
     ("p90_us", "p90 (us)"), ("stdev_us", "Stdev (us)"),
     ("traced_device_time_us", "Traced (us)"),
     ("replay_vs_traced", "Replay/Traced"),
-    ("util", "Util"), ("bound", "Bound"),
-    ("memory_level", "Roof"), ("ai", "AI (flop/byte)"),
+    ("util", "Util"), ("util_dram", "Util (DRAM)"),
+    ("bound", "Bound"), ("unit", "Roof"), ("ai", "AI (flop/byte)"),
+    ("ridge_ai", "Ridge AI"),
     ("layers", "Layers"), ("weighted_us", "Weighted (us)"),
     ("seq_len", "Seq Len"), ("ctx_len", "Ctx Len"),
     ("batch_size", "Batch"), ("tp", "TP"),
@@ -34,6 +40,9 @@ COLUMNS = [
     ("reps", "Reps"), ("windows", "Windows"), ("iters", "Iters"),
     ("module", "Module"), ("error", "Error"), ("detail", "Detail"),
 ]
+
+#: Excel forbids these in a sheet name and caps it at 31 characters.
+_SHEET_BAD = re.compile(r"[\[\]:*?/\\]")
 
 
 def enrich(records: Iterable[dict], peaks: dict[str, float] | None = None
@@ -46,20 +55,37 @@ def enrich(records: Iterable[dict], peaks: dict[str, float] | None = None
         lat = float(r.get("latency_us") or 0)
         calls = max(int(r.get("layers") or 1), 1)
         if lat > 0:
-            util, bound, level = estimate.utilization_detail(
+            d = estimate.roofline_detail(
                 lat, float(r.get("flops") or 0), float(r.get("bytes") or 0),
-                peaks)
-            r["util"] = round(util, 3)
-            r["bound"] = bound
-            r["memory_level"] = level
-            r["ai"] = round(estimate.op_ai(float(r.get("flops") or 0),
-                                           float(r.get("bytes") or 0)), 3)
+                peaks, r.get("op"))
+            r["util"] = round(d["util"], 3)
+            r["util_dram"] = round(d["util_dram"], 3) or None
+            r["effective_util"] = round(d["effective_util"], 3)
+            r["bound"] = d["bound"]
+            r["memory_level"] = d["memory_level"]
+            r["unit"] = d["unit"]
+            r["ai"] = round(d["ai"], 3) if d.get("ai") is not None else None
+            r["ridge_ai"] = round(d["ridge_ai"], 2)
             r["weighted_us"] = round(lat * calls, 1)
         traced = float(r.get("traced_device_time_us") or 0)
         if traced > 0 and lat > 0 and r.get("traced_comparable"):
             r["replay_vs_traced"] = round(lat / traced, 3)
         out.append(r)
     return out
+
+
+def sheet_name(op: str, used: set[str]) -> str:
+    """A unique, Excel-legal sheet name for an op's dispatch name."""
+    base = _SHEET_BAD.sub(".", str(op).replace("::", ".")).strip() or "op"
+    name = base[:31]
+    if name in used:
+        for i in range(2, 100):
+            suffix = f"~{i}"
+            name = base[:31 - len(suffix)] + suffix
+            if name not in used:
+                break
+    used.add(name)
+    return name
 
 
 def summarize(records: Iterable[dict]) -> list[dict[str, Any]]:
@@ -125,28 +151,58 @@ def write_workbook(records: list[dict], path: str,
 
     rich = enrich(records, peaks)
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    cases = pd.DataFrame([{label: r.get(key) for key, label in COLUMNS}
-                          for r in rich])
+    summary = summarize(rich)
+    by_op: dict[str, list[dict]] = defaultdict(list)
+    for r in rich:
+        by_op[r.get("op", "?")].append(r)
+    # Op columns drop the redundant "Op" and sort prefill before decode so a
+    # kernel's two regimes read as two blocks.
+    op_cols = [(k, label) for k, label in COLUMNS if k != "op"]
+    phase_order = {"prefill": 0, "decode": 1}
+
     with pd.ExcelWriter(path, engine="openpyxl") as xl:
-        pd.DataFrame(summarize(rich)).to_excel(xl, sheet_name="Summary",
-                                               index=False)
-        cases.to_excel(xl, sheet_name="Cases", index=False)
+        pd.DataFrame(summary).to_excel(xl, sheet_name="Summary", index=False)
+        used: set[str] = {"Summary", "Coverage", "Targets"}
+        for row in summary:
+            op = row["Op"]
+            recs = sorted(by_op.get(op, []),
+                          key=lambda r: (phase_order.get(r.get("phase"), 9),
+                                         -float(r.get("weighted_us") or 0)))
+            pd.DataFrame([{label: r.get(key) for key, label in op_cols}
+                          for r in recs]).to_excel(
+                xl, sheet_name=sheet_name(op, used), index=False)
         cov = coverage(rich)
         if cov:
             pd.DataFrame(cov).to_excel(xl, sheet_name="Coverage", index=False)
         if targets and targets.get("targets"):
-            pd.DataFrame([{
-                "Rank": t["rank"], "Op": t["op"], "Backend": t["backend"],
-                "e2e (us)": t["e2e_us"], "Share": t["share_of_e2e"],
-                "Util": t["roofline"]["util"], "Bound": t["roofline"]["bound"],
-                "Roof": t["roofline"].get("memory_level", ""),
-                "Savings (us)": t["savings_us"]["total"],
-                "Action": t["action"],
-                "Kernel dir": (t.get("kernel") or {}).get("kernel_dir", ""),
-                "Flags": "; ".join(t.get("flags") or []),
-            } for t in targets["targets"]]).to_excel(
+            pd.DataFrame(target_rows(targets["targets"])).to_excel(
                 xl, sheet_name="Targets", index=False)
+            for phase, sec in (targets.get("by_phase") or {}).items():
+                if not sec.get("targets"):
+                    continue
+                pd.DataFrame(target_rows(sec["targets"])).to_excel(
+                    xl, sheet_name=f"Targets {phase}"[:31], index=False)
     return path
+
+
+def target_rows(targets: list[dict]) -> list[dict[str, Any]]:
+    """The ranking as spreadsheet rows."""
+    return [{
+        "Rank": t["rank"], "Op": t["op"], "Backend": t["backend"],
+        "e2e (us)": t["e2e_us"], "Share": t["share_of_e2e"],
+        "Util": t["roofline"]["util"],
+        "Util (DRAM)": t["roofline"].get("util_dram"),
+        "Util (headroom)": t["roofline"].get("effective_util",
+                                             t["roofline"]["util"]),
+        "Bound": t["roofline"]["bound"],
+        "Roof": t["roofline"].get("unit",
+                                  t["roofline"].get("memory_level", "")),
+        "AI (flop/byte)": t["roofline"].get("ai"),
+        "Savings (us)": t["savings_us"]["total"],
+        "Action": t["action"],
+        "Kernel dir": (t.get("kernel") or {}).get("kernel_dir", ""),
+        "Flags": "; ".join(t.get("flags") or []),
+    } for t in targets]
 
 
 def format_summary(records: list[dict]) -> str:

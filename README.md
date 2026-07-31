@@ -156,7 +156,8 @@ ranks the ops by the end-to-end time an optimization would actually recover:
 |---|---|---|
 | calls x latency | Shape Matrix `Layers` at one operating point | a 10 us op in 57 layers beats a 500 us op that runs once |
 | roofline headroom | analytic bytes/FLOPs vs the SKU peaks | an op already at >=80 % of peak is `at_roofline` - don't spend a session on it |
-| which roof | the op's arithmetic intensity vs the machine balance | compute- or memory-bound is a property of the op, not of how the kernel did; a cache-resident op is measured against cache bandwidth, not DRAM |
+| which roof | the op's arithmetic intensity vs the machine balance | compute- or memory-bound is a property of the op, not of how the kernel did; the roof is named as a hardware unit (`XMX` / `XVE` / `DRAM` / `L3-Cache`), a non-matrix op is scored against the vector-engine peak, and a cache-resident op is measured against cache bandwidth *and* DRAM (the headroom uses the larger) |
+| per phase | prefill and decode ranked separately, as in the model graph | the same kernel is a compute-bound GEMM at prefill and a memory-bound GEMV at decode |
 | replay vs traced | the profile's own device time for the same op+shape | a replay far off the profiled time is not a valid baseline, and is flagged |
 
 Because the benchmark *is* the dispatched op, coverage follows the profile:
@@ -193,7 +194,10 @@ is silently omitted.
 Output is `output/bench/<run_id>/targets.json`, the versioned handoff for the
 `xpu-kernel-optimizer` skill: each target carries the kernel directory and
 files, build/test commands, the baseline latency, the roofline bound, and a
-ready-to-run `bench_cmd` / `profile_cmd` for the shapes that dominate. Every run
+ready-to-run `bench_cmd` / `profile_cmd` for the shapes that dominate. The
+document holds a combined ranking plus a per-phase one (`by_phase.prefill` /
+`by_phase.decode`), and the report workbook has **one sheet per op** (plus
+`Summary`, `Coverage` and per-phase `Targets` sheets). Every run
 also records the git commit of each component that can move a number (kernel
 repos, vLLM, this tool), and its cases are stored in
 `output/bench/history.sqlite` so regressions are detectable across kernel bumps.

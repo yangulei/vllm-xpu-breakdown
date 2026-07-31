@@ -628,8 +628,46 @@ rows (`shape_matrix`) → replay cases (`spec`) → measured cases (`worker`/
   `SKU_PEAKS[...]["cache_bw_gbs"]` instead (BMG: 18 MB at ~1.2 TB/s, *measured*
   on an Arc Pro B60 with a bf16 copy sweep). Before this, such ops were reported
   as "utilization 300 % of peak", a number that said nothing about the kernel.
-  `roofline.memory_level` records which roof was used (the console table shows
-  `mem/$`).
+  `roofline.memory_level` records which roof was used.
+- **The roof is reported as a hardware unit, and a vector op is not held to the
+  XMX peak.** "compute"/"memory" does not tell a reader what to do, so
+  `roofline.unit` names the bounding unit — `XMX` / `XVE` / `DRAM` /
+  `L3-Cache` (`estimate.roof_unit`, names carried per SKU in `devices.py` as
+  `matrix_unit`/`vector_unit`/`cache_name`, so CUDA reads `Tensor`/`CUDA`/
+  `L2-Cache`). The compute roof itself is now the peak of the unit the op can
+  actually issue to: only matrix-family ops (`estimate.uses_matrix_engine` —
+  `mm`/`addmm`/`bmm`/`matmul`/`linear`/`gemm`/`einsum`/`attn`/`conv`) reach
+  `tflops` (XMX); everything else (norms, activations, gathers, collectives) is
+  scored against `vector_tflops` (XVE, 8x lower on Xe2). Charging an RMSNorm to
+  the 98.3 TFLOPS XMX peak made every elementwise kernel look like it had ~99 %
+  headroom, and it moved the ridge point 8x too far right.
+- **A cache-resident op is also scored against DRAM, and the headroom uses the
+  larger.** Cache-resident ops are typically already-optimal streaming kernels;
+  measured only against the 2.6x higher cache roof they show headroom the model
+  can never use (the whole reason the user saw `rms_norm`-class ops proposed as
+  kernel sessions). `estimate.roofline_detail` returns `util` (vs the named
+  roof), `util_dram` (the same measurement vs DRAM) and `effective_util` = max
+  of the two; the ranking's headroom/`at_roofline` decision uses
+  `effective_util` while the `MAX_CREDIBLE_UTIL` credibility check keeps using
+  `util`, so a cache-served kernel is never flagged as "above peak". An op
+  retired this way carries a flag saying it is already at N % of the DRAM roof.
+  Both numbers are shown (console `util`/`dram` columns, UI `util`/`DRAM`).
+- **Per-op roofline numbers are averaged only over the cases on the named
+  roof.** `_rank_phases` picks `(bound, memory_level, unit)` by *weighted*
+  majority and then averages `util`/`util_dram`/`ai` over just those cases: an
+  op whose prefill case is compute-bound and whose decode case is memory-bound
+  otherwise reports a utilization that belongs to neither (`aten::linear` read
+  "DRAM 109 %" from a compute-bound prefill case mixed into a DRAM average).
+- **Prefill and decode are ranked separately as well as together.** The same
+  kernel is a compute-bound GEMM at prefill and a memory-bound GEMV at decode,
+  so one combined ranking hides which phase a session would help — the same
+  reason the model graph keeps the phases apart. `rank()` runs the ranking core
+  (`_rank_phases`) once for the combined phases (`targets`) and once per phase
+  (`by_phase.{prefill,decode}` = `{targets, e2e_us_total, operating_point}`).
+  `format_table(doc, phase=None)` prints the combined table followed by the
+  per-phase ones; the UI has a Prefill + Decode / Prefill / Decode toggle above
+  the targets table; the workbook gets `Targets prefill` / `Targets decode`
+  sheets.
 - **The roofline is only as honest as the FLOPs/bytes it is fed
   (`analyzer.py` / `shape_derive.py`).** Three cost-model rules earn their keep:
   attention has an explicit FLOPs model (`2·2·q·kv·heads·dim`, with
@@ -653,16 +691,26 @@ rows (`shape_matrix`) → replay cases (`spec`) → measured cases (`worker`/
   *last* resort: an op that merely ran out of a cache is explained by the cache
   roof, and the common table-lookup overcounts are fixed at the source, so a
   `check_cost_model` flag means a genuinely unmodelled op.
-- **`targets.json` is a versioned contract** (`schema_version`, now **3**: v2
+- **`targets.json` is a versioned contract** (`schema_version`, now **4**: v2
   was the replay model — provider fields removed, ops keyed by dispatch name,
-  `traced_device_time_us` added — and v3 the roofline change: `roofline.bound`
+  `traced_device_time_us` added — v3 the roofline change: `roofline.bound`
   now comes from arithmetic intensity, with `memory_level` / `cache_bw_gbs` /
-  `cache_bytes` / `ridge_ai` added) consumed by the `xpu-kernel-optimizer` skill:
+  `cache_bytes` / `ridge_ai` added — and v4 the hardware-unit roof
+  (`roofline.unit`, vector-vs-matrix compute peak), the cache/DRAM pair
+  (`roofline.util_dram` / `effective_util`) and the per-phase ranking
+  (`by_phase`)) consumed by the `xpu-kernel-optimizer` skill:
   kernel dir/files, build/test commands, baseline latency, roofline bound and
   `bench_cmd`/`profile_cmd` per dominant shape. Changing a field's meaning
   requires bumping the version. `bench/kernel_sources.json` maps op/backend →
   repo, files, build and test command; **add an entry when a new op is
   benchmarked**, otherwise its target degrades to `tune_config` with no source.
+- **The report workbook has one sheet per op.** A single flat `Cases` sheet
+  mixed dozens of ops with different shape vocabularies into one table, which is
+  unreadable exactly when it matters (comparing a kernel's own shapes against
+  each other). `reports.write_workbook` writes `Summary`, then one sheet per op
+  (ordered by weighted time, rows sorted prefill-then-decode, name sanitized to
+  Excel's 31-char/no-`[]:*?/\` rule and de-duplicated by `reports.sheet_name`),
+  then `Coverage` and the `Targets` sheets.
 - **Artifacts are owned.** Everything lands in `output/bench/<run_id>/`
   (`cases.json`, `plan.json`, `results.jsonl`, `run_result.json`, `logs/`,
   `targets.json`, `report.xlsx`) with a `run.json` recording the git commit of

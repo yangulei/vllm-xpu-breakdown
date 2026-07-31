@@ -30,11 +30,28 @@ Two properties of that roofline are deliberate:
   footprint fits in the last-level cache legitimately exceeds the DRAM peak.
   Charging it to DRAM produced "utilization 300 % of peak" warnings that said
   nothing about the kernel; the honest roof is the cache one.
+
+Two refinements make the answer name a *hardware unit* rather than a category:
+
+* **The compute roof is the unit the op can actually issue to.** Only
+  matrix-family ops (GEMM, attention, convolution) reach the XMX / Tensor peak;
+  an RMSNorm or a gather issues vector instructions and is bounded by the XVE /
+  CUDA-core peak, which on Xe2 is 8x lower. Charging every op to XMX made all
+  the elementwise kernels look like they had ~99 % headroom. So the roof is
+  reported as ``XMX`` / ``XVE`` / ``DRAM`` / ``L3-Cache``.
+* **A cache-resident op is also scored against DRAM.** Ops whose footprint fits
+  in the last-level cache are usually already-optimal streaming kernels; scored
+  only against the (much higher) cache bandwidth they appear to have large
+  headroom that does not exist. :func:`roofline_detail` therefore reports both
+  utilizations and an ``effective_util`` = max of the two, which is what the
+  ranking's headroom uses, while the credibility check still uses the cache
+  number so a cache-resident kernel is not flagged as "above peak".
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Iterable
 
 #: Seconds a worker spends importing torch/vLLM before its first case.
@@ -48,6 +65,53 @@ MIN_TIMEOUT_S = 120
 MAX_TIMEOUT_S = 7200
 #: Conservative rate at which operand memory can be allocated and filled.
 ALLOC_BYTES_PER_S = 2e9
+
+
+#: An op reaches the matrix-engine (XMX / Tensor) peak only if it issues matrix
+#: instructions. Everything else - norms, activations, gathers, collectives -
+#: is bounded by the vector engine, which on Xe2 is 8x slower.
+_MATRIX_OP_RE = re.compile(
+    r"(^|_)((b?add)?(b)?mm|matmul|linear|gemm|einsum|attn|attention"
+    r"|conv\d?d?)(_|$)")
+
+
+def uses_matrix_engine(op: str | None) -> bool:
+    """Does this dispatch name denote a matrix-engine (GEMM-family) op?"""
+    if not op:
+        return False
+    name = str(op).split("::")[-1].lower().lstrip("_")
+    return bool(_MATRIX_OP_RE.search(name))
+
+
+def compute_peak(peaks: dict[str, float],
+                 op: str | None = None) -> tuple[float, str]:
+    """``(peak TFLOPS, unit name)`` for the compute roof this op can reach.
+
+    ``op is None`` keeps the matrix peak, so callers that do not know the op
+    behave exactly as before.
+    """
+    if op is not None and not uses_matrix_engine(op):
+        vec = float(peaks.get("vector_tflops") or 0)
+        if vec > 0:
+            return vec, str(peaks.get("vector_unit") or "vector")
+    return float(peaks["tflops"]), str(peaks.get("matrix_unit") or "matrix")
+
+
+def memory_unit(peaks: dict[str, float], level: str) -> str:
+    """Human name of the memory roof: ``DRAM`` or the SKU's cache name."""
+    if level == "cache":
+        return str(peaks.get("cache_name") or "cache")
+    return "DRAM"
+
+
+def roof_unit(peaks: dict[str, float], bound: str, level: str,
+              op: str | None = None) -> str:
+    """The hardware unit that bounds this op (``XMX``/``XVE``/``DRAM``/...)."""
+    if bound == "compute":
+        return compute_peak(peaks, op)[1]
+    if bound == "memory":
+        return memory_unit(peaks, level)
+    return "—"
 
 
 def cache_resident(nbytes: float, peaks: dict[str, float]) -> bool:
@@ -78,17 +142,20 @@ def effective_bw_gbs(nbytes: float, peaks: dict[str, float]
     return float(peaks["bw_gbs"]), "dram"
 
 
-def ridge_ai(peaks: dict[str, float], bw_gbs: float | None = None) -> float:
+def ridge_ai(peaks: dict[str, float], bw_gbs: float | None = None,
+             op: str | None = None) -> float:
     """Machine balance in FLOP/byte: the roofline's ridge point.
 
     An op with a higher arithmetic intensity than this is compute-bound, one
     below it is memory-bound. That comparison - **not** "whichever utilization
-    number comes out larger" - is what defines the bound.
+    number comes out larger" - is what defines the bound. The compute term is
+    the peak of the unit the op can issue to (matrix vs vector), so a vector op
+    is not held to the XMX ridge it could never approach.
     """
     bw = float(bw_gbs if bw_gbs is not None else peaks["bw_gbs"])
     if bw <= 0:
         return 0.0
-    return (float(peaks["tflops"]) * 1e12) / (bw * 1e9)
+    return (compute_peak(peaks, op)[0] * 1e12) / (bw * 1e9)
 
 
 def op_ai(flops: float, nbytes: float) -> float:
@@ -98,8 +165,8 @@ def op_ai(flops: float, nbytes: float) -> float:
     return flops / nbytes
 
 
-def bound_of(flops: float, nbytes: float,
-             peaks: dict[str, float]) -> tuple[str, str]:
+def bound_of(flops: float, nbytes: float, peaks: dict[str, float],
+             op: str | None = None) -> tuple[str, str]:
     """``(bound, memory level)`` from the op's AI against the machine balance.
 
     The previous rule compared the two *utilizations* and took the larger, which
@@ -112,7 +179,7 @@ def bound_of(flops: float, nbytes: float,
         return ("memory" if nbytes > 0 else "unknown"), level
     if nbytes <= 0:
         return "compute", level
-    return ("compute" if op_ai(flops, nbytes) >= ridge_ai(peaks, bw)
+    return ("compute" if op_ai(flops, nbytes) >= ridge_ai(peaks, bw, op)
             else "memory"), level
 
 
@@ -125,46 +192,85 @@ def kernel_seconds(flops: float, nbytes: float, peak_tflops: float,
     return max(t_c, t_m)
 
 
-def roofline_bound_us(flops: float, nbytes: float,
-                      peaks: dict[str, float]) -> tuple[float, str]:
+def roofline_bound_us(flops: float, nbytes: float, peaks: dict[str, float],
+                      op: str | None = None) -> tuple[float, str]:
     """``(fastest possible microseconds, bound)`` at 100 % of peak.
 
     The memory term uses the roof the op's footprint actually sees (cache or
-    DRAM), so a cache-resident kernel is not told it beat the speed of light.
+    DRAM), so a cache-resident kernel is not told it beat the speed of light,
+    and the compute term uses the unit the op can issue to.
     """
-    bound, _ = bound_of(flops, nbytes, peaks)
+    bound, _ = bound_of(flops, nbytes, peaks, op)
     bw, _ = effective_bw_gbs(nbytes, peaks)
-    t_c = (flops / (peaks["tflops"] * 1e12)) if flops > 0 else 0.0
+    t_c = (flops / (compute_peak(peaks, op)[0] * 1e12)) if flops > 0 else 0.0
     t_m = (nbytes / (bw * 1e9)) if nbytes > 0 else 0.0
     return ((t_c if bound == "compute" else t_m) * 1e6), bound
 
 
 def utilization(latency_us: float, flops: float, nbytes: float,
-                peaks: dict[str, float]) -> tuple[float, str]:
+                peaks: dict[str, float],
+                op: str | None = None) -> tuple[float, str]:
     """``(achieved fraction of the relevant roof, which roof)``.
 
     The roof is selected by the op's arithmetic intensity (see :func:`bound_of`)
     and, for a memory-bound op, by whether its footprint is cache-resident.
     """
-    util, bound, _ = utilization_detail(latency_us, flops, nbytes, peaks)
-    return util, bound
+    d = roofline_detail(latency_us, flops, nbytes, peaks, op)
+    return d["util"], d["bound"]
 
 
 def utilization_detail(latency_us: float, flops: float, nbytes: float,
-                       peaks: dict[str, float]) -> tuple[float, str, str]:
+                       peaks: dict[str, float], op: str | None = None
+                       ) -> tuple[float, str, str]:
     """``(utilization, bound, memory level)`` for a measured case."""
-    bound, level = bound_of(flops, nbytes, peaks)
+    d = roofline_detail(latency_us, flops, nbytes, peaks, op)
+    return d["util"], d["bound"], d["memory_level"]
+
+
+def roofline_detail(latency_us: float, flops: float, nbytes: float,
+                    peaks: dict[str, float], op: str | None = None
+                    ) -> dict[str, Any]:
+    """Everything the report and the ranking need about one measured case.
+
+    Keys: ``util`` (against the roof the op actually sees), ``util_dram`` (the
+    same measurement against DRAM bandwidth, for a memory-bound op),
+    ``effective_util`` = max of the two, ``bound``, ``memory_level``, ``unit``
+    (the hardware unit that bounds it), ``ai`` and ``ridge_ai``.
+
+    ``effective_util`` exists because a cache-resident op scored only against
+    the cache roof looks like it has headroom it does not have: such ops are
+    typically already-optimal streaming kernels running at the DRAM roof. The
+    ranking spends its headroom budget on ``effective_util`` while the
+    credibility check keeps using ``util`` (so a cache-resident kernel is never
+    flagged as "above peak").
+    """
+    bound, level = bound_of(flops, nbytes, peaks, op)
+    ai = op_ai(flops, nbytes)
+    peak_flops, unit_name = compute_peak(peaks, op)
+    out: dict[str, Any] = {
+        "bound": bound, "memory_level": level,
+        "unit": roof_unit(peaks, bound, level, op),
+        "ai": ai if ai != float("inf") else None,
+        "ridge_ai": ridge_ai(peaks, effective_bw_gbs(nbytes, peaks)[0], op),
+        "compute_unit": unit_name, "compute_peak_tflops": peak_flops,
+        "util": 0.0, "util_dram": 0.0, "effective_util": 0.0,
+    }
     if latency_us <= 0:
-        return 0.0, bound, level
+        return out
     secs = latency_us / 1e6
     if bound == "compute":
-        peak = float(peaks["tflops"]) * 1e12
-        return ((flops / secs) / peak if peak > 0 else 0.0), bound, level
+        peak = peak_flops * 1e12
+        out["util"] = (flops / secs) / peak if peak > 0 else 0.0
+        out["effective_util"] = out["util"]
+        return out
     if bound == "memory":
-        bw, level = effective_bw_gbs(nbytes, peaks)
-        roof = bw * 1e9
-        return ((nbytes / secs) / roof if roof > 0 else 0.0), bound, level
-    return 0.0, bound, level
+        bw, _ = effective_bw_gbs(nbytes, peaks)
+        achieved = nbytes / secs
+        out["util"] = achieved / (bw * 1e9) if bw > 0 else 0.0
+        dram = float(peaks.get("bw_gbs") or 0)
+        out["util_dram"] = achieved / (dram * 1e9) if dram > 0 else 0.0
+        out["effective_util"] = max(out["util"], out["util_dram"])
+    return out
 
 
 def op_timeout(n_cases: int, budget_s: float,

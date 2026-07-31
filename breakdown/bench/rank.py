@@ -46,7 +46,13 @@ from breakdown.bench import devices, estimate
 #: larger), and a cache-resident op is measured against the last-level-cache
 #: bandwidth - ``roofline.memory_level`` says which roof was used, alongside
 #: the new ``cache_bw_gbs`` / ``cache_bytes`` / ``ridge_ai`` fields.
-SCHEMA_VERSION = 3
+#: v4 - the roof is named as a **hardware unit** (``roofline.unit``: ``XMX`` /
+#: ``XVE`` / ``DRAM`` / ``L3-Cache``); a non-matrix op is scored against the
+#: vector-engine peak, a cache-resident op also against DRAM
+#: (``roofline.util_dram``) with ``roofline.effective_util`` = max of the two
+#: driving the headroom; and the document carries a per-phase ranking in
+#: ``by_phase`` (prefill and decode ranked separately, as in the model graph).
+SCHEMA_VERSION = 4
 
 #: Fraction of the roofline treated as "done" - above it, only a redesign helps.
 DEFAULT_TARGET_UTIL = 0.8
@@ -157,7 +163,14 @@ def _fidelity(rec: dict) -> tuple[float, str]:
 
 def rank(records: Iterable[dict], rc: RankConfig | None = None,
          kernel_sources: dict | None = None) -> dict[str, Any]:
-    """Rank ops by the end-to-end time an optimization would recover."""
+    """Rank ops by the end-to-end time an optimization would recover.
+
+    Prefill and decode are ranked **together** (the document's ``targets``) and
+    **separately** (``by_phase``). The two phases are different machines: the
+    same GEMM is compute-bound at prefill and a memory-bound GEMV at decode, so
+    a combined ranking hides which phase a kernel session would actually help -
+    the same reason the model graph keeps the phases apart.
+    """
     rc = rc or RankConfig()
     recs = [r for r in records if r.get("status") == "ok"]
     if not recs:
@@ -174,15 +187,59 @@ def rank(records: Iterable[dict], rc: RankConfig | None = None,
     sources = kernel_sources or load_kernel_sources()
 
     points = {ph: pick_point(recs, ph, rc.points.get(ph)) for ph in rc.phases}
+    targets, grand = _rank_phases(recs, rc, rc.phases, points, peaks, sources)
+
+    by_phase: dict[str, Any] = {}
+    for ph in rc.phases:
+        if points.get(ph) is None:
+            continue
+        try:
+            ph_targets, ph_grand = _rank_phases(
+                recs, rc, (ph,), points, peaks, sources)
+        except ValueError:
+            continue
+        by_phase[ph] = {"e2e_us_total": round(ph_grand, 1),
+                        "operating_point": _point_doc(points[ph]),
+                        "targets": ph_targets}
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "engine": "replay",
+        "device": device,
+        "sku": sku,
+        "peaks": peaks,
+        "target_util": rc.target_util,
+        "tp": rc.tp,
+        "run_id": rc.run_id,
+        "operating_points": {p: _point_doc(points.get(p)) for p in rc.phases},
+        "phase_weight": dict(rc.phase_weight),
+        "e2e_us_total": round(grand, 1),
+        "provenance": rc.provenance,
+        "targets": targets,
+        "by_phase": by_phase,
+    }
+
+
+def _point_doc(point: tuple | None) -> dict[str, Any] | None:
+    if not point:
+        return None
+    return {"seq_len": point[0], "ctx_len": point[1], "batch_size": point[2]}
+
+
+def _rank_phases(recs: list[dict], rc: RankConfig, phases: tuple[str, ...],
+                 points: dict[str, tuple | None], peaks: dict[str, float],
+                 sources: dict) -> tuple[list[dict[str, Any]], float]:
+    """Rank ``recs`` restricted to ``phases``; returns ``(targets, grand)``."""
     op_time: dict[str, dict[str, float]] = defaultdict(
         lambda: defaultdict(float))
     op_cases: dict[str, list[dict]] = defaultdict(list)
     op_backend: dict[str, Counter] = defaultdict(Counter)
-    op_util: dict[str, list[tuple[float, float, str, str]]] = defaultdict(list)
+    op_util: dict[str, list[tuple[float, dict[str, Any]]]] = defaultdict(list)
     op_flags: dict[str, list[str]] = defaultdict(list)
 
     for r in recs:
-        for ph in rc.phases:
+        for ph in phases:
             if points.get(ph) is None:
                 continue
             if points[ph] not in _points_of(r, ph):
@@ -193,10 +250,10 @@ def rank(records: Iterable[dict], rc: RankConfig | None = None,
             weighted = lat * calls
             op_time[op][ph] += weighted
             op_backend[op][r.get("backend") or ""] += 1
-            util, bound, level = estimate.utilization_detail(
+            detail = estimate.roofline_detail(
                 lat, float(r.get("flops") or 0), float(r.get("bytes") or 0),
-                peaks)
-            op_util[op].append((weighted, util, bound, level))
+                peaks, op)
+            op_util[op].append((weighted, detail))
             ratio, note = _fidelity(r)
             if note:
                 op_flags[op].append(note)
@@ -215,33 +272,54 @@ def rank(records: Iterable[dict], rc: RankConfig | None = None,
 
     def total(op: str) -> float:
         return sum(op_time[op][p] * rc.phase_weight.get(p, 1.0)
-                   for p in rc.phases)
+                   for p in phases)
 
     grand = sum(total(op) for op in op_time)
     targets: list[dict[str, Any]] = []
     for op in op_time:
         t = total(op)
         uw = op_util[op]
-        wsum = sum(w for w, _, _, _ in uw) or 1.0
-        util = sum(w * u for w, u, _, _ in uw) / wsum
-        bound = Counter(b for _, _, b, _ in uw).most_common(1)[0][0]
-        level = Counter(l for _, _, _, l in uw).most_common(1)[0][0]
+        # The roof is chosen by *weighted* majority, and the utilizations are
+        # then averaged over the cases that actually sit on that roof: an op
+        # whose prefill case is compute-bound and whose decode case is
+        # memory-bound otherwise reports a util that belongs to neither.
+        votes: Counter = Counter()
+        for w, d in uw:
+            votes[(d["bound"], d["memory_level"], d["unit"])] += w
+        bound, level, unit = votes.most_common(1)[0][0]
+        on_roof = [(w, d) for w, d in uw
+                   if (d["bound"], d["memory_level"]) == (bound, level)] or uw
+        wsum = sum(w for w, _ in on_roof) or 1.0
+
+        def _avg(key: str, rows=on_roof, wsum=wsum) -> float:
+            return sum(w * float(d.get(key) or 0) for w, d in rows) / wsum
+
+        util = _avg("util")
+        util_dram = _avg("util_dram")
+        eff_util = _avg("effective_util")
+        ridge = Counter(round(float(d.get("ridge_ai") or 0), 2)
+                        for _, d in on_roof).most_common(1)[0][0]
+        ais = [float(d["ai"]) for _, d in on_roof if d.get("ai") is not None]
         backend = (op_backend[op].most_common(1)[0][0]
                    if op_backend[op] else "")
         info = kernel_info(sources, op, backend)
         buildable = bool(info.get("build_cmd"))
         credible = util <= MAX_CREDIBLE_UTIL
-        headroom = max(0.0, 1.0 - util / rc.target_util)
+        headroom = max(0.0, 1.0 - eff_util / rc.target_util)
         save = t * headroom if (buildable and credible) else 0.0
         if not credible:
             action = "check_cost_model"
-            roof = ("cache" if level == "cache" else "DRAM")
             op_flags[op].append(
-                f"roofline utilization {util * 100:.0f}% exceeds the {roof} "
-                f"{bound} peak - the analytic FLOPs/bytes for this op overstate "
+                f"roofline utilization {util * 100:.0f}% exceeds the {unit} "
+                f"peak - the analytic FLOPs/bytes for this op overstate "
                 f"the traffic it really does, so its headroom cannot be trusted")
-        elif util >= rc.target_util:
+        elif eff_util >= rc.target_util:
             action = "at_roofline"
+            if level == "cache" and util < rc.target_util:
+                op_flags[op].append(
+                    f"cache-resident, but already at {util_dram * 100:.0f}% of "
+                    f"the DRAM roof - the {unit} headroom is not reachable "
+                    f"once the working set leaves the cache")
         elif buildable:
             action = "optimize_kernel"
         else:
@@ -252,15 +330,20 @@ def rank(records: Iterable[dict], rc: RankConfig | None = None,
             "op": op,
             "backend": backend,
             "e2e_us": round(t, 1),
-            "phase_us": {ph: round(op_time[op][ph], 1) for ph in rc.phases},
+            "phase_us": {ph: round(op_time[op][ph], 1) for ph in phases},
             "calls": sum(c["calls"] for c in op_cases[op]),
             "roofline": {"util": round(util, 3), "bound": bound,
+                         "unit": unit,
+                         "util_dram": round(util_dram, 3),
+                         "effective_util": round(eff_util, 3),
                          "memory_level": level,
+                         "ai": round(sum(ais) / len(ais), 3) if ais else None,
                          "peak_bw_gbs": peaks["bw_gbs"],
                          "peak_tflops": peaks["tflops"],
+                         "vector_tflops": peaks.get("vector_tflops", 0.0),
                          "cache_bw_gbs": peaks.get("cache_bw_gbs", 0.0),
                          "cache_bytes": peaks.get("cache_bytes", 0.0),
-                         "ridge_ai": round(estimate.ridge_ai(peaks), 2),
+                         "ridge_ai": ridge,
                          "target_util": rc.target_util},
             "savings_us": {"optimize_kernel": round(save, 1),
                            "total": round(save, 1)},
@@ -279,26 +362,7 @@ def rank(records: Iterable[dict], rc: RankConfig | None = None,
         t["rank"] = i
     if rc.top:
         targets = targets[:rc.top]
-
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "engine": "replay",
-        "device": device,
-        "sku": sku,
-        "peaks": peaks,
-        "target_util": rc.target_util,
-        "tp": rc.tp,
-        "run_id": rc.run_id,
-        "operating_points": {
-            p: ({"seq_len": points[p][0], "ctx_len": points[p][1],
-                 "batch_size": points[p][2]} if points.get(p) else None)
-            for p in rc.phases},
-        "phase_weight": dict(rc.phase_weight),
-        "e2e_us_total": round(grand, 1),
-        "provenance": rc.provenance,
-        "targets": targets,
-    }
+    return targets, grand
 
 
 def _shape_entry(op: str, case: dict, rc: RankConfig) -> dict[str, Any]:
@@ -319,43 +383,77 @@ def _shape_entry(op: str, case: dict, rc: RankConfig) -> dict[str, Any]:
 
 
 def _bound_label(roofline: dict[str, Any]) -> str:
-    """``memory`` on the cache roof reads ``mem/$`` so the roof is visible."""
+    """The hardware unit that bounds the op (``XMX``/``XVE``/``DRAM``/...)."""
+    unit = roofline.get("unit")
+    if unit:
+        return str(unit)
     bound = roofline.get("bound") or ""
     if bound == "memory" and roofline.get("memory_level") == "cache":
         return "mem/$"
     return bound
 
 
-def format_table(doc: dict[str, Any]) -> str:
-    """The ranking as a console table."""
+def format_table(doc: dict[str, Any], phase: str | None = None) -> str:
+    """The ranking as a console table.
+
+    Without ``phase`` the combined ranking is printed, followed by the per-phase
+    rankings (prefill and decode are different machines for the same kernel).
+    """
+    peaks = doc["peaks"]
     out = [
         f"device      : {doc['device']} / {doc['sku']}  (peaks "
-        f"{doc['peaks']['bw_gbs']:.0f} GB/s DRAM"
-        + (f" / {doc['peaks']['cache_bw_gbs']:.0f} GB/s cache"
-           if doc['peaks'].get('cache_bw_gbs') else "")
-        + f", {doc['peaks']['tflops']:.1f} "
-        f"TFLOPS, target util {doc['target_util']:.0%})",
+        f"{peaks['bw_gbs']:.0f} GB/s DRAM"
+        + (f" / {peaks['cache_bw_gbs']:.0f} GB/s "
+           f"{peaks.get('cache_name', 'cache')}"
+           if peaks.get('cache_bw_gbs') else "")
+        + f", {peaks['tflops']:.1f} TFLOPS "
+        f"{peaks.get('matrix_unit', 'matrix')}"
+        + (f" / {peaks['vector_tflops']:.1f} TFLOPS "
+           f"{peaks.get('vector_unit', 'vector')}"
+           if peaks.get('vector_tflops') else "")
+        + f", target util {doc['target_util']:.0%})",
     ]
-    for phase, p in doc["operating_points"].items():
+    for ph, p in doc["operating_points"].items():
         if p:
-            out.append(f"{phase:<12}: seq={p['seq_len']} ctx={p['ctx_len']} "
+            out.append(f"{ph:<12}: seq={p['seq_len']} ctx={p['ctx_len']} "
                        f"bs={p['batch_size']}")
-    out.append(f"e2e op time : {doc['e2e_us_total'] / 1000:.2f} ms/step over "
-               f"{len(doc['targets'])} ops\n")
-    hdr = (f"{'#':>2} {'op':<44}{'backend':<18}{'e2e_us':>10}{'share':>7}"
-           f"{'util':>6} {'bound':<8}{'save_us':>9}  action")
-    out += [hdr, "-" * len(hdr)]
-    for t in doc["targets"]:
+    sections: list[tuple[str, list[dict], float]] = []
+    by_phase = doc.get("by_phase") or {}
+    if phase:
+        sec = by_phase.get(phase)
+        if not sec:
+            return "\n".join(out + [f"\n(no {phase} records)"])
+        sections.append((phase, sec["targets"], sec["e2e_us_total"]))
+    else:
+        sections.append(("prefill + decode", doc["targets"],
+                         doc["e2e_us_total"]))
+        for ph, sec in by_phase.items():
+            sections.append((ph, sec["targets"], sec["e2e_us_total"]))
+    for name, targets, e2e in sections:
+        out.append(f"\n=== {name} === {e2e / 1000:.2f} ms/step over "
+                   f"{len(targets)} ops")
+        out += _phase_table(targets)
+    return "\n".join(out)
+
+
+def _phase_table(targets: list[dict[str, Any]]) -> list[str]:
+    hdr = (f"{'#':>2} {'op':<40}{'backend':<17}{'e2e_us':>10}{'share':>7} "
+           f"{'roof':<10}{'util':>6}{'dram':>7}{'AI':>8}{'save_us':>9}  action")
+    out = [hdr, "-" * len(hdr)]
+    for t in targets:
         flag = "  !" if t["flags"] else ""
+        r = t["roofline"]
+        dram = (f"{r['util_dram'] * 100:>6.0f}%" if r.get("util_dram")
+                else "      —")
+        ai = f"{r['ai']:>8.1f}" if r.get("ai") is not None else "       —"
         out.append(
-            f"{t['rank']:>2} {t['op'][:44]:<44}{t['backend'][:18]:<18}"
-            f"{t['e2e_us']:>10.1f}{t['share_of_e2e'] * 100:>6.1f}%"
-            f"{t['roofline']['util'] * 100:>5.0f}% "
-            f"{_bound_label(t['roofline']):<8}"
+            f"{t['rank']:>2} {t['op'][:40]:<40}{t['backend'][:17]:<17}"
+            f"{t['e2e_us']:>10.1f}{t['share_of_e2e'] * 100:>6.1f}% "
+            f"{_bound_label(r):<10}{r['util'] * 100:>5.0f}%{dram}{ai}"
             f"{t['savings_us']['total']:>9.1f}  {t['action']}{flag}")
-    flagged = [t for t in doc["targets"] if t["flags"]]
+    flagged = [t for t in targets if t["flags"]]
     if flagged:
-        out.append("\n! fidelity warnings:")
+        out.append("! notes:")
         for t in flagged:
             out.append(f"  {t['op']}: {t['flags'][0]}")
-    return "\n".join(out)
+    return out

@@ -66,8 +66,13 @@ rather than refused; a wrapper with no such entry point (`vllm::moe_forward*`)
 is still reported with a reason, and the kernels it launches are benchmarked as
 their own ops. The roofline classifies an op as compute- or memory-bound by its
 **arithmetic intensity vs the machine balance** (not by whichever utilization
-came out larger), and charges a cache-resident op to the last-level-cache
-bandwidth instead of DRAM. Timing repeats the kernel inside
+came out larger), names the bounding **hardware unit** (`XMX`/`XVE`/`DRAM`/
+`L3-Cache` — a non-matrix op is scored against the vector-engine peak, not
+XMX), and charges a cache-resident op to the last-level-cache bandwidth **and**
+to DRAM, taking the larger utilization as the headroom (a cache-resident kernel
+already at the DRAM roof is `at_roofline`, not a session). Prefill and decode
+are ranked **separately as well as together** (`targets.json` `by_phase`), and
+the report workbook writes **one sheet per op**. Timing repeats the kernel inside
 a device-event window and subtracts the measured empty-window cost, because that
 floor (~60-90 us on Level Zero) dwarfs a small kernel. The old `breakdown/perf/`
 op-map + xpu-perf/micro_perf shell-out was removed; do not reintroduce it.

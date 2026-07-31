@@ -468,6 +468,17 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 
     <div class="card">
       <h2>Ranked targets</h2>
+      <div class="graph-phase-toggle" id="perf-phase-toggle">
+        <button class="phase-btn active" data-perf-phase="all"
+                onclick="setTargetPhase(this)"
+                title="Prefill and decode weighted together">Prefill + Decode</button>
+        <button class="phase-btn" data-perf-phase="prefill"
+                onclick="setTargetPhase(this)"
+                title="Rank the prefill phase on its own — a GEMM that is compute-bound here is a memory-bound GEMV at decode">Prefill</button>
+        <button class="phase-btn" data-perf-phase="decode"
+                onclick="setTargetPhase(this)"
+                title="Rank the decode phase on its own (the steady-state serving regime)">Decode</button>
+      </div>
       <div id="perf-summary" style="font-size:12px;color:#666;margin-bottom:10px"></div>
       <div style="overflow:auto">
         <table id="perf-targets" class="perf-table" style="width:100%;border-collapse:collapse;font-size:12px"></table>
@@ -1189,6 +1200,8 @@ function switchTab(name) {
 
 // ---- Replay benchmark: re-invoke the dispatched ops, rank what to optimize ----
 let PERF_RUN_ID = null;
+let PERF_TARGETS_DOC = null;
+let PERF_TARGET_PHASE = 'all';
 
 const PERF_ACTION_STYLE = {
   optimize_kernel: ['#c0392b', 'open a kernel session'],
@@ -1352,24 +1365,48 @@ function benchDownloadReport() {
   window.location.href = '/api/bench/report?run_id=' + encodeURIComponent(runId);
 }
 
+function setTargetPhase(el) {
+  document.querySelectorAll('#perf-phase-toggle .phase-btn')
+    .forEach(b => b.classList.remove('active'));
+  el.classList.add('active');
+  PERF_TARGET_PHASE = el.dataset.perfPhase;
+  if (PERF_TARGETS_DOC) renderPerfTargets(PERF_TARGETS_DOC);
+}
+
 function renderPerfTargets(doc) {
+  PERF_TARGETS_DOC = doc;
   const summary = document.getElementById('perf-summary');
+  // Prefill and decode are ranked separately (same reason the model graph keeps
+  // them apart): the same kernel is compute-bound at prefill and a memory-bound
+  // GEMV at decode, so one combined number hides which phase a session helps.
+  const phase = PERF_TARGET_PHASE;
+  const section = phase !== 'all' ? ((doc.by_phase || {})[phase] || null) : null;
+  const targets = section ? section.targets : (doc.targets || []);
+  const e2e = section ? section.e2e_us_total : doc.e2e_us_total;
   const pts = Object.entries(doc.operating_points || {})
-    .filter(([, v]) => v)
+    .filter(([p, v]) => v && (phase === 'all' || p === phase))
     .map(([p, v]) => `${p}: seq=${v.seq_len} ctx=${v.ctx_len} bs=${v.batch_size}`)
     .join(' · ');
+  const pk = doc.peaks || {};
   summary.innerHTML =
-    `<b>${doc.device}</b> (${doc.sku}: ${doc.peaks.bw_gbs} GB/s DRAM` +
-    (doc.peaks.cache_bw_gbs ? ` / ${doc.peaks.cache_bw_gbs} GB/s cache` : '') +
-    `, ${doc.peaks.tflops} TFLOPS, ` +
-    `target util ${(doc.target_util * 100).toFixed(0)}%) — e2e op time ` +
-    `${(doc.e2e_us_total / 1000).toFixed(2)} ms/step<br>${pts}`;
+    `<b>${doc.device}</b> (${doc.sku}: ${pk.bw_gbs} GB/s DRAM` +
+    (pk.cache_bw_gbs ? ` / ${pk.cache_bw_gbs} GB/s ${pk.cache_name || 'cache'}` : '') +
+    `, ${pk.tflops} TFLOPS ${pk.matrix_unit || 'matrix'}` +
+    (pk.vector_tflops ? ` / ${pk.vector_tflops} TFLOPS ${pk.vector_unit || 'vector'}` : '') +
+    `, target util ${(doc.target_util * 100).toFixed(0)}%) — ` +
+    `${phase === 'all' ? 'e2e' : phase} op time ` +
+    `${(e2e / 1000).toFixed(2)} ms/step<br>${pts}` +
+    (phase !== 'all' && !section ? '<br><i>no records for this phase</i>' : '');
 
   const head = `<tr style="text-align:left;border-bottom:2px solid #ddd">
     <th>#</th><th>op</th><th>backend</th><th>e2e µs</th><th>share</th>
-    <th>util</th><th>bound</th><th>replay/traced</th><th>save µs</th>
+    <th title="the hardware unit that bounds this op: XMX/XVE (compute) or DRAM/L3-Cache (memory)">roof</th>
+    <th title="achieved fraction of that roof">util</th>
+    <th title="the same measurement against DRAM bandwidth — a cache-resident op that already reaches the DRAM roof has no headroom the model can use, so the headroom (save µs) is computed from the larger of the two">DRAM</th>
+    <th title="arithmetic intensity, flop/byte — compute-bound above the machine balance, memory-bound below">AI</th>
+    <th>replay/traced</th><th>save µs</th>
     <th>action</th><th>kernel</th></tr>`;
-  const rows = (doc.targets || []).map(t => {
+  const rows = targets.map(t => {
     const [color, hint] = PERF_ACTION_STYLE[t.action] || ['#333', ''];
     const shape = (t.top_shapes || [])[0];
     const cmd = shape ? shape.bench_cmd.replace(/"/g, '&quot;') : '';
@@ -1378,6 +1415,15 @@ function renderPerfTargets(doc) {
     const ratio = shape && shape.replay_vs_traced != null
       ? shape.replay_vs_traced.toFixed(2) : '—';
     const flags = (t.flags || []).join(' ');
+    const rf = t.roofline;
+    const roofTip = rf.bound === 'memory'
+      ? (rf.memory_level === 'cache'
+          ? `this op's footprint fits in the ${rf.unit || 'cache'}, so the replay is served `
+            + `from cache and is measured against cache bandwidth; the DRAM column is the `
+            + `same measurement against ${rf.peak_bw_gbs} GB/s, which is the roof the model actually sees`
+          : `bounded by DRAM bandwidth (${rf.peak_bw_gbs} GB/s)`)
+      : `bounded by the ${rf.unit || 'compute'} engine — arithmetic intensity `
+        + `${rf.ai != null ? rf.ai : '?'} ≥ machine balance ${rf.ridge_ai || 0} flop/byte`;
     return `<tr style="border-bottom:1px solid #eee">
       <td>${t.rank}</td>
       <td><b>${perfEsc(t.op)}</b>${flags
@@ -1385,15 +1431,11 @@ function renderPerfTargets(doc) {
       <td>${perfEsc(t.backend || '—')}</td>
       <td style="text-align:right">${t.e2e_us.toFixed(1)}</td>
       <td style="text-align:right">${(t.share_of_e2e * 100).toFixed(1)}%</td>
-      <td style="text-align:right">${(t.roofline.util * 100).toFixed(0)}%</td>
-      <td title="${t.roofline.bound === 'memory'
-          ? 'measured against the ' + (t.roofline.memory_level === 'cache'
-              ? 'last-level-cache bandwidth (this op&#39;s footprint is cache-resident)'
-              : 'DRAM bandwidth')
-          : 'arithmetic intensity is at or above the machine balance (' +
-            (t.roofline.ridge_ai || 0) + ' flop/byte)'}">${t.roofline.bound}${
-        t.roofline.memory_level === 'cache' && t.roofline.bound === 'memory'
-          ? ' <span style="color:#888">($)</span>' : ''}</td>
+      <td title="${roofTip}"><b>${perfEsc(rf.unit || rf.bound)}</b></td>
+      <td style="text-align:right">${(rf.util * 100).toFixed(0)}%</td>
+      <td style="text-align:right;color:#888">${rf.util_dram
+        ? (rf.util_dram * 100).toFixed(0) + '%' : '—'}</td>
+      <td style="text-align:right">${rf.ai != null ? rf.ai.toFixed(1) : '—'}</td>
       <td style="text-align:right">${ratio}</td>
       <td style="text-align:right">${t.savings_us.total.toFixed(1)}</td>
       <td><span title="${hint}" style="color:${color};font-weight:600">${t.action}</span></td>

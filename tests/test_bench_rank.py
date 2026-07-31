@@ -215,6 +215,143 @@ class TestReports(unittest.TestCase):
         self.assertEqual(cov[0]["Reason"], "needs forward context")
 
 
+class TestHardwareUnitRoofs(unittest.TestCase):
+    """The roof is a *hardware unit*, and a vector op cannot reach XMX."""
+
+    UNIT_PEAKS = dict(CACHE_PEAKS, vector_tflops=12.3, matrix_unit="XMX",
+                      vector_unit="XVE", cache_name="L3-Cache")
+
+    def test_matrix_family_ops_are_recognized(self):
+        for op in ("aten::mm", "aten::bmm", "aten::addmm", "aten::linear",
+                   "aten::_scaled_mm", "_moe_C::grouped_gemm",
+                   "vllm::unified_attention_with_output"):
+            self.assertTrue(estimate.uses_matrix_engine(op), op)
+        for op in ("_C::rms_norm", "_C::silu_and_mul", "aten::embedding",
+                   "_moe_C::moe_gather", "c10d::allreduce_"):
+            self.assertFalse(estimate.uses_matrix_engine(op), op)
+
+    def test_a_vector_op_is_scored_against_the_vector_peak(self):
+        # A norm issues vector instructions; charging it to the 98.3 TFLOPS XMX
+        # peak made every elementwise kernel look like it had ~99 % headroom.
+        peak, unit = estimate.compute_peak(self.UNIT_PEAKS, "_C::rms_norm")
+        self.assertEqual((peak, unit), (12.3, "XVE"))
+        peak, unit = estimate.compute_peak(self.UNIT_PEAKS, "aten::linear")
+        self.assertEqual((peak, unit), (98.3, "XMX"))
+        # ... and the ridge point moves with it.
+        self.assertLess(estimate.ridge_ai(self.UNIT_PEAKS, 456.0,
+                                          "_C::rms_norm"),
+                        estimate.ridge_ai(self.UNIT_PEAKS, 456.0,
+                                          "aten::linear"))
+
+    def test_the_roof_is_named_as_a_unit(self):
+        d = estimate.roofline_detail(1.0, 0.0, 64 * 1024 ** 2, self.UNIT_PEAKS,
+                                     "_C::rms_norm")
+        self.assertEqual(d["unit"], "DRAM")
+        d = estimate.roofline_detail(1.0, 0.0, 1024 ** 2, self.UNIT_PEAKS,
+                                     "_C::rms_norm")
+        self.assertEqual(d["unit"], "L3-Cache")
+        # 300 MFLOP in 10 us on a vector op: AI 300 >> the XVE ridge.
+        d = estimate.roofline_detail(10.0, 300e6, 1e6, self.UNIT_PEAKS,
+                                     "_C::silu_and_mul")
+        self.assertEqual((d["bound"], d["unit"]), ("compute", "XVE"))
+
+    def test_a_cache_resident_op_is_also_scored_against_dram(self):
+        # Cache-resident ops are usually already-optimal streaming kernels:
+        # scored only against the (2.6x higher) cache roof they look like they
+        # have headroom the model can never use. ``effective_util`` keeps the
+        # honest cache number *and* the DRAM one.
+        nbytes = 456_000  # 1 us of DRAM peak, and it fits the LLC
+        d = estimate.roofline_detail(1.0, 0.0, nbytes, self.UNIT_PEAKS,
+                                     "_C::rms_norm")
+        self.assertEqual(d["memory_level"], "cache")
+        self.assertAlmostEqual(d["util"], 456.0 / 1200.0, places=2)
+        self.assertAlmostEqual(d["util_dram"], 1.0, places=2)
+        self.assertAlmostEqual(d["effective_util"], 1.0, places=2)
+
+    def test_an_op_at_the_dram_roof_is_not_a_kernel_target(self):
+        # 1 us moving 456 kB: 38 % of the cache roof but 100 % of DRAM. The
+        # cache headroom is unreachable, so this is not a kernel session.
+        recs = [_rec("_C::rms_norm", 1.0, layers=36, nbytes=456_000)]
+        doc = rank.rank(recs)
+        t = doc["targets"][0]
+        self.assertEqual(t["roofline"]["unit"], "L3-Cache")
+        self.assertLess(t["roofline"]["util"], 0.5)
+        self.assertGreaterEqual(t["roofline"]["effective_util"], 0.9)
+        self.assertEqual(t["action"], "at_roofline")
+        self.assertEqual(t["savings_us"]["total"], 0.0)
+        self.assertTrue(any("DRAM roof" in f for f in t["flags"]))
+
+
+class TestPhaseSeparation(unittest.TestCase):
+    """Prefill and decode are different machines for the same kernel."""
+
+    def test_targets_are_also_ranked_per_phase(self):
+        recs = [
+            _rec("_C::rms_norm", 10.0, layers=36, nbytes=1_000,
+                 phase="prefill", seq_len=1024, ctx_len=0, batch_size=1),
+            _rec("aten::linear", 500.0, layers=1, nbytes=1_000,
+                 phase="prefill", seq_len=1024, ctx_len=0, batch_size=1),
+            _rec("_C::rms_norm", 5.0, layers=36, nbytes=1_000, phase="decode"),
+        ]
+        doc = rank.rank(recs)
+        self.assertIn("by_phase", doc)
+        self.assertEqual(sorted(doc["by_phase"]), ["decode", "prefill"])
+        # decode saw only one op; prefill saw both
+        self.assertEqual([t["op"] for t in doc["by_phase"]["decode"]["targets"]],
+                         ["_C::rms_norm"])
+        self.assertEqual(len(doc["by_phase"]["prefill"]["targets"]), 2)
+        # the per-phase e2e sums only that phase's weighted time
+        self.assertAlmostEqual(doc["by_phase"]["decode"]["e2e_us_total"],
+                               5.0 * 36, places=1)
+        self.assertEqual(doc["by_phase"]["prefill"]["operating_point"],
+                         {"seq_len": 1024, "ctx_len": 0, "batch_size": 1})
+        # and the combined ranking is still there
+        self.assertEqual(len(doc["targets"]), 2)
+
+    def test_format_table_can_print_one_phase(self):
+        recs = [_rec("_C::rms_norm", 5.0, layers=36, nbytes=1_000)]
+        doc = rank.rank(recs)
+        text = rank.format_table(doc, phase="decode")
+        self.assertIn("=== decode ===", text)
+        self.assertNotIn("=== prefill + decode ===", text)
+
+
+class TestPerOpSheets(unittest.TestCase):
+    """One sheet per op: a flat Cases sheet mixed shape vocabularies."""
+
+    def test_sheet_names_are_legal_and_unique(self):
+        used: set[str] = set()
+        self.assertEqual(reports.sheet_name("vllm::xpu_topk_topp_sampler",
+                                            used),
+                         "vllm.xpu_topk_topp_sampler")
+        long = reports.sheet_name(
+            "vllm::unified_attention_with_output_and_more", used)
+        self.assertLessEqual(len(long), 31)
+        again = reports.sheet_name(
+            "vllm::unified_attention_with_output_and_more", used)
+        self.assertNotEqual(long, again)
+        self.assertNotIn(":", again)
+
+    def test_workbook_has_a_sheet_per_op(self):
+        recs = [_rec("_C::rms_norm", 5.0, nbytes=1_000, phase="prefill"),
+                _rec("_C::rms_norm", 3.0, nbytes=1_000),
+                _rec("aten::linear", 50.0, nbytes=1_000)]
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "report.xlsx")
+            try:
+                reports.write_workbook(recs, path, CACHE_PEAKS,
+                                       rank.rank(recs))
+            except ImportError:  # pragma: no cover - pandas not installed
+                self.skipTest("pandas/openpyxl not available")
+            import openpyxl
+            names = openpyxl.load_workbook(path).sheetnames
+        self.assertIn("_C.rms_norm", names)
+        self.assertIn("aten.linear", names)
+        self.assertNotIn("Cases", names)
+        self.assertIn("Targets prefill", names)
+        self.assertIn("Targets decode", names)
+
+
 class TestHistory(unittest.TestCase):
     def test_only_shapes_present_in_both_runs_are_compared(self):
         with tempfile.TemporaryDirectory() as d:
