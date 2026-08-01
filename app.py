@@ -1581,8 +1581,8 @@ def bench_plan():
     if not model_id:
         return jsonify({"ok": False, "error": "No model_id specified"}), 400
 
-    template, _settings, err = _profile_template_for(model_id,
-                                                     data.get("quantization"))
+    template, settings, err = _profile_template_for(model_id,
+                                                    data.get("quantization"))
     if err:
         return jsonify({"ok": False, "error": err}), 400
 
@@ -1601,6 +1601,15 @@ def bench_plan():
         model_id, int(tp_sizes[0]), device)
     paths = bench_store.run_paths(run_id).ensure()
     bench_runner.write_cases(cases, paths.cases)
+    # The Shape Matrix is the run's input, not a separate artifact: persist the
+    # swept rows so the report workbook can carry the shape space alongside the
+    # measurements taken on it.
+    bench_store.write_json(paths.rows, {
+        "model_id": model_id,
+        "quantization": data.get("quantization"),
+        "info": shape_matrix.build_info_rows(model_id, template, settings),
+        "rows": rows,
+    })
 
     # Classify before benchmarking, so the plan can say what will *not* be
     # measured - and why - instead of the run silently omitting it.
@@ -1755,9 +1764,46 @@ def bench_targets():
     return jsonify({"ok": True, "run_id": run_id, "targets": doc})
 
 
+def _bench_matrix(paths) -> dict | None:
+    """A run's Shape Matrix rows for the report workbook.
+
+    Runs planned after the matrix/benchmark merge persist ``rows.json`` at plan
+    time. Older runs predate it, so fall back to rebuilding the rows from the
+    sweep the plan recorded plus the current profile - correct whenever the
+    profile still matches, and simply absent (no sheet) when it does not.
+    """
+    if os.path.isfile(paths.rows):
+        try:
+            with open(paths.rows) as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None
+    meta = bench_store.read_meta(paths)
+    model_id = meta.get("model_id")
+    configs = None
+    if os.path.isfile(paths.plan):
+        try:
+            with open(paths.plan) as fh:
+                configs = (json.load(fh) or {}).get("sweep")
+        except (OSError, ValueError):
+            configs = None
+    if not model_id or not configs:
+        return None
+    template, settings, err = _profile_template_for(model_id, None)
+    if err:
+        return None
+    return {"model_id": model_id,
+            "info": shape_matrix.build_info_rows(model_id, template, settings),
+            "rows": shape_matrix.build_rows(template, configs)}
+
+
 @app.route("/api/bench/report")
 def bench_report():
-    """Download a run's report workbook (built on demand)."""
+    """Download a run's report workbook (built on demand).
+
+    One download, not two: the workbook carries the run's Shape Matrix (the
+    sweep the cases were built from) next to what was measured on it.
+    """
     run_id = request.args.get("run_id")
     if not run_id:
         return jsonify({"ok": False, "error": "run_id is required"}), 400
@@ -1773,7 +1819,7 @@ def bench_report():
     bench_reports.write_workbook(
         records, paths.report,
         bench_devices.peaks(meta.get("sku") or bench_devices.DEFAULT_SKU),
-        targets)
+        targets, _bench_matrix(paths))
     return send_file(paths.report, as_attachment=True,
                      download_name=f"{run_id}_bench.xlsx")
 

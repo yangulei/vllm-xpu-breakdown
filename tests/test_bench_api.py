@@ -130,8 +130,23 @@ class TestPlan(BenchApiTest):
     def test_plan_writes_the_run_artifacts(self):
         run_id = json.loads(self._plan().data)["run_id"]
         paths = store.run_paths(run_id, self.tmp.name)
-        for path in (paths.cases, paths.plan, paths.run_json):
+        for path in (paths.cases, paths.plan, paths.run_json, paths.rows):
             self.assertTrue(os.path.isfile(path), path)
+
+    def test_plan_persists_the_shape_matrix_rows(self):
+        """The sweep's rows are the run's input, so the run keeps them.
+
+        The report workbook ships them as its Shape Matrix sheet; re-deriving
+        them at report time would silently follow a profile that has since been
+        overwritten.
+        """
+        run_id = json.loads(self._plan().data)["run_id"]
+        with open(store.run_paths(run_id, self.tmp.name).rows) as fh:
+            matrix = json.load(fh)
+        self.assertTrue(matrix["rows"])
+        self.assertTrue(matrix["info"])
+        self.assertIn("Op Name", matrix["rows"][0])
+        self.assertIn("Phase", matrix["rows"][0])
 
 
 class TestRunAndTargets(BenchApiTest):
@@ -170,6 +185,37 @@ class TestRunAndTargets(BenchApiTest):
                          {"aten::linear", "_C::silu_and_mul_with_clamp"})
         # the ranking is persisted next to the run
         self.assertTrue(os.path.isfile(paths.targets))
+
+    def test_report_carries_the_runs_shape_matrix(self):
+        """One download, not two.
+
+        The measured latencies are only interpretable against the shapes they
+        were taken at, and those shapes are what the cases were built from - so
+        the sweep ships as a sheet of the same workbook.
+        """
+        run_id = json.loads(self._plan().data)["run_id"]
+        paths = store.run_paths(run_id, self.tmp.name)
+        with open(paths.results, "w") as fh:
+            fh.write(json.dumps({
+                "op": "aten::linear", "status": "ok", "device": "cpu",
+                "phase": "decode", "seq_len": 1, "ctx_len": 0,
+                "batch_size": 1, "tp": 1, "backend": "torch-xpu-ops",
+                "layers": 36, "latency_us": 50.0, "flops": 1e6,
+                "bytes": 1e5, "shape": "[1, 2560]",
+                "shape_key": "aten::linear", "case_id": "aten::linear",
+            }) + "\n")
+        resp = self.client.get(f"/api/bench/report?run_id={run_id}")
+        if resp.status_code == 500:  # pragma: no cover - pandas missing
+            self.skipTest("pandas/openpyxl not available")
+        self.assertEqual(resp.status_code, 200, resp.data)
+        import io
+
+        import openpyxl
+        names = openpyxl.load_workbook(io.BytesIO(resp.data)).sheetnames
+        self.assertIn("Shape Matrix", names)
+        self.assertIn("Info", names)
+        self.assertIn("Summary", names)
+        self.assertIn("aten.linear", names)
 
     def test_results_endpoint_returns_summary_and_coverage(self):
         run_id = json.loads(self._plan().data)["run_id"]

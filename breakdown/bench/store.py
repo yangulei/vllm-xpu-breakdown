@@ -5,6 +5,7 @@ Everything a run produces lives under one directory so it is reproducible and
 attributable::
 
     output/bench/<run_id>/
+        rows.json           the Shape Matrix rows the cases were swept from
         cases.json          the replay plan (BenchCase list)
         plan.json           coverage: replayable / needs-recipe / skipped
         results.jsonl       one JSON record per benchmarked case
@@ -94,11 +95,16 @@ class RunPaths:
         return os.path.join(self.dir, "logs")
 
     @property
-    def matrix(self) -> str:
-        return os.path.join(self.dir, "matrix.xlsx")
-
-    @property
     def rows(self) -> str:
+        """The Shape Matrix rows this run's cases were swept from.
+
+        The benchmark and the Shape Matrix are two readings of the *same*
+        sweep: ``shape_matrix.build_rows`` produces the rows, ``bench.spec``
+        turns them into replay cases, and the report workbook shows both. The
+        rows are persisted at plan time so the report can carry the shape
+        space the run actually measured, rather than re-deriving it from a
+        profile that may since have been overwritten.
+        """
         return os.path.join(self.dir, "rows.json")
 
     @property

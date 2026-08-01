@@ -61,16 +61,17 @@ Then open `http://localhost:8080` in your browser.
 
 **Features:**
 - Three tabs: **Model Graph** (profile + reconstructed graph), **Benchmark &
-  Targets** (sweep config + Shape Matrix export + replay benchmark + ranked
-  targets) and **Op Detail** (every measured case of the op clicked in the
-  ranked table)
+  Targets** (one module: ① shape sweep → ② replay → ③ ranked targets, with the
+  Shape Matrix as the sweep's own rendering) and **Op Detail** (every measured
+  case of the op clicked in the ranked table)
 - Search for any HuggingFace model by ID
 - Auto-loads model config (architecture, layers, MoE, dtype)
 - Toggle between eager and torch.compile mode
 - Reconstructed model graph (from a profiling run) with symbolic shapes and TP-aware annotations
 - Quantization support (fp8, gptq, awq) — affects weight dtype and memory estimates
-- Shape Matrix Export: sweep across seq_len, batch_size, context_len, and TP
-  configurations (the same sweep the benchmark plans its cases from)
+- Shape Matrix: sweep across seq_len, batch_size, context_len, and TP
+  configurations — the benchmark's input, shipped as a sheet of its report (or
+  downloadable on its own)
 - Rich ops table with:
   - Shapes with symbolic dimensions (B=batch, S=seq_len, H=hidden_size, etc.)
   - Per-tensor dtype tags (bf16, fp8, int4)
@@ -154,9 +155,11 @@ not measured.
 
 ## Replay Benchmark — what to optimize next
 
-The Shape Matrix says *what runs at which shapes*; the replay benchmark says
-**which kernel is worth a session**. It re-invokes **the ops vLLM actually
-dispatched** — same kernel, same shapes and dtypes, rebuilt from the trace — and
+The Shape Matrix and the replay benchmark are **one pipeline**: the matrix says
+*what runs at which shapes*, and those exact rows become the benchmark's replay
+cases, so the benchmark says **which kernel is worth a session**. It re-invokes
+**the ops vLLM actually dispatched** — same kernel, same shapes and dtypes,
+rebuilt from the trace — and
 ranks the ops by the end-to-end time an optimization would actually recover:
 
 | signal | source | why it matters |
@@ -170,7 +173,10 @@ ranks the ops by the end-to-end time an optimization would actually recover:
 Because the benchmark *is* the dispatched op, coverage follows the profile:
 there is no adapter table to extend and no external benchmark suite to install.
 
-Use the **Benchmark & Targets** tab, or run it headless:
+Use the **Benchmark & Targets** tab — one numbered module: **① Shape sweep**
+(the configuration space, also downloadable on its own as *Shapes only*) →
+**② Replay** (plan / benchmark / rank, one `📥 Report`) → **③ Ranked targets**,
+with a clicked op opening in the **Op Detail** tab. Or run it headless:
 
 ```bash
 # one command: plan cases -> replay (one op per process) -> rank -> report
@@ -203,8 +209,11 @@ Output is `output/bench/<run_id>/targets.json`, the versioned handoff for the
 files, build/test commands, the baseline latency, the roofline bound, and a
 ready-to-run `bench_cmd` / `profile_cmd` for the shapes that dominate. The
 document holds a combined ranking plus a per-phase one (`by_phase.prefill` /
-`by_phase.decode`), and the report workbook has **one sheet per op** (plus
-`Summary`, `Coverage` and per-phase `Targets` sheets). The ranking is done at
+`by_phase.decode`), and the report workbook is the run's **single deliverable**:
+`Info`, `Summary`, per-phase `Targets`, **one sheet per op**, `Coverage`, and
+the run's own **`Shape Matrix`** — the sweep the cases were built from, because
+a measured latency is only interpretable against the shape it was taken at. The
+ranking is done at
 the **profiled** operating point (the sweep point whose shapes are the ones the
 trace recorded) whenever it was benchmarked, so the numbers are comparable to
 the profile. In the web UI the Ranked-targets table shows one phase at a time

@@ -1,18 +1,29 @@
 # SPDX-License-Identifier: Apache-2.0
 """Turn a run's ``results.jsonl`` into a readable workbook.
 
-Sheets, in the order a reader needs them:
+The workbook is the run's **single deliverable**: the shape space it swept, the
+cost it measured there, and the ranking that follows. Sheets, in the order a
+reader needs them:
 
-``Summary``   one row per op: e2e weight, utilization, action, coverage.
-``<op>``      **one sheet per op** with every case measured for it - a single
-              flat Cases sheet mixed dozens of ops with different shape
-              vocabularies into one table, which is unreadable exactly when it
-              matters (comparing a kernel's own shapes against each other).
-``Coverage``  what was *not* measured and why (collectives without ranks,
-              context-bound wrappers, ops needing a synthesizer), because a
-              silent omission is the one failure mode a benchmark cannot afford.
-``Targets``   the ranking, and one sheet per phase when the run ranked prefill
-              and decode separately.
+``Info``         what the run was: model, profiled config, caveats, validation.
+``Summary``      one row per op: e2e weight, utilization, action, coverage.
+``Targets``      the ranking, and one sheet per phase when the run ranked
+                 prefill and decode separately.
+``<op>``         **one sheet per op** with every case measured for it - a single
+                 flat Cases sheet mixed dozens of ops with different shape
+                 vocabularies into one table, which is unreadable exactly when
+                 it matters (comparing a kernel's own shapes against each other).
+``Coverage``     what was *not* measured and why (collectives without ranks,
+                 context-bound wrappers, ops needing a synthesizer), because a
+                 silent omission is the one failure mode a benchmark cannot
+                 afford.
+``Shape Matrix`` the sweep itself - every (phase, S, C, B, TP, op) point with
+                 its shapes, dtypes, memory and FLOPs. This is the same table
+                 the standalone Shape Matrix export produces, and it belongs
+                 here because it is the benchmark's *input*: the cases are
+                 built from these rows, so the measured latencies are only
+                 interpretable against them. It is last because it is by far
+                 the longest sheet.
 """
 from __future__ import annotations
 
@@ -22,6 +33,7 @@ from collections import Counter, defaultdict
 from typing import Any, Iterable
 
 from breakdown.bench import devices, estimate
+from breakdown.shape_matrix import MATRIX_HEADERS
 
 COLUMNS = [
     ("op", "Op"), ("backend", "Backend"), ("phase", "Phase"),
@@ -145,8 +157,16 @@ def coverage(records: Iterable[dict]) -> list[dict[str, Any]]:
 
 def write_workbook(records: list[dict], path: str,
                    peaks: dict[str, float] | None = None,
-                   targets: dict | None = None) -> str:
-    """Write the report workbook (requires pandas + an Excel writer)."""
+                   targets: dict | None = None,
+                   matrix: dict | None = None) -> str:
+    """Write the report workbook (requires pandas + an Excel writer).
+
+    ``matrix`` is the run's persisted Shape Matrix (``rows.json``:
+    ``{"info": [[key, value], ...], "rows": [...]}``). It is the sweep the
+    cases were built from, so it ships in the same workbook as the
+    measurements instead of being a separate download the reader has to
+    correlate by hand.
+    """
     import pandas as pd
 
     rich = enrich(records, peaks)
@@ -159,10 +179,24 @@ def write_workbook(records: list[dict], path: str,
     # kernel's two regimes read as two blocks.
     op_cols = [(k, label) for k, label in COLUMNS if k != "op"]
     phase_order = {"prefill": 0, "decode": 1}
+    matrix = matrix or {}
 
     with pd.ExcelWriter(path, engine="openpyxl") as xl:
+        info = matrix.get("info") or []
+        if info:
+            pd.DataFrame([{"Key": k, "Value": v} for k, v in info]).to_excel(
+                xl, sheet_name="Info", index=False)
         pd.DataFrame(summary).to_excel(xl, sheet_name="Summary", index=False)
-        used: set[str] = {"Summary", "Coverage", "Targets"}
+        used: set[str] = {"Info", "Summary", "Coverage", "Targets",
+                          "Shape Matrix"}
+        if targets and targets.get("targets"):
+            pd.DataFrame(target_rows(targets["targets"])).to_excel(
+                xl, sheet_name="Targets", index=False)
+            for phase, sec in (targets.get("by_phase") or {}).items():
+                if not sec.get("targets"):
+                    continue
+                pd.DataFrame(target_rows(sec["targets"])).to_excel(
+                    xl, sheet_name=f"Targets {phase}"[:31], index=False)
         for row in summary:
             op = row["Op"]
             recs = sorted(by_op.get(op, []),
@@ -174,14 +208,10 @@ def write_workbook(records: list[dict], path: str,
         cov = coverage(rich)
         if cov:
             pd.DataFrame(cov).to_excel(xl, sheet_name="Coverage", index=False)
-        if targets and targets.get("targets"):
-            pd.DataFrame(target_rows(targets["targets"])).to_excel(
-                xl, sheet_name="Targets", index=False)
-            for phase, sec in (targets.get("by_phase") or {}).items():
-                if not sec.get("targets"):
-                    continue
-                pd.DataFrame(target_rows(sec["targets"])).to_excel(
-                    xl, sheet_name=f"Targets {phase}"[:31], index=False)
+        rows = matrix.get("rows") or []
+        if rows:
+            pd.DataFrame([{h: r.get(h) for h in MATRIX_HEADERS} for r in rows]
+                         ).to_excel(xl, sheet_name="Shape Matrix", index=False)
     return path
 
 

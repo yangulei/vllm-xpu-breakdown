@@ -334,29 +334,54 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 
   </div><!-- /tab-graph -->
 
-  <!-- Tab: Benchmark & Targets (sweep config + replay the dispatched ops, rank what to optimize) -->
+  <!-- Tab: Benchmark & Targets
+       One module, one pipeline: the sweep defines the shape space, the ops
+       profiled at those shapes become replay cases, the measurements become a
+       ranking, and all of it ships in one report workbook. The Shape Matrix is
+       not a separate feature - it is this pipeline's input, rendered. -->
   <div id="tab-perf" class="tab-content hidden">
 
     <div class="card">
-      <h2>📊 Sweep configuration &amp; Shape Matrix export</h2>
+      <h2>🎯 Benchmark &amp; Optimization Targets</h2>
+      <p style="font-size:12px;color:#666;margin:0">
+        Re-invokes <b>the ops vLLM actually dispatched</b> — same kernel, same shapes and dtypes,
+        rebuilt from the trace — and ranks them by the
+        <b>end-to-end time an optimization would actually recover</b>
+        (calls&nbsp;×&nbsp;latency&nbsp;×&nbsp;roofline headroom). Each op is replayed in its own
+        process, so a kernel that rejects a shape costs only its own results.
+        Everything here also runs headless:
+        <code>python -m breakdown.bench all --trace &lt;trace&gt; --model &lt;id&gt;</code>.
+      </p>
+      <div style="font-size:12px;color:#666;margin-top:10px;padding:8px 12px;
+                  background:#f6f8fa;border-radius:6px">
+        <b>① sweep</b> → shape matrix rows &nbsp;→&nbsp; <b>② replay</b> → measured cases
+        &nbsp;→&nbsp; <b>③ rank</b> → targets &nbsp;→&nbsp; <b>📥 one report</b>
+        (Info · Summary · Targets · one sheet per op · Coverage · Shape Matrix)
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>① Shape sweep — the configuration space</h2>
       <p style="font-size:12px;color:#666;margin-bottom:16px">
-        The sweep below defines the configuration space used by <b>both</b> the benchmark
-        (<i>Plan cases</i> sweeps the profiled graph over these points) and the Shape Matrix
-        export — a flat table of op shapes/dtypes across all combinations of
-        sequence length, context length, batch size, and TP size.
-        Shapes are grounded in a real profiling run — the latest run for this model is reused,
-        or a fresh profile (using the Model Graph tab settings) is launched automatically if none exists.
+        The grid below is <b>the benchmark's input</b>. The profiled graph's ops are re-resolved at
+        every (phase, seq&nbsp;len, ctx&nbsp;len, batch, TP) point — that resolved table
+        <i>is</i> the Shape Matrix — and <b>Plan</b> turns those same rows into replay cases.
+        So the shapes you sweep here are exactly the shapes that get benchmarked, and the
+        matrix ships as a sheet of the report rather than as a separate download.
+        Shapes are grounded in a real profiling run: the latest run for this model and
+        quantization is reused, or a fresh profile (using the Model Graph tab settings) is
+        launched automatically if none exists.
       </p>
 
       <div class="controls-row" style="margin-bottom:16px">
         <div class="control-group">
           <label>TP Sizes (comma-separated)</label>
-          <input id="sm-tp-sizes" type="text" value="1, 2, 4, 8"
+          <input id="sweep-tp-sizes" type="text" value="1, 2, 4, 8"
                  style="font-family:monospace">
         </div>
         <div class="control-group">
           <label>Quantization</label>
-          <select id="sm-quant-select">
+          <select id="sweep-quant-select">
             <option value="auto" selected>None (default)</option>
             <option value="none">None (BF16)</option>
             <option value="fp8">FP8</option>
@@ -377,17 +402,17 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
           <legend style="font-size:12px;font-weight:600;padding:0 6px">Prefill (chunked prefill)</legend>
           <div style="margin-bottom:8px">
             <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Sequence Lengths</label>
-            <input id="sm-prefill-seq-lens" type="text" value="128, 256, 512, 1024, 2048, 4096, 8192"
+            <input id="sweep-prefill-seq-lens" type="text" value="128, 256, 512, 1024, 2048, 4096, 8192"
                    style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace">
           </div>
           <div style="margin-bottom:8px">
             <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Context Lengths</label>
-            <input id="sm-prefill-ctx-lens" type="text" value="0, 8192"
+            <input id="sweep-prefill-ctx-lens" type="text" value="0, 8192"
                    style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace">
           </div>
           <div>
             <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Batch Sizes</label>
-            <input id="sm-prefill-batch-sizes" type="text" value="1"
+            <input id="sweep-prefill-batch-sizes" type="text" value="1"
                    style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace">
           </div>
         </fieldset>
@@ -395,40 +420,39 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
           <legend style="font-size:12px;font-weight:600;padding:0 6px">Decode</legend>
           <div style="margin-bottom:8px">
             <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Sequence Length</label>
-            <input id="sm-decode-seq-len" type="text" value="1" disabled
+            <input id="sweep-decode-seq-len" type="text" value="1" disabled
                    style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace;background:#eee">
           </div>
           <div style="margin-bottom:8px">
             <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Context Lengths</label>
-            <input id="sm-decode-ctx-lens" type="text" value="8192"
+            <input id="sweep-decode-ctx-lens" type="text" value="8192"
                    style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace">
           </div>
           <div>
             <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Batch Sizes</label>
-            <input id="sm-decode-batch-sizes" type="text" value="1, 2, 4, 8, 16, 32, 64, 128"
+            <input id="sweep-decode-batch-sizes" type="text" value="1, 2, 4, 8, 16, 32, 64, 128"
                    style="width:100%;font-size:12px;padding:4px 8px;border:1px solid #ccc;border-radius:4px;font-family:monospace">
           </div>
         </fieldset>
       </div>
 
       <div style="display:flex;gap:12px;align-items:center">
-        <button class="btn btn-primary" id="sm-download-btn" onclick="downloadShapeMatrix()" style="font-size:13px;padding:8px 20px">
-          📥 Download Shape Matrix
+        <button class="btn" id="sweep-download-btn" onclick="downloadShapeMatrix()"
+                style="font-size:12px"
+                title="The shape matrix on its own, without benchmarking it — needs only a profiling run. The full report below contains this same table as its Shape Matrix sheet.">
+          📥 Shapes only (.xlsx)
         </button>
-        <span id="sm-status" style="font-size:12px;color:#666"></span>
+        <span id="sweep-status" style="font-size:12px;color:#666"></span>
       </div>
     </div>
 
     <div class="card">
-      <h2>🎯 Benchmark &amp; Optimization Targets</h2>
-      <p style="font-size:12px;color:#666;margin-bottom:16px">
-        Re-invokes <b>the ops vLLM actually dispatched</b> — same kernel, same shapes and dtypes,
-        rebuilt from the trace — and ranks them by the
-        <b>end-to-end time an optimization would actually recover</b>
-        (calls&nbsp;×&nbsp;latency&nbsp;×&nbsp;roofline headroom). Each op is replayed in its own
-        process, so a kernel that rejects a shape costs only its own results. The sweep comes
-        from the <b>sweep configuration above</b>. Everything here also runs headless:
-        <code>python -m breakdown.bench all --trace &lt;trace&gt; --model &lt;id&gt;</code>.
+      <h2>② Replay the dispatched ops</h2>
+      <p style="font-size:12px;color:#666;margin-bottom:12px">
+        <b>Plan</b> sweeps the graph over the grid above and turns each row into a replay case
+        (reporting up front what it will <i>not</i> be able to measure, and why).
+        <b>Benchmark</b> replays them, one op per process. <b>Rank</b> scores every op by
+        calls&nbsp;×&nbsp;latency&nbsp;×&nbsp;roofline headroom at the profiled operating point.
       </p>
 
       <div class="controls-row" style="margin-bottom:12px">
@@ -453,10 +477,11 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
       </div>
 
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-        <button class="btn btn-primary" id="perf-emit-btn" onclick="benchPlan()">1 · Plan cases</button>
-        <button class="btn" id="perf-run-btn" onclick="benchRun()">2 · Benchmark</button>
-        <button class="btn" id="perf-rank-btn" onclick="benchRank()">3 · Rank targets</button>
-        <button class="btn" onclick="benchDownloadReport()">📥 Report</button>
+        <button class="btn btn-primary" id="perf-emit-btn" onclick="benchPlan()">① Plan cases</button>
+        <button class="btn" id="perf-run-btn" onclick="benchRun()">② Benchmark</button>
+        <button class="btn" id="perf-rank-btn" onclick="benchRank()">③ Rank targets</button>
+        <button class="btn" onclick="benchDownloadReport()"
+                title="One workbook: Info, Summary, Targets (per phase), one sheet per op, Coverage, and the run's Shape Matrix">📥 Report</button>
         <select id="perf-run-select" onchange="benchLoadTargets()" style="font-size:12px;padding:6px"></select>
         <span id="perf-status" style="font-size:12px;color:#666"></span>
       </div>
@@ -467,7 +492,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
     </div>
 
     <div class="card">
-      <h2>Ranked targets</h2>
+      <h2>③ Ranked targets</h2>
       <div class="graph-phase-toggle" id="perf-phase-toggle">
         <button class="phase-btn active" data-perf-phase="prefill"
                 onclick="setTargetPhase(this)"
@@ -489,8 +514,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
       <div class="card">
         <h2>🔍 Op Detail</h2>
         <p style="font-size:12px;color:#666;margin:0">
-          Click an op in the <b>Benchmark &amp; Targets</b> ranked table to inspect every case
-          measured for it — the same rows as that op's sheet in the exported report.
+          Step ④ of the benchmark module: click an op in the <b>Benchmark &amp; Targets</b>
+          ranked table to inspect every case measured for it, across both phases and every
+          swept shape — the same rows as that op's sheet in the downloaded report.
         </p>
       </div>
     </div>
@@ -1222,8 +1248,9 @@ let PERF_OPEN_OP = null;
 const PERF_OP_DETAIL_PLACEHOLDER = `<div class="card">
   <h2>🔍 Op Detail</h2>
   <p style="font-size:12px;color:#666;margin:0">
-    Click an op in the <b>Benchmark &amp; Targets</b> ranked table to inspect every case
-    measured for it — the same rows as that op's sheet in the exported report.
+    Step ④ of the benchmark module: click an op in the <b>Benchmark &amp; Targets</b>
+    ranked table to inspect every case measured for it, across both phases and every
+    swept shape — the same rows as that op's sheet in the downloaded report.
   </p>
 </div>`;
 
@@ -1670,27 +1697,27 @@ function nums(id, minVal) {
 function buildSweepPayload() {
   const modelId = document.getElementById('model-input').value.trim();
   if (!modelId) { alert('Enter a model ID first'); return null; }
-  const tpSizes = nums('sm-tp-sizes', 1);
+  const tpSizes = nums('sweep-tp-sizes', 1);
   if (tpSizes.length === 0) { alert('Enter valid TP sizes'); return null; }
   // Quantization: the sweep is grounded in a profiling run, so the run must
   // have used the same quantization for the derived shapes/dtypes/memory to be
   // valid. null = no quantization (BF16).
-  const q = document.getElementById('sm-quant-select').value;
+  const q = document.getElementById('sweep-quant-select').value;
   return {
     model_id: modelId,
     tp_sizes: tpSizes,
-    prefill_seq_lens: nums('sm-prefill-seq-lens', 0),
-    prefill_ctx_lens: nums('sm-prefill-ctx-lens', 0),
-    prefill_batch_sizes: nums('sm-prefill-batch-sizes', 1),
-    decode_ctx_lens: nums('sm-decode-ctx-lens', 0),
-    decode_batch_sizes: nums('sm-decode-batch-sizes', 1),
+    prefill_seq_lens: nums('sweep-prefill-seq-lens', 0),
+    prefill_ctx_lens: nums('sweep-prefill-ctx-lens', 0),
+    prefill_batch_sizes: nums('sweep-prefill-batch-sizes', 1),
+    decode_ctx_lens: nums('sweep-decode-ctx-lens', 0),
+    decode_batch_sizes: nums('sweep-decode-batch-sizes', 1),
     quantization: (q === 'auto' || q === 'none') ? null : q,
   };
 }
 
 async function downloadShapeMatrix() {
-  const btn = document.getElementById('sm-download-btn');
-  const status = document.getElementById('sm-status');
+  const btn = document.getElementById('sweep-download-btn');
+  const status = document.getElementById('sweep-status');
 
   const payload = buildSweepPayload();
   if (!payload) return;

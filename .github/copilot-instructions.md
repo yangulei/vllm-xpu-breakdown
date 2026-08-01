@@ -46,7 +46,8 @@ Flask web app (`app.py`) + static SPA (`static/index.html`) backed by a `breakdo
 
 **Query Len / Context Len profiling (Method 1 / APC):** `_run_profile` builds exact-length synthetic token prompts (`_make_token_ids`) instead of a fixed text prompt. `query_len` = new prefill tokens (`S`); `context_len` (floored to `block_size`) is pre-computed in an un-profiled warm pass and served from the prefix cache (`enable_prefix_caching=True`) during the profiled run, so the profiled prefill sees `S` new tokens attending to a `context_len`-token KV. Warm the context prefix alone first, warm kernels with distinct query seeds, and profile with yet another seed (`900000+b`) so profiled queries are never cache-hit; each batch item gets a distinct query over a shared context. A cache miss (`outputs[0].num_cached_tokens < ctx_aligned`) is surfaced as `cache_hit_note`. `start_profile` bumps `max_model_len` to `context+query+max_tokens`. Absent `query_len` → legacy text-prompt path.
 
-**Replay benchmark (`breakdown/bench/`)** — the Shape Matrix rows become
+**Replay benchmark + Shape Matrix (`breakdown/bench/`, `breakdown/shape_matrix.py`)** —
+**one module, not two features.** The Shape Matrix rows become
 **replay cases**: the trace records each op's dispatch name, per-tensor
 shapes/dtypes/strides and its non-tensor argument values, so the benchmark
 **re-invokes the op vLLM actually dispatched** (`torch.ops.<ns>.<op>`, or the
@@ -75,7 +76,12 @@ are ranked **separately as well as together** (`targets.json` `by_phase`; the
 UI shows one phase at a time, sortable, with a per-op case drill-down in its own
 **Op Detail** tab), the
 ranking is done at the **profiled** operating point when it was benchmarked
-(`rank.profiled_point`), and the report workbook writes **one sheet per op**. Timing repeats the kernel inside
+(`rank.profiled_point`), and the report workbook is the run's single
+deliverable: `Info`, `Summary`, per-phase `Targets`, **one sheet per op**,
+`Coverage`, and the run's own **`Shape Matrix`** (the sweep the cases were built
+from, persisted to `rows.json` at plan time). The UI has three tabs — `Model
+Graph`, `Benchmark & Targets` (① sweep → ② replay → ③ ranked targets) and
+`Op Detail`; do **not** re-add a Shape Matrix tab. Timing repeats the kernel inside
 a device-event window and subtracts the measured empty-window cost, because that
 floor (~60-90 us on Level Zero) dwarfs a small kernel. The old `breakdown/perf/`
 op-map + xpu-perf/micro_perf shell-out was removed; do not reintroduce it.

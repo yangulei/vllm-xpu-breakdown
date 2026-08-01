@@ -97,7 +97,7 @@ def _graph_from_args(a) -> tuple[dict, dict]:
 # ---------------------------------------------------------------------------
 def cmd_plan(a) -> int:
     from breakdown.bench import resolve
-    from breakdown.shape_matrix import build_rows
+    from breakdown.shape_matrix import build_info_rows, build_rows
 
     graph, summary = _graph_from_args(a)
     rows = build_rows(graph, _sweep(a))
@@ -108,6 +108,15 @@ def cmd_plan(a) -> int:
         a.model or summary.get("architecture") or "model", a.tp, device)
     paths = store.run_paths(run_id, a.root).ensure()
     runner.write_cases(cases, paths.cases)
+    # Persist the sweep's rows: they are the benchmark's input, and the report
+    # workbook ships them as its Shape Matrix sheet.
+    store.write_json(paths.rows, {
+        "model_id": a.model or "",
+        "quantization": a.quantization or None,
+        "info": build_info_rows(a.model or summary.get("architecture") or "",
+                                graph, None),
+        "rows": rows,
+    })
 
     # Classify up front so the plan says what will *not* be measured, and why,
     # before an hour of benchmarking rather than after.
@@ -189,7 +198,11 @@ def cmd_report(a) -> int:
                 targets = json.load(fh)
         meta = store.read_meta(paths)
         peaks = devices.peaks(meta.get("sku") or devices.DEFAULT_SKU)
-        reports.write_workbook(records, paths.report, peaks, targets)
+        matrix = None
+        if os.path.isfile(paths.rows):
+            with open(paths.rows) as fh:
+                matrix = json.load(fh)
+        reports.write_workbook(records, paths.report, peaks, targets, matrix)
         print(f"\nworkbook: {paths.report}")
     return 0
 

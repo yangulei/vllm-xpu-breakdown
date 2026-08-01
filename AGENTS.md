@@ -418,9 +418,15 @@ Op shapes use symbolic expressions for dimensions:
 - `_get_tensor_dtype()` determines per-tensor dtype based on op role (weight vs activation)
 - Supported: fp8, gptq, awq, marlin, bitsandbytes, int4, int8
 
-### Shape Matrix Export (`/api/export/shape-matrix`)
+### Shape Matrix (`breakdown/shape_matrix.py`, `/api/export/shape-matrix`)
 
-Exports a flat Excel table sweeping across configurations:
+The matrix is the **benchmark's input**, not a standalone feature — see *Replay
+Benchmark + Shape Matrix* below for how the same rows become replay cases and
+come back as the report's `Shape Matrix` sheet. This endpoint is the
+**shapes-only** path (it needs a profile but no benchmark run) and the
+offline/headless exchange format.
+
+A flat Excel table sweeping across configurations:
 - Prefill: seq_lens × ctx_lens × batch_sizes × tp_sizes
 - Decode: seq_len=1 × ctx_lens × batch_sizes × tp_sizes
 - Each row = one (Phase, SeqLen, CtxLen, BatchSize, TP, Op) combination
@@ -477,9 +483,34 @@ validation summary. Filename is
   Note: memory/FLOPs are still analytic estimates — only the op set, shapes,
   dtypes and backends come from the trace.
 
-### Replay Benchmark (`breakdown/bench/`)
+### Replay Benchmark + Shape Matrix (`breakdown/bench/`, `breakdown/shape_matrix.py`)
 
-Answers the question the Shape Matrix cannot: **which kernel is worth an
+**These are one module, not two features.** The Shape Matrix is the benchmark's
+*input*, rendered: `shape_matrix.build_rows(template, configs)` resolves the
+profiled graph's ops at every swept `(phase, S, C, B, TP)` point, `bench.spec`
+turns **those same rows** into replay cases, and the run's report workbook ships
+the rows back as its `Shape Matrix` sheet next to what was measured on them.
+Treating them as separate deliverables made a reader correlate two files by
+hand — a measured latency is only interpretable against the shape it was taken
+at, and that shape came from the matrix. Concretely:
+
+- `bench_plan` (`app.py`) / `cmd_plan` (`cli.py`) persist the swept rows to
+  `output/bench/<run_id>/rows.json` (`{model_id, quantization, info, rows}`)
+  **at plan time**. Re-deriving them at report time would silently follow a
+  profile that has since been overwritten.
+- `reports.write_workbook(..., matrix=)` writes `Info` (first) and
+  `Shape Matrix` (last, it is by far the longest sheet) around the existing
+  `Summary` / `Targets*` / per-op / `Coverage` sheets.
+- `/api/bench/report` loads `rows.json`; for **runs planned before the merge**
+  `_bench_matrix` falls back to rebuilding the rows from `plan.json`'s recorded
+  sweep plus the current profile, and simply omits the sheet when no profile
+  matches — never a wrong matrix.
+- `/api/export/shape-matrix` **stays** as the shapes-only path: it needs only a
+  profiling run, not a benchmark, and the headless/offline exchange format
+  (`shape_matrix_xlsx`) depends on it. In the UI it is the secondary
+  *Shapes only (.xlsx)* button, not a tab.
+
+Answers the question the Shape Matrix alone cannot: **which kernel is worth an
 optimization session**. It does so by **re-invoking the ops vLLM actually
 dispatched** rather than benchmarking substitutes in an external suite. Stages:
 rows (`shape_matrix`) → replay cases (`spec`) → measured cases (`worker`/
@@ -687,17 +718,20 @@ rows (`shape_matrix`) → replay cases (`spec`) → measured cases (`worker`/
   does not ship every case of every op). The operating-point row is highlighted
   and sorted first; profiled cases are marked ✓.
 - **The UI has three tabs: `Model Graph`, `Benchmark & Targets`, `Op Detail`
-  (`TABS` in `static/index.html`).** There is **no** separate Shape Matrix tab —
-  the sweep card (`sm-*` inputs + `Download Shape Matrix`) lives at the top of
-  the *Benchmark & Targets* tab, because the same sweep defines both the
-  exported matrix and the benchmark's cases (`buildSweepPayload` is shared);
-  keeping them on one tab means the numbers you plan with are the numbers you
-  export. Do not re-add a Shape Matrix tab. The per-op drill-down is its own
-  **top-level tab** (`#tab-opdetail` wrapping `#perf-op-detail`) rather than a
-  panel under the ranked table — it is a 15-column × N-case table that pushed
-  the targets off-screen when inlined. `perfToggleOpDetail` switches to that tab
-  when opening an op and back to `perf` when closing; closing restores
-  `PERF_OP_DETAIL_PLACEHOLDER` (never a blank tab).
+  (`TABS` in `static/index.html`).** There is **no** Shape Matrix tab: the
+  matrix and the benchmark are one pipeline (see above), so *Benchmark &
+  Targets* is a single numbered module — **① Shape sweep** (the `sweep-*`
+  inputs, the configuration space, with a secondary *Shapes only (.xlsx)*
+  download) → **② Replay** (plan/benchmark/rank + the one `📥 Report`) →
+  **③ Ranked targets**. `buildSweepPayload` reads the `sweep-*` inputs for both
+  `/api/bench/plan` and `/api/export/shape-matrix`, which is exactly why they
+  share a tab. Do not re-add a Shape Matrix tab or a second sweep form. The
+  per-op drill-down (step ④) is its own **top-level tab** (`#tab-opdetail`
+  wrapping `#perf-op-detail`) rather than a panel under the ranked table — it is
+  a 15-column × N-case table that pushed the targets off-screen when inlined.
+  `perfToggleOpDetail` switches to that tab when opening an op and back to
+  `perf` when closing; closing restores `PERF_OP_DETAIL_PLACEHOLDER` (never a
+  blank tab).
 - **The roofline is only as honest as the FLOPs/bytes it is fed
   (`analyzer.py` / `shape_derive.py`).** Three cost-model rules earn their keep:
   attention has an explicit FLOPs model (`2·2·q·kv·heads·dim`, with
@@ -744,9 +778,9 @@ rows (`shape_matrix`) → replay cases (`spec`) → measured cases (`worker`/
   Excel's 31-char/no-`[]:*?/\` rule and de-duplicated by `reports.sheet_name`),
   then `Coverage` and the `Targets` sheets.
 - **Artifacts are owned.** Everything lands in `output/bench/<run_id>/`
-  (`cases.json`, `plan.json`, `results.jsonl`, `run_result.json`, `logs/`,
-  `targets.json`, `report.xlsx`) with a `run.json` recording the git commit of
-  every component that can move a number, and cases are ingested into
+  (`rows.json`, `cases.json`, `plan.json`, `results.jsonl`, `run_result.json`,
+  `logs/`, `targets.json`, `report.xlsx`) with a `run.json` recording the git
+  commit of every component that can move a number, and cases are ingested into
   `output/bench/history.sqlite` so a regression can be attributed to a kernel
   bump (`/api/bench/history?base=&new=`).
 

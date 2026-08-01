@@ -353,6 +353,53 @@ class TestPerOpSheets(unittest.TestCase):
         self.assertIn("Targets decode", names)
 
 
+class TestShapeMatrixInReport(unittest.TestCase):
+    """The Shape Matrix is the run's *input*, so it ships in the run's report.
+
+    Keeping it as a separate download made the reader correlate two files by
+    hand: the measured latencies are only interpretable against the shapes they
+    were measured at, and those shapes are what the cases were built from.
+    """
+
+    def _workbook(self, matrix):
+        recs = [_rec("aten::linear", 50.0, nbytes=1_000, phase="prefill")]
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "report.xlsx")
+            try:
+                reports.write_workbook(recs, path, CACHE_PEAKS, None, matrix)
+            except ImportError:  # pragma: no cover - pandas not installed
+                self.skipTest("pandas/openpyxl not available")
+            import openpyxl
+            wb = openpyxl.load_workbook(path)
+            return wb.sheetnames, {n: [[c.value for c in r]
+                                       for r in wb[n].iter_rows()]
+                                   for n in wb.sheetnames}
+
+    def test_matrix_and_info_sheets_are_written(self):
+        rows = [{"Phase": "prefill", "Op Name": "aten::linear", "Seq Len": 2048,
+                 "Ctx Len": 0, "Batch Size": 1, "TP": 1}]
+        names, cells = self._workbook(
+            {"info": [["Model", "Qwen/Qwen3-4B"]], "rows": rows})
+        self.assertIn("Shape Matrix", names)
+        self.assertIn("Info", names)
+        # Info first (what the run is), Shape Matrix last (the longest sheet).
+        self.assertEqual(names[0], "Info")
+        self.assertEqual(names[-1], "Shape Matrix")
+        matrix = cells["Shape Matrix"]
+        self.assertEqual(matrix[0][0], "Phase")
+        self.assertEqual(matrix[1][0], "prefill")
+        # the row's values land under their own headers, not by position
+        hdr = matrix[0]
+        self.assertEqual(matrix[1][hdr.index("Seq Len")], 2048)
+        self.assertEqual(cells["Info"][1], ["Model", "Qwen/Qwen3-4B"])
+
+    def test_report_without_a_matrix_still_writes(self):
+        names, _ = self._workbook(None)
+        self.assertNotIn("Shape Matrix", names)
+        self.assertNotIn("Info", names)
+        self.assertIn("Summary", names)
+
+
 class TestHistory(unittest.TestCase):
     def test_only_shapes_present_in_both_runs_are_compared(self):
         with tempfile.TemporaryDirectory() as d:
