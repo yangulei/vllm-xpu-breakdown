@@ -66,6 +66,21 @@ MAX_TIMEOUT_S = 7200
 #: Conservative rate at which operand memory can be allocated and filled.
 ALLOC_BYTES_PER_S = 2e9
 
+#: Bounds of the *adaptive* per-case measurement budget (seconds). There is no
+#: user-facing "budget / case" knob: the budget a case needs is a property of
+#: the shape being replayed, which the profile already tells us.
+MIN_BUDGET_S = 0.1
+MAX_BUDGET_S = 2.0
+#: Timed windows a case should get. ``timing.plan_window`` clamps the window
+#: count to [MIN_WINDOWS, MAX_WINDOWS]; the budget only has to be long enough
+#: that a slow kernel still gets a statistically usable number of them.
+TARGET_WINDOWS = 12
+#: Fraction of peak a replayed kernel is assumed to reach when its latency has
+#: to be *predicted* from the analytic shape cost (no traced time available).
+#: Deliberately pessimistic: under-predicting the latency under-budgets the
+#: measurement, which costs windows; over-predicting only costs wall time.
+ASSUMED_UTIL = 0.25
+
 
 #: An op reaches the matrix-engine (XMX / Tensor) peak only if it issues matrix
 #: instructions. Everything else - norms, activations, gathers, collectives -
@@ -273,6 +288,52 @@ def roofline_detail(latency_us: float, flops: float, nbytes: float,
     return out
 
 
+def case_seconds(case: Any, peaks: dict[str, float]) -> float:
+    """Predicted device seconds of one replayed call of ``case``.
+
+    The profile is the best predictor it has: a case whose swept shapes equal
+    the recorded ones carries the trace's own device time. Everything else is
+    predicted from the case's analytic work at :data:`ASSUMED_UTIL` of the roof
+    the op can actually reach.
+    """
+    traced = float(getattr(case, "traced_device_time_us", 0.0) or 0.0)
+    if getattr(case, "traced_comparable", False) and traced > 0:
+        return traced / 1e6
+    op = getattr(case, "op", None)
+    flops = float(getattr(case, "flops", 0.0) or 0.0)
+    nbytes = float(getattr(case, "nbytes", 0.0) or 0.0)
+    bw, _ = effective_bw_gbs(nbytes, peaks)
+    return kernel_seconds(flops, nbytes, compute_peak(peaks, op)[0], bw,
+                          ASSUMED_UTIL)
+
+
+def case_budget(case: Any, peaks: dict[str, float]) -> float:
+    """Adaptive measurement budget (seconds) for one case.
+
+    A budget must buy a usable number of timed windows, and a window costs
+    ``max(kernel time, TARGET_WINDOW_S)`` - the repetition target that
+    amortizes the device-event floor. So the budget scales with the shape being
+    replayed instead of being a constant the user is asked to guess.
+    """
+    from breakdown.bench import timing
+
+    window = max(case_seconds(case, peaks), timing.TARGET_WINDOW_S)
+    return max(MIN_BUDGET_S, min(MAX_BUDGET_S, TARGET_WINDOWS * window))
+
+
+def op_budgets(cases_by_op: dict[str, list], peaks: dict[str, float]
+               ) -> dict[str, float]:
+    """op -> adaptive budget, sized by the op's most expensive case.
+
+    One worker measures all of an op's cases with one budget, so the op takes
+    the largest budget any of its cases needs (bounded by
+    :data:`MAX_BUDGET_S`); a cheap shape simply finishes its windows early.
+    """
+    return {op: round(max((case_budget(c, peaks) for c in cases),
+                          default=MIN_BUDGET_S), 3)
+            for op, cases in cases_by_op.items()}
+
+
 def op_timeout(n_cases: int, budget_s: float,
                startup_s: float = DEFAULT_STARTUP_S,
                case_overhead_s: float = DEFAULT_CASE_OVERHEAD_S,
@@ -339,13 +400,21 @@ def calibrate(run_results: Iterable[dict[str, Any]]
     return startup, max(per_case, 0.5)
 
 
-def plan(case_counts: dict[str, int], budget_s: float, root: str | None = None,
+def plan(case_counts: dict[str, int], budget_s: float | dict[str, float],
+         root: str | None = None,
          safety: float = DEFAULT_SAFETY,
          alloc_bytes: dict[str, float] | None = None) -> dict[str, int]:
-    """op -> timeout seconds, calibrated against previous runs when present."""
+    """op -> timeout seconds, calibrated against previous runs when present.
+
+    ``budget_s`` may be a single budget or the per-op budgets
+    :func:`op_budgets` derived from the profiled shapes, in which case each
+    op's timeout follows the budget its own cases were given.
+    """
     startup, per_case = (calibrate(previous_run_results(root))
                          if root else (DEFAULT_STARTUP_S,
                                        DEFAULT_CASE_OVERHEAD_S))
-    return {op: op_timeout(n, budget_s, startup, per_case, safety,
-                           (alloc_bytes or {}).get(op, 0.0))
+    budgets = (budget_s if isinstance(budget_s, dict)
+               else {op: float(budget_s) for op in case_counts})
+    return {op: op_timeout(n, budgets.get(op, MIN_BUDGET_S), startup, per_case,
+                           safety, (alloc_bytes or {}).get(op, 0.0))
             for op, n in case_counts.items()}

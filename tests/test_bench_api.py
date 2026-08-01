@@ -257,5 +257,87 @@ class TestRunAndTargets(BenchApiTest):
         self.assertIn(run_id, [r["run_id"] for r in data["runs"]])
 
 
+class TestDeviceSelection(BenchApiTest):
+    """The device selector holds indexes of devices that exist.
+
+    A selection naming a device the host does not have - or fewer devices than
+    the widest swept TP needs - must be refused by the API, because the
+    alternative is a driver error surfacing deep inside a replay worker with no
+    useful message.
+    """
+
+    def test_devices_endpoint_lists_what_is_present(self):
+        data = json.loads(self.client.get("/api/devices").data)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["indexes"], list(range(data["count"])))
+        self.assertIn("kind", data)
+
+    def test_plan_refuses_a_device_that_does_not_exist(self):
+        resp = self._plan(device_ids=[9999])
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("not available", json.loads(resp.data)["error"])
+
+    def test_plan_refuses_a_non_index_token(self):
+        resp = self._plan(device_ids="xpu0")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("device index", json.loads(resp.data)["error"])
+
+    def test_plan_records_the_selection_on_the_run(self):
+        from breakdown.bench import devices as dev
+        if not dev.device_count("cpu") and not dev.available()["count"]:
+            self.skipTest("no accelerator on this host")
+        avail = dev.available()
+        resp = self._plan(device_ids=avail["indexes"][:1], tp_sizes=[1])
+        self.assertEqual(resp.status_code, 200, resp.data)
+        run_id = json.loads(resp.data)["run_id"]
+        meta = store.read_meta(store.run_paths(run_id, self.tmp.name))
+        self.assertEqual(meta["device_ids"], avail["indexes"][:1])
+
+    def test_plan_refuses_fewer_devices_than_the_widest_tp(self):
+        from breakdown.bench import devices as dev
+        avail = dev.available()
+        if avail["count"] < 1:
+            self.skipTest("no accelerator on this host")
+        resp = self._plan(device_ids=avail["indexes"][:1],
+                          tp_sizes=[1, avail["count"] + 1])
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("required", json.loads(resp.data)["error"])
+
+
+class TestBenchOps(BenchApiTest):
+    """The Ops filter's checklist is the profile's own dispatch names."""
+
+    def test_ops_endpoint_lists_dispatched_ops_by_device_time(self):
+        data = json.loads(self.client.get("/api/bench/ops").data)
+        self.assertTrue(data["ok"])
+        names = [o["op"] for o in data["ops"]]
+        self.assertIn("aten::linear", names)
+        self.assertIn("vllm::unified_attention_with_output", names)
+        times = [o["device_time_us"] for o in data["ops"]]
+        self.assertEqual(times, sorted(times, reverse=True))
+        self.assertTrue(all(o["backend"] for o in data["ops"]))
+
+    def test_ops_endpoint_excludes_framework_plumbing(self):
+        import app as app_module
+        graph = _graph()
+        graph["prefill"]["ops"] = [{
+            "name": "aten::t", "role": "", "backend": "framework",
+            "input_shapes": [], "recorded_shapes": [], "input_dtypes": [],
+            "input_args": [], "memory_bytes": 0, "flops": 0,
+            "device_time_us": 1.0}]
+        app_module._profile_state = {**app_module._profile_state,
+                                     "result": {"graph": graph}}
+        data = json.loads(self.client.get("/api/bench/ops").data)
+        self.assertNotIn("aten::t", [o["op"] for o in data["ops"]])
+
+    def test_ops_endpoint_is_empty_without_a_profile(self):
+        import app as app_module
+        app_module._profile_state = {"status": "idle", "result": None,
+                                     "model_id": None}
+        data = json.loads(self.client.get("/api/bench/ops").data)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["ops"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

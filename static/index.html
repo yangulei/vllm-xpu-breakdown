@@ -60,9 +60,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 .controls-row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
 .control-group { display: flex; flex-direction: column; gap: 4px; }
 .control-group label { font-size: 12px; color: var(--text2); font-weight: 500; }
-.control-group select, .control-group input[type="number"] {
+.control-group select, .control-group input[type="number"],
+.control-group input[type="text"], .control-group .ops-filter-btn {
   padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px;
-  font-size: 14px; min-width: 120px; }
+  font-size: 14px; min-width: 120px; height: 38px; box-sizing: border-box; }
 
 /* Status */
 .status-banner { display: none; padding: 12px 20px; border-radius: 8px; margin-bottom: 20px;
@@ -84,6 +85,29 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 .tab-btn:hover { color: var(--accent); }
 .perf-table th, .perf-table td { padding: 5px 10px; vertical-align: top; }
 .tab-content.hidden { display: none; }
+
+/* Devices: the detected-device hint rides on the label line, so the group
+   stays the same height as its siblings and the input stays aligned with the
+   other boxes in the row. */
+.device-group label { white-space: nowrap; }
+.device-group #device-hint { font-weight: 400; color: #999; }
+
+/* Ops filter (Excel-style checkbox list) */
+.ops-filter { position: relative; }
+.ops-filter-btn { background: #fff; cursor: pointer; min-width: 200px;
+                  text-align: left; }
+.ops-menu { position: absolute; top: 100%; left: 0; z-index: 40; width: 340px;
+            background: #fff; border: 1px solid var(--border); border-radius: 8px;
+            box-shadow: 0 6px 20px rgba(0,0,0,.14); padding: 8px; margin-top: 4px; }
+.ops-menu.hidden { display: none; }
+.ops-menu input[type="search"] { width: 100%; padding: 6px 8px; font-size: 12px;
+            border: 1px solid var(--border); border-radius: 4px; margin-bottom: 6px; }
+.ops-list { max-height: 260px; overflow: auto; font-size: 12px; }
+.ops-list label { display: flex; align-items: center; gap: 6px; padding: 3px 4px;
+                  cursor: pointer; border-radius: 4px; }
+.ops-list label:hover { background: #f5f7fa; }
+.ops-list .ops-op { font-family: 'SF Mono', SFMono-Regular, monospace; }
+.ops-list .ops-time { margin-left: auto; color: #888; }
 
 /* Model Graph */
 #graph-section { display: none; }
@@ -195,7 +219,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
   <!-- Tabs -->
   <div class="tab-bar">
     <button class="tab-btn active" id="tab-btn-graph" onclick="switchTab('graph')">Model Graph</button>
-    <button class="tab-btn" id="tab-btn-perf" onclick="switchTab('perf')">Benchmark &amp; Targets</button>
+    <button class="tab-btn" id="tab-btn-perf" onclick="switchTab('perf')">Bench &amp; Rank</button>
     <button class="tab-btn" id="tab-btn-opdetail" onclick="switchTab('opdetail')">Op Detail</button>
   </div>
 
@@ -253,6 +277,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
           <option value="bitsandbytes">BitsAndBytes</option>
           <option value="gguf">GGUF</option>
         </select>
+      </div>
+      <div class="control-group device-group">
+        <label>Devices <span id="device-hint"></span></label>
+        <input type="text" id="device-input" value="" placeholder="all"
+               style="font-family:monospace"
+               title="Comma-separated indexes of the devices to use, e.g. 0,1,2,3 — for profiling and for the Bench & Rank replay. Blank = every available device. A TP=N run needs N of them.">
       </div>
     </div>
 
@@ -325,7 +355,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
         </div>
       </div>
       <p style="font-size:12px;color:#888;margin-bottom:12px" id="graph-subtitle">
-        Run a profile to reconstruct the model graph from the trace. See the <strong>Shape Matrix</strong> tab for a config-driven shape sweep export.
+        Run a profile to reconstruct the model graph from the trace, then use <strong>Bench &amp; Rank</strong> to replay and rank its ops.
       </p>
       <div class="symbol-legend" id="symbol-legend"></div>
       <div id="graph-tree"></div>
@@ -334,72 +364,66 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 
   </div><!-- /tab-graph -->
 
-  <!-- Tab: Benchmark & Targets
-       One module, one pipeline: the sweep defines the shape space, the ops
-       profiled at those shapes become replay cases, the measurements become a
-       ranking, and all of it ships in one report workbook. The Shape Matrix is
-       not a separate feature - it is this pipeline's input, rendered. -->
+  <!-- Tab: Bench & Rank
+       One module, one pipeline, one button: the sweep defines the shape space,
+       the ops profiled at those shapes are replayed, and the measurements are
+       ranked into optimization targets. The Shape Matrix is not a separate
+       feature - it is this pipeline's input, rendered. The long-form
+       explanation of how each stage works lives in the README, not here. -->
   <div id="tab-perf" class="tab-content hidden">
 
     <div class="card">
-      <h2>🎯 Benchmark &amp; Optimization Targets</h2>
-      <p style="font-size:12px;color:#666;margin:0">
-        Re-invokes <b>the ops vLLM actually dispatched</b> — same kernel, same shapes and dtypes,
-        rebuilt from the trace — and ranks them by the
-        <b>end-to-end time an optimization would actually recover</b>
-        (calls&nbsp;×&nbsp;latency&nbsp;×&nbsp;roofline headroom). Each op is replayed in its own
-        process, so a kernel that rejects a shape costs only its own results.
-        Everything here also runs headless:
-        <code>python -m breakdown.bench all --trace &lt;trace&gt; --model &lt;id&gt;</code>.
-      </p>
-      <div style="font-size:12px;color:#666;margin-top:10px;padding:8px 12px;
-                  background:#f6f8fa;border-radius:6px">
-        <b>① sweep</b> → shape matrix rows &nbsp;→&nbsp; <b>② replay</b> → measured cases
-        &nbsp;→&nbsp; <b>③ rank</b> → targets &nbsp;→&nbsp; <b>📥 one report</b>
-        (Info · Summary · Targets · one sheet per op · Coverage · Shape Matrix)
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>① Shape sweep — the configuration space</h2>
-      <p style="font-size:12px;color:#666;margin-bottom:16px">
-        The grid below is <b>the benchmark's input</b>. The profiled graph's ops are re-resolved at
-        every (phase, seq&nbsp;len, ctx&nbsp;len, batch, TP) point — that resolved table
-        <i>is</i> the Shape Matrix — and <b>Plan</b> turns those same rows into replay cases.
-        So the shapes you sweep here are exactly the shapes that get benchmarked, and the
-        matrix ships as a sheet of the report rather than as a separate download.
-        Shapes are grounded in a real profiling run: the latest run for this model and
-        quantization is reused, or a fresh profile (using the Model Graph tab settings) is
-        launched automatically if none exists.
+      <h2>Bench Settings</h2>
+      <p style="font-size:12px;color:#888;margin-bottom:16px">
+        Benchmarks the kernels over the shapes for the config below and ranks them by the
+        E2E potential performance gain.
       </p>
 
       <div class="controls-row" style="margin-bottom:16px">
         <div class="control-group">
-          <label>TP Sizes (comma-separated)</label>
+          <label>TP Sizes</label>
           <input id="sweep-tp-sizes" type="text" value="1, 2, 4, 8"
+                 title="Comma-separated tensor-parallel sizes to sweep."
                  style="font-family:monospace">
         </div>
+        <div class="control-group ops-filter">
+          <label>Kernels</label>
+          <button type="button" class="ops-filter-btn" id="perf-ops-btn"
+                  onclick="perfToggleOpsMenu(event)"
+                  title="Which dispatched kernels to benchmark. Defaults to all of them.">All kernels ▾</button>
+          <div class="ops-menu hidden" id="perf-ops-menu" onclick="event.stopPropagation()">
+            <input type="search" id="perf-ops-search" placeholder="Filter kernels…"
+                   oninput="renderOpsMenu()">
+            <div style="display:flex;gap:10px;font-size:11px;margin-bottom:6px">
+              <a href="#" onclick="perfSelectAllOps(true);return false">Select all</a>
+              <a href="#" onclick="perfSelectAllOps(false);return false">Clear</a>
+              <span id="perf-ops-count" style="margin-left:auto;color:#888"></span>
+            </div>
+            <div class="ops-list" id="perf-ops-list"></div>
+          </div>
+        </div>
         <div class="control-group">
-          <label>Quantization</label>
-          <select id="sweep-quant-select">
-            <option value="auto" selected>None (default)</option>
-            <option value="none">None (BF16)</option>
-            <option value="fp8">FP8</option>
-            <option value="gptq">GPTQ</option>
-            <option value="awq">AWQ</option>
-            <option value="squeezellm">SqueezeLLM</option>
-            <option value="marlin">Marlin</option>
-            <option value="gptq_marlin">GPTQ-Marlin</option>
-            <option value="awq_marlin">AWQ-Marlin</option>
-            <option value="bitsandbytes">BitsAndBytes</option>
-            <option value="gguf">GGUF</option>
-          </select>
+          <label>Target util</label>
+          <input id="perf-target-util" type="number" step="0.05" min="0.1" max="1"
+                 value="0.8"
+                 title="An op already running at this fraction of its roofline has no headroom left, so it is reported as done rather than as a target.">
+        </div>
+        <!-- The replay does not have to run on the devices the model was
+             profiled on (a 4-device TP profile can be replayed on one card, a
+             sweep can be given the idle half of the box), so the tab has its
+             own selection. Blank = whatever Model Graph is set to. -->
+        <div class="control-group device-group">
+          <label>Devices <span id="bench-device-hint"></span></label>
+          <input type="text" id="bench-device-input" value=""
+                 placeholder="same as Model Graph"
+                 style="font-family:monospace"
+                 title="Comma-separated indexes of the devices to replay on, e.g. 0,1,2,3. Blank = the Model Graph tab's selection. The widest swept TP size is how many devices the run needs.">
         </div>
       </div>
 
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
         <fieldset style="border:1px solid #ddd;border-radius:6px;padding:12px;margin:0">
-          <legend style="font-size:12px;font-weight:600;padding:0 6px">Prefill (chunked prefill)</legend>
+          <legend style="font-size:12px;font-weight:600;padding:0 6px">Prefill</legend>
           <div style="margin-bottom:8px">
             <label style="font-size:11px;color:#555;display:block;margin-bottom:2px">Sequence Lengths</label>
             <input id="sweep-prefill-seq-lens" type="text" value="128, 256, 512, 1024, 2048, 4096, 8192"
@@ -436,50 +460,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
         </fieldset>
       </div>
 
-      <div style="display:flex;gap:12px;align-items:center">
-        <button class="btn" id="sweep-download-btn" onclick="downloadShapeMatrix()"
-                style="font-size:12px"
-                title="The shape matrix on its own, without benchmarking it — needs only a profiling run. The full report below contains this same table as its Shape Matrix sheet.">
-          📥 Shapes only (.xlsx)
-        </button>
-        <span id="sweep-status" style="font-size:12px;color:#666"></span>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>② Replay the dispatched ops</h2>
-      <p style="font-size:12px;color:#666;margin-bottom:12px">
-        <b>Plan</b> sweeps the graph over the grid above and turns each row into a replay case
-        (reporting up front what it will <i>not</i> be able to measure, and why).
-        <b>Benchmark</b> replays them, one op per process. <b>Rank</b> scores every op by
-        calls&nbsp;×&nbsp;latency&nbsp;×&nbsp;roofline headroom at the profiled operating point.
-      </p>
-
-      <div class="controls-row" style="margin-bottom:12px">
-        <div class="control-group">
-          <label>Device</label>
-          <input id="perf-device" type="text" value="" placeholder="auto" style="width:90px">
-        </div>
-        <div class="control-group">
-          <label>Budget / case (s)</label>
-          <input id="perf-budget" type="number" step="0.1" min="0.05" value="0.5"
-                 style="width:90px">
-        </div>
-        <div class="control-group">
-          <label>Ops (blank = all)</label>
-          <input id="perf-ops" type="text" value="" style="width:220px">
-        </div>
-        <div class="control-group">
-          <label>Target util</label>
-          <input id="perf-target-util" type="number" step="0.05" min="0.1" max="1"
-                 value="0.8" style="width:80px">
-        </div>
-      </div>
-
       <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-        <button class="btn btn-primary" id="perf-emit-btn" onclick="benchPlan()">① Plan cases</button>
-        <button class="btn" id="perf-run-btn" onclick="benchRun()">② Benchmark</button>
-        <button class="btn" id="perf-rank-btn" onclick="benchRank()">③ Rank targets</button>
+        <button class="btn btn-primary" id="perf-bench-btn" onclick="benchAll()"
+                title="Sweep the profiled graph into replay cases, replay them one op per process, and rank the results — in one run.">▶ Bench &amp; Rank</button>
         <button class="btn" onclick="benchDownloadReport()"
                 title="One workbook: Info, Summary, Targets (per phase), one sheet per op, Coverage, and the run's Shape Matrix">📥 Report</button>
         <select id="perf-run-select" onchange="benchLoadTargets()" style="font-size:12px;padding:6px"></select>
@@ -492,14 +475,16 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
     </div>
 
     <div class="card">
-      <h2>③ Ranked targets</h2>
-      <div class="graph-phase-toggle" id="perf-phase-toggle">
-        <button class="phase-btn active" data-perf-phase="prefill"
-                onclick="setTargetPhase(this)"
-                title="Rank the prefill phase on its own — a GEMM that is compute-bound here is a memory-bound GEMV at decode">Prefill</button>
-        <button class="phase-btn" data-perf-phase="decode"
-                onclick="setTargetPhase(this)"
-                title="Rank the decode phase on its own (the steady-state serving regime)">Decode</button>
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+        <h2 style="margin-bottom:0">Ranked Targets — What to Optimize</h2>
+        <div class="graph-phase-toggle" id="perf-phase-toggle" style="margin-bottom:0">
+          <button class="phase-btn active" data-perf-phase="prefill"
+                  onclick="setTargetPhase(this)"
+                  title="Rank the prefill phase on its own — a GEMM that is compute-bound here is a memory-bound GEMV at decode">Prefill</button>
+          <button class="phase-btn" data-perf-phase="decode"
+                  onclick="setTargetPhase(this)"
+                  title="Rank the decode phase on its own (the steady-state serving regime)">Decode</button>
+        </div>
       </div>
       <div id="perf-summary" style="font-size:12px;color:#666;margin-bottom:10px"></div>
       <div style="overflow:auto">
@@ -514,9 +499,9 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
       <div class="card">
         <h2>🔍 Op Detail</h2>
         <p style="font-size:12px;color:#666;margin:0">
-          Step ④ of the benchmark module: click an op in the <b>Benchmark &amp; Targets</b>
-          ranked table to inspect every case measured for it, across both phases and every
-          swept shape — the same rows as that op's sheet in the downloaded report.
+          Click an op in the <b>Bench &amp; Rank</b> ranked table to inspect every case
+          measured for it, across both phases and every swept shape — the same rows as
+          that op's sheet in the downloaded report.
         </p>
       </div>
     </div>
@@ -698,12 +683,109 @@ function buildProfileBody(modelId) {
       const q = document.getElementById('quant-select').value;
       return (q === 'auto' || q === 'none') ? null : q;
     })(),
+    device_ids: selectedDeviceIds(),
   };
+}
+
+// ---- Device selection (Model Graph = the default, Bench & Rank may differ) ----
+// Both selectors hold *indexes of devices that exist*, so a bad selection is
+// caught here (and again server-side) instead of surfacing as a driver error
+// inside a worker. The benchmark has its own field because the replay does not
+// have to run where the model was profiled; blank there means "whatever Model
+// Graph says", which is the common case.
+let AVAILABLE_DEVICES = { kind: '', count: 0, indexes: [], names: [] };
+const PROFILE_DEVICE_INPUT = 'device-input';
+const BENCH_DEVICE_INPUT = 'bench-device-input';
+
+function deviceInputValue(id) {
+  const el = document.getElementById(id);
+  return el ? (el.value || '').trim() : '';
+}
+
+// The raw text a request's device selection comes from: the benchmark's own
+// field when it is filled in, the Model Graph one otherwise.
+function deviceSpec(inputId) {
+  if (inputId === BENCH_DEVICE_INPUT) {
+    return deviceInputValue(BENCH_DEVICE_INPUT)
+        || deviceInputValue(PROFILE_DEVICE_INPUT);
+  }
+  return deviceInputValue(inputId || PROFILE_DEVICE_INPUT);
+}
+
+function selectedDeviceIds(inputId) {
+  const raw = deviceSpec(inputId);
+  if (!raw) return [];   // blank = every available device
+  return raw.split(',').map(s => s.trim()).filter(Boolean)
+            .map(s => parseInt(s, 10));
+}
+
+// Returns the selection, or null (after alerting) when it is not usable.
+// `need` is how many devices the request requires — a TP=N run needs N.
+function validateDeviceIds(need, inputId) {
+  const raw = deviceSpec(inputId);
+  const ids = [];
+  for (const tok of raw.split(',').map(s => s.trim()).filter(Boolean)) {
+    if (!/^\d+$/.test(tok)) { alert(`'${tok}' is not a device index`); return null; }
+    const n = parseInt(tok, 10);
+    if (!AVAILABLE_DEVICES.indexes.includes(n)) {
+      alert(`Device ${n} is not available — this host has `
+            + (AVAILABLE_DEVICES.count
+               ? AVAILABLE_DEVICES.indexes.join(', ')
+               : `no ${AVAILABLE_DEVICES.kind || 'accelerator'} devices`));
+      return null;
+    }
+    if (!ids.includes(n)) ids.push(n);
+  }
+  const selected = ids.length || AVAILABLE_DEVICES.count;
+  if (need && selected < need) {
+    alert(`${need} devices are required but ${selected} `
+          + `${selected === 1 ? 'is' : 'are'} selected`);
+    return null;
+  }
+  return ids;
+}
+
+// The bench field's placeholder mirrors what it would inherit, so "blank"
+// never leaves the reader guessing which devices a run will use.
+function syncBenchDevicePlaceholder() {
+  const el = document.getElementById(BENCH_DEVICE_INPUT);
+  if (!el) return;
+  const inherited = deviceInputValue(PROFILE_DEVICE_INPUT)
+      || (AVAILABLE_DEVICES.count ? 'all (' + AVAILABLE_DEVICES.indexes.join(',') + ')' : '');
+  el.placeholder = inherited ? `same as Model Graph: ${inherited}`
+                             : 'same as Model Graph';
+}
+
+async function loadDevices() {
+  try {
+    const data = await (await fetch('/api/devices')).json();
+    if (!data.ok) return;
+    AVAILABLE_DEVICES = data;
+    const name = (data.names || []).find(Boolean) || data.kind;
+    // Name the hardware, not the runtime: "4x Intel(R) Arc(TM) Pro B60
+    // Graphics" says what is in the box, while the indexes to type are already
+    // the input's placeholder.
+    const hint = data.count ? `(${data.count}x ${name})` : '(none detected)';
+    for (const id of ['device-hint', 'bench-device-hint']) {
+      const el = document.getElementById(id);
+      if (el) el.textContent = hint;
+    }
+    const input = document.getElementById(PROFILE_DEVICE_INPUT);
+    if (data.count) {
+      input.placeholder = 'all (' + data.indexes.join(',') + ')';
+      input.title = `${data.kind} ${data.indexes.join(',')}\n` + input.title;
+    }
+    input.addEventListener('input', syncBenchDevicePlaceholder);
+    syncBenchDevicePlaceholder();
+  } catch (e) { /* the selector still accepts a manual value */ }
 }
 
 async function startProfile() {
   const modelId = document.getElementById('model-input').value.trim();
   if (!modelId) { alert('Enter a model ID first'); return; }
+
+  const tp = parseInt(document.getElementById('tp-size-select').value) || 1;
+  if (validateDeviceIds(tp) === null) return;
 
   const body = buildProfileBody(modelId);
 
@@ -791,6 +873,8 @@ function applyProfileResult(data) {
       currentPhase = avail;
     }
     renderGraph();
+    // The Bench & Rank op filter lists what this profile dispatched.
+    loadBenchOps();
   }
 }
 
@@ -1230,7 +1314,11 @@ function switchTab(name) {
     if (pane) pane.classList.toggle('hidden', t !== name);
     if (btn) btn.classList.toggle('active', t === name);
   });
-  if (name === 'perf') refreshPerfRuns();
+  if (name === 'perf') {
+    refreshPerfRuns();
+    loadBenchOps();
+    syncBenchDevicePlaceholder();   // it mirrors the Model Graph selection
+  }
 }
 
 
@@ -1243,14 +1331,14 @@ let PERF_TARGET_PHASE = 'prefill';
 let PERF_SORT = null;
 let PERF_OPEN_OP = null;
 
-// The Op Detail tab lives beside Model Graph / Benchmark & Targets, so closing
+// The Op Detail tab lives beside Model Graph / Bench & Rank, so closing
 // a detail view restores this placeholder rather than blanking the tab.
 const PERF_OP_DETAIL_PLACEHOLDER = `<div class="card">
   <h2>🔍 Op Detail</h2>
   <p style="font-size:12px;color:#666;margin:0">
-    Step ④ of the benchmark module: click an op in the <b>Benchmark &amp; Targets</b>
-    ranked table to inspect every case measured for it, across both phases and every
-    swept shape — the same rows as that op's sheet in the downloaded report.
+    Click an op in the <b>Bench &amp; Rank</b> ranked table to inspect every case
+    measured for it, across both phases and every swept shape — the same rows as
+    that op's sheet in the downloaded report.
   </p>
 </div>`;
 
@@ -1309,13 +1397,101 @@ function renderCoverage(cov) {
   }).join('') + `<span style="margin-left:8px">${cov.cases} cases / ${cov.ops} ops</span>`;
 }
 
-async function benchPlan() {
+// ---- Ops filter (Excel-style checkbox list of the dispatched ops) ----
+// The benchmark's op set is a property of the profile, so the filter offers
+// exactly what was dispatched rather than asking for typed dispatch names.
+let PERF_OPS_ALL = [];        // [{op, backend, device_time_us, phases}]
+let PERF_OPS_SELECTED = null; // Set of op names; null = all
+
+async function loadBenchOps() {
+  try {
+    const data = await (await fetch('/api/bench/ops')).json();
+    PERF_OPS_ALL = (data.ops || []);
+  } catch (e) { PERF_OPS_ALL = []; }
+  if (PERF_OPS_SELECTED) {
+    // keep only still-dispatched ops, so a re-profile cannot leave a stale name
+    const names = new Set(PERF_OPS_ALL.map(o => o.op));
+    PERF_OPS_SELECTED = new Set([...PERF_OPS_SELECTED].filter(o => names.has(o)));
+    if (!PERF_OPS_SELECTED.size) PERF_OPS_SELECTED = null;
+  }
+  renderOpsMenu();
+}
+
+function perfSelectedOps() {
+  // null = every op: the run then benchmarks whatever the plan produced.
+  if (!PERF_OPS_SELECTED || PERF_OPS_SELECTED.size === PERF_OPS_ALL.length) return null;
+  return [...PERF_OPS_SELECTED];
+}
+
+function perfToggleOpsMenu(ev) {
+  if (ev) ev.stopPropagation();
+  const menu = document.getElementById('perf-ops-menu');
+  const opening = menu.classList.contains('hidden');
+  menu.classList.toggle('hidden');
+  if (opening && !PERF_OPS_ALL.length) loadBenchOps();
+}
+
+document.addEventListener('click', () => {
+  const menu = document.getElementById('perf-ops-menu');
+  if (menu) menu.classList.add('hidden');
+});
+
+function perfSelectAllOps(all) {
+  PERF_OPS_SELECTED = all ? null : new Set();
+  renderOpsMenu();
+}
+
+function perfToggleOp(op, on) {
+  if (!PERF_OPS_SELECTED) PERF_OPS_SELECTED = new Set(PERF_OPS_ALL.map(o => o.op));
+  if (on) PERF_OPS_SELECTED.add(op); else PERF_OPS_SELECTED.delete(op);
+  if (PERF_OPS_SELECTED.size === PERF_OPS_ALL.length) PERF_OPS_SELECTED = null;
+  renderOpsMenu();
+}
+
+function renderOpsMenu() {
+  const list = document.getElementById('perf-ops-list');
+  if (!list) return;
+  const q = (document.getElementById('perf-ops-search').value || '').toLowerCase();
+  const shown = PERF_OPS_ALL.filter(o => !q || o.op.toLowerCase().includes(q));
+  list.innerHTML = shown.length ? shown.map(o => {
+    const on = !PERF_OPS_SELECTED || PERF_OPS_SELECTED.has(o.op);
+    return `<label><input type="checkbox" ${on ? 'checked' : ''}
+      onchange="perfToggleOp('${perfEsc(o.op).replace(/'/g, "\\'")}', this.checked)">
+      <span class="ops-op">${perfEsc(o.op)}</span>
+      <span class="ops-time">${fmtTime(o.device_time_us)}</span></label>`;
+  }).join('') : `<div style="color:#888;padding:6px">${
+    PERF_OPS_ALL.length ? 'no kernel matches'
+                        : 'run a profile to list its kernels'}</div>`;
+
+  const n = PERF_OPS_SELECTED ? PERF_OPS_SELECTED.size : PERF_OPS_ALL.length;
+  document.getElementById('perf-ops-count').textContent =
+    `${n}/${PERF_OPS_ALL.length} selected`;
+  document.getElementById('perf-ops-btn').textContent =
+    (!PERF_OPS_SELECTED ? 'All kernels'
+                        : `${n} of ${PERF_OPS_ALL.length} kernels`) + ' ▾';
+}
+
+// ---- Bench & Rank: sweep -> replay -> rank, in one run ----
+// The three stages were three buttons that could only ever be pressed in that
+// order, so pressing them is not a decision worth exposing.
+async function benchAll() {
   const payload = buildSweepPayload();
   if (!payload) return;
-  const dev = document.getElementById('perf-device').value.trim();
-  if (dev) payload.device = dev;
-  const btn = document.getElementById('perf-emit-btn');
+  const btn = document.getElementById('perf-bench-btn');
   btn.disabled = true;
+  document.getElementById('perf-progress').textContent = '';
+  try {
+    const runId = await benchPlan(payload);
+    if (!runId) return;
+    await benchRun(runId);
+    await benchRank(runId);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// Stage 1: sweep the profiled graph into replay cases. Returns the run id.
+async function benchPlan(payload) {
   perfStatus('Planning replay cases…');
   try {
     // the case set is profile-derived, so make sure a matching run exists first
@@ -1331,39 +1507,34 @@ async function benchPlan() {
     renderCoverage(data.coverage);
     perfStatus(`run ${data.run_id}: ${data.cases} cases from ${data.rows} rows`);
     await refreshPerfRuns();
+    await loadBenchOps();
+    return data.run_id;
   } catch (e) {
     perfStatus('');
     alert('Plan failed: ' + e.message);
-  } finally {
-    btn.disabled = false;
+    return null;
   }
 }
 
-async function benchRun() {
-  const runId = document.getElementById('perf-run-select').value || PERF_RUN_ID;
-  if (!runId) { alert('Plan the cases first'); return; }
-  const btn = document.getElementById('perf-run-btn');
-  btn.disabled = true;
-  document.getElementById('perf-progress').textContent = '';
-  try {
-    const ops = document.getElementById('perf-ops').value.trim();
-    const resp = await fetch('/api/bench/run', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        run_id: runId,
-        device: document.getElementById('perf-device').value.trim() || null,
-        budget: parseFloat(document.getElementById('perf-budget').value) || 0.5,
-        ops: ops ? ops.split(',').map(s => s.trim()).filter(Boolean) : null,
-      }),
-    });
-    const data = await resp.json();
-    if (!resp.ok || !data.ok) throw new Error(data.error || resp.statusText);
-    await benchPollRun();
-  } catch (e) {
-    alert('Benchmark failed: ' + e.message);
-  } finally {
-    btn.disabled = false;
+// Stage 2: replay the cases, one op per process. The per-case measurement
+// budget is derived from the profiled shapes by the runner, so there is
+// nothing to send for it.
+async function benchRun(runId) {
+  const resp = await fetch('/api/bench/run', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      run_id: runId,
+      device_ids: selectedDeviceIds(BENCH_DEVICE_INPUT),
+      ops: perfSelectedOps(),
+    }),
+  });
+  const data = await resp.json();
+  if (!resp.ok || !data.ok) {
+    perfStatus('');
+    alert('Benchmark failed: ' + (data.error || resp.statusText));
+    throw new Error(data.error || resp.statusText);
   }
+  await benchPollRun();
 }
 
 async function benchPollRun() {
@@ -1378,23 +1549,25 @@ async function benchPollRun() {
         .map(([k, v]) => `${k}:${v}`).join(' ');
       return `${o.ok ? '✅' : '❌'} ${perfEsc(o.op)} `
            + `${o.measured}/${o.cases} cases ${o.seconds}s/${o.timeout || '?'}s `
-           + `<span style="opacity:.7">${perfEsc(st_)}</span>`
+           + `<span style="opacity:.7">budget ${o.budget || '?'}s ${perfEsc(st_)}</span>`
            + `${o.error ? ' <span style="color:#c0392b">' + perfEsc(o.error) + '</span>' : ''}`;
     });
     progress.innerHTML = lines.join('<br>');
     perfStatus(`replaying… ${(st.ops || []).length} ops done`);
     if (st.status !== 'running') {
-      perfStatus(st.status === 'error' ? ('run failed: ' + st.error)
-                                       : 'replay finished');
+      if (st.status === 'error') {
+        perfStatus('run failed: ' + st.error);
+        throw new Error(st.error || 'benchmark run failed');
+      }
+      perfStatus('replay finished');
       return;
     }
     await new Promise(r => setTimeout(r, 2000));
   }
 }
 
-async function benchRank() {
-  const runId = document.getElementById('perf-run-select').value || PERF_RUN_ID;
-  if (!runId) { alert('Plan the cases first'); return; }
+// Stage 3: score every measured op by calls x latency x roofline headroom.
+async function benchRank(runId) {
   perfStatus('Ranking…');
   const util = document.getElementById('perf-target-util').value;
   const resp = await fetch(
@@ -1686,9 +1859,10 @@ function fmtNum(v, digits) {
   return (v == null || v === '') ? '—' : Number(v).toFixed(digits);
 }
 
-// ---- Shape Matrix Export ----
-// The sweep inputs are shared by the Shape Matrix export and the Perf pipeline
-// (which consumes the same rows in-process instead of re-reading the .xlsx).
+// ---- Shape sweep ----
+// The sweep inputs define the configuration space the kernels are benchmarked
+// over. The same rows are what /api/export/shape-matrix serializes for the
+// headless/offline path, which the pipeline itself never round-trips through.
 function nums(id, minVal) {
   return document.getElementById(id).value.trim()
     .split(',').map(s => parseInt(s.trim())).filter(n => n >= minVal);
@@ -1699,10 +1873,16 @@ function buildSweepPayload() {
   if (!modelId) { alert('Enter a model ID first'); return null; }
   const tpSizes = nums('sweep-tp-sizes', 1);
   if (tpSizes.length === 0) { alert('Enter valid TP sizes'); return null; }
-  // Quantization: the sweep is grounded in a profiling run, so the run must
-  // have used the same quantization for the derived shapes/dtypes/memory to be
-  // valid. null = no quantization (BF16).
-  const q = document.getElementById('sweep-quant-select').value;
+  // The widest swept TP is the widest collective the run replays, so it is
+  // also how many devices the selection has to contain. The benchmark's own
+  // Devices field wins over the Model Graph one when it is filled in.
+  const deviceIds = validateDeviceIds(Math.max(...tpSizes),
+                                      BENCH_DEVICE_INPUT);
+  if (deviceIds === null) return null;
+  // Quantization is a property of the profiling run, so it is set once on the
+  // Model Graph tab and read from there: the derived shapes/dtypes/memory are
+  // only valid for the quantization the run actually used.
+  const q = document.getElementById('quant-select').value;
   return {
     model_id: modelId,
     tp_sizes: tpSizes,
@@ -1712,68 +1892,14 @@ function buildSweepPayload() {
     decode_ctx_lens: nums('sweep-decode-ctx-lens', 0),
     decode_batch_sizes: nums('sweep-decode-batch-sizes', 1),
     quantization: (q === 'auto' || q === 'none') ? null : q,
+    device_ids: deviceIds,
   };
 }
 
-async function downloadShapeMatrix() {
-  const btn = document.getElementById('sweep-download-btn');
-  const status = document.getElementById('sweep-status');
-
-  const payload = buildSweepPayload();
-  if (!payload) return;
-  const modelId = payload.model_id;
-
-  btn.disabled = true;
-
-  try {
-    // The Shape Matrix is derived from a profiling run: reuse the latest
-    // completed run for this model *and* quantization, or launch a fresh one
-    // if none matches.
-    try {
-      await ensureProfileForMatrix(modelId, payload.quantization, status);
-    } catch (e) {
-      alert('Profiling failed: ' + e.message);
-      status.textContent = '';
-      btn.disabled = false;
-      return;
-    }
-
-    status.textContent = 'Generating shape matrix...';
-    const resp = await fetch('/api/export/shape-matrix', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({ error: resp.statusText }));
-      alert('Export failed: ' + (err.error || resp.statusText));
-      status.textContent = '';
-      btn.disabled = false;
-      return;
-    }
-    const blob = await resp.blob();
-    const cd = resp.headers.get('Content-Disposition') || '';
-    const match = cd.match(/filename="?([^"]+)"?/);
-    const filename = match ? match[1] : 'vllm_xpu_shape_matrix.xlsx';
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = filename;
-    a.click();
-    URL.revokeObjectURL(a.href);
-    status.textContent = '✓ Downloaded';
-    setTimeout(() => { status.textContent = ''; }, 3000);
-  } catch (e) {
-    alert('Export error: ' + e.message);
-    status.textContent = '';
-  } finally {
-    btn.disabled = false;
-  }
-}
-
 // Ensure a completed profiling run matching this model *and* quantization
-// exists before deriving the Shape Matrix: reuse the latest run if it matches,
-// wait out any run in progress, otherwise launch a fresh one (using the
-// Profile tab base config with the requested quantization).
+// exists before the sweep is derived from it: reuse the latest run if it
+// matches, wait out any run in progress, otherwise launch a fresh one (using
+// the Model Graph tab base config with the requested quantization).
 async function ensureProfileForMatrix(modelId, quant, status) {
   const getStatus = async () => (await fetch('/api/profile/status')).json();
   const wantQuant = quant || null;
@@ -1791,9 +1917,9 @@ async function ensureProfileForMatrix(modelId, quant, status) {
   await runProfileForMatrix(modelId, wantQuant, status);
 }
 
-// Run a fresh profiling run (reusing the Profile tab base config, overriding
-// the quantization to the one requested for the Shape Matrix) and resolve once
-// it completes. Rejects on error so the caller can abort.
+// Run a fresh profiling run (reusing the Model Graph tab base config,
+// overriding the quantization to the requested one) and resolve once it
+// completes. Rejects on error so the caller can abort.
 function runProfileForMatrix(modelId, quant, status) {
   return new Promise((resolve, reject) => {
     const body = buildProfileBody(modelId);
@@ -1821,6 +1947,7 @@ function runProfileForMatrix(modelId, quant, status) {
 }
 
 // ---- Init ----
+loadDevices();
 document.getElementById('model-input').addEventListener('keydown', e => {
   if (e.key === 'Enter') loadConfig();
 });

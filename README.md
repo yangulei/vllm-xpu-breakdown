@@ -60,10 +60,16 @@ python app.py [--port 8080]
 Then open `http://localhost:8080` in your browser.
 
 **Features:**
-- Three tabs: **Model Graph** (profile + reconstructed graph), **Benchmark &
-  Targets** (one module: ① shape sweep → ② replay → ③ ranked targets, with the
-  Shape Matrix as the sweep's own rendering) and **Op Detail** (every measured
-  case of the op clicked in the ranked table)
+- Three tabs: **Model Graph** (profile + reconstructed graph), **Bench & Rank**
+  (one sweep form and one button: shapes → replay → ranked targets) and
+  **Op Detail** (every measured case of the op clicked in the ranked table)
+- The model, quantization and **device selection** are set once on *Model
+  Graph* and used by both tabs (*Bench & Rank* has its own Devices field for
+  when the replay should run elsewhere; blank there inherits Model Graph's). Devices are the comma-separated indexes of the
+  accelerators this host actually has (blank = all of them); a selection naming
+  a device that does not exist — or fewer devices than the TP size needs — is
+  refused before anything starts, by the browser and again by the API
+  (`GET /api/devices` lists what is present)
 - Search for any HuggingFace model by ID
 - Auto-loads model config (architecture, layers, MoE, dtype)
 - Toggle between eager and torch.compile mode
@@ -138,9 +144,10 @@ dtypes) become a template that is re-resolved for every other
 (seq/ctx/batch/TP) case, with memory/FLOPs recomputed per config. This makes the
 matrix accurate to what the model really executes on XPU — the intended input
 for downstream optimization work. The sweep card at the top of the
-**Benchmark & Targets** tab handles this automatically: it **reuses the latest
+**Bench & Rank** tab handles this automatically: it **reuses the latest
 completed run** for the model, or **launches a fresh profile** (using the Model
-Graph tab settings) if none exists. The same sweep drives the replay benchmark's
+Graph tab settings, including its quantization and device selection) if none
+exists. The same sweep drives the replay benchmark's
 cases, which is why the two share one tab.
 The exported workbook adds an **Info** sheet with the profiled config, caveats,
 and a shape round-trip **validation** summary. Because the op set is fixed at
@@ -173,10 +180,38 @@ ranks the ops by the end-to-end time an optimization would actually recover:
 Because the benchmark *is* the dispatched op, coverage follows the profile:
 there is no adapter table to extend and no external benchmark suite to install.
 
-Use the **Benchmark & Targets** tab — one numbered module: **① Shape sweep**
-(the configuration space, also downloadable on its own as *Shapes only*) →
-**② Replay** (plan / benchmark / rank, one `📥 Report`) → **③ Ranked targets**,
-with a clicked op opening in the **Op Detail** tab. Or run it headless:
+### Using it from the web UI
+
+The **Bench & Rank** tab is one form and one button. *Bench Settings* is the
+shape sweep — the configuration space the ops are replayed over — plus three
+controls:
+
+| control | what it does |
+|---|---|
+| **TP Sizes** | tensor-parallel sizes to sweep; the widest one is also how many devices the run needs |
+| **Devices** | which devices to *replay* on — blank inherits the Model Graph selection (the placeholder shows what that is). The replay does not have to run where the model was profiled: a TP=4 profile can be replayed on one card, or a sweep given the idle half of the box |
+| **Kernels** | an Excel-style checkbox list of **the kernels/dispatch names this profile actually ran**, ordered by device time (searchable; default = all). The set is a property of the profile, so there is nothing to type |
+| **Target util** | the fraction of its roofline at which an op is reported as `at_roofline` (done) rather than as a target |
+
+**▶ Bench & Rank** then runs the whole pipeline: sweep the profiled graph into
+replay cases → replay them (one op per process) → rank the results. They were
+three buttons that could only ever be pressed in that order, so pressing them
+is not a decision worth exposing. `📥 Report` downloads the run's workbook —
+which carries the run's Shape Matrix as one of its sheets, so there is no
+second download to choose between. A clicked target row opens in the
+**Op Detail** tab. (The shape matrix on its own is still available headless via
+`POST /api/export/shape-matrix`; it needs a profile but no benchmark.)
+
+There is **no "budget / case" knob**: how long a case needs to be measured is a
+property of the kernel being replayed, and the profile already knows it. The
+runner sizes the per-op budget from the profiled shapes — the trace's own
+device time for a case whose shapes match the recorded ones, the analytic
+roofline cost otherwise — so a millisecond-scale GEMM gets a longer measurement
+window than a microsecond-scale elementwise kernel, and each op's worker
+timeout follows its own budget (see `breakdown/bench/estimate.py`:
+`case_budget` / `op_budgets`).
+
+Or run it headless:
 
 ```bash
 # one command: plan cases -> replay (one op per process) -> rank -> report
@@ -185,7 +220,8 @@ python -m breakdown.bench all --run m3 --trace output/traces/<trace>.json.gz \
 
 # or stage by stage
 python -m breakdown.bench plan   --trace <trace> --model <id> --tp 4
-python -m breakdown.bench run    --run <id> --budget 0.5
+python -m breakdown.bench run    --run <id>            # budget derived per op
+python -m breakdown.bench run    --run <id> --budget 0.5   # or pin it
 python -m breakdown.bench rank   --run <id> --target-util 0.8
 python -m breakdown.bench report --run <id> --xlsx
 python -m breakdown.bench case   --run <id> --case-id <id>     # re-run one shape

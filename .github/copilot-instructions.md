@@ -80,8 +80,15 @@ ranking is done at the **profiled** operating point when it was benchmarked
 deliverable: `Info`, `Summary`, per-phase `Targets`, **one sheet per op**,
 `Coverage`, and the run's own **`Shape Matrix`** (the sweep the cases were built
 from, persisted to `rows.json` at plan time). The UI has three tabs — `Model
-Graph`, `Benchmark & Targets` (① sweep → ② replay → ③ ranked targets) and
-`Op Detail`; do **not** re-add a Shape Matrix tab. Timing repeats the kernel inside
+Graph`, `Bench & Rank` (one sweep form + one `▶ Bench & Rank` button that
+chains plan → replay → rank) and `Op Detail`; do **not** re-add a Shape Matrix
+tab or the separate ①/②/③ buttons. Model/quantization/**device** are set on
+`Model Graph`; the device selection is comma-separated **indexes of devices
+that exist** (validated by `bench.devices`, applied to workers via
+`ZE_AFFINITY_MASK`/`CUDA_VISIBLE_DEVICES`), the *Kernels* filter is a checkbox list
+fed by `/api/bench/ops`, and there is **no budget knob**: `estimate.case_budget`
+/ `op_budgets` derive the per-case measurement budget (and hence each worker's
+timeout) from the profiled shapes. Timing repeats the kernel inside
 a device-event window and subtracts the measured empty-window cost, because that
 floor (~60-90 us on Level Zero) dwarfs a small kernel. The old `breakdown/perf/`
 op-map + xpu-perf/micro_perf shell-out was removed; do not reintroduce it.
@@ -125,6 +132,8 @@ The model graph is reconstructed from the trace, so no static builder is needed:
 | `/api/profile/result` | GET | Fetch profiling result (ops + reconstructed graph) |
 | `/api/profile/trace` | GET | Download raw trace file |
 | `/api/export/shape-matrix` | POST | Export config-driven shape sweep to Excel |
+| `/api/devices` | GET | Accelerators present on this host (for the Device selector) |
+| `/api/bench/ops` | GET | Dispatch names the latest profile ran (Ops filter) |
 | `/api/bench/plan` | POST | Sweep the profiled graph into replay cases |
 | `/api/bench/run` | POST | Replay a run's cases (async) |
 | `/api/bench/status` | GET | Poll the benchmark run |

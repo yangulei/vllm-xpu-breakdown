@@ -50,6 +50,30 @@ class TestWorkerEnvironment(unittest.TestCase):
                              records[0].get("error"))
 
 
+class TestAdaptiveBudget(unittest.TestCase):
+    """``budget=None`` derives the per-case budget from the profiled shapes."""
+
+    def test_each_op_is_measured_with_its_own_derived_budget(self):
+        from breakdown.bench import devices, estimate
+
+        cheap = BenchCase(op="op_cheap", args=[], device="cpu",
+                          traced_device_time_us=2.0, traced_comparable=True)
+        dear = BenchCase(op="op_dear", args=[], device="cpu",
+                         traced_device_time_us=30_000.0,
+                         traced_comparable=True)
+        peaks = devices.peaks(devices.DEFAULT_SKU)
+        with tempfile.TemporaryDirectory() as d:
+            paths = store.RunPaths(d, "adaptive").ensure()
+            res = runner.run([cheap, dear], paths, "cpu",
+                             timeouts={"op_cheap": 5, "op_dear": 5})
+        got = {o.op: o.budget for o in res.ops}
+        self.assertAlmostEqual(got["op_cheap"],
+                               estimate.case_budget(cheap, peaks), places=3)
+        self.assertAlmostEqual(got["op_dear"],
+                               estimate.case_budget(dear, peaks), places=3)
+        self.assertLess(got["op_cheap"], got["op_dear"])
+
+
 class TestPartialRerun(unittest.TestCase):
     def _paths(self, d):
         paths = store.RunPaths(d, "partial").ensure()

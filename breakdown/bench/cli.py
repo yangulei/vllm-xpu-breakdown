@@ -325,8 +325,9 @@ def build_parser() -> argparse.ArgumentParser:
             sp.add_argument("--tp-sizes", dest="tp_sizes")
 
     def bench_opts(sp):
-        sp.add_argument("--budget", type=float, default=0.5,
-                        help="seconds of measurement per case")
+        sp.add_argument("--budget", type=float, default=None,
+                        help="seconds of measurement per case; omit to derive "
+                             "it per op from the profiled shapes")
         sp.add_argument("--ops", help="comma-separated ops to benchmark")
         sp.add_argument("--no-flush-cache", action="store_true")
         sp.add_argument("--in-process", action="store_true",

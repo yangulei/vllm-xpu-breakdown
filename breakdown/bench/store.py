@@ -191,6 +191,8 @@ class RunMeta:
     device: str
     tp: int
     device_name: str = ""
+    #: physical device indexes the run is pinned to (empty = every device)
+    device_ids: list[int] = field(default_factory=list)
     sku: str = ""
     created: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat(

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import shutil
+from typing import Any, Iterable
 
 # Roofline peaks per SKU.
 #
@@ -136,6 +137,86 @@ def device_count(kind: str) -> int:
         return int(mod.device_count()) if mod is not None else 0
     except (RuntimeError, AttributeError):
         return 0
+
+
+#: Environment variable that restricts which physical devices a *child*
+#: process sees. Applied to replay workers (and therefore to the peer ranks of
+#: a collective), which is the only place a device selection can be honoured:
+#: both runtimes read it at driver init, so it cannot be changed inside a
+#: process that has already touched the device.
+VISIBILITY_ENV = {"xpu": "ZE_AFFINITY_MASK", "cuda": "CUDA_VISIBLE_DEVICES"}
+
+
+def available(kind: str | None = None) -> dict[str, Any]:
+    """The devices that are actually present: ``{kind, indexes, names}``.
+
+    The UI offers device *indexes*, not a free-text device string, so the
+    selection can be checked against what exists instead of failing deep inside
+    a worker with a driver error.
+    """
+    kind = kind or detect_device()
+    count = device_count(kind)
+    return {"kind": kind, "count": count, "indexes": list(range(count)),
+            "names": [device_name(kind, i) for i in range(count)]}
+
+
+def parse_device_ids(spec: Any) -> list[int]:
+    """``"0, 2,3"`` / ``[0, 2]`` -> ``[0, 2, 3]``; empty -> ``[]`` (= all).
+
+    Raises ``ValueError`` on a token that is not a device index.
+    """
+    if spec is None or spec == "":
+        return []
+    items = spec if isinstance(spec, (list, tuple)) else str(spec).split(",")
+    out: list[int] = []
+    for item in items:
+        token = str(item).strip()
+        if not token:
+            continue
+        try:
+            idx = int(token)
+        except ValueError:
+            raise ValueError(f"'{token}' is not a device index") from None
+        if idx < 0:
+            raise ValueError(f"device index {idx} is negative")
+        if idx not in out:
+            out.append(idx)
+    return out
+
+
+def validate_device_ids(ids: Iterable[int], kind: str | None = None,
+                        need: int = 0) -> str | None:
+    """Why these device indexes cannot be used, or ``None`` if they can.
+
+    ``need`` is the number of devices the request requires (a TP=4 run needs
+    four), so an under-sized selection is refused up front rather than
+    discovered when the collective fails to form.
+    """
+    kind = kind or detect_device()
+    ids = list(ids)
+    count = device_count(kind)
+    if not count:
+        return f"no {kind} devices are available on this host"
+    missing = [i for i in ids if i >= count]
+    if missing:
+        plural = "s" if len(missing) > 1 else ""
+        return (f"{kind} device{plural} "
+                f"{', '.join(str(i) for i in missing)} not available - this "
+                f"host has {count} ({', '.join(str(i) for i in range(count))})")
+    selected = len(ids) or count
+    if need and selected < need:
+        return (f"{need} devices are required but {selected} "
+                f"{'is' if selected == 1 else 'are'} selected")
+    return None
+
+
+def visibility_env(kind: str, ids: Iterable[int]) -> dict[str, str]:
+    """Environment restricting a child process to ``ids`` (empty = no change)."""
+    ids = list(ids)
+    var = VISIBILITY_ENV.get(kind)
+    if not ids or not var:
+        return {}
+    return {var: ",".join(str(i) for i in ids)}
 
 
 def has_unitrace() -> bool:

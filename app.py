@@ -1024,6 +1024,17 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             pass
 
 
+@app.route("/api/devices")
+def list_devices():
+    """The accelerators present on this host, for the Device selector.
+
+    The UI selects device *indexes*, so it needs to know which exist; a
+    selection is then checked against this list before a profile or a benchmark
+    starts.
+    """
+    return jsonify({"ok": True, **bench_devices.available(_DEVICE)})
+
+
 @app.route("/api/profile", methods=["POST"])
 def start_profile():
     """Start a profiling run. Non-blocking — poll /api/profile/status."""
@@ -1055,6 +1066,18 @@ def start_profile():
     prefill_batch_size = data.get("prefill_batch_size")
     decode_batch_size = data.get("decode_batch_size")
 
+    # Device selection: comma-separated indexes of the devices actually present.
+    # A TP=N run needs N of them, so an under-sized or non-existent selection is
+    # refused here rather than failing deep inside engine start-up.
+    try:
+        device_ids = bench_devices.parse_device_ids(data.get("device_ids"))
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    dev_err = bench_devices.validate_device_ids(device_ids, _DEVICE,
+                                                need=int(tp_size or 1))
+    if dev_err:
+        return jsonify({"ok": False, "error": dev_err}), 400
+
     # The engine must fit the whole sequence it will ever see: cached context +
     # new query tokens + the decode tokens we generate. The frontend sizes
     # max_model_len from Query+Context; bump it to also cover the decode budget.
@@ -1079,6 +1102,7 @@ def start_profile():
                 "quantization": quantization,
                 "query_len": query_len,
                 "context_len": context_len,
+                "device_ids": device_ids,
             },
         }
 
@@ -1568,6 +1592,22 @@ _bench_state: dict[str, Any] = {
 _bench_lock = threading.Lock()
 
 
+def _bench_device_ids(data: dict, device: str, need: int = 0
+                      ) -> tuple[bool, list[int], str | None]:
+    """``(ok, device_ids, error)`` for a request's device selection.
+
+    A selection that names a device this host does not have, or fewer devices
+    than the widest collective in the sweep needs, is refused before a run
+    starts - the failure is otherwise a driver error inside a worker.
+    """
+    try:
+        ids = bench_devices.parse_device_ids(data.get("device_ids"))
+    except ValueError as exc:
+        return False, [], str(exc)
+    err = bench_devices.validate_device_ids(ids, device, need=need)
+    return (err is None), ids, err
+
+
 @app.route("/api/bench/plan", methods=["POST"])
 def bench_plan():
     """Sweep the profiled graph into replay cases for a new benchmark run.
@@ -1595,6 +1635,12 @@ def bench_plan():
 
     rows = shape_matrix.build_rows(template, configs)
     device = data.get("device") or bench_devices.detect_device()
+    # The largest swept TP is the widest collective the run will replay, so the
+    # selection must contain at least that many devices.
+    ok, device_ids, dev_err = _bench_device_ids(data, device,
+                                                need=max(int(t) for t in tp_sizes))
+    if not ok:
+        return jsonify({"ok": False, "error": dev_err}), 400
     cases, coverage = bench_spec.build_cases(rows, device=device)
 
     run_id = data.get("run_id") or bench_store.make_run_id(
@@ -1623,11 +1669,12 @@ def bench_plan():
     for op, st in status.items():
         by_status.setdefault(st["status"], []).append(op)
     coverage.update({"op_status": status, "ops_by_status": by_status,
-                     "device": device, "sweep": configs})
+                     "device": device, "device_ids": device_ids,
+                     "sweep": configs})
     bench_store.write_json(paths.plan, coverage)
     bench_store.RunMeta(
         run_id=run_id, model_id=model_id, device=device, tp=int(tp_sizes[0]),
-        device_name=bench_devices.device_name(device),
+        device_name=bench_devices.device_name(device), device_ids=device_ids,
         sku=bench_devices.sku_for_device(bench_devices.device_name(device)),
         smoke=bool(data.get("smoke")),
         sweep={**sweep, "configs": len(configs)}).write(paths)
@@ -1636,8 +1683,9 @@ def bench_plan():
                     "cases": len(cases), "coverage": coverage})
 
 
-def _run_bench(run_id: str, device: str, budget: float,
-               ops: list[str] | None) -> None:
+def _run_bench(run_id: str, device: str, budget: float | None,
+               ops: list[str] | None, device_ids: list[int] | None = None
+               ) -> None:
     paths = bench_store.run_paths(run_id)
     try:
         cases = [bench_spec.BenchCase.from_dict(c)
@@ -1647,8 +1695,13 @@ def _run_bench(run_id: str, device: str, budget: float,
             with _bench_lock:
                 _bench_state["ops"].append(asdict(op_result))
 
+        # Device visibility is inherited by the worker processes: both runtimes
+        # read it at driver init, so pinning the selection here is what makes
+        # the choice effective (including for a collective's peer ranks).
+        env = {**os.environ,
+               **bench_devices.visibility_env(device, device_ids or [])}
         result = bench_runner.run(cases, paths, device, budget=budget, ops=ops,
-                                  on_op=progress)
+                                  env=env, on_op=progress)
         with _bench_lock:
             _bench_state["status"] = "done"
             _bench_state["result"] = result.to_dict()
@@ -1661,7 +1714,12 @@ def _run_bench(run_id: str, device: str, budget: float,
 
 @app.route("/api/bench/run", methods=["POST"])
 def bench_run():
-    """Replay a run's cases. Non-blocking - poll /api/bench/status."""
+    """Replay a run's cases. Non-blocking - poll /api/bench/status.
+
+    ``budget`` (seconds of measurement per case) is optional and normally
+    omitted: the runner derives it per op from the profiled shapes, so the UI
+    has no budget knob to guess at.
+    """
     data = request.json or {}
     run_id = data.get("run_id")
     if not run_id:
@@ -1678,14 +1736,64 @@ def bench_run():
                              "error": None, "ops": [], "result": None})
 
     meta = bench_store.read_meta(paths)
+    device = (data.get("device") or meta.get("device")
+              or bench_devices.detect_device())
+    ok, device_ids, dev_err = _bench_device_ids(
+        {"device_ids": data.get("device_ids", meta.get("device_ids"))},
+        device, need=int(meta.get("tp") or 1))
+    if not ok:
+        with _bench_lock:
+            _bench_state.update({"status": "idle", "run_id": None})
+        return jsonify({"ok": False, "error": dev_err}), 400
+    budget = data.get("budget")
     thread = threading.Thread(
         target=_run_bench,
-        args=(run_id, data.get("device") or meta.get("device")
-              or bench_devices.detect_device(),
-              float(data.get("budget", 0.5)), data.get("ops")),
+        args=(run_id, device, float(budget) if budget else None,
+              data.get("ops"), device_ids),
         daemon=True)
     thread.start()
     return jsonify({"ok": True, "status": "running", "run_id": run_id})
+
+
+@app.route("/api/bench/ops")
+def bench_ops():
+    """The dispatch names the latest profile ran - the Ops filter's checklist.
+
+    The benchmark's op set is a property of the profile, so the filter offers
+    exactly what was dispatched (framework plumbing excluded, since replaying
+    it measures allocator noise) ordered by device time, i.e. by how much
+    selecting it is worth.
+    """
+    with _profile_lock:
+        status = _profile_state["status"]
+        result = _profile_state.get("result")
+        model_id = _profile_state.get("model_id")
+    graph = (result or {}).get("graph") if status == "done" and result else None
+    if not graph:
+        return jsonify({"ok": True, "model_id": model_id, "ops": []})
+
+    agg: dict[str, dict[str, Any]] = {}
+    for phase in ("prefill", "decode"):
+        tree = graph.get(phase)
+        if not tree:
+            continue
+        for node in _flatten_graph_nodes(tree):
+            repeat = node.get("effective_repeat", 1) or 1
+            for op in node.get("ops") or []:
+                name = op.get("name") or ""
+                if not name or bench_spec.is_skipped(name):
+                    continue
+                entry = agg.setdefault(name, {
+                    "op": name, "backend": op.get("backend", ""),
+                    "device_time_us": 0.0, "phases": []})
+                entry["device_time_us"] += float(
+                    op.get("device_time_us") or 0.0) * repeat
+                if phase not in entry["phases"]:
+                    entry["phases"].append(phase)
+    ops = sorted(agg.values(), key=lambda e: -e["device_time_us"])
+    for e in ops:
+        e["device_time_us"] = round(e["device_time_us"], 2)
+    return jsonify({"ok": True, "model_id": model_id, "ops": ops})
 
 
 @app.route("/api/bench/status")

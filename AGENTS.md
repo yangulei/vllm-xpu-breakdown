@@ -507,8 +507,10 @@ at, and that shape came from the matrix. Concretely:
   matches — never a wrong matrix.
 - `/api/export/shape-matrix` **stays** as the shapes-only path: it needs only a
   profiling run, not a benchmark, and the headless/offline exchange format
-  (`shape_matrix_xlsx`) depends on it. In the UI it is the secondary
-  *Shapes only (.xlsx)* button, not a tab.
+  (`shape_matrix_xlsx`) depends on it. It is **API-only** — not a tab, and no
+  longer a button either: the run's report already carries the matrix as a
+  sheet, so a second download in a one-button tab was a choice with no
+  consequence. Do not re-add it to the UI.
 
 Answers the question the Shape Matrix alone cannot: **which kernel is worth an
 optimization session**. It does so by **re-invoking the ops vLLM actually
@@ -516,7 +518,7 @@ dispatched** rather than benchmarking substitutes in an external suite. Stages:
 rows (`shape_matrix`) → replay cases (`spec`) → measured cases (`worker`/
 `runner`, budgeted by `estimate`) → ranked targets (`rank`) → history
 (`history`). Every stage runs headless (`python -m breakdown.bench`);
-`/api/bench/*` and the **Benchmark & Targets** tab are wrappers.
+`/api/bench/*` and the **Bench & Rank** tab are wrappers.
 
 > The old `breakdown/perf/` pipeline (op-map adapters + a shell-out to
 > `$XPU_PERF_HOME/projects/micro_perf/launch.py`) was **removed**. Do not
@@ -717,21 +719,63 @@ rows (`shape_matrix`) → replay cases (`spec`) → measured cases (`worker`/
   `/api/bench/results?run_id=&op=` (the `op` filter exists so one row's detail
   does not ship every case of every op). The operating-point row is highlighted
   and sorted first; profiled cases are marked ✓.
-- **The UI has three tabs: `Model Graph`, `Benchmark & Targets`, `Op Detail`
+- **The UI has three tabs: `Model Graph`, `Bench & Rank`, `Op Detail`
   (`TABS` in `static/index.html`).** There is **no** Shape Matrix tab: the
-  matrix and the benchmark are one pipeline (see above), so *Benchmark &
-  Targets* is a single numbered module — **① Shape sweep** (the `sweep-*`
-  inputs, the configuration space, with a secondary *Shapes only (.xlsx)*
-  download) → **② Replay** (plan/benchmark/rank + the one `📥 Report`) →
-  **③ Ranked targets**. `buildSweepPayload` reads the `sweep-*` inputs for both
-  `/api/bench/plan` and `/api/export/shape-matrix`, which is exactly why they
-  share a tab. Do not re-add a Shape Matrix tab or a second sweep form. The
+  matrix and the benchmark are one pipeline (see above), so *Bench & Rank* is
+  **one form and one button** — the `sweep-*` inputs (the configuration space)
+  plus `▶ Bench & Rank` (`benchAll`), which chains plan → run → rank, with the
+  single `📥 Report` download beside it.
+  `buildSweepPayload` reads the `sweep-*` inputs for both `/api/bench/plan` and
+  `/api/export/shape-matrix`, which is exactly why they share a tab. **Do not
+  re-add** a Shape Matrix tab, a second sweep form, or the separate ①/②/③
+  buttons: the three stages could only ever be run in that order, so choosing
+  between them was never a decision. The long-form explanation of how each
+  stage works lives in the README, not in the page. The
   per-op drill-down (step ④) is its own **top-level tab** (`#tab-opdetail`
   wrapping `#perf-op-detail`) rather than a panel under the ranked table — it is
   a 15-column × N-case table that pushed the targets off-screen when inlined.
   `perfToggleOpDetail` switches to that tab when opening an op and back to
   `perf` when closing; closing restores `PERF_OP_DETAIL_PLACEHOLDER` (never a
   blank tab).
+- **The measurement budget is derived, not asked for (`estimate.case_budget` /
+  `op_budgets`).** There is no "budget / case" control: how long a case needs
+  is a property of the kernel being replayed, and the profile already knows it.
+  `runner.run(budget=None)` — the normal path — sizes each op's per-case budget
+  from its most expensive case: the **trace's own device time** when the case's
+  swept shapes equal the recorded ones (`traced_comparable`), the analytic
+  roofline cost at `ASSUMED_UTIL` otherwise, clamped to
+  `[MIN_BUDGET_S, MAX_BUDGET_S]` and floored at `TARGET_WINDOWS ×
+  timing.TARGET_WINDOW_S` (a shorter budget buys fewer timed windows than the
+  device-event floor needs). `estimate.plan` accepts those per-op budgets, so
+  each worker's **timeout follows its own budget**; `OpResult.budget` records
+  what it got, and the UI's progress lines show it. Passing a float still pins
+  every op to one budget (tests, `bench run --budget`).
+- **The device selection is device *indexes*, validated on both sides
+  (`bench.devices.available` / `parse_device_ids` / `validate_device_ids` /
+  `visibility_env`).** It lives on the **Model Graph** tab (`#device-input`,
+  comma-separated, blank = all) because it is a property of the run, not of the
+  benchmark, and is used by profiling *and* by the replay — but *Bench & Rank*
+  carries its **own** Devices field (`#bench-device-input`), because the replay
+  need not run where the model was profiled (a TP=4 profile replayed on one
+  card, a sweep given the idle half of the box). Blank there **inherits** the
+  Model Graph value (`deviceSpec(BENCH_DEVICE_INPUT)`), and the field's
+  placeholder mirrors what it would inherit so "blank" never leaves the reader
+  guessing. `GET /api/devices`
+  lists what is present; `/api/profile` and `/api/bench/plan|run` refuse a
+  non-existent index or a selection smaller than the TP size the request needs
+  (the profile's `tensor_parallel_size`, the sweep's **widest** `tp_sizes`) —
+  otherwise the failure surfaces as an opaque driver error deep inside a
+  worker. The selection is honoured by exporting `ZE_AFFINITY_MASK` /
+  `CUDA_VISIBLE_DEVICES` to the **replay worker processes** (which is also what
+  a collective's peer ranks inherit); it cannot be applied to profiling
+  in-process, since both runtimes read it at driver init.
+- **The Kernels filter lists what the profile dispatched (`/api/bench/ops`).**
+  It is an Excel-style checkbox list (labelled *Kernels* in the UI; the ids and
+  the API keep the `ops` wording), not a free-text field of dispatch names: the
+  benchmark's op set is a property of the profile, so the UI offers exactly
+  those names (framework plumbing excluded via `bench_spec.is_skipped`, ordered
+  by device time so the expensive ones are on top). All-selected sends `ops:
+  null`, i.e. benchmark everything the plan produced.
 - **The roofline is only as honest as the FLOPs/bytes it is fed
   (`analyzer.py` / `shape_derive.py`).** Three cost-model rules earn their keep:
   attention has an explicit FLOPs model (`2·2·q·kv·heads·dim`, with
@@ -869,8 +913,10 @@ static builder. Ensure:
 | `/api/profile/result` | GET | Fetch profiling result (ops + reconstructed graph) |
 | `/api/profile/trace` | GET | Download raw trace file (two-pass runs: `?pass=prefill\|decode`; default = decode) |
 | `/api/export/shape-matrix` | POST | Export profile-derived multi-config shape sweep to Excel |
+| `/api/devices` | GET | Accelerators present on this host (kind, indexes, names) for the Device selector |
+| `/api/bench/ops` | GET | Dispatch names the latest profile ran — the Ops filter's checklist |
 | `/api/bench/plan` | POST | Sweep the profiled graph into replay cases (creates a bench run) |
-| `/api/bench/run` | POST | Replay a run's cases (async — poll `/api/bench/status`) |
+| `/api/bench/run` | POST | Replay a run's cases (async — poll `/api/bench/status`); the per-case budget is derived from the profiled shapes unless one is sent |
 | `/api/bench/status` | GET | Poll the benchmark run (per-op progress) |
 | `/api/bench/runs` | GET | List bench runs under `output/bench/` |
 | `/api/bench/results` | GET | A run's measured cases + summary + coverage (`?op=` filters to one op, for the UI's per-op detail view) |

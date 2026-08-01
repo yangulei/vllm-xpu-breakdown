@@ -22,7 +22,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable
 
-from breakdown.bench import estimate, resolve, store
+from breakdown.bench import devices, estimate, resolve, store
 from breakdown.bench.spec import BenchCase, group_by_op
 from breakdown.bench.worker import bench_env
 
@@ -35,6 +35,8 @@ class OpResult:
     measured: int = 0
     failed: int = 0
     seconds: float = 0.0
+    #: adaptive per-case measurement budget this op was given (seconds)
+    budget: float = 0.0
     timeout: int = 0
     timed_out: bool = False
     log: str = ""
@@ -89,12 +91,20 @@ def _statuses(records: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def run(cases: list[BenchCase], paths: store.RunPaths, device: str,
-        budget: float = 0.5, ops: Iterable[str] | None = None,
+        budget: float | None = None, ops: Iterable[str] | None = None,
         flush_cache: bool = True, timeouts: dict[str, int] | None = None,
         on_op: Callable[[OpResult], None] | None = None,
         env: dict[str, str] | None = None,
         in_process: bool = False) -> RunResult:
     """Benchmark every op of ``cases``, one worker process each.
+
+    ``budget`` is the per-case measurement budget in seconds. ``None`` - the
+    normal path - derives it **per op from the profiled shapes**
+    (:func:`breakdown.bench.estimate.op_budgets`): a kernel that runs for
+    milliseconds needs a longer window than one that runs for microseconds, and
+    the profile already knows which is which, so there is nothing for a user to
+    guess. Pass a float only to pin every op to the same budget (tests, a
+    quick smoke run).
 
     ``in_process`` runs the cases in this process instead - useful for tests and
     for a single-op debug session, but it gives up the crash containment that
@@ -117,8 +127,11 @@ def run(cases: list[BenchCase], paths: store.RunPaths, device: str,
     inherited = run_env.get("PYTHONPATH")
     run_env["PYTHONPATH"] = (f"{repo_root}{os.pathsep}{inherited}"
                              if inherited else repo_root)
+    peaks = devices.peaks(devices.sku_for_device(devices.device_name(device)))
+    op_budget = ({op: float(budget) for op in selected} if budget is not None
+                 else estimate.op_budgets(selected, peaks))
     budgets = timeouts or estimate.plan(
-        {op: len(cs) for op, cs in selected.items()}, budget, paths.root,
+        {op: len(cs) for op, cs in selected.items()}, op_budget, paths.root,
         alloc_bytes={op: sum(_operand_bytes(c) for c in cs)
                      for op, cs in selected.items()})
 
@@ -135,22 +148,23 @@ def run(cases: list[BenchCase], paths: store.RunPaths, device: str,
         t0 = time.time()
         log_path = os.path.join(paths.logs, _safe(op) + ".log")
         timeout = int(budgets.get(op, estimate.MIN_TIMEOUT_S))
+        case_budget = op_budget.get(op, estimate.MIN_BUDGET_S)
         before = _count_lines(paths.results)
         timed_out = False
         error = ""
         if resolve.is_collective(op):
-            error = _run_collective(op, op_cases, paths, device, budget,
+            error = _run_collective(op, op_cases, paths, device, case_budget,
                                     timeout, run_env, log_path)
         elif in_process:
             from breakdown.bench import worker
             try:
-                worker.run_op(op_cases, device, paths.results, budget=budget,
-                              flush_cache=flush_cache)
+                worker.run_op(op_cases, device, paths.results,
+                              budget=case_budget, flush_cache=flush_cache)
             except Exception as exc:              # noqa: BLE001
                 error = f"{type(exc).__name__}: {exc}"
         else:
-            cmd = _worker_cmd(paths.cases, op, paths.results, device, budget,
-                              flush_cache)
+            cmd = _worker_cmd(paths.cases, op, paths.results, device,
+                              case_budget, flush_cache)
             try:
                 proc = subprocess.run(cmd, env=run_env, capture_output=True,
                                       text=True, timeout=timeout,
@@ -171,7 +185,8 @@ def run(cases: list[BenchCase], paths: store.RunPaths, device: str,
         r = OpResult(op=op, ok=bool(measured) and not timed_out,
                      cases=len(op_cases), measured=measured,
                      failed=len(records) - measured,
-                     seconds=round(time.time() - t0, 1), timeout=timeout,
+                     seconds=round(time.time() - t0, 1),
+                     budget=case_budget, timeout=timeout,
                      timed_out=timed_out, log=log_path, error=error,
                      statuses=statuses)
         res.ops.append(r)

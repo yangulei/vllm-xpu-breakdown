@@ -9,7 +9,9 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from breakdown.bench import estimate, history, rank, reports, timing  # noqa: E402
+from breakdown.bench import (  # noqa: E402
+    estimate, history, rank, reports, spec, timing,
+)
 
 
 def _rec(op, latency, layers=1, flops=0.0, nbytes=0.0, phase="decode",
@@ -185,6 +187,64 @@ class TestEstimate(unittest.TestCase):
         startup, per_case = estimate.calibrate(prev)
         self.assertAlmostEqual(startup, 20.0)
         self.assertAlmostEqual(per_case, 10.0)
+
+    def test_per_op_budgets_are_carried_through_the_timeout_plan(self):
+        """A per-op budget must size that op's timeout, not a global constant."""
+        plan = estimate.plan({"slow": 200, "fast": 200},
+                             {"slow": 2.0, "fast": 0.1},
+                             safety=1.0)
+        self.assertGreater(plan["slow"], plan["fast"])
+
+
+class TestAdaptiveBudget(unittest.TestCase):
+    """The measurement budget is derived from the profiled shape.
+
+    There is no user-facing "budget / case" knob: how long a case needs is a
+    property of the kernel being replayed, and the profile already knows it.
+    """
+
+    @staticmethod
+    def _case(**kw):
+        return spec.BenchCase(op=kw.pop("op", "aten::mm"), **kw)
+
+    def test_a_slow_shape_gets_a_bigger_budget_than_a_fast_one(self):
+        fast = self._case(traced_device_time_us=5.0, traced_comparable=True)
+        slow = self._case(traced_device_time_us=50_000.0,
+                          traced_comparable=True)
+        self.assertLess(estimate.case_budget(fast, CACHE_PEAKS),
+                        estimate.case_budget(slow, CACHE_PEAKS))
+
+    def test_the_budget_stays_inside_its_bounds(self):
+        """A microsecond kernel still buys full windows; a huge one is capped.
+
+        The floor is the device-event window target (a shorter budget would buy
+        fewer windows than the timer needs), and the ceiling stops one
+        pathological shape from owning the run.
+        """
+        tiny = self._case(traced_device_time_us=0.001, traced_comparable=True)
+        huge = self._case(traced_device_time_us=1e9, traced_comparable=True)
+        self.assertGreaterEqual(estimate.case_budget(tiny, CACHE_PEAKS),
+                                estimate.MIN_BUDGET_S)
+        self.assertAlmostEqual(
+            estimate.case_budget(tiny, CACHE_PEAKS),
+            estimate.TARGET_WINDOWS * timing.TARGET_WINDOW_S)
+        self.assertAlmostEqual(estimate.case_budget(huge, CACHE_PEAKS),
+                               estimate.MAX_BUDGET_S)
+
+    def test_a_case_without_a_traced_time_is_predicted_from_its_work(self):
+        """No trace-comparable shape: fall back to the analytic cost."""
+        light = self._case(nbytes=1e5)
+        heavy = self._case(flops=1e13, nbytes=1e9)
+        self.assertLess(estimate.case_budget(light, CACHE_PEAKS),
+                        estimate.case_budget(heavy, CACHE_PEAKS))
+
+    def test_an_op_is_budgeted_by_its_most_expensive_case(self):
+        cheap = self._case(traced_device_time_us=5.0, traced_comparable=True)
+        dear = self._case(traced_device_time_us=20_000.0,
+                          traced_comparable=True)
+        budgets = estimate.op_budgets({"aten::mm": [cheap, dear]}, CACHE_PEAKS)
+        self.assertAlmostEqual(budgets["aten::mm"],
+                               estimate.case_budget(dear, CACHE_PEAKS))
 
     def test_roofline_bound_is_the_fastest_possible_time(self):
         us, bound = estimate.roofline_bound_us(0.0, 456_000, PEAKS)
