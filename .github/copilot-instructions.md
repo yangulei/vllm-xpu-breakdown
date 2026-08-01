@@ -72,7 +72,8 @@ XMX), and charges a cache-resident op to the last-level-cache bandwidth **and**
 to DRAM, taking the larger utilization as the headroom (a cache-resident kernel
 already at the DRAM roof is `at_roofline`, not a session). Prefill and decode
 are ranked **separately as well as together** (`targets.json` `by_phase`; the
-UI shows one phase at a time, sortable, with a per-op case drill-down), the
+UI shows one phase at a time, sortable, with a per-op case drill-down in its own
+**Op Detail** tab), the
 ranking is done at the **profiled** operating point when it was benchmarked
 (`rank.profiled_point`), and the report workbook writes **one sheet per op**. Timing repeats the kernel inside
 a device-event window and subtracts the measured empty-window cost, because that

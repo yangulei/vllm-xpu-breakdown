@@ -60,12 +60,17 @@ python app.py [--port 8080]
 Then open `http://localhost:8080` in your browser.
 
 **Features:**
+- Three tabs: **Model Graph** (profile + reconstructed graph), **Benchmark &
+  Targets** (sweep config + Shape Matrix export + replay benchmark + ranked
+  targets) and **Op Detail** (every measured case of the op clicked in the
+  ranked table)
 - Search for any HuggingFace model by ID
 - Auto-loads model config (architecture, layers, MoE, dtype)
 - Toggle between eager and torch.compile mode
 - Reconstructed model graph (from a profiling run) with symbolic shapes and TP-aware annotations
 - Quantization support (fp8, gptq, awq) — affects weight dtype and memory estimates
-- Shape Matrix Export: sweep across seq_len, batch_size, context_len, and TP configurations
+- Shape Matrix Export: sweep across seq_len, batch_size, context_len, and TP
+  configurations (the same sweep the benchmark plans its cases from)
 - Rich ops table with:
   - Shapes with symbolic dimensions (B=batch, S=seq_len, H=hidden_size, etc.)
   - Per-tensor dtype tags (bf16, fp8, int4)
@@ -131,9 +136,11 @@ actually-dispatched ops (with their symbolic shapes and recorded per-tensor
 dtypes) become a template that is re-resolved for every other
 (seq/ctx/batch/TP) case, with memory/FLOPs recomputed per config. This makes the
 matrix accurate to what the model really executes on XPU — the intended input
-for downstream optimization work. The Shape Matrix tab handles this
-automatically: it **reuses the latest completed run** for the model, or
-**launches a fresh profile** (using the Profile tab settings) if none exists.
+for downstream optimization work. The sweep card at the top of the
+**Benchmark & Targets** tab handles this automatically: it **reuses the latest
+completed run** for the model, or **launches a fresh profile** (using the Model
+Graph tab settings) if none exists. The same sweep drives the replay benchmark's
+cases, which is why the two share one tab.
 The exported workbook adds an **Info** sheet with the profiled config, caveats,
 and a shape round-trip **validation** summary. Because the op set is fixed at
 the profiled config, profile at **each TP** you need (sweeping TP only divides
@@ -201,8 +208,8 @@ document holds a combined ranking plus a per-phase one (`by_phase.prefill` /
 the **profiled** operating point (the sweep point whose shapes are the ones the
 trace recorded) whenever it was benchmarked, so the numbers are comparable to
 the profile. In the web UI the Ranked-targets table shows one phase at a time
-(Prefill / Decode), sorts on any column header, and expands a clicked op into
-its measured cases. Every run
+(Prefill / Decode), sorts on any column header, and opens a clicked op in the
+**Op Detail** tab with every case measured for it. Every run
 also records the git commit of each component that can move a number (kernel
 repos, vLLM, this tool), and its cases are stored in
 `output/bench/history.sqlite` so regressions are detectable across kernel bumps.

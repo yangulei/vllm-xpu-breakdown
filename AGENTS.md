@@ -686,6 +686,18 @@ rows (`shape_matrix`) → replay cases (`spec`) → measured cases (`worker`/
   `/api/bench/results?run_id=&op=` (the `op` filter exists so one row's detail
   does not ship every case of every op). The operating-point row is highlighted
   and sorted first; profiled cases are marked ✓.
+- **The UI has three tabs: `Model Graph`, `Benchmark & Targets`, `Op Detail`
+  (`TABS` in `static/index.html`).** There is **no** separate Shape Matrix tab —
+  the sweep card (`sm-*` inputs + `Download Shape Matrix`) lives at the top of
+  the *Benchmark & Targets* tab, because the same sweep defines both the
+  exported matrix and the benchmark's cases (`buildSweepPayload` is shared);
+  keeping them on one tab means the numbers you plan with are the numbers you
+  export. Do not re-add a Shape Matrix tab. The per-op drill-down is its own
+  **top-level tab** (`#tab-opdetail` wrapping `#perf-op-detail`) rather than a
+  panel under the ranked table — it is a 15-column × N-case table that pushed
+  the targets off-screen when inlined. `perfToggleOpDetail` switches to that tab
+  when opening an op and back to `perf` when closing; closing restores
+  `PERF_OP_DETAIL_PLACEHOLDER` (never a blank tab).
 - **The roofline is only as honest as the FLOPs/bytes it is fed
   (`analyzer.py` / `shape_derive.py`).** Three cost-model rules earn their keep:
   attention has an explicit FLOPs model (`2·2·q·kv·heads·dim`, with
