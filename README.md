@@ -197,7 +197,12 @@ files, build/test commands, the baseline latency, the roofline bound, and a
 ready-to-run `bench_cmd` / `profile_cmd` for the shapes that dominate. The
 document holds a combined ranking plus a per-phase one (`by_phase.prefill` /
 `by_phase.decode`), and the report workbook has **one sheet per op** (plus
-`Summary`, `Coverage` and per-phase `Targets` sheets). Every run
+`Summary`, `Coverage` and per-phase `Targets` sheets). The ranking is done at
+the **profiled** operating point (the sweep point whose shapes are the ones the
+trace recorded) whenever it was benchmarked, so the numbers are comparable to
+the profile. In the web UI the Ranked-targets table shows one phase at a time
+(Prefill / Decode), sorts on any column header, and expands a clicked op into
+its measured cases. Every run
 also records the git commit of each component that can move a number (kernel
 repos, vLLM, this tool), and its cases are stored in
 `output/bench/history.sqlite` so regressions are detectable across kernel bumps.

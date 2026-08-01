@@ -186,6 +186,25 @@ class TestRunAndTargets(BenchApiTest):
         self.assertEqual(data["coverage"][0]["Op"],
                          "vllm::moe_forward_shared")
 
+    def test_results_endpoint_filters_by_op(self):
+        """The per-op detail view asks for one op, not the whole run."""
+        run_id = json.loads(self._plan().data)["run_id"]
+        paths = store.run_paths(run_id, self.tmp.name)
+        with open(paths.results, "w") as fh:
+            for op in ("_C::rms_norm", "aten::linear"):
+                fh.write(json.dumps({
+                    "op": op, "status": "ok", "latency_us": 5.0,
+                    "layers": 36, "bytes": 1000.0, "flops": 0.0,
+                    "phase": "decode", "seq_len": 1, "ctx_len": 2048,
+                    "batch_size": 32, "tp": 1, "device": "xpu",
+                }) + "\n")
+        data = json.loads(self.client.get(
+            f"/api/bench/results?run_id={run_id}&op=_C::rms_norm").data)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["op"], "_C::rms_norm")
+        self.assertEqual({r["op"] for r in data["records"]}, {"_C::rms_norm"})
+        self.assertIn("bw_gbs", data["peaks"])
+
     def test_runs_endpoint_lists_planned_runs(self):
         run_id = json.loads(self._plan().data)["run_id"]
         data = json.loads(self.client.get("/api/bench/runs").data)

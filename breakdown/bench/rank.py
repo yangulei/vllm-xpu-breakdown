@@ -52,7 +52,11 @@ from breakdown.bench import devices, estimate
 #: (``roofline.util_dram``) with ``roofline.effective_util`` = max of the two
 #: driving the headroom; and the document carries a per-phase ranking in
 #: ``by_phase`` (prefill and decode ranked separately, as in the model graph).
-SCHEMA_VERSION = 4
+#: v5 - the operating point defaults to the **profiled** one (the sweep point
+#: whose shapes equal the ones the profile recorded) instead of the busiest
+#: swept point, and every point/shape entry says whether it is profiled
+#: (``operating_points[ph].profiled``, ``top_shapes[i].profiled``).
+SCHEMA_VERSION = 5
 
 #: Fraction of the roofline treated as "done" - above it, only a redesign helps.
 DEFAULT_TARGET_UTIL = 0.8
@@ -133,9 +137,25 @@ def _points_of(rec: dict, phase: str) -> list[tuple]:
     return [_point_of(rec)] if rec.get("phase") == phase else []
 
 
+def profiled_point(records: list[dict], phase: str) -> tuple | None:
+    """The sweep point the *profile* actually ran, if it was benchmarked.
+
+    A case is ``traced_comparable`` when its swept shapes equal the ones the
+    trace recorded - i.e. it is the model's own shape rather than a
+    what-if point of the sweep. Ranking there is what makes the numbers
+    answerable against the profile (and against ``traced_device_time_us``);
+    the busiest swept point is only a fallback.
+    """
+    pts = Counter(p for r in records
+                  if r.get("status") == "ok" and r.get("traced_comparable")
+                  for p in _points_of(r, phase))
+    return pts.most_common(1)[0][0] if pts else None
+
+
 def pick_point(records: list[dict], phase: str,
                want: tuple | None = None) -> tuple | None:
-    """The operating point to rank at: the requested one, else the busiest."""
+    """The operating point to rank at: the requested one, else the profiled
+    one, else the busiest."""
     pts = Counter(p for r in records if r.get("status") == "ok"
                   for p in _points_of(r, phase))
     if not pts:
@@ -144,6 +164,9 @@ def pick_point(records: list[dict], phase: str,
         for p in pts:
             if tuple(p) == tuple(want):
                 return p
+    prof = profiled_point(records, phase)
+    if prof is not None and prof in pts:
+        return prof
     return pts.most_common(1)[0][0]
 
 
@@ -187,6 +210,7 @@ def rank(records: Iterable[dict], rc: RankConfig | None = None,
     sources = kernel_sources or load_kernel_sources()
 
     points = {ph: pick_point(recs, ph, rc.points.get(ph)) for ph in rc.phases}
+    prof_points = {ph: profiled_point(recs, ph) for ph in rc.phases}
     targets, grand = _rank_phases(recs, rc, rc.phases, points, peaks, sources)
 
     by_phase: dict[str, Any] = {}
@@ -199,7 +223,8 @@ def rank(records: Iterable[dict], rc: RankConfig | None = None,
         except ValueError:
             continue
         by_phase[ph] = {"e2e_us_total": round(ph_grand, 1),
-                        "operating_point": _point_doc(points[ph]),
+                        "operating_point": _point_doc(points[ph],
+                                                      prof_points.get(ph)),
                         "targets": ph_targets}
 
     return {
@@ -212,7 +237,8 @@ def rank(records: Iterable[dict], rc: RankConfig | None = None,
         "target_util": rc.target_util,
         "tp": rc.tp,
         "run_id": rc.run_id,
-        "operating_points": {p: _point_doc(points.get(p)) for p in rc.phases},
+        "operating_points": {p: _point_doc(points.get(p), prof_points.get(p))
+                             for p in rc.phases},
         "phase_weight": dict(rc.phase_weight),
         "e2e_us_total": round(grand, 1),
         "provenance": rc.provenance,
@@ -221,10 +247,12 @@ def rank(records: Iterable[dict], rc: RankConfig | None = None,
     }
 
 
-def _point_doc(point: tuple | None) -> dict[str, Any] | None:
+def _point_doc(point: tuple | None,
+               profiled: tuple | None = None) -> dict[str, Any] | None:
     if not point:
         return None
-    return {"seq_len": point[0], "ctx_len": point[1], "batch_size": point[2]}
+    return {"seq_len": point[0], "ctx_len": point[1], "batch_size": point[2],
+            "profiled": profiled is not None and tuple(profiled) == tuple(point)}
 
 
 def _rank_phases(recs: list[dict], rc: RankConfig, phases: tuple[str, ...],
@@ -262,6 +290,7 @@ def _rank_phases(recs: list[dict], rc: RankConfig, phases: tuple[str, ...],
                 "latency_us": round(lat, 3), "weighted_us": round(weighted, 1),
                 "traced_device_time_us": r.get("traced_device_time_us"),
                 "replay_vs_traced": round(ratio, 3) if ratio else None,
+                "profiled": bool(r.get("traced_comparable")),
                 "case_id": r.get("case_id"),
             })
 
@@ -325,7 +354,11 @@ def _rank_phases(recs: list[dict], rc: RankConfig, phases: tuple[str, ...],
         else:
             action = "tune_config"
 
-        shapes = sorted(op_cases[op], key=lambda c: -c["weighted_us"])
+        # The profiled shape first: it is the one the model actually ran, so
+        # it is the shape an optimization session should be measured at (and
+        # the only one with a traced device time to check the replay against).
+        shapes = sorted(op_cases[op],
+                        key=lambda c: (not c["profiled"], -c["weighted_us"]))
         targets.append({
             "op": op,
             "backend": backend,
@@ -371,6 +404,7 @@ def _shape_entry(op: str, case: dict, rc: RankConfig) -> dict[str, Any]:
              f"--case-id {case['case_id']}")
     return {
         "phase": case["phase"],
+        "profiled": case.get("profiled", False),
         "calls": case["calls"],
         "shape": case["shape"],
         "latency_us": case["latency_us"],
@@ -416,7 +450,9 @@ def format_table(doc: dict[str, Any], phase: str | None = None) -> str:
     for ph, p in doc["operating_points"].items():
         if p:
             out.append(f"{ph:<12}: seq={p['seq_len']} ctx={p['ctx_len']} "
-                       f"bs={p['batch_size']}")
+                       f"bs={p['batch_size']}"
+                       + ("  (profiled)" if p.get("profiled") else
+                          "  (swept - the profiled shape was not benchmarked)"))
     sections: list[tuple[str, list[dict], float]] = []
     by_phase = doc.get("by_phase") or {}
     if phase:

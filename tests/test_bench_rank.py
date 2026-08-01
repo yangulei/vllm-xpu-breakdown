@@ -304,7 +304,8 @@ class TestPhaseSeparation(unittest.TestCase):
         self.assertAlmostEqual(doc["by_phase"]["decode"]["e2e_us_total"],
                                5.0 * 36, places=1)
         self.assertEqual(doc["by_phase"]["prefill"]["operating_point"],
-                         {"seq_len": 1024, "ctx_len": 0, "batch_size": 1})
+                         {"seq_len": 1024, "ctx_len": 0, "batch_size": 1,
+                          "profiled": False})
         # and the combined ranking is still there
         self.assertEqual(len(doc["targets"]), 2)
 
@@ -429,3 +430,57 @@ class TestAnalyticCostModel(unittest.TestCase):
             _profile_op_memory("aten::embedding", [[8, 4], [64]],
                                ["bfloat16", "long int"], 2),
             8 * 4 * 2 + 64 * 8 + 8 * 4 * 2)
+
+
+class TestProfiledOperatingPoint(unittest.TestCase):
+    """The ranking defaults to the point the *profile* ran, not the busiest.
+
+    A sweep measures dozens of what-if points; only the one whose shapes equal
+    the trace's is answerable against the profile (and against
+    ``traced_device_time_us``). Ranking at the busiest swept point instead
+    silently reported a shape the model never ran.
+    """
+
+    def test_profiled_point_wins_over_the_busiest_swept_point(self):
+        recs = [
+            # three cases at a swept point, one at the profiled point
+            _rec("_C::rms_norm", 5.0, batch_size=1),
+            _rec("aten::linear", 6.0, batch_size=1),
+            _rec("aten::mm", 7.0, batch_size=1),
+            _rec("_C::rms_norm", 9.0, batch_size=32, comparable=True,
+                 traced=9.0),
+        ]
+        self.assertEqual(rank.profiled_point(recs, "decode"), (1, 2048, 32))
+        self.assertEqual(rank.pick_point(recs, "decode"), (1, 2048, 32))
+        doc = rank.rank(recs)
+        self.assertEqual(doc["operating_points"]["decode"],
+                         {"seq_len": 1, "ctx_len": 2048, "batch_size": 32,
+                          "profiled": True})
+        # only the profiled case is ranked
+        self.assertEqual([t["op"] for t in doc["targets"]], ["_C::rms_norm"])
+
+    def test_busiest_point_is_the_fallback_and_is_marked_unprofiled(self):
+        recs = [_rec("_C::rms_norm", 5.0, batch_size=1),
+                _rec("aten::mm", 6.0, batch_size=1)]
+        self.assertIsNone(rank.profiled_point(recs, "decode"))
+        doc = rank.rank(recs)
+        self.assertFalse(doc["operating_points"]["decode"]["profiled"])
+
+    def test_explicit_point_still_wins(self):
+        recs = [_rec("_C::rms_norm", 5.0, batch_size=1),
+                _rec("_C::rms_norm", 9.0, batch_size=32, comparable=True)]
+        rc = rank.RankConfig(points={"decode": (1, 2048, 1)})
+        self.assertEqual(rank.pick_point(recs, "decode", rc.points["decode"]),
+                         (1, 2048, 1))
+
+    def test_profiled_shape_is_listed_first_for_the_target(self):
+        recs = [_rec("_C::rms_norm", 5.0, layers=36, batch_size=32,
+                     case_id="swept", shape="[1, 6144]"),
+                _rec("_C::rms_norm", 1.0, layers=1, batch_size=32,
+                     comparable=True, traced=1.0, case_id="profiled",
+                     shape="[32, 6144]")]
+        doc = rank.rank(recs)
+        shapes = doc["targets"][0]["top_shapes"]
+        self.assertTrue(shapes[0]["profiled"])
+        self.assertEqual(shapes[0]["shape"], "[32, 6144]")
+        self.assertFalse(shapes[1]["profiled"])

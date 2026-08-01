@@ -1692,7 +1692,11 @@ def bench_runs():
 
 @app.route("/api/bench/results")
 def bench_results():
-    """A run's measured cases, enriched with utilization and the traced time."""
+    """A run's measured cases, enriched with utilization and the traced time.
+
+    ``?op=`` narrows the payload to one dispatch name - what the UI's per-op
+    detail view needs, instead of shipping every case of every op to render one.
+    """
     run_id = request.args.get("run_id")
     runs = bench_store.list_runs()
     run_id = run_id or (runs[0]["run_id"] if runs else None)
@@ -1701,9 +1705,12 @@ def bench_results():
     paths = bench_store.run_paths(run_id)
     meta = bench_store.read_meta(paths)
     records = bench_store.read_results(paths.results)
+    op = request.args.get("op")
+    if op:
+        records = [r for r in records if r.get("op") == op]
     peaks = bench_devices.peaks(meta.get("sku") or bench_devices.DEFAULT_SKU)
     rich = bench_reports.enrich(records, peaks)
-    return jsonify({"ok": True, "run_id": run_id,
+    return jsonify({"ok": True, "run_id": run_id, "op": op, "peaks": peaks,
                     "summary": bench_reports.summarize(rich),
                     "coverage": bench_reports.coverage(rich),
                     "records": rich})

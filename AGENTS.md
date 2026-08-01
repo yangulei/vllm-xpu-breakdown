@@ -665,9 +665,27 @@ rows (`shape_matrix`) → replay cases (`spec`) → measured cases (`worker`/
   (`_rank_phases`) once for the combined phases (`targets`) and once per phase
   (`by_phase.{prefill,decode}` = `{targets, e2e_us_total, operating_point}`).
   `format_table(doc, phase=None)` prints the combined table followed by the
-  per-phase ones; the UI has a Prefill + Decode / Prefill / Decode toggle above
-  the targets table; the workbook gets `Targets prefill` / `Targets decode`
-  sheets.
+  per-phase ones; the workbook gets `Targets prefill` / `Targets decode`
+  sheets. **The UI shows the phases only** — its toggle is Prefill (default) /
+  Decode with no combined view, because a combined row is not a number anyone
+  optimizes against. Do not re-add a "Prefill + Decode" tab; the combined
+  `targets` list stays in the JSON for the optimizer skill.
+- **The ranking's default operating point is the *profiled* one, not the
+  busiest swept point.** A sweep measures dozens of what-if points; only the one
+  whose shapes equal the trace's is answerable against the profile — and it is
+  the only one with a `traced_device_time_us` to check the replay against.
+  `rank.profiled_point` finds it from the `traced_comparable` records (a case is
+  comparable when its swept shapes equal the recorded ones), `pick_point` uses
+  it unless an explicit point was requested, and every point/shape entry says
+  which it is (`operating_points[ph].profiled`, `top_shapes[i].profiled`, marked
+  ✓ in the UI). Without this, the table reported a shape the model never ran.
+  Each target's `top_shapes` is likewise ordered profiled-first.
+- **The targets table is sortable and drills down per op.** Any column header
+  sorts (`PERF_COLUMNS` carries the sort key/`get`); clicking a row opens the
+  op's cases — the workbook's per-op sheet, live — from
+  `/api/bench/results?run_id=&op=` (the `op` filter exists so one row's detail
+  does not ship every case of every op). The operating-point row is highlighted
+  and sorted first; profiled cases are marked ✓.
 - **The roofline is only as honest as the FLOPs/bytes it is fed
   (`analyzer.py` / `shape_derive.py`).** Three cost-model rules earn their keep:
   attention has an explicit FLOPs model (`2·2·q·kv·heads·dim`, with
@@ -691,14 +709,16 @@ rows (`shape_matrix`) → replay cases (`spec`) → measured cases (`worker`/
   *last* resort: an op that merely ran out of a cache is explained by the cache
   roof, and the common table-lookup overcounts are fixed at the source, so a
   `check_cost_model` flag means a genuinely unmodelled op.
-- **`targets.json` is a versioned contract** (`schema_version`, now **4**: v2
+- **`targets.json` is a versioned contract** (`schema_version`, now **5**: v2
   was the replay model — provider fields removed, ops keyed by dispatch name,
   `traced_device_time_us` added — v3 the roofline change: `roofline.bound`
   now comes from arithmetic intensity, with `memory_level` / `cache_bw_gbs` /
   `cache_bytes` / `ridge_ai` added — and v4 the hardware-unit roof
   (`roofline.unit`, vector-vs-matrix compute peak), the cache/DRAM pair
   (`roofline.util_dram` / `effective_util`) and the per-phase ranking
-  (`by_phase`)) consumed by the `xpu-kernel-optimizer` skill:
+  (`by_phase`) — and v5 the profiled operating point
+  (`operating_points[ph].profiled`, `top_shapes[i].profiled`)) consumed by the
+  `xpu-kernel-optimizer` skill:
   kernel dir/files, build/test commands, baseline latency, roofline bound and
   `bench_cmd`/`profile_cmd` per dominant shape. Changing a field's meaning
   requires bumping the version. `bench/kernel_sources.json` maps op/backend →
@@ -807,7 +827,7 @@ static builder. Ensure:
 | `/api/bench/run` | POST | Replay a run's cases (async — poll `/api/bench/status`) |
 | `/api/bench/status` | GET | Poll the benchmark run (per-op progress) |
 | `/api/bench/runs` | GET | List bench runs under `output/bench/` |
-| `/api/bench/results` | GET | A run's measured cases + summary + coverage |
+| `/api/bench/results` | GET | A run's measured cases + summary + coverage (`?op=` filters to one op, for the UI's per-op detail view) |
 | `/api/bench/targets` | GET | Ranked optimization targets (`?run_id=`, `?refresh=1`, `?target_util=`) |
 | `/api/bench/report` | GET | Download a run's report workbook |
 | `/api/bench/history` | GET | Runs in the history db, or `?base=&new=` per-shape diff |

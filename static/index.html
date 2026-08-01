@@ -469,10 +469,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
     <div class="card">
       <h2>Ranked targets</h2>
       <div class="graph-phase-toggle" id="perf-phase-toggle">
-        <button class="phase-btn active" data-perf-phase="all"
-                onclick="setTargetPhase(this)"
-                title="Prefill and decode weighted together">Prefill + Decode</button>
-        <button class="phase-btn" data-perf-phase="prefill"
+        <button class="phase-btn active" data-perf-phase="prefill"
                 onclick="setTargetPhase(this)"
                 title="Rank the prefill phase on its own — a GEMM that is compute-bound here is a memory-bound GEMV at decode">Prefill</button>
         <button class="phase-btn" data-perf-phase="decode"
@@ -483,6 +480,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
       <div style="overflow:auto">
         <table id="perf-targets" class="perf-table" style="width:100%;border-collapse:collapse;font-size:12px"></table>
       </div>
+      <div id="perf-op-detail" style="margin-top:16px"></div>
     </div>
   </div>
 </div>
@@ -1201,7 +1199,11 @@ function switchTab(name) {
 // ---- Replay benchmark: re-invoke the dispatched ops, rank what to optimize ----
 let PERF_RUN_ID = null;
 let PERF_TARGETS_DOC = null;
-let PERF_TARGET_PHASE = 'all';
+let PERF_TARGET_PHASE = 'prefill';
+// Column sort state for the ranked-targets table; null = the ranking's own
+// order (savings first), which is the answer the ranker computed.
+let PERF_SORT = null;
+let PERF_OPEN_OP = null;
 
 const PERF_ACTION_STYLE = {
   optimize_kernel: ['#c0392b', 'open a kernel session'],
@@ -1370,23 +1372,69 @@ function setTargetPhase(el) {
     .forEach(b => b.classList.remove('active'));
   el.classList.add('active');
   PERF_TARGET_PHASE = el.dataset.perfPhase;
+  PERF_OPEN_OP = null;
+  document.getElementById('perf-op-detail').innerHTML = '';
+  if (PERF_TARGETS_DOC) renderPerfTargets(PERF_TARGETS_DOC);
+}
+
+// The ranked-targets columns. `get` extracts the sort key from a target.
+const PERF_COLUMNS = [
+  {key: 'rank', label: '#', get: t => t.rank, num: true},
+  {key: 'op', label: 'op', get: t => t.op,
+   tip: 'the dispatch name that was replayed — click a row for its cases'},
+  {key: 'backend', label: 'backend', get: t => t.backend || ''},
+  {key: 'e2e', label: 'e2e µs', get: t => t.e2e_us, num: true,
+   tip: 'latency × calls at this phase\'s operating point'},
+  {key: 'share', label: 'share', get: t => t.share_of_e2e, num: true},
+  {key: 'roof', label: 'roof', get: t => t.roofline.unit || t.roofline.bound,
+   tip: 'the hardware unit that bounds this op: XMX/XVE (compute) or DRAM/L3-Cache (memory)'},
+  {key: 'util', label: 'util', get: t => t.roofline.util, num: true,
+   tip: 'achieved fraction of that roof'},
+  {key: 'dram', label: 'DRAM', get: t => t.roofline.util_dram || 0, num: true,
+   tip: 'the same measurement against DRAM bandwidth — a cache-resident op that already reaches the DRAM roof has no headroom the model can use, so the headroom (save µs) is computed from the larger of the two'},
+  {key: 'ai', label: 'AI', get: t => t.roofline.ai == null ? -1 : t.roofline.ai,
+   num: true,
+   tip: 'arithmetic intensity, flop/byte — compute-bound above the machine balance, memory-bound below'},
+  {key: 'ratio', label: 'replay/traced',
+   get: t => perfTopShape(t) && perfTopShape(t).replay_vs_traced != null
+     ? perfTopShape(t).replay_vs_traced : -1, num: true,
+   tip: 'replayed latency ÷ the profile\'s own device time for the same shape — far below 1 means the replay is not doing the model\'s work'},
+  {key: 'save', label: 'save µs', get: t => t.savings_us.total, num: true},
+  {key: 'action', label: 'action', get: t => t.action},
+  {key: 'kernel', label: 'kernel',
+   get: t => (t.kernel && t.kernel.kernel_dir) || ''},
+];
+
+function perfTopShape(t) {
+  return (t.top_shapes || [])[0] || null;
+}
+
+function perfSortTargets(el) {
+  const key = el.dataset.sortKey;
+  if (PERF_SORT && PERF_SORT.key === key) PERF_SORT.dir = -PERF_SORT.dir;
+  else PERF_SORT = {key: key, dir: key === 'rank' ? 1 : -1};
   if (PERF_TARGETS_DOC) renderPerfTargets(PERF_TARGETS_DOC);
 }
 
 function renderPerfTargets(doc) {
   PERF_TARGETS_DOC = doc;
   const summary = document.getElementById('perf-summary');
-  // Prefill and decode are ranked separately (same reason the model graph keeps
-  // them apart): the same kernel is compute-bound at prefill and a memory-bound
-  // GEMV at decode, so one combined number hides which phase a session helps.
+  // Prefill and decode are always ranked separately (same reason the model
+  // graph keeps them apart): the same kernel is compute-bound at prefill and a
+  // memory-bound GEMV at decode, so one combined number hides which phase a
+  // session helps. There is deliberately no combined view.
   const phase = PERF_TARGET_PHASE;
-  const section = phase !== 'all' ? ((doc.by_phase || {})[phase] || null) : null;
-  const targets = section ? section.targets : (doc.targets || []);
-  const e2e = section ? section.e2e_us_total : doc.e2e_us_total;
-  const pts = Object.entries(doc.operating_points || {})
-    .filter(([p, v]) => v && (phase === 'all' || p === phase))
-    .map(([p, v]) => `${p}: seq=${v.seq_len} ctx=${v.ctx_len} bs=${v.batch_size}`)
-    .join(' · ');
+  const section = (doc.by_phase || {})[phase] || null;
+  const targets = section ? (section.targets || []) : [];
+  const e2e = section ? section.e2e_us_total : 0;
+  const pt = (section && section.operating_point)
+    || (doc.operating_points || {})[phase];
+  const ptTxt = pt
+    ? `seq=${pt.seq_len} ctx=${pt.ctx_len} bs=${pt.batch_size}` +
+      (pt.profiled
+        ? ' <span style="color:#27ae60" title="these are the shapes the profiling run actually recorded — the replay is comparable to the trace here">· profiled shapes</span>'
+        : ' <span style="color:#e67e22" title="the profiled shape was not among the benchmarked cases, so this is the busiest swept point instead">· swept point (not profiled)</span>')
+    : '—';
   const pk = doc.peaks || {};
   summary.innerHTML =
     `<b>${doc.device}</b> (${doc.sku}: ${pk.bw_gbs} GB/s DRAM` +
@@ -1394,21 +1442,33 @@ function renderPerfTargets(doc) {
     `, ${pk.tflops} TFLOPS ${pk.matrix_unit || 'matrix'}` +
     (pk.vector_tflops ? ` / ${pk.vector_tflops} TFLOPS ${pk.vector_unit || 'vector'}` : '') +
     `, target util ${(doc.target_util * 100).toFixed(0)}%) — ` +
-    `${phase === 'all' ? 'e2e' : phase} op time ` +
-    `${(e2e / 1000).toFixed(2)} ms/step<br>${pts}` +
-    (phase !== 'all' && !section ? '<br><i>no records for this phase</i>' : '');
+    `${phase} op time ${(e2e / 1000).toFixed(2)} ms/step<br>${ptTxt}` +
+    (section ? '' : '<br><i>no benchmarked records for this phase</i>');
 
-  const head = `<tr style="text-align:left;border-bottom:2px solid #ddd">
-    <th>#</th><th>op</th><th>backend</th><th>e2e µs</th><th>share</th>
-    <th title="the hardware unit that bounds this op: XMX/XVE (compute) or DRAM/L3-Cache (memory)">roof</th>
-    <th title="achieved fraction of that roof">util</th>
-    <th title="the same measurement against DRAM bandwidth — a cache-resident op that already reaches the DRAM roof has no headroom the model can use, so the headroom (save µs) is computed from the larger of the two">DRAM</th>
-    <th title="arithmetic intensity, flop/byte — compute-bound above the machine balance, memory-bound below">AI</th>
-    <th>replay/traced</th><th>save µs</th>
-    <th>action</th><th>kernel</th></tr>`;
-  const rows = targets.map(t => {
+  const rows = targets.slice();
+  if (PERF_SORT) {
+    const col = PERF_COLUMNS.find(c => c.key === PERF_SORT.key);
+    if (col) {
+      rows.sort((a, b) => {
+        const x = col.get(a), y = col.get(b);
+        const c = col.num ? (x - y) : String(x).localeCompare(String(y));
+        return c * PERF_SORT.dir;
+      });
+    }
+  }
+
+  const head = '<tr style="text-align:left;border-bottom:2px solid #ddd">' +
+    PERF_COLUMNS.map(c => {
+      const arrow = PERF_SORT && PERF_SORT.key === c.key
+        ? (PERF_SORT.dir > 0 ? ' ▲' : ' ▼') : '';
+      const tip = (c.tip ? c.tip + ' — ' : '') + 'click to sort';
+      return `<th data-sort-key="${c.key}" onclick="perfSortTargets(this)"
+        style="cursor:pointer;user-select:none" title="${perfEsc(tip)}">${c.label}${arrow}</th>`;
+    }).join('') + '</tr>';
+
+  const body = rows.map(t => {
     const [color, hint] = PERF_ACTION_STYLE[t.action] || ['#333', ''];
-    const shape = (t.top_shapes || [])[0];
+    const shape = perfTopShape(t);
     const cmd = shape ? shape.bench_cmd.replace(/"/g, '&quot;') : '';
     // The profile's own device time for the same op+shape is the run's
     // built-in fidelity check: a replay far off it is not a valid baseline.
@@ -1424,10 +1484,15 @@ function renderPerfTargets(doc) {
           : `bounded by DRAM bandwidth (${rf.peak_bw_gbs} GB/s)`)
       : `bounded by the ${rf.unit || 'compute'} engine — arithmetic intensity `
         + `${rf.ai != null ? rf.ai : '?'} ≥ machine balance ${rf.ridge_ai || 0} flop/byte`;
-    return `<tr style="border-bottom:1px solid #eee">
+    const open = PERF_OPEN_OP === t.op;
+    return `<tr class="perf-target-row" data-op="${perfEsc(t.op)}"
+      onclick="perfToggleOpDetail('${perfEsc(t.op)}')"
+      style="border-bottom:1px solid #eee;cursor:pointer;${open ? 'background:#eef6ff' : ''}">
       <td>${t.rank}</td>
       <td><b>${perfEsc(t.op)}</b>${flags
-        ? ` <span title="${perfEsc(flags)}" style="color:#e67e22">⚠</span>` : ''}</td>
+        ? ` <span title="${perfEsc(flags)}" style="color:#e67e22">⚠</span>` : ''}
+        ${shape && shape.profiled
+          ? ' <span title="benchmarked at the shape the profile recorded" style="color:#27ae60">✓</span>' : ''}</td>
       <td>${perfEsc(t.backend || '—')}</td>
       <td style="text-align:right">${t.e2e_us.toFixed(1)}</td>
       <td style="text-align:right">${(t.share_of_e2e * 100).toFixed(1)}%</td>
@@ -1441,10 +1506,131 @@ function renderPerfTargets(doc) {
       <td><span title="${hint}" style="color:${color};font-weight:600">${t.action}</span></td>
       <td>${t.kernel && t.kernel.kernel_dir ? t.kernel.kernel_dir : '—'}
         ${cmd ? `<button class="btn" style="font-size:10px;padding:2px 6px;margin-left:6px"
-           onclick="navigator.clipboard.writeText(&quot;${cmd}&quot;)">copy bench</button>` : ''}</td>
+           onclick="event.stopPropagation();navigator.clipboard.writeText(&quot;${cmd}&quot;)">copy bench</button>` : ''}</td>
     </tr>`;
   }).join('');
-  document.getElementById('perf-targets').innerHTML = head + rows;
+  document.getElementById('perf-targets').innerHTML = head + body;
+  if (PERF_OPEN_OP && !targets.some(t => t.op === PERF_OPEN_OP)) {
+    PERF_OPEN_OP = null;
+    document.getElementById('perf-op-detail').innerHTML = '';
+  }
+}
+
+// ---- Per-op detail: the exported workbook's op sheet, for a quick look ----
+function perfToggleOpDetail(op) {
+  if (PERF_OPEN_OP === op) {
+    PERF_OPEN_OP = null;
+    document.getElementById('perf-op-detail').innerHTML = '';
+    renderPerfTargets(PERF_TARGETS_DOC);
+    return;
+  }
+  PERF_OPEN_OP = op;
+  renderPerfTargets(PERF_TARGETS_DOC);
+  showOpDetail(op);
+}
+
+async function showOpDetail(op) {
+  const runId = document.getElementById('perf-run-select').value || PERF_RUN_ID;
+  const box = document.getElementById('perf-op-detail');
+  box.innerHTML = `<div class="card"><h3 style="margin:0">${perfEsc(op)}</h3>
+    <div style="font-size:12px;color:#666">loading cases…</div></div>`;
+  const resp = await fetch(`/api/bench/results?run_id=${encodeURIComponent(runId)}`
+    + `&op=${encodeURIComponent(op)}`);
+  const data = await resp.json();
+  if (!resp.ok || !data.ok) {
+    box.innerHTML = `<div class="card"><h3 style="margin:0">${perfEsc(op)}</h3>
+      <div style="font-size:12px;color:#c0392b">${perfEsc(data.error || 'failed to load cases')}</div></div>`;
+    return;
+  }
+  renderOpDetail(op, data);
+}
+
+function renderOpDetail(op, data) {
+  const box = document.getElementById('perf-op-detail');
+  const section = (PERF_TARGETS_DOC.by_phase || {})[PERF_TARGET_PHASE] || null;
+  const target = section
+    ? (section.targets || []).find(t => t.op === op) : null;
+  const pt = (section && section.operating_point) || null;
+  // Same ordering as the workbook's per-op sheet: the phase in view first,
+  // heaviest case first — a case's weight is what puts the op on this list.
+  const atPoint = r => pt && r.phase === PERF_TARGET_PHASE
+    && r.seq_len === pt.seq_len && r.ctx_len === pt.ctx_len
+    && r.batch_size === pt.batch_size;
+  const recs = (data.records || []).slice().sort((a, b) => {
+    const pa = a.phase === PERF_TARGET_PHASE ? 0 : 1;
+    const pb = b.phase === PERF_TARGET_PHASE ? 0 : 1;
+    if (pa !== pb) return pa - pb;
+    // the ranked operating point first — it is the case the row was scored at
+    const oa = atPoint(a) ? 0 : 1, ob = atPoint(b) ? 0 : 1;
+    if (oa !== ob) return oa - ob;
+    return (b.weighted_us || 0) - (a.weighted_us || 0);
+  });
+  const cols = [
+    ['phase', 'phase', r => r.phase],
+    ['point', 'seq/ctx/bs', r => `${r.seq_len}/${r.ctx_len}/${r.batch_size}`],
+    ['shape', 'shape', r => r.shape || '—'],
+    ['status', 'status', r => r.status || '—'],
+    ['latency_us', 'latency µs', r => fmtNum(r.latency_us, 3)],
+    ['p10_us', 'p10', r => fmtNum(r.p10_us, 3)],
+    ['p90_us', 'p90', r => fmtNum(r.p90_us, 3)],
+    ['traced_device_time_us', 'traced µs', r => fmtNum(r.traced_device_time_us, 1)],
+    ['replay_vs_traced', 'replay/traced', r => fmtNum(r.replay_vs_traced, 2)],
+    ['unit', 'roof', r => r.unit || r.bound || '—'],
+    ['util', 'util', r => r.util != null ? (r.util * 100).toFixed(0) + '%' : '—'],
+    ['util_dram', 'DRAM', r => r.util_dram != null ? (r.util_dram * 100).toFixed(0) + '%' : '—'],
+    ['ai', 'AI', r => fmtNum(r.ai, 1)],
+    ['layers', 'calls', r => r.layers != null ? r.layers : '—'],
+    ['weighted_us', 'weighted µs', r => fmtNum(r.weighted_us, 1)],
+  ];
+  const head = '<tr style="text-align:left;border-bottom:2px solid #ddd">'
+    + '<th title="the shapes the profiling run recorded for this op">profiled</th>'
+    + cols.map(c => `<th>${c[1]}</th>`).join('') + '</tr>';
+  const body = recs.map(r => {
+    const bad = r.status !== 'ok';
+    return `<tr style="border-bottom:1px solid #eee;${atPoint(r) ? 'background:#eef6ff;' : ''}${bad ? 'color:#c0392b;' : ''}">
+      <td style="text-align:center">${r.traced_comparable ? '✓' : ''}</td>`
+      + cols.map(c => `<td${c[0] === 'shape' ? ' style="font-family:monospace"' : ''}>`
+          + perfEsc(String(c[2](r))) + '</td>').join('')
+      + '</tr>';
+  }).join('');
+  const errs = recs.filter(r => r.status !== 'ok' && (r.error || r.detail));
+  const rf = target ? target.roofline : null;
+  box.innerHTML = `<div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <h3 style="margin:0">${perfEsc(op)}</h3>
+      <button class="btn" style="font-size:11px;padding:3px 8px"
+        onclick="perfToggleOpDetail('${perfEsc(op)}')">close ✕</button>
+    </div>
+    <div style="font-size:12px;color:#666;margin:6px 0 10px">
+      ${target ? `backend <b>${perfEsc(target.backend || '—')}</b> · `
+        + `${PERF_TARGET_PHASE} e2e ${target.e2e_us.toFixed(1)} µs `
+        + `(${(target.share_of_e2e * 100).toFixed(1)}%) · `
+        + `${rf.unit || rf.bound} ${(rf.util * 100).toFixed(0)}%`
+        + ((rf.unit !== 'DRAM' && rf.util_dram)
+            ? ` (DRAM ${(rf.util_dram * 100).toFixed(0)}%)` : '')
+        + ` · <b>${target.action}</b>` : 'not ranked in this phase'}
+      · ${recs.length} case${recs.length === 1 ? '' : 's'} measured in this run
+      ${pt ? `· highlighted rows are the ${PERF_TARGET_PHASE} operating point `
+        + `(seq=${pt.seq_len} ctx=${pt.ctx_len} bs=${pt.batch_size})` : ''}
+    </div>
+    ${(target && (target.flags || []).length)
+      ? `<div style="font-size:12px;color:#e67e22;margin-bottom:8px">⚠ `
+        + target.flags.map(perfEsc).join('<br>⚠ ') + '</div>' : ''}
+    <div style="overflow:auto">
+      <table class="perf-table" style="width:100%;border-collapse:collapse;font-size:11px">
+        ${head}${body}</table>
+    </div>
+    ${errs.length ? `<div style="font-size:11px;color:#c0392b;margin-top:8px">`
+      + errs.map(r => perfEsc(`${r.status}: ${r.error || r.detail}`)).join('<br>')
+      + '</div>' : ''}
+    ${target && (target.top_shapes || []).length
+      ? `<div style="font-size:11px;color:#666;margin-top:8px">bench this shape:
+         <code>${perfEsc(target.top_shapes[0].bench_cmd)}</code></div>` : ''}
+  </div>`;
+}
+
+function fmtNum(v, digits) {
+  return (v == null || v === '') ? '—' : Number(v).toFixed(digits);
 }
 
 // ---- Shape Matrix Export ----
