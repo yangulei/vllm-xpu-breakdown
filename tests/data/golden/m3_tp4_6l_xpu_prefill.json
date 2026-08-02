@@ -1,0 +1,2734 @@
+{
+ "decode": null,
+ "has_timing": true,
+ "prefill": {
+  "carries_device_time": true,
+  "children": [
+   {
+    "carries_device_time": true,
+    "children": [
+     {
+      "carries_device_time": true,
+      "children": [
+       {
+        "carries_device_time": true,
+        "children": [
+         {
+          "carries_device_time": true,
+          "children": [],
+          "module_type": "VocabParallelEmbedding",
+          "name": "embed_tokens",
+          "ops": [
+           {
+            "backend": "cpu",
+            "carries_device_time": false,
+            "dtypes": [],
+            "name": "TorchDynamo Cache Lookup",
+            "order": 0,
+            "role": "embedding",
+            "shapes": []
+           },
+           {
+            "backend": "framework",
+            "carries_device_time": true,
+            "dtypes": [],
+            "name": "Torch-Compiled Region: 0/1",
+            "order": 1,
+            "role": "embedding",
+            "shapes": []
+           },
+           {
+            "backend": "framework",
+            "carries_device_time": false,
+            "dtypes": [
+             "long int"
+            ],
+            "name": "aten::to",
+            "order": 2,
+            "role": "embedding",
+            "shapes": [
+             [
+              "S"
+             ]
+            ]
+           },
+           {
+            "backend": "torch-xpu-ops",
+            "carries_device_time": true,
+            "dtypes": [
+             "bfloat16",
+             "long int"
+            ],
+            "name": "aten::embedding",
+            "order": 3,
+            "role": "embedding",
+            "shapes": [
+             [
+              "V/TP",
+              "H"
+             ],
+             [
+              "S"
+             ]
+            ]
+           },
+           {
+            "backend": "torch-xpu-ops",
+            "carries_device_time": true,
+            "dtypes": [
+             "bfloat16",
+             "bool"
+            ],
+            "name": "aten::masked_fill_",
+            "order": 4,
+            "role": "embedding",
+            "shapes": [
+             [
+              "S",
+              "H"
+             ],
+             [
+              "S",
+              "n_kv/TP"
+             ]
+            ]
+           },
+           {
+            "backend": "framework",
+            "carries_device_time": true,
+            "dtypes": [
+             "bfloat16"
+            ],
+            "name": "aten::clone",
+            "order": 5,
+            "role": "embedding",
+            "shapes": [
+             [
+              "S",
+              "H"
+             ]
+            ]
+           },
+           {
+            "backend": "ccl",
+            "carries_device_time": true,
+            "dtypes": [
+             "bfloat16"
+            ],
+            "name": "c10d::allreduce_",
+            "order": 6,
+            "role": "embedding",
+            "shapes": [
+             [
+              "S",
+              "H"
+             ]
+            ]
+           }
+          ],
+          "repeat_count": 1
+         },
+         {
+          "carries_device_time": true,
+          "children": [
+           {
+            "carries_device_time": true,
+            "children": [],
+            "module_type": "MiniMAXGemmaRMSNorm",
+            "name": "input_layernorm",
+            "ops": [
+             {
+              "backend": "triton",
+              "carries_device_time": true,
+              "dtypes": [
+               "bfloat16"
+              ],
+              "name": "triton::_gemma_rmsnorm_kernel",
+              "order": 0,
+              "role": "norm",
+              "shapes": [
+               [
+                "S",
+                "H"
+               ]
+              ]
+             }
+            ],
+            "repeat_count": 1
+           },
+           {
+            "carries_device_time": true,
+            "children": [
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "QKVParallelLinear",
+              "name": "qkv_proj",
+              "ops": [
+               {
+                "backend": "torch-xpu-ops",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16",
+                 "bfloat16"
+                ],
+                "name": "aten::linear",
+                "order": 0,
+                "role": "qkv_proj",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ],
+                 [
+                  "QKV/TP",
+                  "H"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             },
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "Attention",
+              "name": "attn",
+              "ops": [
+               {
+                "backend": "vllm-xpu-kernels",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16",
+                 "bfloat16"
+                ],
+                "name": "vllm::unified_kv_cache_update",
+                "order": 0,
+                "role": "cache_store",
+                "shapes": [
+                 [
+                  "S",
+                  "n_kv/TP",
+                  "d"
+                 ],
+                 [
+                  "S",
+                  "n_kv/TP",
+                  "d"
+                 ]
+                ]
+               },
+               {
+                "backend": "vllm-xpu-kernels",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16",
+                 "bfloat16",
+                 "bfloat16",
+                 "bfloat16",
+                 "bfloat16"
+                ],
+                "name": "vllm::unified_attention_with_output",
+                "order": 1,
+                "role": "attention",
+                "shapes": [
+                 [
+                  "S",
+                  "n_h/TP",
+                  "d"
+                 ],
+                 [
+                  "S+C",
+                  "n_kv/TP",
+                  "d"
+                 ],
+                 [
+                  "S+C",
+                  "n_kv/TP",
+                  "d"
+                 ],
+                 [
+                  "S",
+                  "n_h/TP",
+                  "d"
+                 ],
+                 [
+                  0
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             },
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "RowParallelLinear",
+              "name": "o_proj",
+              "ops": [
+               {
+                "backend": "torch-xpu-ops",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16",
+                 "bfloat16"
+                ],
+                "name": "aten::linear",
+                "order": 0,
+                "role": "o_proj",
+                "shapes": [
+                 [
+                  "S",
+                  "n_h\u00b7d/TP"
+                 ],
+                 [
+                  "H",
+                  "n_h\u00b7d/TP"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             }
+            ],
+            "module_type": "MiniMaxM3Attention",
+            "name": "self_attn",
+            "ops": [
+             {
+              "backend": "vllm-xpu-kernels",
+              "carries_device_time": true,
+              "dtypes": [
+               "bfloat16",
+               "bfloat16",
+               "bfloat16",
+               "bfloat16",
+               "long int"
+              ],
+              "name": "_C::fused_minimax_m3_qknorm_rope_kv_insert",
+              "order": 1,
+              "role": "attention_norm",
+              "shapes": [
+               [
+                "S",
+                "QKV/TP"
+               ],
+               [
+                "d"
+               ],
+               [
+                "d"
+               ],
+               [
+                "P",
+                "n_h"
+               ],
+               [
+                "S"
+               ]
+              ]
+             }
+            ],
+            "repeat_count": 1
+           },
+           {
+            "carries_device_time": true,
+            "children": [
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "MiniMAXGemmaRMSNorm",
+              "name": "post_attention_layernorm",
+              "ops": [
+               {
+                "backend": "triton",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16"
+                ],
+                "name": "triton::_gemma_fused_add_rmsnorm_kernel",
+                "order": 0,
+                "role": "norm",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             }
+            ],
+            "module_type": "FusedAllreduceGemmaRMSNorm",
+            "name": "fused_allreduce_gemma_rms_norm",
+            "ops": [
+             {
+              "backend": "framework",
+              "carries_device_time": true,
+              "dtypes": [
+               "bfloat16"
+              ],
+              "name": "aten::clone",
+              "order": 0,
+              "role": "norm",
+              "shapes": [
+               [
+                "S",
+                "H"
+               ]
+              ]
+             },
+             {
+              "backend": "ccl",
+              "carries_device_time": true,
+              "dtypes": [
+               "bfloat16"
+              ],
+              "name": "c10d::allreduce_",
+              "order": 1,
+              "role": "norm",
+              "shapes": [
+               [
+                "S",
+                "H"
+               ]
+              ]
+             }
+            ],
+            "repeat_count": 1
+           },
+           {
+            "carries_device_time": true,
+            "children": [
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "MergedColumnParallelLinear",
+              "name": "gate_up_proj",
+              "ops": [
+               {
+                "backend": "torch-xpu-ops",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16",
+                 "bfloat16"
+                ],
+                "name": "aten::linear",
+                "order": 0,
+                "role": "gate_up_proj",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ],
+                 [
+                  "H",
+                  "H"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             },
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "SiluAndMulWithClamp",
+              "name": "act_fn",
+              "ops": [
+               {
+                "backend": "vllm-xpu-kernels",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16",
+                 "bfloat16"
+                ],
+                "name": "_C::silu_and_mul_with_clamp",
+                "order": 0,
+                "role": "activation",
+                "shapes": [
+                 [
+                  "S",
+                  "I/TP"
+                 ],
+                 [
+                  "S",
+                  "H"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             },
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "RowParallelLinear",
+              "name": "down_proj",
+              "ops": [
+               {
+                "backend": "torch-xpu-ops",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16",
+                 "bfloat16"
+                ],
+                "name": "aten::linear",
+                "order": 0,
+                "role": "down_proj",
+                "shapes": [
+                 [
+                  "S",
+                  "I/TP"
+                 ],
+                 [
+                  "H",
+                  "I/TP"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             }
+            ],
+            "module_type": "MiniMaxM3MLP",
+            "name": "mlp",
+            "ops": [],
+            "repeat_count": 1
+           }
+          ],
+          "module_type": "MiniMaxM3DecoderLayer",
+          "name": "decoder_layer",
+          "ops": [],
+          "repeat_count": 1
+         },
+         {
+          "carries_device_time": true,
+          "children": [
+           {
+            "carries_device_time": true,
+            "children": [
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "MiniMAXGemmaRMSNorm",
+              "name": "input_layernorm",
+              "ops": [
+               {
+                "backend": "triton",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16"
+                ],
+                "name": "triton::_gemma_fused_add_rmsnorm_kernel",
+                "order": 0,
+                "role": "norm",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             }
+            ],
+            "module_type": "FusedAllreduceGemmaRMSNorm",
+            "name": "fused_allreduce_gemma_rms_norm",
+            "ops": [
+             {
+              "backend": "framework",
+              "carries_device_time": true,
+              "dtypes": [
+               "bfloat16"
+              ],
+              "name": "aten::clone",
+              "order": 0,
+              "role": "norm",
+              "shapes": [
+               [
+                "S",
+                "H"
+               ]
+              ]
+             },
+             {
+              "backend": "ccl",
+              "carries_device_time": true,
+              "dtypes": [
+               "bfloat16"
+              ],
+              "name": "c10d::allreduce_",
+              "order": 1,
+              "role": "norm",
+              "shapes": [
+               [
+                "S",
+                "H"
+               ]
+              ]
+             }
+            ],
+            "repeat_count": 1
+           },
+           {
+            "carries_device_time": true,
+            "children": [
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "QKVParallelLinear",
+              "name": "qkv_proj",
+              "ops": [
+               {
+                "backend": "torch-xpu-ops",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16",
+                 "bfloat16"
+                ],
+                "name": "aten::linear",
+                "order": 0,
+                "role": "qkv_proj",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ],
+                 [
+                  "QKV/TP",
+                  "H"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             },
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "Attention",
+              "name": "attn",
+              "ops": [
+               {
+                "backend": "vllm-xpu-kernels",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16",
+                 "bfloat16"
+                ],
+                "name": "vllm::unified_kv_cache_update",
+                "order": 0,
+                "role": "cache_store",
+                "shapes": [
+                 [
+                  "S",
+                  "n_kv/TP",
+                  "d"
+                 ],
+                 [
+                  "S",
+                  "n_kv/TP",
+                  "d"
+                 ]
+                ]
+               },
+               {
+                "backend": "vllm-xpu-kernels",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16",
+                 "bfloat16",
+                 "bfloat16",
+                 "bfloat16",
+                 "bfloat16"
+                ],
+                "name": "vllm::unified_attention_with_output",
+                "order": 1,
+                "role": "attention",
+                "shapes": [
+                 [
+                  "S",
+                  "n_h/TP",
+                  "d"
+                 ],
+                 [
+                  "S+C",
+                  "n_kv/TP",
+                  "d"
+                 ],
+                 [
+                  "S+C",
+                  "n_kv/TP",
+                  "d"
+                 ],
+                 [
+                  "S",
+                  "n_h/TP",
+                  "d"
+                 ],
+                 [
+                  0
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             },
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "RowParallelLinear",
+              "name": "o_proj",
+              "ops": [
+               {
+                "backend": "torch-xpu-ops",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16",
+                 "bfloat16"
+                ],
+                "name": "aten::linear",
+                "order": 0,
+                "role": "o_proj",
+                "shapes": [
+                 [
+                  "S",
+                  "n_h\u00b7d/TP"
+                 ],
+                 [
+                  "H",
+                  "n_h\u00b7d/TP"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             }
+            ],
+            "module_type": "MiniMaxM3Attention",
+            "name": "self_attn",
+            "ops": [
+             {
+              "backend": "vllm-xpu-kernels",
+              "carries_device_time": true,
+              "dtypes": [
+               "bfloat16",
+               "bfloat16",
+               "bfloat16",
+               "bfloat16",
+               "long int"
+              ],
+              "name": "_C::fused_minimax_m3_qknorm_rope_kv_insert",
+              "order": 1,
+              "role": "attention_norm",
+              "shapes": [
+               [
+                "S",
+                "QKV/TP"
+               ],
+               [
+                "d"
+               ],
+               [
+                "d"
+               ],
+               [
+                "P",
+                "n_h"
+               ],
+               [
+                "S"
+               ]
+              ]
+             }
+            ],
+            "repeat_count": 1
+           },
+           {
+            "carries_device_time": true,
+            "children": [
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "MiniMAXGemmaRMSNorm",
+              "name": "post_attention_layernorm",
+              "ops": [
+               {
+                "backend": "triton",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16"
+                ],
+                "name": "triton::_gemma_fused_add_rmsnorm_kernel",
+                "order": 0,
+                "role": "norm",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             }
+            ],
+            "module_type": "FusedAllreduceGemmaRMSNorm",
+            "name": "fused_allreduce_gemma_rms_norm",
+            "ops": [
+             {
+              "backend": "framework",
+              "carries_device_time": true,
+              "dtypes": [
+               "bfloat16"
+              ],
+              "name": "aten::clone",
+              "order": 0,
+              "role": "norm",
+              "shapes": [
+               [
+                "S",
+                "H"
+               ]
+              ]
+             },
+             {
+              "backend": "ccl",
+              "carries_device_time": true,
+              "dtypes": [
+               "bfloat16"
+              ],
+              "name": "c10d::allreduce_",
+              "order": 1,
+              "role": "norm",
+              "shapes": [
+               [
+                "S",
+                "H"
+               ]
+              ]
+             }
+            ],
+            "repeat_count": 1
+           },
+           {
+            "carries_device_time": true,
+            "children": [
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "MergedColumnParallelLinear",
+              "name": "gate_up_proj",
+              "ops": [
+               {
+                "backend": "torch-xpu-ops",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16",
+                 "bfloat16"
+                ],
+                "name": "aten::linear",
+                "order": 0,
+                "role": "gate_up_proj",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ],
+                 [
+                  "H",
+                  "H"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             },
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "SiluAndMulWithClamp",
+              "name": "act_fn",
+              "ops": [
+               {
+                "backend": "vllm-xpu-kernels",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16",
+                 "bfloat16"
+                ],
+                "name": "_C::silu_and_mul_with_clamp",
+                "order": 0,
+                "role": "activation",
+                "shapes": [
+                 [
+                  "S",
+                  "I/TP"
+                 ],
+                 [
+                  "S",
+                  "H"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             },
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "RowParallelLinear",
+              "name": "down_proj",
+              "ops": [
+               {
+                "backend": "torch-xpu-ops",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16",
+                 "bfloat16"
+                ],
+                "name": "aten::linear",
+                "order": 0,
+                "role": "down_proj",
+                "shapes": [
+                 [
+                  "S",
+                  "I/TP"
+                 ],
+                 [
+                  "H",
+                  "I/TP"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             }
+            ],
+            "module_type": "MiniMaxM3MLP",
+            "name": "mlp",
+            "ops": [],
+            "repeat_count": 1
+           }
+          ],
+          "module_type": "MiniMaxM3DecoderLayer",
+          "name": "decoder_layer",
+          "ops": [],
+          "repeat_count": 2
+         },
+         {
+          "carries_device_time": true,
+          "children": [
+           {
+            "carries_device_time": true,
+            "children": [
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "MiniMAXGemmaRMSNorm",
+              "name": "input_layernorm",
+              "ops": [
+               {
+                "backend": "triton",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16"
+                ],
+                "name": "triton::_gemma_fused_add_rmsnorm_kernel",
+                "order": 0,
+                "role": "norm",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             }
+            ],
+            "module_type": "FusedAllreduceGemmaRMSNorm",
+            "name": "fused_allreduce_gemma_rms_norm",
+            "ops": [
+             {
+              "backend": "framework",
+              "carries_device_time": true,
+              "dtypes": [
+               "bfloat16"
+              ],
+              "name": "aten::clone",
+              "order": 0,
+              "role": "norm",
+              "shapes": [
+               [
+                "S",
+                "H"
+               ]
+              ]
+             },
+             {
+              "backend": "ccl",
+              "carries_device_time": true,
+              "dtypes": [
+               "bfloat16"
+              ],
+              "name": "c10d::allreduce_",
+              "order": 1,
+              "role": "norm",
+              "shapes": [
+               [
+                "S",
+                "H"
+               ]
+              ]
+             }
+            ],
+            "repeat_count": 1
+           },
+           {
+            "carries_device_time": true,
+            "children": [
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "MinimaxM3QKVParallelLinearWithIndexer",
+              "name": "qkv_proj",
+              "ops": [
+               {
+                "backend": "torch-xpu-ops",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16",
+                 "bfloat16"
+                ],
+                "name": "aten::linear",
+                "order": 0,
+                "role": "qkv_proj",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ],
+                 [
+                  "QKV_idx/TP",
+                  "H"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             },
+             {
+              "carries_device_time": true,
+              "children": [
+               {
+                "carries_device_time": true,
+                "children": [],
+                "module_type": "MiniMaxM3IndexerTritonImpl",
+                "name": "impl",
+                "ops": [
+                 {
+                  "backend": "flash_xpu",
+                  "carries_device_time": true,
+                  "dtypes": [
+                   "bfloat16"
+                  ],
+                  "name": "flash_xpu::minimax_m3_index_score",
+                  "order": 0,
+                  "role": "minimax_m3_index_score",
+                  "shapes": [
+                   [
+                    "S",
+                    "n_idx/TP",
+                    "d"
+                   ]
+                  ]
+                 },
+                 {
+                  "backend": "flash_xpu",
+                  "carries_device_time": true,
+                  "dtypes": [
+                   "int32"
+                  ],
+                  "name": "flash_xpu::minimax_m3_index_topk",
+                  "order": 1,
+                  "role": "minimax_m3_index_topk",
+                  "shapes": [
+                   [
+                    "n_idx/TP",
+                    "S",
+                    "K_topk"
+                   ]
+                  ]
+                 }
+                ],
+                "repeat_count": 1
+               }
+              ],
+              "module_type": "MiniMaxM3Indexer",
+              "name": "indexer",
+              "ops": [],
+              "repeat_count": 1
+             },
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "RowParallelLinear",
+              "name": "o_proj",
+              "ops": [
+               {
+                "backend": "torch-xpu-ops",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16",
+                 "bfloat16"
+                ],
+                "name": "aten::linear",
+                "order": 0,
+                "role": "o_proj",
+                "shapes": [
+                 [
+                  "S",
+                  "n_h\u00b7d/TP"
+                 ],
+                 [
+                  "H",
+                  "n_h\u00b7d/TP"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             }
+            ],
+            "module_type": "MiniMaxM3SparseAttention",
+            "name": "self_attn",
+            "ops": [
+             {
+              "backend": "framework",
+              "carries_device_time": false,
+              "dtypes": [
+               "bfloat16"
+              ],
+              "name": "aten::new_empty",
+              "order": 1,
+              "role": "attention",
+              "shapes": [
+               [
+                "S",
+                "QKV_idx/TP"
+               ]
+              ]
+             },
+             {
+              "backend": "framework",
+              "carries_device_time": false,
+              "dtypes": [
+               "bfloat16"
+              ],
+              "name": "aten::new_empty",
+              "order": 2,
+              "role": "attention",
+              "shapes": [
+               [
+                "S",
+                "QKV_idx/TP"
+               ]
+              ]
+             },
+             {
+              "backend": "vllm-xpu-kernels",
+              "carries_device_time": true,
+              "dtypes": [
+               "bfloat16",
+               "bfloat16",
+               "bfloat16",
+               "bfloat16",
+               "long int",
+               "bfloat16",
+               "bfloat16",
+               "long int",
+               "long int",
+               "bfloat16",
+               "bfloat16",
+               "bfloat16",
+               "bfloat16"
+              ],
+              "name": "_C::fused_minimax_m3_qknorm_rope_kv_insert",
+              "order": 3,
+              "role": "attention_norm",
+              "shapes": [
+               [
+                "S",
+                "QKV_idx/TP"
+               ],
+               [
+                "d"
+               ],
+               [
+                "d"
+               ],
+               [
+                "P",
+                "n_h"
+               ],
+               [
+                "S"
+               ],
+               [
+                "d"
+               ],
+               [
+                "d"
+               ],
+               [
+                "S"
+               ],
+               [
+                "S"
+               ],
+               [
+                "N_kv",
+                2,
+                "d",
+                "n_kv/TP",
+                "d"
+               ],
+               [
+                "N_kv",
+                "d",
+                "d"
+               ],
+               [
+                "S",
+                "n_h\u00b7d/TP"
+               ],
+               [
+                "S",
+                "d"
+               ]
+              ]
+             },
+             {
+              "backend": "flash_xpu",
+              "carries_device_time": true,
+              "dtypes": [
+               "bfloat16"
+              ],
+              "name": "flash_xpu::minimax_m3_sparse_attn",
+              "order": 5,
+              "role": "attention",
+              "shapes": [
+               [
+                "S",
+                "n_h/TP",
+                "d"
+               ]
+              ]
+             }
+            ],
+            "repeat_count": 1
+           },
+           {
+            "carries_device_time": true,
+            "children": [
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "MiniMAXGemmaRMSNorm",
+              "name": "post_attention_layernorm",
+              "ops": [
+               {
+                "backend": "triton",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16"
+                ],
+                "name": "triton::_gemma_fused_add_rmsnorm_kernel",
+                "order": 0,
+                "role": "norm",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             }
+            ],
+            "module_type": "FusedAllreduceGemmaRMSNorm",
+            "name": "fused_allreduce_gemma_rms_norm",
+            "ops": [
+             {
+              "backend": "framework",
+              "carries_device_time": true,
+              "dtypes": [
+               "bfloat16"
+              ],
+              "name": "aten::clone",
+              "order": 0,
+              "role": "norm",
+              "shapes": [
+               [
+                "S",
+                "H"
+               ]
+              ]
+             },
+             {
+              "backend": "ccl",
+              "carries_device_time": true,
+              "dtypes": [
+               "bfloat16"
+              ],
+              "name": "c10d::allreduce_",
+              "order": 1,
+              "role": "norm",
+              "shapes": [
+               [
+                "S",
+                "H"
+               ]
+              ]
+             }
+            ],
+            "repeat_count": 1
+           },
+           {
+            "carries_device_time": true,
+            "children": [
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "GateLinear",
+              "name": "gate",
+              "ops": [
+               {
+                "backend": "framework",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16"
+                ],
+                "name": "aten::to",
+                "order": 0,
+                "role": "to",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ]
+                ]
+               },
+               {
+                "backend": "torch-xpu-ops",
+                "carries_device_time": true,
+                "dtypes": [
+                 "float",
+                 "float"
+                ],
+                "name": "aten::linear",
+                "order": 1,
+                "role": "linear",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ],
+                 [
+                  "d",
+                  "H"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             },
+             {
+              "carries_device_time": true,
+              "children": [
+               {
+                "carries_device_time": true,
+                "children": [],
+                "module_type": "XpuFusedMoE",
+                "name": "moe",
+                "ops": [
+                 {
+                  "backend": "framework",
+                  "carries_device_time": true,
+                  "dtypes": [],
+                  "name": "aten::zeros",
+                  "order": 0,
+                  "role": "zeros",
+                  "shapes": []
+                 },
+                 {
+                  "backend": "vllm-xpu-kernels",
+                  "carries_device_time": true,
+                  "dtypes": [
+                   "bfloat16",
+                   "bfloat16",
+                   "int",
+                   "int",
+                   "int"
+                  ],
+                  "name": "_moe_C::remap_hidden_states",
+                  "order": 1,
+                  "role": "remap_hidden_states",
+                  "shapes": [
+                   [
+                    "S",
+                    "H"
+                   ],
+                   [
+                    "n_h\u00b7d",
+                    "H"
+                   ],
+                   [
+                    "d"
+                   ],
+                   [
+                    "S",
+                    "n_kv"
+                   ],
+                   [
+                    "S",
+                    "n_kv"
+                   ]
+                  ]
+                 },
+                 {
+                  "backend": "vllm-xpu-kernels",
+                  "carries_device_time": true,
+                  "dtypes": [
+                   "bfloat16",
+                   "bfloat16",
+                   "bfloat16",
+                   "int"
+                  ],
+                  "name": "_xpu_C::cutlass_grouped_gemm_interface",
+                  "order": 2,
+                  "role": "cutlass_grouped_gemm_interface",
+                  "shapes": [
+                   [
+                    "n_h\u00b7d",
+                    "H"
+                   ],
+                   [
+                    "d",
+                    "H",
+                    "H/TP"
+                   ],
+                   [
+                    "n_h\u00b7d",
+                    "H/TP"
+                   ],
+                   [
+                    "d"
+                   ]
+                  ]
+                 },
+                 {
+                  "backend": "vllm-xpu-kernels",
+                  "carries_device_time": true,
+                  "dtypes": [
+                   "bfloat16",
+                   "bfloat16"
+                  ],
+                  "name": "_C::swigluoai_and_mul",
+                  "order": 3,
+                  "role": "swigluoai_and_mul",
+                  "shapes": [
+                   [
+                    "n_h\u00b7d",
+                    "I_moe/TP"
+                   ],
+                   [
+                    "n_h\u00b7d",
+                    "H/TP"
+                   ]
+                  ]
+                 },
+                 {
+                  "backend": "vllm-xpu-kernels",
+                  "carries_device_time": true,
+                  "dtypes": [
+                   "bfloat16",
+                   "bfloat16",
+                   "bfloat16",
+                   "int"
+                  ],
+                  "name": "_xpu_C::cutlass_grouped_gemm_interface",
+                  "order": 4,
+                  "role": "cutlass_grouped_gemm_interface",
+                  "shapes": [
+                   [
+                    "n_h\u00b7d",
+                    "I_moe/TP"
+                   ],
+                   [
+                    "d",
+                    "I_moe/TP",
+                    "H"
+                   ],
+                   [
+                    "n_h\u00b7d",
+                    "H"
+                   ],
+                   [
+                    "d"
+                   ]
+                  ]
+                 },
+                 {
+                  "backend": "vllm-xpu-kernels",
+                  "carries_device_time": true,
+                  "dtypes": [
+                   "bfloat16",
+                   "bfloat16",
+                   "float",
+                   "int"
+                  ],
+                  "name": "_moe_C::moe_gather",
+                  "order": 5,
+                  "role": "moe_gather",
+                  "shapes": [
+                   [
+                    "S",
+                    "H"
+                   ],
+                   [
+                    "n_h\u00b7d",
+                    "H"
+                   ],
+                   [
+                    "S",
+                    "n_kv"
+                   ],
+                   [
+                    "S",
+                    "n_kv"
+                   ]
+                  ]
+                 }
+                ],
+                "repeat_count": 1
+               },
+               {
+                "carries_device_time": true,
+                "children": [],
+                "module_type": "FusedTopKBiasRouter",
+                "name": "router",
+                "ops": [
+                 {
+                  "backend": "vllm-xpu-kernels",
+                  "carries_device_time": true,
+                  "dtypes": [
+                   "float",
+                   "int",
+                   "int",
+                   "float",
+                   "float"
+                  ],
+                  "name": "_moe_C::topk_sigmoid",
+                  "order": 0,
+                  "role": "topk_sigmoid",
+                  "shapes": [
+                   [
+                    "S",
+                    "n_kv"
+                   ],
+                   [
+                    "S",
+                    "n_kv"
+                   ],
+                   [
+                    "S",
+                    "n_kv"
+                   ],
+                   [
+                    "S",
+                    "d"
+                   ],
+                   [
+                    "d"
+                   ]
+                  ]
+                 }
+                ],
+                "repeat_count": 1
+               },
+               {
+                "carries_device_time": true,
+                "children": [
+                 {
+                  "carries_device_time": true,
+                  "children": [],
+                  "module_type": "MergedColumnParallelLinear",
+                  "name": "gate_up_proj",
+                  "ops": [
+                   {
+                    "backend": "torch-xpu-ops",
+                    "carries_device_time": true,
+                    "dtypes": [
+                     "bfloat16",
+                     "bfloat16"
+                    ],
+                    "name": "aten::linear",
+                    "order": 0,
+                    "role": "gate_up_proj",
+                    "shapes": [
+                     [
+                      "S",
+                      "H"
+                     ],
+                     [
+                      "H/TP",
+                      "H"
+                     ]
+                    ]
+                   }
+                  ],
+                  "repeat_count": 1
+                 },
+                 {
+                  "carries_device_time": true,
+                  "children": [],
+                  "module_type": "SiluAndMulWithClamp",
+                  "name": "act_fn",
+                  "ops": [
+                   {
+                    "backend": "vllm-xpu-kernels",
+                    "carries_device_time": true,
+                    "dtypes": [
+                     "bfloat16",
+                     "bfloat16"
+                    ],
+                    "name": "_C::silu_and_mul_with_clamp",
+                    "order": 0,
+                    "role": "activation",
+                    "shapes": [
+                     [
+                      "S",
+                      "I_moe/TP"
+                     ],
+                     [
+                      "S",
+                      "H/TP"
+                     ]
+                    ]
+                   }
+                  ],
+                  "repeat_count": 1
+                 },
+                 {
+                  "carries_device_time": true,
+                  "children": [],
+                  "module_type": "RowParallelLinear",
+                  "name": "down_proj",
+                  "ops": [
+                   {
+                    "backend": "torch-xpu-ops",
+                    "carries_device_time": true,
+                    "dtypes": [
+                     "bfloat16",
+                     "bfloat16"
+                    ],
+                    "name": "aten::linear",
+                    "order": 0,
+                    "role": "down_proj",
+                    "shapes": [
+                     [
+                      "S",
+                      "I_moe/TP"
+                     ],
+                     [
+                      "H",
+                      "I_moe/TP"
+                     ]
+                    ]
+                   }
+                  ],
+                  "repeat_count": 1
+                 }
+                ],
+                "module_type": "MiniMaxM3MLP",
+                "name": "shared_experts",
+                "ops": [],
+                "repeat_count": 1
+               }
+              ],
+              "module_type": "FusedMoE",
+              "name": "experts",
+              "ops": [
+               {
+                "backend": "vllm-xpu-kernels",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16",
+                 "float",
+                 "bfloat16"
+                ],
+                "name": "vllm::moe_forward_shared",
+                "order": 0,
+                "role": "moe_forward_shared",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ],
+                 [
+                  "S",
+                  "d"
+                 ],
+                 [
+                  "S",
+                  "H"
+                 ]
+                ]
+               },
+               {
+                "backend": "torch-xpu-ops",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16"
+                ],
+                "name": "aten::mul_",
+                "order": 4,
+                "role": "mul_",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ]
+                ]
+               },
+               {
+                "backend": "torch-xpu-ops",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16",
+                 "bfloat16"
+                ],
+                "name": "aten::add",
+                "order": 5,
+                "role": "add",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ],
+                 [
+                  "S",
+                  "H"
+                 ]
+                ]
+               },
+               {
+                "backend": "framework",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16"
+                ],
+                "name": "aten::clone",
+                "order": 6,
+                "role": "clone",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ]
+                ]
+               },
+               {
+                "backend": "ccl",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16"
+                ],
+                "name": "c10d::allreduce_",
+                "order": 7,
+                "role": "allreduce_",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             }
+            ],
+            "module_type": "MiniMaxM3MoE",
+            "name": "block_sparse_moe",
+            "ops": [],
+            "repeat_count": 1
+           }
+          ],
+          "module_type": "MiniMaxM3DecoderLayer",
+          "name": "decoder_layer",
+          "ops": [],
+          "repeat_count": 1
+         },
+         {
+          "carries_device_time": true,
+          "children": [
+           {
+            "carries_device_time": true,
+            "children": [],
+            "module_type": "MiniMAXGemmaRMSNorm",
+            "name": "input_layernorm",
+            "ops": [
+             {
+              "backend": "triton",
+              "carries_device_time": true,
+              "dtypes": [
+               "bfloat16"
+              ],
+              "name": "triton::_gemma_fused_add_rmsnorm_kernel",
+              "order": 0,
+              "role": "norm",
+              "shapes": [
+               [
+                "S",
+                "H"
+               ]
+              ]
+             }
+            ],
+            "repeat_count": 1
+           },
+           {
+            "carries_device_time": true,
+            "children": [
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "MinimaxM3QKVParallelLinearWithIndexer",
+              "name": "qkv_proj",
+              "ops": [
+               {
+                "backend": "torch-xpu-ops",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16",
+                 "bfloat16"
+                ],
+                "name": "aten::linear",
+                "order": 0,
+                "role": "qkv_proj",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ],
+                 [
+                  "QKV_idx/TP",
+                  "H"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             },
+             {
+              "carries_device_time": true,
+              "children": [
+               {
+                "carries_device_time": true,
+                "children": [],
+                "module_type": "MiniMaxM3IndexerTritonImpl",
+                "name": "impl",
+                "ops": [
+                 {
+                  "backend": "flash_xpu",
+                  "carries_device_time": true,
+                  "dtypes": [
+                   "bfloat16"
+                  ],
+                  "name": "flash_xpu::minimax_m3_index_score",
+                  "order": 0,
+                  "role": "minimax_m3_index_score",
+                  "shapes": [
+                   [
+                    "S",
+                    "n_idx/TP",
+                    "d"
+                   ]
+                  ]
+                 },
+                 {
+                  "backend": "flash_xpu",
+                  "carries_device_time": true,
+                  "dtypes": [
+                   "int32"
+                  ],
+                  "name": "flash_xpu::minimax_m3_index_topk",
+                  "order": 1,
+                  "role": "minimax_m3_index_topk",
+                  "shapes": [
+                   [
+                    "n_idx/TP",
+                    "S",
+                    "K_topk"
+                   ]
+                  ]
+                 }
+                ],
+                "repeat_count": 1
+               }
+              ],
+              "module_type": "MiniMaxM3Indexer",
+              "name": "indexer",
+              "ops": [],
+              "repeat_count": 1
+             },
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "RowParallelLinear",
+              "name": "o_proj",
+              "ops": [
+               {
+                "backend": "torch-xpu-ops",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16",
+                 "bfloat16"
+                ],
+                "name": "aten::linear",
+                "order": 0,
+                "role": "o_proj",
+                "shapes": [
+                 [
+                  "S",
+                  "n_h\u00b7d/TP"
+                 ],
+                 [
+                  "H",
+                  "n_h\u00b7d/TP"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             }
+            ],
+            "module_type": "MiniMaxM3SparseAttention",
+            "name": "self_attn",
+            "ops": [
+             {
+              "backend": "framework",
+              "carries_device_time": false,
+              "dtypes": [
+               "bfloat16"
+              ],
+              "name": "aten::new_empty",
+              "order": 1,
+              "role": "attention",
+              "shapes": [
+               [
+                "S",
+                "QKV_idx/TP"
+               ]
+              ]
+             },
+             {
+              "backend": "framework",
+              "carries_device_time": false,
+              "dtypes": [
+               "bfloat16"
+              ],
+              "name": "aten::new_empty",
+              "order": 2,
+              "role": "attention",
+              "shapes": [
+               [
+                "S",
+                "QKV_idx/TP"
+               ]
+              ]
+             },
+             {
+              "backend": "vllm-xpu-kernels",
+              "carries_device_time": true,
+              "dtypes": [
+               "bfloat16",
+               "bfloat16",
+               "bfloat16",
+               "bfloat16",
+               "long int",
+               "bfloat16",
+               "bfloat16",
+               "long int",
+               "long int",
+               "bfloat16",
+               "bfloat16",
+               "bfloat16",
+               "bfloat16"
+              ],
+              "name": "_C::fused_minimax_m3_qknorm_rope_kv_insert",
+              "order": 3,
+              "role": "attention_norm",
+              "shapes": [
+               [
+                "S",
+                "QKV_idx/TP"
+               ],
+               [
+                "d"
+               ],
+               [
+                "d"
+               ],
+               [
+                "P",
+                "n_h"
+               ],
+               [
+                "S"
+               ],
+               [
+                "d"
+               ],
+               [
+                "d"
+               ],
+               [
+                "S"
+               ],
+               [
+                "S"
+               ],
+               [
+                "N_kv",
+                2,
+                "d",
+                "n_kv/TP",
+                "d"
+               ],
+               [
+                "N_kv",
+                "d",
+                "d"
+               ],
+               [
+                "S",
+                "n_h\u00b7d/TP"
+               ],
+               [
+                "S",
+                "d"
+               ]
+              ]
+             },
+             {
+              "backend": "flash_xpu",
+              "carries_device_time": true,
+              "dtypes": [
+               "bfloat16"
+              ],
+              "name": "flash_xpu::minimax_m3_sparse_attn",
+              "order": 5,
+              "role": "attention",
+              "shapes": [
+               [
+                "S",
+                "n_h/TP",
+                "d"
+               ]
+              ]
+             }
+            ],
+            "repeat_count": 1
+           },
+           {
+            "carries_device_time": true,
+            "children": [
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "MiniMAXGemmaRMSNorm",
+              "name": "post_attention_layernorm",
+              "ops": [
+               {
+                "backend": "triton",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16"
+                ],
+                "name": "triton::_gemma_fused_add_rmsnorm_kernel",
+                "order": 0,
+                "role": "norm",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             }
+            ],
+            "module_type": "FusedAllreduceGemmaRMSNorm",
+            "name": "fused_allreduce_gemma_rms_norm",
+            "ops": [
+             {
+              "backend": "framework",
+              "carries_device_time": true,
+              "dtypes": [
+               "bfloat16"
+              ],
+              "name": "aten::clone",
+              "order": 0,
+              "role": "norm",
+              "shapes": [
+               [
+                "S",
+                "H"
+               ]
+              ]
+             },
+             {
+              "backend": "ccl",
+              "carries_device_time": true,
+              "dtypes": [
+               "bfloat16"
+              ],
+              "name": "c10d::allreduce_",
+              "order": 1,
+              "role": "norm",
+              "shapes": [
+               [
+                "S",
+                "H"
+               ]
+              ]
+             }
+            ],
+            "repeat_count": 1
+           },
+           {
+            "carries_device_time": true,
+            "children": [
+             {
+              "carries_device_time": true,
+              "children": [],
+              "module_type": "GateLinear",
+              "name": "gate",
+              "ops": [
+               {
+                "backend": "framework",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16"
+                ],
+                "name": "aten::to",
+                "order": 0,
+                "role": "to",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ]
+                ]
+               },
+               {
+                "backend": "torch-xpu-ops",
+                "carries_device_time": true,
+                "dtypes": [
+                 "float",
+                 "float"
+                ],
+                "name": "aten::linear",
+                "order": 1,
+                "role": "linear",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ],
+                 [
+                  "d",
+                  "H"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             },
+             {
+              "carries_device_time": true,
+              "children": [
+               {
+                "carries_device_time": true,
+                "children": [],
+                "module_type": "XpuFusedMoE",
+                "name": "moe",
+                "ops": [
+                 {
+                  "backend": "framework",
+                  "carries_device_time": true,
+                  "dtypes": [],
+                  "name": "aten::zeros",
+                  "order": 0,
+                  "role": "zeros",
+                  "shapes": []
+                 },
+                 {
+                  "backend": "vllm-xpu-kernels",
+                  "carries_device_time": true,
+                  "dtypes": [
+                   "bfloat16",
+                   "bfloat16",
+                   "int",
+                   "int",
+                   "int"
+                  ],
+                  "name": "_moe_C::remap_hidden_states",
+                  "order": 1,
+                  "role": "remap_hidden_states",
+                  "shapes": [
+                   [
+                    "S",
+                    "H"
+                   ],
+                   [
+                    "n_h\u00b7d",
+                    "H"
+                   ],
+                   [
+                    "d"
+                   ],
+                   [
+                    "S",
+                    "n_kv"
+                   ],
+                   [
+                    "S",
+                    "n_kv"
+                   ]
+                  ]
+                 },
+                 {
+                  "backend": "vllm-xpu-kernels",
+                  "carries_device_time": true,
+                  "dtypes": [
+                   "bfloat16",
+                   "bfloat16",
+                   "bfloat16",
+                   "int"
+                  ],
+                  "name": "_xpu_C::cutlass_grouped_gemm_interface",
+                  "order": 2,
+                  "role": "cutlass_grouped_gemm_interface",
+                  "shapes": [
+                   [
+                    "n_h\u00b7d",
+                    "H"
+                   ],
+                   [
+                    "d",
+                    "H",
+                    "H/TP"
+                   ],
+                   [
+                    "n_h\u00b7d",
+                    "H/TP"
+                   ],
+                   [
+                    "d"
+                   ]
+                  ]
+                 },
+                 {
+                  "backend": "vllm-xpu-kernels",
+                  "carries_device_time": true,
+                  "dtypes": [
+                   "bfloat16",
+                   "bfloat16"
+                  ],
+                  "name": "_C::swigluoai_and_mul",
+                  "order": 3,
+                  "role": "swigluoai_and_mul",
+                  "shapes": [
+                   [
+                    "n_h\u00b7d",
+                    "I_moe/TP"
+                   ],
+                   [
+                    "n_h\u00b7d",
+                    "H/TP"
+                   ]
+                  ]
+                 },
+                 {
+                  "backend": "vllm-xpu-kernels",
+                  "carries_device_time": true,
+                  "dtypes": [
+                   "bfloat16",
+                   "bfloat16",
+                   "bfloat16",
+                   "int"
+                  ],
+                  "name": "_xpu_C::cutlass_grouped_gemm_interface",
+                  "order": 4,
+                  "role": "cutlass_grouped_gemm_interface",
+                  "shapes": [
+                   [
+                    "n_h\u00b7d",
+                    "I_moe/TP"
+                   ],
+                   [
+                    "d",
+                    "I_moe/TP",
+                    "H"
+                   ],
+                   [
+                    "n_h\u00b7d",
+                    "H"
+                   ],
+                   [
+                    "d"
+                   ]
+                  ]
+                 },
+                 {
+                  "backend": "vllm-xpu-kernels",
+                  "carries_device_time": true,
+                  "dtypes": [
+                   "bfloat16",
+                   "bfloat16",
+                   "float",
+                   "int"
+                  ],
+                  "name": "_moe_C::moe_gather",
+                  "order": 5,
+                  "role": "moe_gather",
+                  "shapes": [
+                   [
+                    "S",
+                    "H"
+                   ],
+                   [
+                    "n_h\u00b7d",
+                    "H"
+                   ],
+                   [
+                    "S",
+                    "n_kv"
+                   ],
+                   [
+                    "S",
+                    "n_kv"
+                   ]
+                  ]
+                 }
+                ],
+                "repeat_count": 1
+               },
+               {
+                "carries_device_time": true,
+                "children": [],
+                "module_type": "FusedTopKBiasRouter",
+                "name": "router",
+                "ops": [
+                 {
+                  "backend": "vllm-xpu-kernels",
+                  "carries_device_time": true,
+                  "dtypes": [
+                   "float",
+                   "int",
+                   "int",
+                   "float",
+                   "float"
+                  ],
+                  "name": "_moe_C::topk_sigmoid",
+                  "order": 0,
+                  "role": "topk_sigmoid",
+                  "shapes": [
+                   [
+                    "S",
+                    "n_kv"
+                   ],
+                   [
+                    "S",
+                    "n_kv"
+                   ],
+                   [
+                    "S",
+                    "n_kv"
+                   ],
+                   [
+                    "S",
+                    "d"
+                   ],
+                   [
+                    "d"
+                   ]
+                  ]
+                 }
+                ],
+                "repeat_count": 1
+               },
+               {
+                "carries_device_time": true,
+                "children": [
+                 {
+                  "carries_device_time": true,
+                  "children": [],
+                  "module_type": "MergedColumnParallelLinear",
+                  "name": "gate_up_proj",
+                  "ops": [
+                   {
+                    "backend": "torch-xpu-ops",
+                    "carries_device_time": true,
+                    "dtypes": [
+                     "bfloat16",
+                     "bfloat16"
+                    ],
+                    "name": "aten::linear",
+                    "order": 0,
+                    "role": "gate_up_proj",
+                    "shapes": [
+                     [
+                      "S",
+                      "H"
+                     ],
+                     [
+                      "H/TP",
+                      "H"
+                     ]
+                    ]
+                   }
+                  ],
+                  "repeat_count": 1
+                 },
+                 {
+                  "carries_device_time": true,
+                  "children": [],
+                  "module_type": "SiluAndMulWithClamp",
+                  "name": "act_fn",
+                  "ops": [
+                   {
+                    "backend": "vllm-xpu-kernels",
+                    "carries_device_time": true,
+                    "dtypes": [
+                     "bfloat16",
+                     "bfloat16"
+                    ],
+                    "name": "_C::silu_and_mul_with_clamp",
+                    "order": 0,
+                    "role": "activation",
+                    "shapes": [
+                     [
+                      "S",
+                      "I_moe/TP"
+                     ],
+                     [
+                      "S",
+                      "H/TP"
+                     ]
+                    ]
+                   }
+                  ],
+                  "repeat_count": 1
+                 },
+                 {
+                  "carries_device_time": true,
+                  "children": [],
+                  "module_type": "RowParallelLinear",
+                  "name": "down_proj",
+                  "ops": [
+                   {
+                    "backend": "torch-xpu-ops",
+                    "carries_device_time": true,
+                    "dtypes": [
+                     "bfloat16",
+                     "bfloat16"
+                    ],
+                    "name": "aten::linear",
+                    "order": 0,
+                    "role": "down_proj",
+                    "shapes": [
+                     [
+                      "S",
+                      "I_moe/TP"
+                     ],
+                     [
+                      "H",
+                      "I_moe/TP"
+                     ]
+                    ]
+                   }
+                  ],
+                  "repeat_count": 1
+                 }
+                ],
+                "module_type": "MiniMaxM3MLP",
+                "name": "shared_experts",
+                "ops": [],
+                "repeat_count": 1
+               }
+              ],
+              "module_type": "FusedMoE",
+              "name": "experts",
+              "ops": [
+               {
+                "backend": "vllm-xpu-kernels",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16",
+                 "float",
+                 "bfloat16"
+                ],
+                "name": "vllm::moe_forward_shared",
+                "order": 0,
+                "role": "moe_forward_shared",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ],
+                 [
+                  "S",
+                  "d"
+                 ],
+                 [
+                  "S",
+                  "H"
+                 ]
+                ]
+               },
+               {
+                "backend": "torch-xpu-ops",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16"
+                ],
+                "name": "aten::mul_",
+                "order": 4,
+                "role": "mul_",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ]
+                ]
+               },
+               {
+                "backend": "torch-xpu-ops",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16",
+                 "bfloat16"
+                ],
+                "name": "aten::add",
+                "order": 5,
+                "role": "add",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ],
+                 [
+                  "S",
+                  "H"
+                 ]
+                ]
+               },
+               {
+                "backend": "framework",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16"
+                ],
+                "name": "aten::clone",
+                "order": 6,
+                "role": "clone",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ]
+                ]
+               },
+               {
+                "backend": "ccl",
+                "carries_device_time": true,
+                "dtypes": [
+                 "bfloat16"
+                ],
+                "name": "c10d::allreduce_",
+                "order": 7,
+                "role": "allreduce_",
+                "shapes": [
+                 [
+                  "S",
+                  "H"
+                 ]
+                ]
+               }
+              ],
+              "repeat_count": 1
+             }
+            ],
+            "module_type": "MiniMaxM3MoE",
+            "name": "block_sparse_moe",
+            "ops": [],
+            "repeat_count": 1
+           }
+          ],
+          "module_type": "MiniMaxM3DecoderLayer",
+          "name": "decoder_layer",
+          "ops": [],
+          "repeat_count": 56
+         },
+         {
+          "carries_device_time": true,
+          "children": [],
+          "module_type": "MiniMAXGemmaRMSNorm",
+          "name": "norm",
+          "ops": [
+           {
+            "backend": "triton",
+            "carries_device_time": true,
+            "dtypes": [
+             "bfloat16"
+            ],
+            "name": "triton::_gemma_fused_add_rmsnorm_kernel",
+            "order": 0,
+            "role": "norm",
+            "shapes": [
+             [
+              "S",
+              "H"
+             ]
+            ]
+           }
+          ],
+          "repeat_count": 1
+         }
+        ],
+        "module_type": "MiniMaxM3Model",
+        "name": "model",
+        "ops": [],
+        "repeat_count": 1
+       }
+      ],
+      "module_type": "MiniMaxM3SparseForCausalLM",
+      "name": "language_model",
+      "ops": [],
+      "repeat_count": 1
+     }
+    ],
+    "module_type": "MiniMaxM3SparseForConditionalGeneration",
+    "name": "MiniMaxM3SparseForConditionalGeneration",
+    "ops": [],
+    "repeat_count": 1
+   },
+   {
+    "carries_device_time": true,
+    "children": [],
+    "module_type": "LogitsProcessor",
+    "name": "logits_processor",
+    "ops": [
+     {
+      "backend": "torch-xpu-ops",
+      "carries_device_time": true,
+      "dtypes": [
+       "bfloat16",
+       "bfloat16"
+      ],
+      "name": "aten::linear",
+      "order": 0,
+      "role": "lm_head",
+      "shapes": [
+       [
+        "n_kv/TP",
+        "H"
+       ],
+       [
+        "V/TP",
+        "H"
+       ]
+      ]
+     },
+     {
+      "backend": "ccl",
+      "carries_device_time": true,
+      "dtypes": [
+       "bfloat16",
+       "bfloat16"
+      ],
+      "name": "c10d::_allgather_base_",
+      "order": 1,
+      "role": "lm_head",
+      "shapes": [
+       [
+        "n_kv",
+        "V/TP"
+       ],
+       [
+        "n_kv/TP",
+        "V/TP"
+       ]
+      ]
+     },
+     {
+      "backend": "framework",
+      "carries_device_time": false,
+      "dtypes": [
+       "bfloat16"
+      ],
+      "name": "aten::movedim",
+      "order": 2,
+      "role": "lm_head",
+      "shapes": [
+       [
+        "n_kv",
+        "n_kv/TP",
+        "V/TP"
+       ]
+      ]
+     }
+    ],
+    "repeat_count": 1
+   }
+  ],
+  "module_type": "InferenceStep",
+  "name": "step",
+  "ops": [],
+  "repeat_count": 1
+ },
+ "symbols": {
+  "2\u00b7I": 24576,
+  "2\u00b7I_moe": 6144,
+  "C": 2048,
+  "E": 128,
+  "H": 6144,
+  "I": 12288,
+  "I_moe": 3072,
+  "K_topk": 16,
+  "N_kv": 13813,
+  "P": 1048576,
+  "QKV": 9216,
+  "QKV_idx": 10240,
+  "S": 2048,
+  "S+C": 4096,
+  "TP": 4,
+  "V": 200064,
+  "d": 128,
+  "n_h": 64,
+  "n_h\u00b7d": 8192,
+  "n_idx": 4,
+  "n_kv": 4,
+  "topk": 4
+ }
+}

@@ -300,16 +300,19 @@ _TRACE_NAME_RE = re.compile(
 # Rank marker in a raw vLLM per-rank trace filename, e.g.
 #   dp0_pp0_tp0_dcp0_ep0_rank0.<id>.pt.trace.json.gz
 # The tensor-parallel rank is encoded as ``rank<N>`` (preferred) or ``tp<N>``.
-_RANK_NAME_RE = re.compile(r"rank(?P<rank>\d+)", re.IGNORECASE)
+_RANK_NAME_RE = re.compile(r"rank[-_]?(?P<rank>\d+)", re.IGNORECASE)
 _TP_RANK_NAME_RE = re.compile(r"(?:^|[_/])tp(?P<rank>\d+)", re.IGNORECASE)
 
 
 def _trace_rank(path: str) -> int | None:
     """Extract the tensor-parallel rank index from a raw trace filename.
 
-    vLLM writes one trace per rank named ``…_tp<N>_…_rank<N>.<id>.pt.trace.json.gz``.
-    Returns the rank as an int (``rank<N>`` preferred, ``tp<N>`` fallback), or
-    ``None`` when no rank marker is present (e.g. a merged/descriptive name).
+    vLLM writes one trace per rank. Two naming forms occur in the wild:
+    ``…_tp<N>_…_rank<N>.<id>.pt.trace.json.gz`` and
+    ``<id>-rank-<N>.<id>.pt.trace.json.gz`` — hence the optional ``[-_]``
+    separator. Returns the rank as an int (``rank<N>`` preferred, ``tp<N>``
+    fallback), or ``None`` when no rank marker is present (e.g. a merged or
+    descriptive name).
     """
     name = os.path.basename(path or "")
     m = _RANK_NAME_RE.search(name) or _TP_RANK_NAME_RE.search(name)
@@ -620,6 +623,18 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
         trace_dir = os.path.abspath("output/traces")
         os.makedirs(trace_dir, exist_ok=True)
 
+        # ``LLM.apply_model`` ships a *callable* to the worker process, which
+        # vLLM refuses to serialize unless this is set — it raises
+        # ``TypeError: Object of type <class 'function'> is not serializable``.
+        # Both capture-time paths go through ``apply_model``: the ``module::``
+        # span hooks (the primary source of real module names) and the
+        # ``named_modules()`` reference tree. Without it BOTH fail, and the run
+        # silently degrades to the heavy meta-device fallback with class-only
+        # names. The callables we send are our own module-level functions, not
+        # untrusted input. Must be set before the engine core process is
+        # spawned, since the worker reads it at startup.
+        os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
         engine_kwargs: dict = {
             "model": model_id,
             "max_model_len": max_model_len,
@@ -763,12 +778,20 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             """
             try:
                 from breakdown.module_hooks import install_module_span_hooks_on
-                llm.apply_model(install_module_span_hooks_on)
+                counts = llm.apply_model(install_module_span_hooks_on)
+                total = sum(c for c in (counts or []) if isinstance(c, int))
+                if not total:
+                    logger.error(
+                        "module span hooks: apply_model returned %r — no hooks "
+                        "installed, module names will be class-only", counts)
+                    return False
+                logger.info("module span hooks: installed %d hooks across %d "
+                            "worker(s)", total, len(counts or []))
                 return True
             except Exception:
-                logger.warning("module span hooks: install failed; module names "
-                               "will fall back to the name overlay",
-                               exc_info=True)
+                logger.error("module span hooks: install FAILED; the trace will "
+                             "carry no module:: spans and module names will fall "
+                             "back to the name overlay", exc_info=True)
                 return False
 
         def _remove_span_hooks(installed: bool) -> None:

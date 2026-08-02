@@ -143,6 +143,31 @@ class TestRank0Selection(unittest.TestCase):
     def test_trace_rank_none_for_merged_name(self):
         self.assertIsNone(app_module._trace_rank("merged.json.gz"))
 
+    def test_trace_rank_from_dash_separated_marker(self):
+        """vLLM also writes ``<id>-rank-<N>.<id>.pt.trace.json.gz``.
+
+        The rank pattern used to require ``rank`` immediately followed by the
+        digits, so this (very common) form parsed as *no rank at all*. With no
+        file carrying a marker, ``_rank0_first`` returned the list untouched and
+        the run silently used whichever rank happened to flush last — whose
+        collective device time is inflated by waiting on rank 0. Observed on a
+        real TP=4 MiniMax-M3 run, which built its graph from rank 2.
+        """
+        self.assertEqual(app_module._trace_rank(
+            "1785662706823108191-rank-2.1785662753086711882.pt.trace.json.gz"), 2)
+        self.assertEqual(app_module._trace_rank(
+            "1785662706823108191-rank-0.1785662753086711882.pt.trace.json.gz"), 0)
+
+    def test_rank0_first_reorders_dash_separated(self):
+        files = [
+            "1785662706823108191-rank-2.a.pt.trace.json.gz",
+            "1785662706823108191-rank-3.b.pt.trace.json.gz",
+            "1785662706823108191-rank-0.c.pt.trace.json.gz",
+            "1785662706823108191-rank-1.d.pt.trace.json.gz",
+        ]
+        out = app_module._rank0_first(files)
+        self.assertEqual([app_module._trace_rank(f) for f in out], [0, 1, 2, 3])
+
     def test_rank0_first_reorders(self):
         files = [
             "dp0_pp0_tp2_dcp0_ep2_rank2.a.pt.trace.json.gz",
