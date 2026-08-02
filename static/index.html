@@ -167,7 +167,12 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
   .controls-row { flex-direction: column; align-items: flex-start; }
 }
 
-</style>
+.precondition {
+      margin: 10px 0 14px; padding: 10px 12px; border-radius: 6px;
+      background: #f4f7fb; border-left: 3px solid #4a76c7;
+      color: #33475b; font-size: 13px; line-height: 1.5;
+    }
+  </style>
 </head>
 <body>
 
@@ -225,6 +230,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 
   <!-- Tab: Model Graph (profiling) -->
   <div id="tab-graph" class="tab-content">
+    <div id="tab-precondition-graph" class="precondition" style="display:none"></div>
 
   <!-- Profile Controls -->
   <div class="card">
@@ -371,6 +377,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
        feature - it is this pipeline's input, rendered. The long-form
        explanation of how each stage works lives in the README, not here. -->
   <div id="tab-perf" class="tab-content hidden">
+    <div id="tab-precondition-perf" class="precondition" style="display:none"></div>
 
     <div class="card">
       <h2>Bench Settings</h2>
@@ -500,6 +507,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
   <!-- Tab: Optimize Kernels (the pipeline's 4th stage: hand a ranked target
        to a Copilot CLI kernel session; one session owns one GPU) -->
   <div id="tab-optimize" class="tab-content hidden">
+    <div id="tab-precondition-optimize" class="precondition" style="display:none"></div>
     <div class="card">
       <h2>🚀 Optimize Kernels</h2>
       <p style="font-size:12px;color:#666;margin:0 0 10px">
@@ -536,9 +544,110 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
 
 <script>
 // ---- State ----
+// One block: what the page knows, in one place. Each stage's state is what the
+// next stage reads (the graph feeds the sweep, the ranking feeds the sessions),
+// so having it scattered across the file made "what is this tab waiting for"
+// a search rather than a read.
 let GRAPH_DATA = null;         // profiled graph reconstructed from the trace
 let currentPhase = 'prefill';
 let modelSummary = null;
+let AVAILABLE_DEVICES = { kind: '', count: 0, indexes: [], names: [] };
+const OPT_DEVICE_INPUT = 'opt-devices';
+let PERF_RUN_ID = null;
+let PERF_TARGETS_DOC = null;
+let PERF_TARGET_PHASE = 'prefill';
+let PERF_SORT = null;
+let PERF_OPEN_OP = null;
+let PERF_OPS_ALL = [];        // [{op, backend, device_time_us, phases}]
+let PERF_OPS_SELECTED = null; // Set of op names; null = all
+let OPT_CANDIDATES = [];
+let OPT_SESSIONS = [];
+let OPT_POOL = null;
+let OPT_POLL = null;
+let OPT_OPEN_LOG = null;
+let OPT_COPILOT = null;
+let OPT_DEVICE_COUNT = 0;
+const OPT_LOG_OFFSET = {};
+const OPT_LOG_BUSY = {};
+const OPT_LOG_TEXT = {};
+const OPT_LOG_STICK = {};
+let OPT_STATE_SEQ = 0;
+let OPT_RUN_ID = '';
+let OPT_REFRESH = null;
+const OPT_STATE_STYLE = {
+  pending: ['#7f8c8d', 'queued — waiting for a GPU to free up'],
+  running: ['#2980b9', 'running on its own GPU'],
+  done: ['#27ae60', 'the agent finished'],
+  failed: ['#c0392b', 'the agent exited non-zero'],
+  stopped: ['#e67e22', 'stopped from here'],
+};
+
+// ---- Tables ----
+// Three tables (ranked targets, an op's cases, the sessions) were each built
+// by interpolating <tr>/<td> strings inline, so a change to how a table sorts,
+// highlights a row or escapes a cell had to be made three times. One renderer:
+// a column is {label, get, tip?, cell?, sortKey?} and a row may carry
+// {style, title}.
+function renderTable(columns, rows, opts = {}) {
+  const head = '<tr style="text-align:left;border-bottom:2px solid #ddd">'
+    + columns.map(c => {
+        const sortable = opts.onSort && c.sortKey;
+        const arrow = (sortable && opts.sort && opts.sort.key === c.sortKey)
+          ? (opts.sort.dir > 0 ? ' \u25b2' : ' \u25bc') : '';
+        const tip = (c.tip || '') + (sortable ? (c.tip ? ' \u2014 ' : '')
+                                                + 'click to sort' : '');
+        return `<th${sortable ? ` data-sort-key="${c.sortKey}" `
+            + `onclick="${opts.onSort}(this)" `
+            + 'style="cursor:pointer;user-select:none"' : ''}`
+          + `${tip ? ` title="${perfEsc(tip)}"` : ''}>${c.label}${arrow}</th>`;
+      }).join('') + '</tr>';
+  const body = rows.map((r, i) => {
+    const meta = opts.rowMeta ? opts.rowMeta(r, i) : {};
+    return `<tr style="border-bottom:1px solid #eee;${meta.style || ''}"`
+      + `${meta.title ? ` title="${perfEsc(meta.title)}"` : ''}`
+      + `${meta.onclick ? ` onclick="${meta.onclick}" style="cursor:pointer;`
+          + (meta.style || '') + '"' : ''}>`
+      + columns.map(c => {
+          const v = c.get(r, i);
+          return `<td${c.cell || ''}>`
+            + (c.html ? v : perfEsc(String(v == null ? '' : v))) + '</td>';
+        }).join('')
+      + '</tr>';
+  }).join('');
+  return head + body;
+}
+
+// ---- Polling ----
+// Every stage of this pipeline is a long server-side job that the page waits
+// on, and each of them had its own loop: a setInterval for the profile, a
+// for(;;) with a sleep for the benchmark, another setInterval inside a Promise
+// for the auto-profile. They differed in how they stopped, whether a transient
+// error aborted them, and whether they could overlap. One helper.
+//
+// `step()` is called every `interval` ms until it returns a truthy value,
+// which becomes the result. A rejected step aborts; a network hiccup does not
+// (fetch failures inside step should be swallowed by the caller if transient).
+function pollUntil(step, { interval = 2000, timeout = 0 } = {}) {
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    let busy = false;
+    const timer = setInterval(async () => {
+      if (busy) return;               // a slow reply must not stack replies
+      busy = true;
+      try {
+        const done = await step();
+        if (done) { clearInterval(timer); resolve(done); return; }
+        if (timeout && Date.now() - started > timeout) {
+          clearInterval(timer);
+          reject(new Error('timed out'));
+        }
+      } catch (e) {
+        clearInterval(timer);
+        reject(e);
+      } finally { busy = false; }
+    }, interval);
+  });
+}
 
 // ---- Formatting ----
 function fmtTime(us) {
@@ -660,7 +769,6 @@ function showModelSummary(modelId, s) {
 }
 
 // ---- Profiling ----
-let pollTimer = null;
 
 function onLayersModeChange() {
   const v = document.getElementById('num-layers-select').value;
@@ -719,9 +827,12 @@ function buildProfileBody(modelId) {
 // inside a worker. The benchmark has its own field because the replay does not
 // have to run where the model was profiled; blank there means "whatever Model
 // Graph says", which is the common case.
-let AVAILABLE_DEVICES = { kind: '', count: 0, indexes: [], names: [] };
 const PROFILE_DEVICE_INPUT = 'device-input';
 const BENCH_DEVICE_INPUT = 'bench-device-input';
+// Every stage inherits the Model Graph selection unless it says otherwise, so
+// "which devices will this use" has one answer and each field's placeholder
+// shows the one it would inherit.
+const INHERITING_DEVICE_INPUTS = [BENCH_DEVICE_INPUT, OPT_DEVICE_INPUT];
 
 function deviceInputValue(id) {
   const el = document.getElementById(id);
@@ -731,9 +842,8 @@ function deviceInputValue(id) {
 // The raw text a request's device selection comes from: the benchmark's own
 // field when it is filled in, the Model Graph one otherwise.
 function deviceSpec(inputId) {
-  if (inputId === BENCH_DEVICE_INPUT) {
-    return deviceInputValue(BENCH_DEVICE_INPUT)
-        || deviceInputValue(PROFILE_DEVICE_INPUT);
+  if (INHERITING_DEVICE_INPUTS.includes(inputId)) {
+    return deviceInputValue(inputId) || deviceInputValue(PROFILE_DEVICE_INPUT);
   }
   return deviceInputValue(inputId || PROFILE_DEVICE_INPUT);
 }
@@ -771,13 +881,17 @@ function validateDeviceIds(need, inputId) {
   return ids;
 }
 
-// The bench field's placeholder mirrors what it would inherit, so "blank"
+// An inheriting field's placeholder mirrors what it would inherit, so "blank"
 // never leaves the reader guessing which devices a run will use.
 function syncBenchDevicePlaceholder() {
-  const el = document.getElementById(BENCH_DEVICE_INPUT);
-  if (!el) return;
   const inherited = deviceInputValue(PROFILE_DEVICE_INPUT)
       || (AVAILABLE_DEVICES.count ? 'all (' + AVAILABLE_DEVICES.indexes.join(',') + ')' : '');
+  INHERITING_DEVICE_INPUTS.forEach(id => syncOneDevicePlaceholder(id, inherited));
+}
+
+function syncOneDevicePlaceholder(id, inherited) {
+  const el = document.getElementById(id);
+  if (!el) return;
   el.placeholder = inherited ? `same as Model Graph: ${inherited}`
                              : 'same as Model Graph';
 }
@@ -834,37 +948,55 @@ async function startProfile() {
       document.getElementById('profile-btn').disabled = false;
       return;
     }
-    // Poll for results
-    pollTimer = setInterval(pollStatus, 2000);
+    await waitForProfile();
   } catch(e) {
     showStatus('error', 'Request failed: ' + e.message);
     document.getElementById('profile-btn').disabled = false;
   }
 }
 
-async function pollStatus() {
+// Wait for the running profile, then show it. Also the restore path: the
+// server persists a completed run, so reloading the page picks it up.
+async function waitForProfile() {
   try {
-    const resp = await fetch('/api/profile/status');
-    const data = await resp.json();
-
-    if (data.status === 'done') {
-      clearInterval(pollTimer);
-      showStatus('hide');
-      document.getElementById('profile-btn').disabled = false;
-      // Fetch results
-      const rr = await fetch('/api/profile/result');
-      const rd = await rr.json();
-      if (rd.ok) {
-        applyProfileResult(rd.data);
+    const final = await pollUntil(async () => {
+      let data;
+      try {
+        data = await (await fetch('/api/profile/status')).json();
+      } catch (e) { return null; }        // transient — keep polling
+      if (data.status === 'running') {
+        showStatus('running', profileProgressText(data));
+        return null;
       }
-    } else if (data.status === 'error') {
-      clearInterval(pollTimer);
-      showStatus('error', data.error || 'Profiling failed');
-      document.getElementById('profile-btn').disabled = false;
+      return data.status === 'idle' ? null : data;
+    });
+    document.getElementById('profile-btn').disabled = false;
+    if (final.status === 'error') {
+      showStatus('error', final.error || 'Profiling failed');
+      return;
     }
-  } catch(e) {
-    // ignore transient errors
+    showStatus('hide');
+    const rd = await (await fetch('/api/profile/result')).json();
+    if (rd.ok) applyProfileResult(rd.data);
+  } catch (e) {
+    document.getElementById('profile-btn').disabled = false;
+    showStatus('error', 'Profiling failed: ' + e.message);
   }
+}
+
+// What the run is doing, so the wait is not a blank spinner.
+function profileProgressText(status) {
+  const s = status.settings || {};
+  const bits = [];
+  if (s.query_len) bits.push('query ' + s.query_len);
+  if (s.context_len) bits.push('context ' + s.context_len);
+  if (s.prefill_batch_size || s.batch_size)
+    bits.push('prefill batch ' + (s.prefill_batch_size || s.batch_size));
+  if (s.decode_batch_size) bits.push('decode batch ' + s.decode_batch_size);
+  if (s.tp_size > 1) bits.push('TP ' + s.tp_size);
+  return 'Profiling ' + (status.model_id || '') +
+         (bits.length ? ' (' + bits.join(', ') + ')' : '') +
+         ' — loading the model, warming the prefix cache, then capturing.';
 }
 
 function applyProfileResult(data) {
@@ -902,6 +1034,8 @@ function applyProfileResult(data) {
     // The Bench & Rank op filter lists what this profile dispatched.
     loadBenchOps();
   }
+  showTabPrecondition('graph');
+  showTabPrecondition('perf');
 }
 
 async function uploadTrace(fileList) {
@@ -1345,18 +1479,44 @@ function switchTab(name) {
     loadBenchOps();
     syncBenchDevicePlaceholder();   // it mirrors the Model Graph selection
   }
-  if (name === 'optimize') optimizeRefresh();
+  if (name === 'optimize') {
+    optimizeRefresh();
+    syncBenchDevicePlaceholder();
+  }
+  showTabPrecondition(name);
+}
+
+// Each tab consumes the previous one's output, so an empty tab should say
+// what is missing and what to do about it - not just be empty.
+function showTabPrecondition(name) {
+  const el = document.getElementById('tab-precondition-' + name);
+  if (!el) return;
+  let msg = '';
+  if (name === 'graph' && !GRAPH_DATA) {
+    msg = 'Enter a model, choose the operating point, and press Profile. '
+        + 'Everything downstream is derived from the run this produces.';
+  } else if (name === 'perf' && !GRAPH_DATA) {
+    msg = 'No profile yet. The benchmark replays the ops a profiling run '
+        + 'dispatched, so profile the model on Model Graph first.';
+  } else if (name === 'perf' && !PERF_TARGETS_DOC) {
+    msg = 'Set the sweep and press ▶ Bench & Rank: it plans replay cases from '
+        + 'the profiled graph, measures them, and ranks what is worth '
+        + 'optimizing.';
+  } else if (name === 'optimize' && !PERF_TARGETS_DOC) {
+    msg = 'No ranking yet. Run Bench & Rank first — a session is opened from '
+        + 'a ranked row with its 🚀 optimize button, not from a list here.';
+  } else if (name === 'optimize' && !(OPT_SESSIONS || []).length) {
+    msg = 'No sessions open. Press 🚀 optimize on a ranked op in Bench & Rank; '
+        + 'this tab then shows its GPU, its log and its result.';
+  }
+  el.textContent = msg;
+  el.style.display = msg ? '' : 'none';
 }
 
 
 // ---- Replay benchmark: re-invoke the dispatched ops, rank what to optimize ----
-let PERF_RUN_ID = null;
-let PERF_TARGETS_DOC = null;
-let PERF_TARGET_PHASE = 'prefill';
 // Column sort state for the ranked-targets table; null = the ranking's own
 // order (savings first), which is the answer the ranker computed.
-let PERF_SORT = null;
-let PERF_OPEN_OP = null;
 
 // The per-op case table lives under the ranked table it is opened from: an
 // op's cases are the evidence for the row, so closing one restores this note
@@ -1428,8 +1588,6 @@ function renderCoverage(cov) {
 // ---- Ops filter (Excel-style checkbox list of the dispatched ops) ----
 // The benchmark's op set is a property of the profile, so the filter offers
 // exactly what was dispatched rather than asking for typed dispatch names.
-let PERF_OPS_ALL = [];        // [{op, backend, device_time_us, phases}]
-let PERF_OPS_SELECTED = null; // Set of op names; null = all
 
 async function loadBenchOps() {
   try {
@@ -1522,9 +1680,9 @@ async function benchAll() {
 async function benchPlan(payload) {
   perfStatus('Planning replay cases…');
   try {
-    // the case set is profile-derived, so make sure a matching run exists first
-    await ensureProfileForMatrix(payload.model_id, payload.quantization,
-                                 document.getElementById('perf-status'));
+    const missing = await profileMismatch(payload.model_id,
+                                          payload.quantization);
+    if (missing) { perfStatus(''); alert(missing); return null; }
     const resp = await fetch('/api/bench/plan', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -1567,7 +1725,7 @@ async function benchRun(runId) {
 
 async function benchPollRun() {
   const progress = document.getElementById('perf-progress');
-  for (;;) {
+  const final = await pollUntil(async () => {
     const st = await (await fetch('/api/bench/status')).json();
     const lines = (st.ops || []).map(o => {
       // Per-op statuses are listed rather than folded away: an op that needs a
@@ -1582,16 +1740,13 @@ async function benchPollRun() {
     });
     progress.innerHTML = lines.join('<br>');
     perfStatus(`replaying… ${(st.ops || []).length} ops done`);
-    if (st.status !== 'running') {
-      if (st.status === 'error') {
-        perfStatus('run failed: ' + st.error);
-        throw new Error(st.error || 'benchmark run failed');
-      }
-      perfStatus('replay finished');
-      return;
-    }
-    await new Promise(r => setTimeout(r, 2000));
+    return st.status === 'running' ? null : st;
+  });
+  if (final.status === 'error') {
+    perfStatus('run failed: ' + final.error);
+    throw new Error(final.error || 'benchmark run failed');
   }
+  perfStatus('replay finished');
 }
 
 // Stage 3: score every measured op by calls x latency x roofline headroom.
@@ -1669,6 +1824,62 @@ const PERF_COLUMNS = [
    get: t => (t.kernel && t.kernel.kernel_dir) || ''},
 ];
 
+// One ranked row's cells. Everything that made the old inline template long -
+// the fidelity ratio, the roofline tooltip, the action colour, the 🚀 button -
+// is per-cell, so the table itself has no op-specific knowledge.
+function perfTargetCell(key, t) {
+  const rf = t.roofline || {};
+  const shape = perfTopShape(t);
+  switch (key) {
+    case 'rank': return t.rank;
+    case 'op': {
+      const flags = (t.flags || []).join(' ');
+      return `<b>${perfEsc(t.op)}</b>`
+        + (flags ? ` <span title="${perfEsc(flags)}" style="color:#e67e22">\u26a0</span>` : '')
+        + (shape && shape.profiled
+            ? ' <span title="benchmarked at the shape the profile recorded"'
+              + ' style="color:#27ae60">\u2713</span>' : '');
+    }
+    case 'backend': return perfEsc(t.backend || '\u2014');
+    case 'e2e': return t.e2e_us.toFixed(1);
+    case 'share': return (t.share_of_e2e * 100).toFixed(1) + '%';
+    case 'roof': {
+      const tip = rf.bound === 'memory'
+        ? (rf.memory_level === 'cache'
+            ? `this op's footprint fits in the ${rf.unit || 'cache'}, so the replay is `
+              + 'served from cache and is measured against cache bandwidth; the DRAM '
+              + `column is the same measurement against ${rf.peak_bw_gbs} GB/s, which `
+              + 'is the roof the model actually sees'
+            : `bounded by DRAM bandwidth (${rf.peak_bw_gbs} GB/s)`)
+        : `bounded by the ${rf.unit || 'compute'} engine \u2014 arithmetic intensity `
+          + `${rf.ai != null ? rf.ai : '?'} \u2265 machine balance ${rf.ridge_ai || 0} flop/byte`;
+      return `<span title="${perfEsc(tip)}"><b>${perfEsc(rf.unit || rf.bound)}</b></span>`;
+    }
+    case 'util': return (rf.util * 100).toFixed(0) + '%';
+    case 'dram':
+      return rf.util_dram ? (rf.util_dram * 100).toFixed(0) + '%' : '\u2014';
+    case 'ai': return rf.ai != null ? rf.ai.toFixed(1) : '\u2014';
+    case 'ratio':
+      // The profile's own device time for the same op+shape is the run's
+      // built-in fidelity check: a replay far off it is not a valid baseline.
+      return (shape && shape.replay_vs_traced != null)
+        ? shape.replay_vs_traced.toFixed(2) : '\u2014';
+    case 'save': return t.savings_us.total.toFixed(1);
+    case 'action': {
+      const [color, hint] = PERF_ACTION_STYLE[t.action] || ['#333', ''];
+      return `<span title="${perfEsc(hint)}" style="color:${color};font-weight:600">`
+        + perfEsc(t.action) + '</span>';
+    }
+    case 'kernel':
+      return perfEsc(t.kernel && t.kernel.kernel_dir ? t.kernel.kernel_dir : '\u2014')
+        + ' <button class="btn" style="font-size:10px;padding:2px 6px;margin-left:6px"'
+        + ' title="open a Copilot CLI kernel session for this op on a GPU of its own"'
+        + ` onclick="event.stopPropagation();optimizeOpNow('${perfEsc(t.op)}')">`
+        + '\ud83d\ude80 optimize</button>';
+    default: return '';
+  }
+}
+
 function perfTopShape(t) {
   return (t.top_shapes || [])[0] || null;
 }
@@ -1681,6 +1892,8 @@ function perfSortTargets(el) {
 }
 
 function renderPerfTargets(doc) {
+  showTabPrecondition('perf');
+  showTabPrecondition('optimize');
   PERF_TARGETS_DOC = doc;
   const summary = document.getElementById('perf-summary');
   // Prefill and decode are always ranked separately (same reason the model
@@ -1721,59 +1934,21 @@ function renderPerfTargets(doc) {
     }
   }
 
-  const head = '<tr style="text-align:left;border-bottom:2px solid #ddd">' +
-    PERF_COLUMNS.map(c => {
-      const arrow = PERF_SORT && PERF_SORT.key === c.key
-        ? (PERF_SORT.dir > 0 ? ' ▲' : ' ▼') : '';
-      const tip = (c.tip ? c.tip + ' — ' : '') + 'click to sort';
-      return `<th data-sort-key="${c.key}" onclick="perfSortTargets(this)"
-        style="cursor:pointer;user-select:none" title="${perfEsc(tip)}">${c.label}${arrow}</th>`;
-    }).join('') + '</tr>';
-
-  const body = rows.map(t => {
-    const [color, hint] = PERF_ACTION_STYLE[t.action] || ['#333', ''];
-    const shape = perfTopShape(t);
-    // The profile's own device time for the same op+shape is the run's
-    // built-in fidelity check: a replay far off it is not a valid baseline.
-    const ratio = shape && shape.replay_vs_traced != null
-      ? shape.replay_vs_traced.toFixed(2) : '—';
-    const flags = (t.flags || []).join(' ');
-    const rf = t.roofline;
-    const roofTip = rf.bound === 'memory'
-      ? (rf.memory_level === 'cache'
-          ? `this op's footprint fits in the ${rf.unit || 'cache'}, so the replay is served `
-            + `from cache and is measured against cache bandwidth; the DRAM column is the `
-            + `same measurement against ${rf.peak_bw_gbs} GB/s, which is the roof the model actually sees`
-          : `bounded by DRAM bandwidth (${rf.peak_bw_gbs} GB/s)`)
-      : `bounded by the ${rf.unit || 'compute'} engine — arithmetic intensity `
-        + `${rf.ai != null ? rf.ai : '?'} ≥ machine balance ${rf.ridge_ai || 0} flop/byte`;
-    const open = PERF_OPEN_OP === t.op;
-    return `<tr class="perf-target-row" data-op="${perfEsc(t.op)}"
-      onclick="perfToggleOpDetail('${perfEsc(t.op)}')"
-      style="border-bottom:1px solid #eee;cursor:pointer;${open ? 'background:#eef6ff' : ''}">
-      <td>${t.rank}</td>
-      <td><b>${perfEsc(t.op)}</b>${flags
-        ? ` <span title="${perfEsc(flags)}" style="color:#e67e22">⚠</span>` : ''}
-        ${shape && shape.profiled
-          ? ' <span title="benchmarked at the shape the profile recorded" style="color:#27ae60">✓</span>' : ''}</td>
-      <td>${perfEsc(t.backend || '—')}</td>
-      <td style="text-align:right">${t.e2e_us.toFixed(1)}</td>
-      <td style="text-align:right">${(t.share_of_e2e * 100).toFixed(1)}%</td>
-      <td title="${roofTip}"><b>${perfEsc(rf.unit || rf.bound)}</b></td>
-      <td style="text-align:right">${(rf.util * 100).toFixed(0)}%</td>
-      <td style="text-align:right;color:#888">${rf.util_dram
-        ? (rf.util_dram * 100).toFixed(0) + '%' : '—'}</td>
-      <td style="text-align:right">${rf.ai != null ? rf.ai.toFixed(1) : '—'}</td>
-      <td style="text-align:right">${ratio}</td>
-      <td style="text-align:right">${t.savings_us.total.toFixed(1)}</td>
-      <td><span title="${hint}" style="color:${color};font-weight:600">${t.action}</span></td>
-      <td>${t.kernel && t.kernel.kernel_dir ? t.kernel.kernel_dir : '—'}
-        <button class="btn" style="font-size:10px;padding:2px 6px;margin-left:6px"
-           title="open a Copilot CLI kernel session for this op on a GPU of its own"
-           onclick="event.stopPropagation();optimizeOpNow('${perfEsc(t.op)}')">🚀 optimize</button></td>
-    </tr>`;
-  }).join('');
-  document.getElementById('perf-targets').innerHTML = head + body;
+  // The ranked table is the selection: each row is an op you might open a
+  // session on, so the row itself opens its cases and carries the 🚀 button.
+  const columns = PERF_COLUMNS.map(c => ({
+    label: c.label, tip: c.tip, sortKey: c.key, html: true,
+    cell: c.num ? ' style="text-align:right"' : '',
+    get: t => perfTargetCell(c.key, t),
+  }));
+  const table = renderTable(columns, rows, {
+    sort: PERF_SORT, onSort: 'perfSortTargets',
+    rowMeta: t => ({
+      style: 'cursor:pointer;' + (PERF_OPEN_OP === t.op ? 'background:#eef6ff' : ''),
+      onclick: `perfToggleOpDetail('${perfEsc(t.op)}')`,
+    }),
+  });
+  document.getElementById('perf-targets').innerHTML = table;
   // An op ranked in one phase but not the other keeps its panel open — the
   // panel says so and still lists that phase's cases. Only an op the run does
   // not know at all (a different run was loaded) closes it.
@@ -1856,17 +2031,21 @@ function renderOpDetail(op, data) {
     ['layers', 'calls', r => r.layers != null ? r.layers : '—'],
     ['weighted_us', 'weighted µs', r => fmtNum(r.weighted_us, 1)],
   ];
-  const head = '<tr style="text-align:left;border-bottom:2px solid #ddd">'
-    + '<th title="the shapes the profiling run recorded for this op">profiled</th>'
-    + cols.map(c => `<th>${c[1]}</th>`).join('') + '</tr>';
-  const body = recs.map(r => {
-    const bad = r.status !== 'ok';
-    return `<tr style="border-bottom:1px solid #eee;${atPoint(r) ? 'background:#eef6ff;' : ''}${bad ? 'color:#c0392b;' : ''}">
-      <td style="text-align:center">${r.traced_comparable ? '✓' : ''}</td>`
-      + cols.map(c => `<td${c[0] === 'shape' ? ' style="font-family:monospace"' : ''}>`
-          + perfEsc(String(c[2](r))) + '</td>').join('')
-      + '</tr>';
-  }).join('');
+  const columns = [{
+    label: 'profiled',
+    tip: 'the shapes the profiling run recorded for this op',
+    get: r => r.traced_comparable ? '\u2713' : '',
+    cell: ' style="text-align:center"',
+  }].concat(cols.map(c => ({
+    label: c[1], get: c[2],
+    cell: c[0] === 'shape' ? ' style="font-family:monospace"' : '',
+  })));
+  const table = renderTable(columns, recs, {
+    rowMeta: r => ({
+      style: (atPoint(r) ? 'background:#eef6ff;' : '')
+           + (r.status !== 'ok' ? 'color:#c0392b;' : ''),
+    }),
+  });
   const errs = recs.filter(r => r.status !== 'ok' && (r.error || r.detail));
   const rf = target ? target.roofline : null;
   const actions = `<div style="display:flex;gap:6px;margin-top:10px">
@@ -1897,7 +2076,7 @@ function renderOpDetail(op, data) {
         + target.flags.map(perfEsc).join('<br>⚠ ') + '</div>' : ''}
     ${recs.length ? `<div style="overflow:auto">
       <table class="perf-table" style="width:100%;border-collapse:collapse;font-size:11px">
-        ${head}${body}</table>
+        ${table}</table>
     </div>` : `<div style="font-size:12px;color:#c0392b">this op has no measured
       ${PERF_TARGET_PHASE} case in this run — switch the phase toggle above.</div>`}
     ${errs.length ? `<div style="font-size:11px;color:#c0392b;margin-top:8px">`
@@ -1919,28 +2098,16 @@ function fmtNum(v, digits) {
 // button opens it, and this tab manages the sessions. One session owns one GPU
 // exclusively, so more sessions than devices queues the surplus — the queue
 // position is shown, not hidden.
-let OPT_CANDIDATES = [];
-let OPT_SESSIONS = [];
-let OPT_POOL = null;
-let OPT_POLL = null;
-let OPT_OPEN_LOG = null;
 // Whether the Copilot CLI was found. Without it a session cannot be spawned,
 // so 🚀 optimize falls back to printing the command to run yourself.
-let OPT_COPILOT = null;
 // How many devices are present — i.e. how many sessions can run at once.
-let OPT_DEVICE_COUNT = 0;
-const OPT_LOG_OFFSET = {};
-const OPT_LOG_BUSY = {};
-const OPT_LOG_TEXT = {};
 // Whether the log pane is pinned to the tail. It stays pinned until the reader
 // scrolls up, so a poll never yanks them away from what they are reading.
-const OPT_LOG_STICK = {};
 // Status polls and a start can be in flight at the same time (starting a
 // session refreshes the candidates first, which polls). A poll issued *before*
 // the session existed used to land *after* it and overwrite the session list
 // with the empty one — and, seeing nothing active, stop the polling that would
 // have corrected it. Every state update takes a ticket; a stale reply is dropped.
-let OPT_STATE_SEQ = 0;
 
 function optStatus(msg) {
   document.getElementById('opt-status').textContent = msg || '';
@@ -1950,7 +2117,6 @@ function optStatus(msg) {
 // Bench & Rank leaves the run selector empty, so the candidates endpoint's
 // default (the latest run) is adopted — otherwise the tab claims a run with
 // live sessions has none.
-let OPT_RUN_ID = '';
 function optRunId() {
   const sel = document.getElementById('perf-run-select');
   return (sel && sel.value) || PERF_RUN_ID || OPT_RUN_ID || '';
@@ -1962,7 +2128,6 @@ function optRunId() {
 // Switching to the tab and hitting 🚀 optimize both refresh, and the button
 // does both in a row — one in-flight refresh is shared rather than issuing the
 // same two requests twice and racing their replies.
-let OPT_REFRESH = null;
 function optimizeRefresh() {
   if (OPT_REFRESH) return OPT_REFRESH;
   OPT_REFRESH = _optimizeRefresh().finally(() => { OPT_REFRESH = null; });
@@ -1983,7 +2148,7 @@ async function _optimizeRefresh() {
     if (!cwd.value) cwd.value = data.workspace_root || '';
     const dev = document.getElementById('opt-devices');
     OPT_DEVICE_COUNT = (data.devices && data.devices.count) || 0;
-    dev.placeholder = OPT_DEVICE_COUNT ? `all (${OPT_DEVICE_COUNT})` : 'none detected';
+    syncBenchDevicePlaceholder();   // it inherits the Model Graph selection
     OPT_COPILOT = data.copilot || null;
     OPT_CANDIDATES = data.ok ? (data.candidates || []) : [];
     const ready = OPT_CANDIDATES.filter(c => c.launchable).length;
@@ -2024,7 +2189,7 @@ async function optimizeStartOps(ops) {
     body: JSON.stringify({
       run_id: optRunId(), phase: PERF_TARGET_PHASE, ops: ops,
       cwd: document.getElementById('opt-cwd').value.trim() || null,
-      device_ids: document.getElementById('opt-devices').value.trim(),
+      device_ids: deviceSpec(OPT_DEVICE_INPUT),
     }),
   });
   const data = await resp.json();
@@ -2055,7 +2220,7 @@ async function optimizeShowCommand(op) {
     body: JSON.stringify({
       run_id: optRunId(), phase: PERF_TARGET_PHASE, ops: [op],
       cwd: document.getElementById('opt-cwd').value.trim() || null,
-      device_ids: document.getElementById('opt-devices').value.trim(),
+      device_ids: deviceSpec(OPT_DEVICE_INPUT),
     }),
   });
   const data = await resp.json();
@@ -2112,15 +2277,9 @@ async function optimizePollStatus() {
   } catch (e) { /* transient poll errors are not worth surfacing */ }
 }
 
-const OPT_STATE_STYLE = {
-  pending: ['#7f8c8d', 'queued — waiting for a GPU to free up'],
-  running: ['#2980b9', 'running on its own GPU'],
-  done: ['#27ae60', 'the agent finished'],
-  failed: ['#c0392b', 'the agent exited non-zero'],
-  stopped: ['#e67e22', 'stopped from here'],
-};
 
 function renderOptSessions() {
+  showTabPrecondition('optimize');
   const box = document.getElementById('opt-sessions');
   // Which run these sessions belong to - the tab can be opened before a run is
   // selected, in which case it adopts the one that actually has sessions.
@@ -2277,54 +2436,83 @@ function buildSweepPayload() {
 // exists before the sweep is derived from it: reuse the latest run if it
 // matches, wait out any run in progress, otherwise launch a fresh one (using
 // the Model Graph tab base config with the requested quantization).
-async function ensureProfileForMatrix(modelId, quant, status) {
-  const getStatus = async () => (await fetch('/api/profile/status')).json();
-  const wantQuant = quant || null;
-  let s = await getStatus();
-  while (s.status === 'running') {
-    status.textContent = 'Waiting for the in-progress profile to finish...';
-    await new Promise(r => setTimeout(r, 2000));
-    s = await getStatus();
+// The benchmark's case set is derived from a profile, so it has a
+// precondition: a *completed* run of this model at this quantization. It used
+// to silently start one - minutes of GPU work from a button that said "Bench
+// & Rank" - so the page now says what is missing and lets the reader decide.
+async function profileMismatch(modelId, quant) {
+  let s;
+  try {
+    s = await (await fetch('/api/profile/status')).json();
+  } catch (e) { return 'Could not reach the server.'; }
+  if (s.status === 'running') {
+    return 'A profiling run is in progress. Wait for it to finish, then '
+         + 'run Bench & Rank.';
   }
-  const runQuant = (s.settings && s.settings.quantization) || null;
-  if (s.status === 'done' && s.model_id === modelId && runQuant === wantQuant) {
-    return;  // reuse latest run — model and quantization both match
+  if (s.status !== 'done') {
+    return 'No profiling run yet. Profile ' + modelId + ' on the Model Graph '
+         + 'tab first — the benchmark replays the ops that run dispatched.';
   }
-  status.textContent = 'No matching profile found — running one now (may take several minutes)...';
-  await runProfileForMatrix(modelId, wantQuant, status);
-}
-
-// Run a fresh profiling run (reusing the Model Graph tab base config,
-// overriding the quantization to the requested one) and resolve once it
-// completes. Rejects on error so the caller can abort.
-function runProfileForMatrix(modelId, quant, status) {
-  return new Promise((resolve, reject) => {
-    const body = buildProfileBody(modelId);
-    body.quantization = quant || null;
-    fetch('/api/profile', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    }).then(r => r.json()).then(data => {
-      if (!data.ok) { reject(new Error(data.error || 'could not start profile')); return; }
-      const timer = setInterval(async () => {
-        try {
-          const s = await (await fetch('/api/profile/status')).json();
-          if (s.status === 'done') {
-            clearInterval(timer);
-            resolve();
-          } else if (s.status === 'error') {
-            clearInterval(timer);
-            reject(new Error(s.error || 'profiling failed'));
-          }
-        } catch (e) { /* ignore transient poll errors */ }
-      }, 2000);
-    }).catch(reject);
-  });
+  if (s.model_id !== modelId) {
+    return 'The latest profile is of ' + s.model_id + ', not ' + modelId
+         + '. Profile this model on the Model Graph tab first.';
+  }
+  const ran = (s.settings && s.settings.quantization) || null;
+  if (ran !== (quant || null)) {
+    return 'The latest profile ran at quantization "' + (ran || 'none')
+         + '", not "' + (quant || 'none') + '". The dtypes - and so the '
+         + 'memory estimates - are only valid for the quantization profiled, '
+         + 'so re-profile before sweeping this one.';
+  }
+  return '';
 }
 
 // ---- Init ----
 loadDevices();
+// The server persists the latest profile, benchmark run and optimize sessions,
+// so a reload (or a second tab) picks up where the last one left off instead
+// of showing an empty page over a finished run.
+restoreSession();
+
+async function restoreSession() {
+  try {
+    const s = await (await fetch('/api/profile/status')).json();
+    if (s.status === 'running') { waitForProfile(); }
+    else if (s.status === 'done') {
+      const rd = await (await fetch('/api/profile/result')).json();
+      if (rd.ok) {
+        applyProfileResult(rd.data);
+        if (s.model_id) {
+          const input = document.getElementById('model-input');
+          if (input && !input.value) { input.value = s.model_id; loadConfig(); }
+        }
+        applyProfileToSweep(s.settings || {});
+      }
+    }
+  } catch (e) { /* a fresh server has nothing to restore */ }
+  try {
+    await refreshPerfRuns();
+    if (PERF_RUN_ID) await benchLoadTargets();
+  } catch (e) { /* no benchmark run yet */ }
+  try { optimizeRefresh(); } catch (e) { /* no sessions yet */ }
+}
+
+// The sweep's defaults are the point the profile was taken at: sweeping
+// somewhere else is a deliberate act, starting somewhere else is a trap.
+function applyProfileToSweep(settings) {
+  const set = (id, v) => {
+    const el = document.getElementById(id);
+    if (el && v) el.value = v;
+  };
+  set('sweep-prefill-seq-lens', settings.query_len);
+  set('sweep-prefill-ctx-lens', settings.context_len);
+  set('sweep-decode-ctx-lens', settings.context_len);
+  set('sweep-prefill-batch-sizes',
+      settings.prefill_batch_size || settings.batch_size);
+  set('sweep-decode-batch-sizes',
+      settings.decode_batch_size || settings.batch_size);
+  set('sweep-tp-sizes', settings.tp_size);
+}
 document.getElementById('model-input').addEventListener('keydown', e => {
   if (e.key === 'Enter') loadConfig();
 });

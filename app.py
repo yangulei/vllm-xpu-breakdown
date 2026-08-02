@@ -324,27 +324,25 @@ def upload_profile():
 
 @app.route("/api/profile/status")
 def profile_status():
-    """Check profiling status."""
-    with _profile_lock:
-        return jsonify({
-            "status": profiling._profile_state["status"],
-            "model_id": profiling._profile_state["model_id"],
-            "settings": profiling._profile_state.get("settings"),
-            "error": profiling._profile_state["error"],
-        })
+    """Check profiling status. Restores the last run on a fresh server."""
+    st = profiling.state()
+    return jsonify({
+        "status": st["status"],
+        "model_id": st["model_id"],
+        "settings": st.get("settings"),
+        "error": st["error"],
+        "run_id": st.get("run_id"),
+    })
 
 
 @app.route("/api/profile/result")
 def profile_result():
     """Get profiling results (only available when status=done)."""
-    with _profile_lock:
-        if profiling._profile_state["status"] != "done":
-            return jsonify({
-                "ok": False,
-                "status": profiling._profile_state["status"],
-                "error": profiling._profile_state.get("error"),
-            }), 202
-        result = profiling._profile_state["result"]
+    st = profiling.state()
+    if st["status"] != "done":
+        return jsonify({"ok": False, "status": st["status"],
+                        "error": st.get("error")}), 202
+    result = st["result"]
     # Don't expose internal trace_file path(s); indicate availability instead.
     _internal = {"trace_file", "prefill_trace_file", "decode_trace_file"}
     client_result = {k: v for k, v in result.items() if k not in _internal}
