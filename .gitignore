@@ -3,3 +3,7 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .hypothesis/
+
+# Stray unitrace/profiler dumps written into the repo root by tooling
+/*.json
+!package.json
