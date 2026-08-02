@@ -30,16 +30,15 @@ graph and the Shape Matrix export are built from this reconstruction.
 
 ```
 app.py                    — Flask web server (API + static serving + exports)
-run_profile.py            — CLI profiling entry point
-chat.py                   — Interactive chat with profiling
 breakdown/
   graph_from_trace.py     — Profile-first graph reconstruction from a trace
   shape_derive.py         — Symbolic shape/dtype/memory resolution (torch-free, shared)
   shape_matrix.py         — Graph + config sweep → matrix rows (the export serializes them)
   shape_matrix_xlsx.py    — Excel serialization of matrix rows
+  op_breakdown.py         — Flat op breakdown (iter_ops, summarize_ops, backend_totals) derived from the reconstructed graph
   bench/                  — Replay benchmark: dispatched ops → measured → ranked targets
     spec.py               — Matrix rows → BenchCase replay specs (+ skip/dedup rules)
-    resolve.py            — Dispatch name → callable + schema (PYTHON_API for kernel ops)
+    resolve.py            — Dispatch name → callable + schema (launch-frame resolution for Python-launched kernels)
     inputs.py             — Schema-driven operand materialization + synthesizer registry
     recipes/{common,xpu,cuda}.py — Per-op overrides, output args, skip reasons
     recipes/attention.py    — Paged attention / KV-cache write replayed context-free
@@ -61,23 +60,24 @@ breakdown/
     manager.py            — Spawn/track/stop the per-kernel copilot processes
     cli.py                — python -m breakdown.optimize {candidates,prompt,start,status,stop}
   module_hooks.py         — Capture-time module-name spans (forward hooks)
-  module_naming.py        — Fallback: recover names from named_modules() overlay
   model_info.py           — HuggingFace config fetcher/summarizer + min_profile_layers
-  analyzer.py             — Op analysis (shapes, memory, FLOPs, AI)
+  analyzer.py             — Shape symbolization, memory/FLOPs estimation (dtype_size, symbolize_shape, estimate_memory, estimate_flops, DTYPE_BYTES)
   classifier.py           — Op → backend classification
   registry.py             — Known vllm-xpu-kernels ops list
-  trace_parser.py         — Chrome trace JSON parser + module/role helpers
-  trace_common.py         — Torch-free trace helpers (overhead-event filtering)
+  trace_common.py         — Torch-free trace helpers (overhead-event filtering, module-span labels, device/role inference, _strip_instance_idx)
   profiler.py             — vLLM profiler integration
-  report.py               — Text/CSV/JSON report generation
-  visualize.py            — Plotting utilities
 static/
   index.html              — Single-page web UI (HTML + CSS + JS)
-scripts/
-  run_profile.sh          — Shell wrapper for profiling
-  compare_modes.sh        — Compare eager vs compile modes
+tools/
+  make_fixture.py         — Trim a full trace to a ~90 KB fixture (refuses if the reconstructed graph differs)
+  capture_fixture.py      — Re-capture the canonical MiniMax-M3 TP4 6-layer profile
 tests/
+  conftest.py                   — Repo root on sys.path + --update-golden flag
+  data/                         — Golden test fixtures (trimmed rank-0 traces + model configs)
+    __init__.py                 — Fixture records (paths, configs, parameters)
+    golden/                     — Snapshot JSON files for graph reconstruction assertions
   test_pipeline.py              — Unit tests (requires torch)
+  test_golden_graph.py          — Golden-snapshot tests over MiniMax-M3 TP4 6-layer fixtures (no GPU)
   test_shape_matrix_export.py   — Shape Matrix Export endpoint tests
   test_bench_spec.py            — Bench: rows → replay cases, skip/dedup (no GPU)
   test_bench_resolve.py         — Bench: dispatch resolution + operand building (no GPU)
@@ -97,11 +97,12 @@ tests/
 # Install dependencies
 pip install -r requirements.txt
 
-# Run web UI (static analysis works without loading model weights)
+# Web UI (static analysis works without loading model weights;
+# profiling requires Intel XPU + vLLM)
 python app.py --port 8080
 
-# Run CLI profiling (requires Intel XPU + vLLM)
-python run_profile.py --model Qwen/Qwen3-4B-Instruct-2507 --max-model-len 32768
+# Re-capture the canonical MiniMax-M3 TP4 6-layer fixture (requires XPU)
+python tools/capture_fixture.py
 ```
 
 ## Testing
@@ -109,6 +110,11 @@ python run_profile.py --model Qwen/Qwen3-4B-Instruct-2507 --max-model-len 32768
 ```bash
 # Unit tests (no GPU required)
 pytest tests/test_pipeline.py -v
+
+# Golden-snapshot tests over MiniMax-M3 TP4 6-layer fixtures (no GPU)
+pytest tests/test_golden_graph.py -v
+# Regenerate golden snapshots after intentional graph changes:
+pytest tests/test_golden_graph.py --update-golden
 
 # Shape Matrix Export tests (no GPU required)
 pytest tests/test_shape_matrix_export.py -v
@@ -149,9 +155,9 @@ consume unchanged. How it works:
   **real attribute path** (`model.layers.0.self_attn.q_norm`). `_build_raw_forest`
   auto-detects those spans on the worker thread and builds module nodes directly
   from them (real names, no overlay, no ordering assumption), skipping the
-  class-only `nn.Module: <Cls>_<idx>` frames to avoid duplication. **Legacy
-  fallback:** traces without spans (older runs / uploads) use the `nn.Module:
-  <Cls>_<idx>` python_function events + the `module_naming` overlay. Either way,
+  class-only `nn.Module: <Cls>_<idx>` frames to avoid duplication. Traces
+  without spans (older runs / uploads) fall back to class-heuristic names only
+  (the `module_naming` overlay was removed). Either way,
   events nest by time-containment (sort by `(ts asc, end desc)`, pop a stack
   while the top ends before the current node).
 - **Op shapes** — taken from each `cpu_op`'s `Input Dims` / `Input type`, then
@@ -325,14 +331,14 @@ The old `annotate_graph_timing` / `annotate_graph_from_modules` /
 `parse_trace_with_modules` paths were **removed**. Do not reintroduce a
 static-overlay step in the profiling worker.
 
-### Module Attribute Naming — capture-time spans (`module_hooks.py`) + overlay fallback (`module_naming.py`)
+### Module Attribute Naming — capture-time spans (`module_hooks.py`)
 
 Same-class sibling modules (Qwen3 `q_norm`/`k_norm`, both `RMSNorm`;
 `input_layernorm`/`post_attention_layernorm`; ...) are indistinguishable in a
-class-only trace. There are **two** ways to recover the real names; the first is
-now primary:
+class-only trace. The **only** mechanism to recover the real names is
+capture-time spans:
 
-**1. Capture-time spans (`module_hooks.py`, research R1 — primary).**
+**Capture-time spans (`module_hooks.py`, research R1).**
 `install_module_span_hooks(model)` registers a `register_forward_pre_hook` /
 `register_forward_hook` pair on every `named_modules()` entry that opens a
 `record_function("module::<qualified_name>::<Cls>")` span around the forward.
@@ -348,45 +354,9 @@ label grammar and the display-name derivation (`module_span_display_name` — a
 numeric `ModuleList` leaf like `layers.0` becomes `decoder_layer`/`layers` so
 siblings still collapse) live torch-free in `trace_common`.
 
-**2. `named_modules()` overlay (`module_naming.py`) — fallback.** Kept for legacy
-/ upload traces that have no spans. `build_graph_from_trace` applies it only when
-the reconstructed forest has no captured names (`_forest_has_named_modules`). It
-ports the *idea* from the retired `torch_export` branch — derive names from the
-model's `named_modules()` — and overlays them onto the accurate profile-based
-tree instead of rebuilding it.
-
-- **`build_ref_tree(named_modules)`** — pure/torch-free. Builds a reference tree
-  of `{attr, cls, children, is_group, group_size}` from
-  `[(qualified_name, class_name), ...]`. Indexed `ModuleList` containers are
-  *inlined* (their `forward` is never called, so they emit no module event) and
-  consecutive numeric entries of the same class collapse into one `is_group`
-  representative — mirroring the trace's layer collapse.
-- **`ref_tree_from_llm(llm)`** — extracts the tree from the *live* vLLM model
-  during profiling (via `LLM.apply_model`, falling back to attribute traversal).
-  Cheap: the model is already loaded.
-- **`ref_tree_from_config(...)`** — `meta`-device instantiation fallback
-  (always trusts remote code). Heavy + network. Used by the trace-upload path **and** as a live-path fallback: if
-  `ref_tree_from_llm` returns `None` during profiling, `_run_profile` retries
-  with `ref_tree_from_config`. The whole naming path logs its outcome
-  (`vllm_xpu_breakdown` logger) — a "reference tree available but no
-  names landed" warning means alignment (not acquisition) failed.
-- **Alignment** — `graph_from_trace._apply_ref_names` walks the *raw* module
-  forest against the reference tree, matching children greedily by
-  `(class, order)` (reusing a matched representative when the trace has more
-  same-class siblings than the collapsed reference, e.g. dense + MoE layer
-  groups). It **unwraps reference levels absent from the trace**
-  (`module_naming._effective_ref_children`): vLLM nests the decoder stack under
-  an inner `*Model` module (`*ForCausalLM → *Model → [embed, layers, norm]`)
-  whose `forward` often emits **no** trace module event, so the trace nests the
-  stack directly under `*ForCausalLM`. Without the unwrap, child-class matching
-  stalls at that missing level and every submodule keeps its class-heuristic name
-  (`q_norm`/`k_norm` → `norm`). Applied **before** finalization/collapse so
-  recovered names feed the structural signature.
-  `build_graph_from_trace(..., ref_module_tree=...)` opts in; without a ref tree
-  the class-heuristic names are used (backward compatible). The assumption:
-  sibling modules **of the same class** execute in their registration/definition
-  order (holds for q_norm-before-k_norm, the layer norms, etc.). Capture-time
-  spans (path 1) do **not** rely on this assumption.
+The legacy `named_modules()` overlay (`module_naming.py`) and the
+`ref_module_tree` parameter to `build_graph_from_trace` were **removed**. Traces
+without spans (older runs / uploads) fall back to class-heuristic names only.
 
 ### Symbolic Shape System
 
@@ -578,8 +548,8 @@ rows (`shape_matrix`) → replay cases (`spec`) → measured cases (`worker`/
   wrapper hides is the context, not the kernel. One level down,
   `fa_utils.flash_attn_varlen_func` / `reshape_and_cache_flash` (the
   vllm-xpu-kernels SYCL kernels on XPU, vllm_flash_attn on CUDA) take exactly
-  that context as plain arguments, so `resolve.PYTHON_API` maps both ops there
-  (**checked before `NOT_REPLAYABLE`**) and a recipe rebuilds the context: a
+  that context as plain arguments, so `resolve.PYTHON_API` redirects both ops
+  there (**checked before `NOT_REPLAYABLE`**) and a recipe rebuilds the context: a
   paged `[num_blocks, block_size, n_kv, d]` NHD cache holding `context+query`
   for every sequence, `cu_seqlens_q` / `seqused_k` for the swept operating
   point, and vLLM's own `softmax_scale`/`causal`. Attention is normally the
@@ -1045,11 +1015,14 @@ static builder. Ensure:
      `needs_synthesizer`, never randomly filled;
    - a `recipes.outputs(...)` declaration if an argument is really an *output*
      the schema doesn't mark (especially one accumulated with atomics);
-   - a `resolve.PYTHON_API` entry if it's a kernel launched straight from Python
-     (Triton / FlashInfer / a SYCL extension) with no dispatcher op — or if it
-     is a **context-bound wrapper with a context-free kernel entry point**, in
-     which case add a `recipes.override` that rebuilds the context (see
-     `recipes/attention.py`); `PYTHON_API` is consulted before `NOT_REPLAYABLE`;
+   - Python-launched kernels (Triton / FlashInfer / SYCL extensions) resolve
+     automatically from the `launch = {file, line, func}` recorded in the trace
+     — no manual table entry is needed. `resolve.PYTHON_API` now holds **only**
+     redirects for context-bound wrappers whose replay entry point is a different
+     function one level down (e.g. `vllm::unified_attention_with_output` →
+     `fa_utils.flash_attn_varlen_func`); in that case add a `recipes.override`
+     that rebuilds the context (see `recipes/attention.py`);
+     `PYTHON_API` is consulted before `NOT_REPLAYABLE`;
    - an entry in `breakdown/bench/kernel_sources.json` if it has editable kernel
      source, so its target carries build/test commands
 
@@ -1271,25 +1244,16 @@ static builder. Ensure:
   prefill phase disappeared (`prefill: None`, blank graph until you click Decode)
   and prefill/decode looked identical. `_partition_steps` now uses
   `_subtree_module_count`. Do NOT revert to a device-time heuristic.
-- **Module names come from capture-time spans; the overlay is a fallback.**
+- **Module names come from capture-time spans; the overlay was removed.**
   `module_hooks` installs forward hooks that emit
   `record_function("module::<qname>::<Cls>")` `user_annotation` spans during the
   profiled generate, so `graph_from_trace._build_raw_forest` reads the real
   attribute path straight from the trace (no alignment, no ordering assumption).
-  `build_graph_from_trace` only applies the `module_naming` overlay when the
-  forest has **no** captured names (`_forest_has_named_modules` → false), i.e.
-  for legacy/upload traces. Do NOT make the overlay unconditional — it would
-  redundantly (and possibly wrongly) relabel a correctly-named span tree. When
-  editing the span label format, update **both** `trace_common.module_span_label`
-  and `parse_module_span` (the emitter in `module_hooks` and the parser in
-  `graph_from_trace` share them).
-- **Module-name alignment (fallback path) must unwrap `*Model` levels absent from the trace.**
-  vLLM nests the decoder stack under an inner `*Model` module whose `forward`
-  usually emits no trace module event, so the trace nests it directly under
-  `*ForCausalLM`. `module_naming._effective_ref_children` flattens reference
-  levels whose class isn't among a node's actual trace-child classes; without it,
-  child matching stalls at the missing level and `q_norm`/`k_norm` stay `norm`.
-  (Capture-time spans don't hit this — they carry the full path already.)
+  The legacy `module_naming.py` overlay and the `ref_module_tree` argument to
+  `build_graph_from_trace` are deleted. Traces without spans fall back to
+  class-heuristic names only. When editing the span label format, update **both**
+  `trace_common.module_span_label` and `parse_module_span` (the emitter in
+  `module_hooks` and the parser in `graph_from_trace` share them).
 - **Device time is attributed by launch-site containment, not `External id`.**
   `graph_from_trace.py` links each device `kernel` to its host launch call
   (`kernel.correlation → xpu_runtime`, the "flow arrow") and attributes it to the
@@ -1438,48 +1402,28 @@ static builder. Ensure:
   `total`/`on_leaf`/`dropped_gap`. See
   `TestGraphFromTrace.test_module_less_kernel_time_conserved_not_dropped` and
   `test_minimax_m3_traces_every_in_step_kernel_on_leaf`.
-- **FlashInfer kernels classify as the `flashinfer` backend and are named after
-  their public API frame.** FlashInfer RMSNorm/fused-add-RMSNorm/attention
-  kernels launch directly from Python (no `aten`/`_C` cpu_op), so
-  `_attribute_kernels` surfaces them as synthetic ops on the enclosing module.
-  Rather than the unreadable raw cutlass functor symbol
-  (`flashinfer::kernel_cutlass_kernel_flashinfernormkernelsfused_add_rmsnormFusedAddRMSNormKernel`),
-  the op is named after the **public FlashInfer API python frame** that launched
-  it — the outermost `flashinfer/**/__init__.py(...): <func>` frame whose
-  function name is public (no leading `_`) — so the input_layernorm norm reads
-  `flashinfer::gemma_fused_add_rmsnorm` (and `flashinfer::gemma_rmsnorm`),
-  matching the readable XPU triton names (`_gemma_fused_add_rmsnorm_kernel`).
-  `_collect_flashinfer_api_frames` gathers those frames on the worker thread and
-  `_flashinfer_api_name` picks the one enclosing each kernel launch; the
-  `flashinfer::` namespace prefix is kept so `classify_op` still routes any op
-  whose name contains `flashinfer` to `Backend.FLASHINFER` (checked before the
-  Triton pattern match). When no such API frame is found (legacy/synthetic
-  traces) it falls back to the cleaned raw kernel symbol. See
-  `TestGraphFromTrace.test_flashinfer_kernel_named_after_public_api_frame`.
-- **xattention (MiniMax-M3 MSA) kernels classify as the `flash_xpu` backend and
-  are named after their xattention API frame.** MiniMax-M3 sparse attention on
-  XPU (the lightning indexer's block score + top-k, and the block-sparse GQA
-  attend) runs as hand-tuned SYCL kernels in the `xattention._C`
-  (`flash_xpu`) extension, launched directly from the `xattention.py` wrappers
-  with no `aten`/`_C` cpu_op, so `_attribute_kernels` surfaces them as synthetic
-  ops on the enclosing module (the `Indexer` / sparse-attention module). Rather
-  than the long raw SYCL symbol (`flash_xpu::(anonymous namespace)::
-  index_score_kernel_t`, `flash_xpu::msa_index_topk_xpu(at::Tensor const&, ...)::
-  {lambda...`), the op is named after the **public xattention API python frame**
-  that launched it — the outermost `xattention.py(...): <func>` frame whose
-  function name is public (no leading `_`) — so they read
-  `flash_xpu::minimax_m3_index_score`, `flash_xpu::minimax_m3_index_topk`,
-  `flash_xpu::minimax_m3_sparse_attn` (prefill) and
-  `flash_xpu::minimax_m3_index_decode`, `flash_xpu::minimax_m3_sparse_attn_decode`
-  (decode). `_collect_flash_xpu_api_frames` gathers those frames on the worker
-  thread and `_flash_xpu_api_name` picks the one enclosing each kernel launch;
-  the `flash_xpu::` namespace prefix is kept so `classify_op` routes any op whose
-  name contains `flash_xpu` to `Backend.FLASH_XPU` (checked **before** the Triton
-  pattern match, since the fallback synthetic name would otherwise misclassify
-  these SYCL kernels as `triton`). When no such API frame is found
-  (legacy/synthetic traces) it falls back to the cleaned raw kernel symbol under
-  `flash_xpu::`. See
+- **Python-launched kernels (FlashInfer, xattention, Triton) are named after
+  their innermost public launcher frame.** Kernels launched straight from Python
+  (no `aten`/`_C` cpu_op) surface as synthetic ops on the enclosing module.
+  Rather than the unreadable raw kernel symbol, the op is named after the
+  **innermost public frame outside the launch machinery** (`_LAUNCH_MACHINERY` =
+  torch/triton/dynamo/inductor/stdlib; `_DISPATCH_FUNCS` =
+  run/launch/call/__call__/execute/invoke/wrapper). `_collect_launcher_frames`
+  gathers those frames on the worker thread and `_launcher_at` picks the one
+  enclosing each kernel launch. The namespace prefix (`flashinfer::`/`flash_xpu::`
+  /`triton::`) still comes from the raw kernel symbol so `classify_op` still
+  routes correctly. For example, the input_layernorm FlashInfer norm reads
+  `flashinfer::fused_add_rmsnorm_cute` (the innermost public launcher), and
+  xattention ops read `flash_xpu::minimax_m3_index_score`, etc. When no launcher
+  frame is found (legacy/synthetic traces) it falls back to the cleaned raw
+  kernel symbol. See
+  `TestGraphFromTrace.test_flashinfer_kernel_named_after_its_launcher_frame` and
   `TestGraphFromTrace.test_flash_xpu_kernel_named_after_xattention_api_frame`.
+  Every op with no dispatcher `cpu_op` also carries
+  `launch = {file, line, func}` in the reconstructed graph, which the benchmark's
+  `resolve.resolve(op, slots, launch=...)` uses to import the callable by file
+  location — resolving Python-launched kernels automatically without a hardcoded
+  `PYTHON_API` table (see *Adding a New Op/Kernel*).
 - **`vllm::` namespace ops classify as vllm-xpu-kernels.** `classify_op` maps the
   `vllm::` prefix (dispatch ops: `unified_attention_with_output`,
   `unified_kv_cache_update`, `moe_forward_shared`, `xpu_topk_topp_sampler`)
@@ -1529,6 +1473,60 @@ static builder. Ensure:
   fallback, derives `first_k_dense_replace` from the leading zeros of a
   per-layer `moe_layer_freq` list, and maps `dense_intermediate_size` → dense
   MLP / `intermediate_size` → MoE experts. M3 uses standard GQA (not MLA).
+- **`LLM.apply_model` requires `VLLM_ALLOW_INSECURE_SERIALIZATION=1`.**
+  `apply_model` ships a *callable* to the vLLM worker, which vLLM refuses to
+  serialize unless that env var is set. Without it, both the module-span hooks
+  (`module_hooks`) and the (now-deleted) `named_modules()` reference tree fail
+  together and the run silently degrades to class-only module names — the primary
+  naming path was dead and no test noticed. `_run_profile` now sets the variable
+  before the engine core process spawns and logs an install failure as ERROR with
+  the hook count. Guarded by
+  `tests/test_golden_graph.py::test_module_names_come_from_spans`.
+- **Rank-0 selection: `_RANK_NAME_RE` must match dash-separated rank markers.**
+  vLLM also writes trace filenames of the form `<id>-rank-<N>.<id>.pt.trace.json.gz`
+  (not just `rank<N>`). The old regex required `rank` immediately followed by
+  digits, so the dash form parsed as *no rank*, and `_rank0_first` left the list
+  untouched — building the graph from whichever rank flushed last (whose
+  collective device time is inflated). Guarded by
+  `tests/test_trace_download.py::TestRank0Selection::test_trace_rank_from_dash_separated_marker`.
+- **`triton::fused_moe_kernel` (CUDA routed-expert grouped GEMM) has NO shape.**
+  Triton launches it from Python with no `cpu_op` to record `Input Dims` on, so
+  it cannot be swept, costed, ranked or replayed. This is a known gap; closing it
+  needs capture-time kernel-launcher spans (recording shapes at launch, the way
+  module spans record names). Listed in
+  `tests/test_golden_graph.py::KNOWN_SHAPELESS`.
+- **A Python-launched kernel resolves, but has no recorded *operands*.** The
+  launcher frame (M2) tells the replay which function to call; it does not tell
+  it what to call the function *with*. A kernel with no dispatcher `cpu_op` has
+  no `Input Dims`, so the graph carries only the one primary tensor shape that
+  `_infer_hidden_activation_ops` / `_infer_attention_kernel_shapes`
+  **reconstructed** from the model config. Replay therefore fails at call time
+  with an honest `TypeError`, e.g. on the canonical example:
+
+      triton::_gemma_rmsnorm_kernel
+        gemma_rmsnorm() missing 2 required positional arguments: 'weight', 'eps'
+      flash_xpu::minimax_m3_sparse_attn
+        minimax_m3_sparse_attn() missing 10 required positional arguments:
+        'kv_cache', 'topk_idx', 'block_table', 'cu_seqlens_q', ...
+
+  This is the same root cause as the shapeless `fused_moe_kernel` above and has
+  the same fix: **capture-time kernel-launcher spans that record the arguments**,
+  exactly as the module hooks record names. Do NOT close it by guessing operands
+  from the model config or from sibling ops — that is the per-model special-casing
+  this pipeline is moving away from, and for the two context-bound MSA kernels
+  (`kv_cache`/`block_table`/`cu_seqlens_q`) a guess would measure a degenerate
+  access pattern. Until then these ops are reported `failed` with the missing
+  argument names, which is the honest state: they are known, resolvable, and not
+  yet measurable.
+- **`OptimizeManager.any_active` must also report active while processes are
+  being reaped.** `stop()` marks a session stopped and signals the process, but
+  the GPU lease is released by the reaper only when the process actually exits.
+  The old version reported the pool free while it was still leased, making tests
+  flaky. Guarded by
+  `tests/test_optimize_scheduler.py::test_stopping_a_pending_session_drops_it_from_the_queue`.
+- **Graph reconstruction failure in `_build_result_from_traces` is FATAL.**
+  It raises instead of logging a warning and returning a result with nothing in
+  it, so a broken trace is not silently treated as success.
 
 ## Updating Documentation
 
@@ -1552,5 +1550,5 @@ When making significant changes to this repository, update documentation accordi
 3. **When to update** — After any PR that adds features, changes APIs, modifies the project structure, or alters how the tool is used. Run `git log --oneline <last_doc_commit>..HEAD` to see what changed since docs were last updated.
 
 4. **How to verify** — After updating, check that:
-   - Project Structure listing matches actual files (`ls breakdown/ tests/ scripts/`)
+   - Project Structure listing matches actual files (`ls breakdown/ tests/ tools/`)
    - API Endpoints table matches routes in `app.py` (`grep "@app.route" app.py`)

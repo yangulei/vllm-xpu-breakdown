@@ -89,36 +89,29 @@ Then open `http://localhost:8080` in your browser.
   - Sortable and filterable by backend
 - Backend distribution chart
 
-## CLI (Quick One-Shot)
+## Profiling
+
+All profiling is done through the web UI. Start the server and use the browser
+interface to configure model, batch sizes, TP, query/context lengths, and launch
+a profile:
 
 ```bash
-# Profile a model
-python run_profile.py --model Qwen/Qwen3-4B-Instruct-2507 --max-model-len 32768
-
-# Profile with custom prompt and batch size
-python run_profile.py --model meta-llama/Llama-3.2-1B-Instruct \
-    --prompt "Explain quantum computing" \
-    --max-tokens 512 --batch-size 4
-
-# Separate prefill / decode batch sizes (mirrors real serving: prefill ~1,
-# decode 32/64/128). Runs two passes → output/prefill and output/decode.
-python run_profile.py --model meta-llama/Llama-3.2-1B-Instruct \
-    --prefill-batch-size 1 --decode-batch-size 32
+python app.py --port 8080
 ```
 
-All standard vLLM `EngineArgs` (e.g., `--model`, `--max-model-len`, `--dtype`) are passed through.
+The canonical validation fixture is **MiniMax-M3, TP=4, 6 layers, XPU** (prefill:
+batch 1, query 2048, context 2048; decode: batch 32). To re-capture it:
+
+```bash
+python tools/capture_fixture.py   # requires Intel XPU + vLLM
+```
 
 ## Output
 
-Reports are written to `output/` (or `--output-dir`):
-
-| File | Description |
-|---|---|
-| `report.txt` | Console summary with backend breakdown and top-N ops |
-| `ops_breakdown.csv` | Every op with backend, timing, and call count |
-| `ops_breakdown.json` | Full structured data for programmatic analysis |
-| `breakdown.html` | Static HTML report with charts and sortable tables |
-| `trace.json` | Chrome trace (`chrome://tracing`) for timeline analysis |
+Profiling results are served through the web UI and the REST API. Downloadable
+artifacts include the raw Chrome trace (`/api/profile/trace`), the Shape Matrix
+Excel export (`/api/export/shape-matrix`), and the benchmark report workbook
+(`/api/bench/report`).
 
 ## Shape Matrix Export
 
@@ -320,26 +313,20 @@ python -m breakdown.optimize status --run <run_id>
 python -m breakdown.optimize stop   --run <run_id>
 ```
 
-## Comparing Eager vs Compiled
-
-```bash
-./scripts/compare_modes.sh --model Qwen/Qwen3-4B-Instruct-2507 --max-model-len 32768
-```
-
 ## Architecture
 
 ```
 app.py                  Web server (Flask) — model config, profiling, exports, REST API
-run_profile.py          CLI entry point — standalone profiling + reports
 static/index.html       Interactive frontend (SPA, vanilla JS)
 breakdown/
   graph_from_trace.py   Profile-first graph reconstruction (from torch profiler trace)
+  op_breakdown.py       Flat op breakdown (iter_ops, summarize_ops, backend_totals) derived from the graph
   shape_derive.py       Symbolic shape resolution (shared by the export + benchmark)
   shape_matrix.py       Graph + config sweep -> matrix rows (the export serializes these)
   shape_matrix_xlsx.py  Excel serialization of those rows
   bench/                Replay benchmark: dispatched ops -> measured -> ranked targets
     spec.py               Matrix rows -> replay cases (skip/dedup rules)
-    resolve.py            Dispatch name -> callable + schema (overload from the slots)
+    resolve.py            Dispatch name -> callable + schema (launch-frame resolution)
     inputs.py             Schema-driven operands + index-synthesizer registry
     recipes/              Per-op overrides, output args, skip reasons (xpu + cuda)
                           + attention.py: paged attention / KV write, context-free
@@ -360,18 +347,20 @@ breakdown/
     manager.py            Spawn/track/stop the per-kernel copilot processes
     cli.py                python -m breakdown.optimize {candidates,prompt,start,status,stop}
   module_hooks.py       Capture-time module-name spans (forward hooks; research R1)
-  module_naming.py      Fallback name overlay from named_modules() (legacy/upload traces)
   model_info.py         HuggingFace model config fetching & summarization
-  analyzer.py           Shape symbolization, memory/FLOPs estimation, layer merging
+  analyzer.py           Shape symbolization, memory/FLOPs estimation (dtype_size, estimate_memory, estimate_flops, DTYPE_BYTES)
   profiler.py           torch.profiler wrapper (XPU activity, shapes, stacks)
   classifier.py         Op classification: vllm-xpu-kernels | triton | torch-xpu-ops | cpu
   registry.py           Known op list from vllm-xpu-kernels (68 ops across 4 modules)
-  trace_parser.py       Chrome trace JSON parser + module/role inference helpers
-  trace_common.py       Torch-free trace helpers (overhead filter, module-span labels)
-  report.py             Console, CSV, JSON report generators
-  visualize.py          Static HTML report generator
+  trace_common.py       Torch-free trace helpers (overhead filter, module-span labels, device/role inference, _strip_instance_idx)
+tools/
+  make_fixture.py       Trim a full trace to ~90 KB fixture (refuses if graph differs)
+  capture_fixture.py    Re-capture the canonical MiniMax-M3 TP4 6-layer profile
 tests/
+  conftest.py                 Repo root on sys.path + --update-golden flag
+  data/                       Golden fixtures (trimmed rank-0 traces + configs + snapshots)
   test_pipeline.py            Unit tests (incl. graph reconstruction; requires torch)
+  test_golden_graph.py        Golden-snapshot tests over MiniMax-M3 TP4 6-layer fixtures
   test_module_spans.py        Capture-time module-span emission + reconstruction tests
   test_shape_matrix_export.py Shape Matrix Export endpoint tests
   test_bench_spec.py          Rows -> replay cases (skip/dedup, swept dims)
