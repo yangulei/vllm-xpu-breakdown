@@ -38,7 +38,7 @@ def _trace() -> str | None:
     The shared traces directory can hold LFS stubs / partial files, so each
     candidate is opened before it is trusted.
     """
-    from breakdown.graph_from_trace import _load_trace
+    from breakdown.trace.events import _load_trace
 
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     for path in sorted(glob.glob(os.path.join(
@@ -53,7 +53,7 @@ def _trace() -> str | None:
 
 
 def _cases() -> list[BenchCase]:
-    from breakdown.graph_from_trace import build_graph_from_trace
+    from breakdown.trace import build_graph_from_trace
     from breakdown.shape_matrix import build_rows
 
     path = _trace()

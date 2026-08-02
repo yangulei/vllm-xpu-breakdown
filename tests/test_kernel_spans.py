@@ -19,7 +19,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from breakdown import kernel_hooks
-from breakdown.graph_from_trace import build_graph_from_trace
+from breakdown.trace import build_graph_from_trace
 from breakdown.trace_common import (
     is_launcher_frame,
     kernel_span_label,

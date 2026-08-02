@@ -22,13 +22,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from breakdown.graph_from_trace import (  # noqa: E402
+from breakdown.trace import build_graph_from_trace  # noqa: E402
+from breakdown.trace.events import _load_trace  # noqa: E402
+from breakdown.trace.rules import (  # noqa: E402
     _DEVICE_KERNEL_CATEGORIES,
     _RUNTIME_CATEGORIES,
-    MODULE_SPAN_PREFIX,
-    _load_trace,
-    build_graph_from_trace,
 )
+from breakdown.trace_common import MODULE_SPAN_PREFIX  # noqa: E402
 
 # Inter-process plumbing frames: vLLM's shared-memory broadcast and the
 # distributed utils poll loops. They launch no kernel and dispatch no op; they

@@ -162,7 +162,7 @@ def _substitute_dims(slots: list[dict], swept: list[list[int]]) -> list[dict]:
 
     ``swept`` is the row's resolved shape list, which is parallel to the
     *tensor* operands in slot order (``TensorList`` entries flattened) - the
-    same ordering :func:`breakdown.graph_from_trace._parse_input_dims_types`
+    same ordering :func:`breakdown.trace._parse_input_dims_types`
     produces, so index ``i`` of ``swept`` is the ``i``-th tensor operand.
     A 0-dim tensor slot is *not* in that list (the shape extraction keeps only
     non-empty tensors), so it must not consume a sweep entry either - otherwise

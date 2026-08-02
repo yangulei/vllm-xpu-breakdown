@@ -13,7 +13,7 @@ import os
 import tempfile
 from typing import Any
 
-from breakdown.graph_from_trace import build_graph_from_trace
+from breakdown.trace import build_graph_from_trace
 
 
 def graph_of(events: list[dict], summary: dict, **kwargs: Any) -> dict:

@@ -191,7 +191,7 @@ class TestNamedSpanReconstruction(unittest.TestCase):
     }
 
     def _build(self):
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(_span_trace(), f)
             path = f.name
@@ -263,7 +263,7 @@ class TestWorkerThreadSelection(unittest.TestCase):
         return {"traceEvents": events}
 
     def test_span_thread_selected_over_busier_decoy(self):
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(self._trace_with_decoy(), f)
             path = f.name

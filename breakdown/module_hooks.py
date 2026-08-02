@@ -14,7 +14,7 @@ This module records the real names **at capture time** instead: it installs a
 that opens a ``record_function("module::<qualified_name>::<Cls>")`` span around
 the forward. Those emit ``user_annotation`` trace events that nest by
 time-containment exactly like the module forwards and carry the exact attribute
-path, so :mod:`breakdown.graph_from_trace` reconstructs the tree with real names
+path, so :mod:`breakdown.trace` reconstructs the tree with real names
 directly — no overlay, no ordering assumption, causally correct even under async
 execution because the span is opened at dispatch time.
 

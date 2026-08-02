@@ -75,7 +75,7 @@ def _graph_from_args(a) -> tuple[dict, dict]:
     if not a.trace:
         raise SystemExit("plan needs --trace (a profiler trace) or --result "
                          "(a saved /api/profile/result payload)")
-    from breakdown.graph_from_trace import build_graph_from_trace
+    from breakdown.trace import build_graph_from_trace
     from breakdown.model_info import fetch_model_config, summarize_config
 
     if a.summary:

@@ -35,6 +35,7 @@ from breakdown.analyzer import (
 from breakdown.classifier import Backend, classify_op
 from breakdown.model_info import fetch_model_config, get_dim_symbols, summarize_config
 from breakdown.profiler import _is_overhead_event
+from breakdown.trace import build_graph_from_trace
 from tests.helpers import device_time, find_op, graph_of, iter_ops
 
 
@@ -586,7 +587,7 @@ class TestGraphFromTrace(unittest.TestCase):
     }
 
     def _build(self, steps):
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(_synthetic_trace(steps), f)
             path = f.name
@@ -633,7 +634,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # both children. This mirrors the MiniMax-M3 case where the decoder
         # layer's post-attention ``c10d::allreduce_`` (a direct op, launched
         # after the attention submodule) was floating to the top of the layer.
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         events = []
         ext = [0]
         corr = [0]
@@ -715,7 +716,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # sits before ``post_attention_layernorm``. Grouping ops only by
         # (name, shapes) collapsed both into one node at the leading position,
         # hiding the post-attention allreduce. Both must now survive, ordered.
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         events = []
         ext = [0]
         tid = 7
@@ -789,7 +790,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # its gate_up/down projections) used to vanish from the graph. The hoist
         # must lift it out to sit beside the op as a child of ``FusedMoE``, with
         # its own device time counted once (moved out of the op's rollup).
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         events = []
         ext = [0]
         corr = [0]
@@ -882,7 +883,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # neither the router nor the experts. They must surface as ``router`` and
         # ``moe`` children of ``FusedMoE`` (order: router → moe), with their ops
         # and device time moved out of the wrapping op.
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         events = []
         ext = [0]
         corr = [0]
@@ -990,7 +991,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # real one. They must collapse to a single node holding the MLP, with
         # device time conserved. The empty-first order here mirrors the CUDA
         # prefill trace (decode has empty-last — coalescing is order-agnostic).
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         events = []
         ext = [0]
         corr = [0]
@@ -1079,7 +1080,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # label — a Gemma decoder layer has two ``fused_allreduce_gemma_rms_norm``
         # (pre- and post-attention). They must stay as two separate siblings, not
         # collapse into one.
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         events = []
         ext = [0]
         corr = [0]
@@ -1168,7 +1169,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # lone norm), which reads as an unexplained "norm" at the layer edge.
         # Promoting the frame must make it a parent node
         # ``fused_allreduce_gemma_rms_norm → {allreduce, norm}``.
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         events = []
         ext = [0]
         corr = [0]
@@ -1255,7 +1256,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # Both operate on the residual ``[tokens, H]`` in the activation dtype, so
         # both must come out with shape ``[S, H]`` and dtype ``bfloat16`` inferred
         # from the neighbouring hidden-state op.
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         events = []
         ext = [0]
         corr = [0]
@@ -1349,7 +1350,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # category so the Triton kernel is attributed to its real launch site
         # (inside ``moe``) instead of falling back to External id and collapsing
         # into ``moe_forward_shared``'s start.
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         events = []
         ext = [0]
         corr = [0]
@@ -1510,7 +1511,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # latency average. Here its kernel is 10x heavier than steady state;
         # the reported decode op time must be the steady-state value, not a
         # mean that includes the warmup step.
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         events, ext, corr, tid, midx = [], [0], [0], 7, [0]
         clock = [0.0]
 
@@ -1587,7 +1588,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # fewer than `batch_size` sequences (partial rows like 2/30). Only the
         # steady-state full-batch (32) steps must survive, so the decode op row
         # dim symbolizes to B=32 rather than leaking literal 2/30 nodes.
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         summary = dict(self.SUMMARY)
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             # 1 prefill (40 tok) + ramp decode (2, 30) + steady decode (32, 32)
@@ -1630,7 +1631,7 @@ class TestGraphFromTrace(unittest.TestCase):
     def test_context_len_symbolized_as_C(self):
         # When a prefix-cached prefill is profiled, the context length (and the
         # full attended KV length context+query) must symbolize as C / S+C.
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         events, ext, corr, tid, midx = [], [0], [0], 7, [0]
 
         def kern(e, ts, dur):
@@ -1699,7 +1700,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # key/value inputs ([S, n_kv, d]); the context length is never a tensor
         # dim. With a context, key/value rows must be rewritten to the full
         # attended KV length S+C while query/output rows stay S.
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         events, ext, corr, tid, midx = [], [0], [0], 7, [0]
 
         def op(name, ts, dur, shapes):
@@ -1765,7 +1766,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # worker with SIGFPE, the MoE grouped GEMM rejected its operands).
         # Paged attention never records the context as a tensor dim, so a
         # config dim must always win.
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         events, ext, tid, midx = [], [0], 7, [0]
 
         def op(name, ts, dur, shapes):
@@ -1820,7 +1821,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # matching the token operand as soon as the Shape Matrix swept S, and
         # the kernels rejected their own shapes ("remapped_hidden_states must be
         # [num_rows * TopK, hidden_size]").
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         events, ext, tid, midx = [], [0], 7, [0]
 
         def op(name, ts, dur, shapes, types=None):
@@ -1888,7 +1889,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # rule would match the router's own [tokens, topk] operand and turn the
         # expert fan-out into topk*B - a width that scales with the swept batch,
         # which is the very bug the pass exists to prevent.
-        from breakdown.graph_from_trace import _symbolize_moe_routed_rows
+        from breakdown.trace.symbols import _symbolize_moe_routed_rows
 
         summary = {"num_experts": 8, "num_experts_per_tok": 4}
         tree = {
@@ -1909,7 +1910,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # (the new tokens only). Attention really reads context+query, so its
         # cost has to be recomputed once the KV rows are annotated - otherwise a
         # 2048-token context understates the heaviest op ~65x.
-        from breakdown.graph_from_trace import _annotate_attention_kv
+        from breakdown.trace.graph import _annotate_attention_kv
 
         op = {"name": "vllm::unified_attention_with_output",
               "input_shapes": [["S", "n_h", "d"], ["S", "n_kv", "d"],
@@ -1960,7 +1961,7 @@ class TestGraphFromTrace(unittest.TestCase):
         self.assertEqual(rows[0]["FLOPs"], one_seq)
 
     def test_empty_trace(self):
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump({"traceEvents": []}, f)
             path = f.name
@@ -1976,7 +1977,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # A Triton-compiled kernel launches straight from Python with no cpu_op
         # wrapper (e.g. an RMSNorm). It must still surface as a ``triton::`` op on
         # its enclosing module, attributed by launch-site containment.
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         tid = 7
         events = [
             {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
@@ -2027,7 +2028,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # a device ``kernel`` whose symbol embeds "flashinfer". The kernel must
         # surface as a FlashInfer op; the launch-API runtime event must NOT
         # appear as a duplicate ``triton::cudaLaunchKernelExC`` op.
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         tid = 7
         fi_kernel = ("kernel_cutlass_kernel_flashinfernormkernelsrmsnorm"
                      "RMSNormKernel_object_at__T_0")
@@ -2088,7 +2089,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # frame (``flashinfer/norm/__init__.py(...): gemma_fused_add_rmsnorm``),
         # the synthetic op is named after that API — short and matching the
         # readable XPU kernel names — instead of the raw cutlass functor symbol.
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         tid = 7
         fi_kernel = ("kernel_cutlass_kernel_flashinfernormkernels"
                      "fused_add_rmsnormFusedAddRMSNormKernel_object_at__T_0")
@@ -2166,7 +2167,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # synthetic op must instead be named after the public xattention API
         # frame (``flash_xpu::minimax_m3_index_score``) and classify as the
         # ``flash_xpu`` backend.
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         tid = 7
         fx_kernel = "flash_xpu::(anonymous namespace)::index_score_kernel_t"
         events = [
@@ -2231,7 +2232,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # ``[total_q, num_index_heads, index_head_dim]``. The reconstruction must
         # rebuild both from the config + the step's token count (leading dim of a
         # neighbouring activation) — ``[S, n_h, d]`` and ``[S, n_idx, idx_d]``.
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         summary = dict(self.SUMMARY, head_dim=8, sparse_num_index_heads=2,
                        sparse_index_dim=4)
         tid = 7
@@ -2310,7 +2311,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # ``[S, n_h/TP, d]`` for the block-sparse attend, ``[S, n_idx/TP, d]`` for
         # the indexer block score and ``[n_idx/TP, S, K_topk]`` (int32) for the
         # top-k block ids.
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         summary = dict(self.SUMMARY, hidden_size=32, num_heads=4, num_kv_heads=2,
                        head_dim=8, sparse_attention=True,
                        sparse_num_index_heads=2, sparse_index_dim=8,
@@ -2383,7 +2384,7 @@ class TestGraphFromTrace(unittest.TestCase):
     def test_layer_extrapolation_to_config_count(self):
         # Reduced-layer profiling captures 2 decoder layers; the config says the
         # model has 5. The unprofiled layers fold into the last decoder group.
-        from breakdown.graph_from_trace import build_graph_from_trace
+        from breakdown.trace import build_graph_from_trace
         summary = dict(self.SUMMARY, num_layers=5)
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(_synthetic_trace([8]), f)
@@ -2495,7 +2496,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # real device-kernel count (no host bookkeeping collected as a kernel),
         # and every kernel launched inside a kept prefill/decode step must land
         # on a leaf op (no silent drops).
-        from breakdown.graph_from_trace import kernel_coverage
+        from breakdown.trace import kernel_coverage
         from tests import data as fixtures
         checked = 0
         for fx in fixtures.available():
@@ -2524,7 +2525,7 @@ class TestSymbolicShapeCompleteness(unittest.TestCase):
     }
 
     def test_config_symbols_include_sparse_qkv_and_rope_cache(self):
-        from breakdown.graph_from_trace import _build_symbol_tables
+        from breakdown.trace.symbols import _build_symbol_tables
         val_to_sym, sym_to_val = _build_symbol_tables(self.M3_SUMMARY, 4)
         # Rope cos/sin cache length = max_position_embeddings → P (not /TP).
         self.assertEqual(sym_to_val["P"], 1048576)
@@ -2543,7 +2544,7 @@ class TestSymbolicShapeCompleteness(unittest.TestCase):
         self.assertEqual(val_to_sym[1], "n_kv/TP")
 
     def test_runtime_dims_symbolized_with_observed_values(self):
-        from breakdown.graph_from_trace import _symbolize_runtime_dims
+        from breakdown.trace.symbols import _symbolize_runtime_dims
         # A minimal tree carrying the run-specific allocation dims that aren't
         # config-derivable: paged KV-cache slots, MoE routed-token rows, and the
         # 1-D moe_align_block_size scratch buffers.
@@ -2583,7 +2584,7 @@ class TestSymbolicShapeCompleteness(unittest.TestCase):
         self.assertEqual(experts[1]["input_shapes"], [["N_moe"], ["N_moe2"]])
 
     def test_trivial_dims_left_concrete(self):
-        from breakdown.graph_from_trace import _symbolize_runtime_dims
+        from breakdown.trace.symbols import _symbolize_runtime_dims
         # The k/v-pair constant 2 (and 0/1 placeholders) must stay literal.
         tree = {"module_type": "M", "children": [], "ops": [
             {"name": "_C::kv_cache_update", "input_shapes": [[2], [1], [0]]}]}
@@ -2591,53 +2592,28 @@ class TestSymbolicShapeCompleteness(unittest.TestCase):
         _symbolize_runtime_dims([tree], sym_to_val)
         self.assertEqual(tree["ops"][0]["input_shapes"], [[2], [1], [0]])
 
-    def test_minimax_m3_traces_no_concrete_structural_dims(self):
-        # End-to-end over the real MiniMax-M3 traces (XPU + CUDA, prefill +
-        # decode): after reconstruction no op input shape may carry a concrete
-        # integer above the trivial threshold (2). Skipped when traces absent.
-        import glob
-        from breakdown.graph_from_trace import build_graph_from_trace, _load_trace
-        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        files = sorted(glob.glob(os.path.join(
-            here, "output", "traces", "vllm_trace_MiniMax-M3_*_tp4_*layers.json.gz")))
-        if not files:
-            self.skipTest("MiniMax-M3 trace files not present")
+    def test_fixture_traces_no_concrete_structural_dims(self):
+        # End-to-end over the committed MiniMax-M3 fixtures (XPU + CUDA,
+        # prefill + decode): after reconstruction no op input shape may carry a
+        # concrete integer above the trivial threshold (2) - every structural
+        # dim must have symbolized, or the Shape Matrix cannot sweep it.
+        from breakdown.trace import build_graph_from_trace
+        from tests import data as fixtures
         checked = 0
-        for f in files:
-            base = os.path.basename(f)
-            # The shared traces dir may hold partial/LFS-stub files; skip any
-            # that aren't a readable trace with events.
-            try:
-                if not _load_trace(f).get("traceEvents"):
+        for fx in fixtures.available():
+            graph = build_graph_from_trace(fx.trace_path, **fx.build_kwargs())
+            for phase in ("prefill", "decode"):
+                tree = graph.get(phase)
+                if not tree:
                     continue
-            except (OSError, ValueError):
-                continue
-            is_prefill = "prefill" in base
-            g = build_graph_from_trace(
-                f, self.M3_SUMMARY, tp_size=4,
-                batch_size=(1 if is_prefill else 32),
-                query_len=(2048 if is_prefill else 1), context_len=2048)
-
-            def concretes(node, acc):
-                if not node:
-                    return
-                for op in node.get("ops", []):
-                    for shp in (op.get("input_shapes") or []):
-                        if not isinstance(shp, list):
-                            continue
-                        for dim in shp:
-                            if isinstance(dim, int) and dim > 2:
-                                acc.append((op["name"], tuple(shp)))
-                for c in node.get("children", []):
-                    concretes(c, acc)
-
-            acc: list = []
-            concretes(g.get("prefill"), acc)
-            concretes(g.get("decode"), acc)
-            self.assertEqual(acc, [], f"{base}: concrete structural dims leaked")
-            checked += 1
-        if not checked:
-            self.skipTest("no readable MiniMax-M3 trace files present")
+                checked += 1
+                for op in iter_ops(tree):
+                    for shape in op.get("input_shapes") or []:
+                        for dim in shape:
+                            self.assertFalse(
+                                isinstance(dim, int) and dim > 2,
+                                f"{fx.name}/{phase}: {op['name']} {shape}")
+        self.assertTrue(checked, "no fixture traces available")
 
 
 class TestPhasePartition(unittest.TestCase):
@@ -2647,7 +2623,6 @@ class TestPhasePartition(unittest.TestCase):
         # Each engine step is [Model(deep), LogitsProcessor(shallow), Sampler].
         # The LogitsProcessor's lm_head matmul is intentionally the most
         # device-time-heavy op — main-class detection must NOT pick it.
-        from breakdown import graph_from_trace as G
         events = []
         ext = [0]
         corr = [0]
@@ -2704,7 +2679,7 @@ class TestPhasePartition(unittest.TestCase):
                        "num_heads": 1, "num_kv_heads": 1, "head_dim": 16,
                        "intermediate_size": 16, "vocab_size": 32000,
                        "num_layers": 1, "dtype": "bfloat16"}
-            return G.build_graph_from_trace(path, summary, tp_size=1,
+            return build_graph_from_trace(path, summary, tp_size=1,
                                             batch_size=1)
         finally:
             os.unlink(path)
@@ -2720,7 +2695,6 @@ class TestPhasePartition(unittest.TestCase):
 
     def _build_steps(self, step_tokens, batch_size):
         """Build a trace of engine steps with explicit per-step token dims."""
-        from breakdown import graph_from_trace as G  # noqa: F401
         events = []
         ext = [0]
         corr = [0]
@@ -2774,8 +2748,7 @@ class TestPhasePartition(unittest.TestCase):
                    "intermediate_size": 16, "vocab_size": 32000,
                    "num_layers": 1, "dtype": "bfloat16"}
         try:
-            from breakdown import graph_from_trace as G
-            return G.build_graph_from_trace(path, summary, tp_size=1,
+                return build_graph_from_trace(path, summary, tp_size=1,
                                             batch_size=batch_size)
         finally:
             os.unlink(path)

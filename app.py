@@ -48,7 +48,7 @@ from breakdown.analyzer import (
 )
 from breakdown.classifier import Backend, classify_op
 from breakdown.op_breakdown import backend_totals, summarize_ops
-from breakdown.graph_from_trace import build_graph_from_trace
+from breakdown.trace import build_graph_from_trace
 from breakdown.trace_common import _detect_device_via_torch
 from breakdown.model_info import (
     fetch_model_config,

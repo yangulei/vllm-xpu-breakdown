@@ -24,7 +24,7 @@ import os
 
 import pytest
 
-from breakdown.graph_from_trace import build_graph_from_trace
+from breakdown.trace import build_graph_from_trace
 from tests.data import GOLDEN_DIR, available
 
 
