@@ -209,6 +209,17 @@ def _msa_kernel_layout(op_label: str) -> str | None:
 # ``(path_substr, funcname, synthetic_class, display_name)`` — ``display_name``
 # is the attribute-style label shown in the graph (``None`` → derive from the
 # class). Only the outermost matching frame becomes a boundary per step.
+#
+# Why a table and not a structural rule. The obvious generalisation — "a Python
+# frame that encloses compute no child module covers becomes a module" — was
+# measured on the canonical MiniMax-M3 TP4 trace: of 91 900 candidate frames on
+# the worker thread, 409 are inside a module and enclose two or more leaves, and
+# they nest (``tensor_model_parallel_all_reduce`` → ``all_reduce`` →
+# ``all_reduce`` → ``all_reduce`` is four of them around one collective). A rule
+# with that hit rate does not produce a readable tree; it produces a deeper one.
+# What the entries below actually encode is a *semantic* judgement — this
+# function is a block of the model — which is model vocabulary, so it lives here
+# with the rest of it. Adding a model means adding a line, not a pass.
 _FUNCTIONAL_MODULE_FRAMES = (
     ("sample/sampler.py", "__call__", "Sampler", None),
     ("fused_topk_bias_router.py", "fused_topk_bias", "FusedTopKBiasRouter",
@@ -311,17 +322,17 @@ def _rowparallel_shape_role(cls: str, child_merged: dict,
     return None
 
 
-def _disambiguate_child_name(cls: str, occ_idx: int, parent_merged: dict,
-                             is_cuda: bool = False) -> str:
+def _disambiguate_child_name(cls: str, occ_idx: int, parent_merged: dict) -> str:
     """Generate a display name for a child module, disambiguating by position.
 
     When multiple children share the same class (e.g. two RMSNorm inside
     Attention → q_norm and k_norm), use positional heuristics to distinguish
     them instead of showing the same generic name for both.
 
-    ``is_cuda`` gates the GPU-only RowParallelLinear parent heuristics (which
-    compensate for corrupted trace nesting on CUDA); the XPU path keeps the
-    original generic naming.
+    This is only reached for a module the capture-time spans did not name, so
+    it is a fallback for archived and third-party traces. Every rule here is
+    device-agnostic: a naming ambiguity is a property of the model's class
+    reuse, not of the runtime.
     """
     parent_type = parent_merged.get("module_type", "").lower()
     low = cls.lower()
@@ -380,20 +391,16 @@ def _disambiguate_child_name(cls: str, occ_idx: int, parent_merged: dict,
             )
             if row_parallel_count <= 1:
                 return "down_proj"
-            # Multiple RowParallel inside MLP: only the last is down_proj, the
-            # earlier ones are misplaced from Attention. This happens on GPU
-            # where async timing can time-contain Attention's RowParallelLinear
-            # inside MLP; XPU nesting is reliable and normally hits the count<=1
-            # branch above, so gate the compensation to CUDA.
-            if is_cuda:
-                last_rp_idx = max(
-                    key[1] for key in parent_merged["child_order"]
-                    if "rowparallel" in key[0].lower()
-                )
-                if occ_idx == last_rp_idx:
-                    return "down_proj"
-                return "o_proj"
-            return "down_proj"
+            # Several RowParallelLinear inside one MLP: only the last is the
+            # down projection; the earlier ones are attention output
+            # projections that async timing time-contained here. An accurate
+            # capture hits the count<=1 branch above, so this only fires where
+            # the nesting is already known to be wrong.
+            last_rp_idx = max(
+                key[1] for key in parent_merged["child_order"]
+                if "rowparallel" in key[0].lower()
+            )
+            return "down_proj" if occ_idx == last_rp_idx else "o_proj"
         if is_attn:
             return "o_proj"
     if "mergedcolumn" in low or "columnparallel" in low:

@@ -124,7 +124,7 @@
             "launch": null,
             "name": "c10d::allreduce_",
             "order": 6,
-            "role": "embedding",
+            "role": "all_reduce",
             "shapes": [
              [
               "S",
@@ -421,7 +421,7 @@
               "launch": null,
               "name": "c10d::allreduce_",
               "order": 1,
-              "role": "norm",
+              "role": "all_reduce",
               "shapes": [
                [
                 "S",
@@ -614,7 +614,7 @@
               "launch": null,
               "name": "c10d::allreduce_",
               "order": 1,
-              "role": "norm",
+              "role": "all_reduce",
               "shapes": [
                [
                 "S",
@@ -875,7 +875,7 @@
               "launch": null,
               "name": "c10d::allreduce_",
               "order": 1,
-              "role": "norm",
+              "role": "all_reduce",
               "shapes": [
                [
                 "S",
@@ -1068,7 +1068,7 @@
               "launch": null,
               "name": "c10d::allreduce_",
               "order": 1,
-              "role": "norm",
+              "role": "all_reduce",
               "shapes": [
                [
                 "S",
@@ -1479,7 +1479,7 @@
               "launch": null,
               "name": "c10d::allreduce_",
               "order": 1,
-              "role": "norm",
+              "role": "all_reduce",
               "shapes": [
                [
                 "S",
@@ -1960,7 +1960,7 @@
                 "launch": null,
                 "name": "c10d::allreduce_",
                 "order": 7,
-                "role": "allreduce_",
+                "role": "all_reduce",
                 "shapes": [
                  [
                   "S",
@@ -2424,7 +2424,7 @@
               "launch": null,
               "name": "c10d::allreduce_",
               "order": 1,
-              "role": "norm",
+              "role": "all_reduce",
               "shapes": [
                [
                 "S",
@@ -2905,7 +2905,7 @@
                 "launch": null,
                 "name": "c10d::allreduce_",
                 "order": 7,
-                "role": "allreduce_",
+                "role": "all_reduce",
                 "shapes": [
                  [
                   "S",
@@ -3022,7 +3022,7 @@
       "launch": null,
       "name": "c10d::_allgather_base_",
       "order": 1,
-      "role": "lm_head",
+      "role": "all_gather",
       "shapes": [
        [
         "n_kv",

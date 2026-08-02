@@ -151,20 +151,12 @@ def _finalize_node(
     module_path = _split_path_types(path)
     display_name = merged.get("attr_name") or name
 
-    # GPU-only naming/role fixes. On CUDA, torch.compile/CUDA-graph async timing
-    # corrupts the trace's time-containment nesting, so path-based role inference
-    # and parent-based module naming are unreliable. These corrections are gated
-    # to CUDA so the XPU path (accurate eager nesting) keeps its original
-    # behaviour and its distinct symbol/naming mapping.
-    is_cuda = (device_type or "").lower() == "cuda"
-
-    # When the module has a resolved semantic identity (e.g. "down_proj"), the
-    # module's *projection* op inherits that role — overriding path-based
-    # inference that can be wrong on GPU. Only the matmul-family op adopts the
-    # role; communication ops (all_reduce/all_gather) keep their own role.
-    module_role_override = display_name if (is_cuda and
-                                            display_name in _KNOWN_MODULE_ROLES) \
-        else None
+    # A module with a resolved semantic identity ("down_proj", "q_proj", ...)
+    # lends it to its own projection matmul: the module knows what it is, the
+    # op's path does not. Only the matmul-family op adopts it; a communication
+    # op keeps its own role.
+    module_role_override = (display_name if display_name in _KNOWN_MODULE_ROLES
+                            else None)
 
     ops_out: list[dict] = []
     node_dev = 0.0
@@ -191,23 +183,21 @@ def _finalize_node(
             self_device_time_us=dev,
             device_time_us=dev,
         )
-        # CUDA-only role corrections: keep collective-comm ops labelled as their
-        # own op (not the enclosing projection), and let the projection matmul
-        # inherit the module's semantic role.
-        cuda_role = None
-        if is_cuda:
-            low_op = raw.label.lower()
-            op_base = low_op.split("::")[-1]
-            if "all_reduce" in low_op or "allreduce" in low_op:
-                cuda_role = "all_reduce"
-            elif "all_gather" in low_op or "allgather" in low_op:
-                cuda_role = "all_gather"
-            elif "reduce_scatter" in low_op or "reducescatter" in low_op:
-                cuda_role = "reduce_scatter"
-            elif module_role_override and op_base in (
-                    "mm", "addmm", "linear", "matmul", "bmm"):
-                cuda_role = module_role_override
-        role = cuda_role \
+        # A collective is its own role, never the enclosing projection's; a
+        # projection matmul takes the role of the module that owns it.
+        low_op = raw.label.lower()
+        op_base = low_op.split("::")[-1]
+        op_role = None
+        if "all_reduce" in low_op or "allreduce" in low_op:
+            op_role = "all_reduce"
+        elif "all_gather" in low_op or "allgather" in low_op:
+            op_role = "all_gather"
+        elif "reduce_scatter" in low_op or "reducescatter" in low_op:
+            op_role = "reduce_scatter"
+        elif module_role_override and op_base in (
+                "mm", "addmm", "linear", "matmul", "bmm"):
+            op_role = module_role_override
+        role = op_role \
             or _infer_role(module_path + [merged["module_type"]], raw.label) \
             or raw.label.split("::")[-1]
         sym_shapes = [
@@ -254,13 +244,12 @@ def _finalize_node(
         norm, occ_idx = key
         child_merged = _merge_modules(insts, n_forward)
         child_name = child_merged.get("attr_name")
-        if not child_name and is_cuda:
-            # CUDA-only: shape-based o_proj/down_proj disambiguation, robust to
-            # the corrupted time-containment nesting seen on GPU traces.
-            child_name = _rowparallel_shape_role(norm, child_merged, symbols_val)
         if not child_name:
-            child_name = _disambiguate_child_name(
-                norm, occ_idx, merged, is_cuda=is_cuda)
+            # The span-less fallbacks: name a RowParallelLinear by the shape of
+            # its own weight, then by its parent's type.
+            child_name = (_rowparallel_shape_role(norm, child_merged,
+                                                  symbols_val)
+                          or _disambiguate_child_name(norm, occ_idx, merged))
         child = _finalize_node(
             child_merged,
             name=child_name,
