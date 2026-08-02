@@ -128,7 +128,7 @@ def main():
             print(f"    {name:60s}  total_dur={total_dur:>10.0f}µs")
 
     # Now parse with our trace_parser
-    from breakdown.trace_parser import parse_trace_file
+    from breakdown.op_breakdown import summarize_ops
     from breakdown.model_info import fetch_model_config, summarize_config, get_dim_symbols
     from breakdown.analyzer import analyze_ops
 

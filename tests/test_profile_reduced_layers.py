@@ -120,7 +120,7 @@ class TestReducedLayerProfiling:
         """Trace from reduced-layer profiling must be parseable by our parser."""
         from vllm import SamplingParams
 
-        from breakdown.trace_parser import parse_trace_file
+        from breakdown.op_breakdown import summarize_ops
 
         llm = _create_engine(num_hidden_layers=1)
         sampling = SamplingParams(max_tokens=8)

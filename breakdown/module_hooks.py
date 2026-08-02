@@ -4,11 +4,10 @@
 The torch profiler labels ``nn.Module`` forward frames with their *class* only
 (``nn.Module: RMSNorm_2``), so same-class siblings (``q_norm``/``k_norm``,
 ``input_layernorm``/``post_attention_layernorm``) are indistinguishable in the
-raw trace. The previous design recovered the real names *after the fact* by
-aligning a ``named_modules()`` reference tree onto the reconstructed tree
-(:mod:`breakdown.module_naming`) — a brittle step that assumes same-class
-siblings run in registration order and has to unwrap ``*Model`` wrapper levels
-the trace omits.
+raw trace. An earlier design recovered the real names *after the fact* by aligning a
+``named_modules()`` reference tree onto the reconstructed tree — a brittle step
+that assumed same-class siblings run in registration order and had to unwrap
+``*Model`` wrapper levels the trace omits. It has been removed.
 
 This module records the real names **at capture time** instead: it installs a
 ``register_forward_pre_hook`` / ``register_forward_hook`` pair on every module

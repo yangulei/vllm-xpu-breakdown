@@ -190,15 +190,14 @@ class TestNamedSpanReconstruction(unittest.TestCase):
         "vocab_size": 32000, "num_layers": 2, "dtype": "bfloat16",
     }
 
-    def _build(self, ref_tree=None):
+    def _build(self):
         from breakdown.graph_from_trace import build_graph_from_trace
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(_span_trace(), f)
             path = f.name
         try:
             return build_graph_from_trace(path, self.SUMMARY, tp_size=1,
-                                          batch_size=1,
-                                          ref_module_tree=ref_tree)
+                                          batch_size=1)
         finally:
             os.unlink(path)
 
@@ -208,9 +207,9 @@ class TestNamedSpanReconstruction(unittest.TestCase):
         return next(c for c in model["children"]
                     if c["module_type"] == "Qwen3DecoderLayer")
 
-    def test_real_names_without_ref_tree(self):
-        # Names come straight from the trace spans — no reference tree passed.
-        g = self._build(ref_tree=None)
+    def test_real_names_come_from_the_spans(self):
+        # Names come straight from the trace spans; there is no other source.
+        g = self._build()
         self.assertTrue(g["has_module_names"])
         layer = self._layer(g)
         self.assertEqual(layer["name"], "decoder_layer")
@@ -223,7 +222,7 @@ class TestNamedSpanReconstruction(unittest.TestCase):
                          ["input_layernorm", "post_attention_layernorm"])
 
     def test_qnorm_knorm_distinguished(self):
-        g = self._build(ref_tree=None)
+        g = self._build()
         layer = self._layer(g)
         attn = next(c for c in layer["children"]
                     if c["module_type"] == "Qwen3Attention")
@@ -234,25 +233,12 @@ class TestNamedSpanReconstruction(unittest.TestCase):
     def test_layers_still_collapse(self):
         # Distinct per-layer qnames (layers.0/layers.1) must not defeat the
         # repeat-collapse: both map to the display name "decoder_layer".
-        g = self._build(ref_tree=None)
+        g = self._build()
         model = g["prefill"]["children"][0]
         layer_nodes = [c for c in model["children"]
                        if c["module_type"] == "Qwen3DecoderLayer"]
         self.assertEqual(len(layer_nodes), 1)
         self.assertEqual(layer_nodes[0]["repeat_count"], 2)
-
-    def test_ref_tree_ignored_when_spans_present(self):
-        # A (deliberately empty) ref tree must not override the exact span names.
-        bogus = {"attr": "", "cls": "Qwen3ForCausalLM", "is_group": False,
-                 "group_size": 1, "children": []}
-        g = self._build(ref_tree=bogus)
-        layer = self._layer(g)
-        attn = next(c for c in layer["children"]
-                    if c["module_type"] == "Qwen3Attention")
-        attn_norms = [c["name"] for c in attn["children"]
-                      if c["module_type"] == "RMSNorm"]
-        self.assertEqual(attn_norms, ["q_norm", "k_norm"])
-
 
 class TestWorkerThreadSelection(unittest.TestCase):
     """R6: the module-span thread is the worker, even if a decoy thread has

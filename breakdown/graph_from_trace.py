@@ -39,11 +39,13 @@ from .analyzer import DTYPE_BYTES, dtype_size, estimate_flops, estimate_memory
 from .classifier import classify_op
 from .trace_common import (
     MODULE_SPAN_PREFIX,
+    _infer_device_from_trace,
+    _infer_role,
     _is_overhead_event,
+    _strip_instance_idx,
     module_span_display_name,
     parse_module_span,
 )
-from .trace_parser import _infer_device_from_trace, _infer_role, _strip_instance_idx
 
 # Chrome-trace categories that carry actual *device* (GPU/XPU) work — real
 # compute kernels, memcpys and memsets. Every event in one of these categories
@@ -938,10 +940,10 @@ def _build_raw_forest(events: list[dict]) -> list[_Raw]:
       ``self_attn``, ...) straight from the trace — no reference-tree overlay,
       no registration-order assumption. The class-only ``nn.Module:`` frames are
       ignored to avoid duplicating the tree.
-    * **Legacy mode** — older traces (and third-party / upload traces) without
-      those spans fall back to the class-only ``nn.Module: <Cls>_<idx>``
-      ``python_function`` events; names are recovered afterwards by the
-      ``module_naming`` overlay (``_apply_ref_names``).
+    * **Span-less mode** — a trace captured without the hooks (an archived or
+      third-party trace) falls back to the class-only ``nn.Module: <Cls>_<idx>``
+      ``python_function`` events, so the tree is structurally correct but the
+      module labels are class heuristics rather than attribute paths.
     """
     cpu_ops = [e for e in events if e.get("cat") == "cpu_op"
                and e.get("ph") == "X"]
@@ -1340,43 +1342,6 @@ def _op_signature(n: _Raw) -> tuple:
 
 def _module_children(node: _Raw) -> list[_Raw]:
     return [c for c in node.children if c.kind == "module"]
-
-
-def _apply_ref_names(roots: list[_Raw], ref_tree: dict) -> None:
-    """Overlay real module attribute names onto the raw module forest.
-
-    Uses the reference module-name tree (from ``module_naming.build_ref_tree``,
-    derived from the live model's ``named_modules()``) to assign each raw module
-    node its attribute name — ``q_norm``/``k_norm``, ``input_layernorm``,
-    ``self_attn``, ... — by matching children on ``(class, order)``. Applied on
-    the *raw* forest before finalization so the recovered names also feed the
-    structural signature, keeping distinctly-named siblings (q_norm vs k_norm)
-    from collapsing while genuinely-repeated layers still merge.
-    """
-    from .module_naming import (_display_name, _effective_ref_children,
-                                _find_ref_desc, _match_ref)
-
-    def align(raw_node: _Raw, rnode: dict) -> None:
-        raw_node.attr_name = _display_name(rnode)
-        raw_mod_children = _module_children(raw_node)
-        present = {_strip_instance_idx(cm.label) for cm in raw_mod_children}
-        rchildren = _effective_ref_children(rnode, present)
-        used = [False] * len(rchildren)
-        for cm in raw_mod_children:
-            j = _match_ref(rchildren, used, _strip_instance_idx(cm.label))
-            if j is not None:
-                used[j] = True
-                align(cm, rchildren[j])
-
-    root_cls = ref_tree.get("cls")
-    for root in roots:
-        rc = _strip_instance_idx(root.label)
-        if rc == root_cls:
-            align(root, ref_tree)
-        else:
-            r = _find_ref_desc(ref_tree, rc)
-            if r is not None:
-                align(root, r)
 
 
 def _direct_ops(node: _Raw) -> list[_Raw]:
@@ -2461,7 +2426,6 @@ def build_graph_from_trace(
     tp_size: int = 1,
     batch_size: int = 1,
     quantization: str | None = None,
-    ref_module_tree: dict | None = None,
     query_len: int | None = None,
     context_len: int | None = None,
 ) -> dict:
@@ -2476,11 +2440,6 @@ def build_graph_from_trace(
         tp_size: tensor-parallel size the trace was captured at (per-rank shapes).
         batch_size: request batch size, used for prefill/decode disambiguation.
         quantization: quant method, surfaced in ``config`` for the UI's dtype hints.
-        ref_module_tree: optional reference module-name tree (from
-            ``module_naming.build_ref_tree``) used to overlay real attribute
-            names (``q_norm``/``k_norm``, ``input_layernorm``, ...) onto the
-            trace-reconstructed module nodes. When omitted, nodes keep their
-            class-name-derived heuristic labels.
         query_len: number of new prefill tokens (``S``); currently informational.
         context_len: prefix-cached context length (already floored to a KV-block
             boundary). Added to the symbol legend as ``C`` and, combined with the
@@ -2514,13 +2473,6 @@ def build_graph_from_trace(
     # (breakdown.module_hooks): those give exact names on the raw forest with no
     # alignment, so the reference-tree overlay is redundant. The overlay remains
     # the fallback for legacy / upload traces without spans.
-    captured_names = _forest_has_named_modules(roots)
-    if ref_module_tree and not captured_names:
-        try:
-            _apply_ref_names(roots, ref_module_tree)
-        except Exception:
-            pass  # naming enrichment is best-effort
-
     # Recover shape/dtype for residual-stream ops the trace leaves shape-less:
     # TP collectives (dtype-less ``TensorList``) and Python-launched norm kernels
     # (no ``cpu_op``). Borrow ``[tokens, H]`` + dtype from the nearest neighbour.
@@ -2639,7 +2591,7 @@ def build_graph_from_trace(
             "num_layers": summary.get("num_layers"),
         },
         "has_timing": True,
-        "has_module_names": captured_names or bool(ref_module_tree),
+        "has_module_names": _forest_has_named_modules(roots),
         "timing_matched": total_ops,
         "timing_total_ops": total_ops,
         "timing_method": "trace_reconstruction",

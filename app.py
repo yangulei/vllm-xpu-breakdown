@@ -41,15 +41,14 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from breakdown.analyzer import (
-    AnalyzedOp,
-    analyze_ops,
     dtype_size,
     estimate_flops,
     estimate_memory,
 )
 from breakdown.classifier import Backend, classify_op
+from breakdown.op_breakdown import backend_totals, summarize_ops
 from breakdown.graph_from_trace import build_graph_from_trace
-from breakdown.trace_parser import _detect_device_via_torch
+from breakdown.trace_common import _detect_device_via_torch
 from breakdown.model_info import (
     fetch_model_config,
     get_dim_symbols,
@@ -400,7 +399,6 @@ def _build_result_from_traces(
     actual_layers: int | None = None,
     layer_scale: float = 1.0,
     trace_file: str | None = None,
-    ref_module_tree: dict | None = None,
     query_len: int | None = None,
     context_len: int | None = None,
 ) -> dict:
@@ -416,37 +414,7 @@ def _build_result_from_traces(
     front regardless of the mtime order the files arrive in; the other ranks are
     ignored.
     """
-    from breakdown.trace_parser import parse_trace_file
-
     rank_files = _rank0_first(rank_files)
-    op_dicts = parse_trace_file(rank_files[0])
-
-    if not op_dicts:
-        raise RuntimeError(
-            f"No ops found in trace file {rank_files[0]}. "
-            "The trace may not contain any captured events."
-        )
-
-    analyzed = analyze_ops(
-        op_dicts,
-        dim_symbols=dim_symbols,
-        batch_size=batch_size,
-        seq_len=None,
-        model_dtype=summary.get("dtype", "bfloat16"),
-        num_layers=summary.get("num_layers"),
-    )
-
-    backend_totals: dict[str, dict] = {}
-    total_dev = sum(o.device_time_us for o in analyzed)
-    for b in Backend:
-        ops = [o for o in analyzed if o.backend == b.value]
-        dev = sum(o.device_time_us for o in ops)
-        backend_totals[b.value] = {
-            "device_time_us": dev,
-            "pct": round(dev / total_dev * 100, 1) if total_dev > 0 else 0,
-            "num_ops": len(ops),
-            "num_calls": sum(o.call_count for o in ops),
-        }
 
     profile_result = {
         "model_id": model_id,
@@ -457,50 +425,36 @@ def _build_result_from_traces(
         "tp_size": tp_size,
         "quantization": quantization,
         "summary": summary,
-        "total_device_time_us": total_dev,
-        "total_cpu_time_us": sum(o.cpu_time_us for o in analyzed),
-        "backends": backend_totals,
-        "ops": [o.to_dict() for o in analyzed],
         "profiled_layers": profiled_layers,
         "actual_layers": actual_layers,
         "layer_scale": layer_scale,
         "trace_file": trace_file if trace_file is not None else rank_files[0],
     }
 
-    # Reconstruct the model graph directly from the profiler trace.
-    try:
-        graph = build_graph_from_trace(
-            rank_files[0],
-            summary=summary,
-            tp_size=tp_size,
-            batch_size=batch_size,
-            quantization=quantization,
-            ref_module_tree=ref_module_tree,
-            query_len=query_len,
-            context_len=context_len,
-        )
-        graph["profiled_layers"] = profiled_layers
-        graph["actual_layers"] = actual_layers
-        graph["layer_scale"] = layer_scale
-        profile_result["graph"] = graph
-        if ref_module_tree:
-            names = _collect_node_names(graph.get("prefill")
-                                        or graph.get("decode"))
-            recovered = names & {"q_norm", "k_norm", "input_layernorm",
-                                 "post_attention_layernorm"}
-            if recovered:
-                logger.info("Module-name recovery applied to graph: %s",
-                            ", ".join(sorted(recovered)))
-            else:
-                logger.warning(
-                    "Module-name recovery: reference tree was available but no "
-                    "attribute names landed on the graph (structural alignment "
-                    "found no match). Trace module classes seen: %s",
-                    ", ".join(sorted(_collect_module_types(
-                        graph.get("prefill") or graph.get("decode")))[:20]),
-                )
-    except Exception:
-        logger.warning("Graph reconstruction failed", exc_info=True)
+    # Reconstruct the model graph directly from the profiler trace. This is the
+    # single source of truth: the flat op breakdown below is an aggregation of
+    # it, not a second parse of the trace, so the table and the tree can never
+    # disagree. A failure here is fatal — a result without a graph has nothing
+    # in it.
+    graph = build_graph_from_trace(
+        rank_files[0],
+        summary=summary,
+        tp_size=tp_size,
+        batch_size=batch_size,
+        quantization=quantization,
+        query_len=query_len,
+        context_len=context_len,
+    )
+    graph["profiled_layers"] = profiled_layers
+    graph["actual_layers"] = actual_layers
+    graph["layer_scale"] = layer_scale
+    profile_result["graph"] = graph
+
+    ops = summarize_ops(graph)
+    profile_result["ops"] = ops
+    profile_result["backends"] = backend_totals(ops)
+    profile_result["total_device_time_us"] = round(
+        sum(o["device_time_us"] for o in ops), 2)
 
     return profile_result
 
@@ -772,9 +726,9 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             "module::<qname>::<Cls>")`` spans around every module's forward, so
             the trace carries real attribute names (``q_norm``/``k_norm``,
             ``self_attn``, ...) and ``build_graph_from_trace`` reconstructs the
-            tree with exact names — no reference-tree overlay needed (research
-            R1). Best-effort: on any failure the run proceeds and naming falls
-            back to the ``module_naming`` overlay.
+            tree with exact names. This is the *only* source of real module
+            names, so a failure is logged loudly: the run still produces a
+            graph, but every module falls back to a class heuristic.
             """
             try:
                 from breakdown.module_hooks import install_module_span_hooks_on
@@ -938,55 +892,6 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             single_files, cache_hit_note = _profiled_pass(
                 dc_batch, query_len, pass_max_tokens=max_tokens)
 
-        # Module attribute names (q_norm/k_norm, ...) come primarily from the
-        # capture-time ``module::`` spans installed above, which the
-        # reconstruction reads directly from the trace. We still capture a
-        # ``named_modules()`` reference tree from the live model as a *fallback*
-        # overlay: ``build_graph_from_trace`` uses it only if the trace lacks
-        # those spans (e.g. hook install failed, or an older trace).
-        ref_module_tree = None
-        try:
-            from breakdown.module_naming import ref_tree_from_llm
-            ref_module_tree = ref_tree_from_llm(llm)
-        except Exception:
-            logger.warning("ref_tree_from_llm raised; fallback name overlay "
-                           "disabled", exc_info=True)
-            ref_module_tree = None
-
-        if ref_module_tree:
-            logger.info(
-                "Module-name overlay (fallback): got reference tree from live "
-                "model (root=%s, %d top-level children)",
-                ref_module_tree.get("cls"),
-                len(ref_module_tree.get("children", [])),
-            )
-        else:
-            logger.warning(
-                "Module-name overlay (fallback): could NOT read module names "
-                "from the live model (ref_tree_from_llm returned None). If the "
-                "capture-time spans also failed, q_norm/k_norm and other "
-                "attribute names will fall back to class heuristics."
-            )
-            # Fallback: the offline meta-device path. Heavy (re-instantiates on
-            # meta) but lets naming work when the live-model traversal fails.
-            if config:
-                try:
-                    from breakdown.module_naming import ref_tree_from_config
-                    ref_module_tree = ref_tree_from_config(
-                        config,
-                        dtype=summary.get("dtype", "bfloat16"),
-                        model_id=model_id,
-                    )
-                    if ref_module_tree:
-                        logger.info(
-                            "Module-name overlay (fallback): recovered names via "
-                            "meta-device fallback."
-                        )
-                except Exception:
-                    logger.warning("ref_tree_from_config fallback failed",
-                                   exc_info=True)
-                    ref_module_tree = None
-
         # --- Parse trace files & build the result ---
         # With TP>1, vLLM produces one trace file per rank; each pass returns all
         # of its rank files (mtime order) and ``_build_result_from_traces`` picks
@@ -1011,8 +916,7 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
                 profiled_layers=profiled_layers,
                 actual_layers=actual_layers,
                 layer_scale=layer_scale,
-                ref_module_tree=ref_module_tree,
-                query_len=qlen,
+                        query_len=qlen,
                 context_len=profiled_context_len or None,
             )
 
@@ -1289,23 +1193,6 @@ def upload_profile():
             },
         }
 
-    # Reconstruct real module attribute names by instantiating the model on
-    # ``meta`` (no weights). Heavy + network-dependent, and only used as a
-    # *fallback* overlay — traces profiled by this tool already carry
-    # capture-time ``module::`` name spans, so ``build_graph_from_trace``
-    # ignores this tree when those spans are present.
-    ref_module_tree = None
-    if model_id:
-        try:
-            from breakdown.module_naming import ref_tree_from_config
-            ref_module_tree = ref_tree_from_config(
-                fetch_model_config(model_id),
-                dtype=summary.get("dtype", "bfloat16"),
-                model_id=model_id,
-            )
-        except Exception:
-            ref_module_tree = None
-
     def _build(rank_files: list[str], bsz: int, qlen: int | None) -> dict:
         return _build_result_from_traces(
             rank_files[:tp_size] if len(rank_files) >= tp_size else rank_files,
@@ -1319,7 +1206,6 @@ def upload_profile():
             profiled_layers=profiled_layers,
             actual_layers=actual_layers,
             layer_scale=layer_scale,
-            ref_module_tree=ref_module_tree,
             query_len=qlen,
             context_len=context_len,
         )
@@ -1798,27 +1684,8 @@ def bench_ops():
     if not graph:
         return jsonify({"ok": True, "model_id": model_id, "ops": []})
 
-    agg: dict[str, dict[str, Any]] = {}
-    for phase in ("prefill", "decode"):
-        tree = graph.get(phase)
-        if not tree:
-            continue
-        for node in _flatten_graph_nodes(tree):
-            repeat = node.get("effective_repeat", 1) or 1
-            for op in node.get("ops") or []:
-                name = op.get("name") or ""
-                if not name or bench_spec.is_skipped(name):
-                    continue
-                entry = agg.setdefault(name, {
-                    "op": name, "backend": op.get("backend", ""),
-                    "device_time_us": 0.0, "phases": []})
-                entry["device_time_us"] += float(
-                    op.get("device_time_us") or 0.0) * repeat
-                if phase not in entry["phases"]:
-                    entry["phases"].append(phase)
-    ops = sorted(agg.values(), key=lambda e: -e["device_time_us"])
-    for e in ops:
-        e["device_time_us"] = round(e["device_time_us"], 2)
+    ops = [op for op in summarize_ops(graph)
+           if not bench_spec.is_skipped(op["op"])]
     return jsonify({"ok": True, "model_id": model_id, "ops": ops})
 
 

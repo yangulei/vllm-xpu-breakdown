@@ -73,7 +73,20 @@ class OptimizeManager:
             return self._pool.snapshot() if self._pool else {}
 
     def any_active(self, run_id: str | None = None) -> bool:
-        return any(s.active for s in self.sessions(run_id))
+        """Whether any session of ``run_id`` still holds resources.
+
+        A stopped session is *not* finished the moment its state says so:
+        ``stop`` marks it stopped and signals the process, but the GPU lease is
+        released by the reaper once the process actually exits. Reporting "not
+        active" in that window would tell a caller the pool is free while it is
+        still leased — which is exactly the window in which the next queued
+        session must not be started twice. So a run counts as active while any
+        of its processes is still being reaped.
+        """
+        with self._lock:
+            reaping = any(rid == run_id or run_id is None
+                          for rid, _ in self._procs)
+        return reaping or any(s.active for s in self.sessions(run_id))
 
     # ---------------------------------------------------------------- start
     def start(self, *, run_id: str, doc: dict[str, Any], ops: Iterable[str],
