@@ -49,8 +49,9 @@ class TestShapeMatrixExport(unittest.TestCase):
         self.client = app.test_client()
         # The Shape Matrix is derived from a completed profiling run; inject one.
         import app as app_module
-        self._saved_state = app_module._profile_state
-        app_module._profile_state = {
+        from breakdown import profiling as profiling_module
+        self._saved_state = profiling_module._profile_state
+        profiling_module._profile_state = {
             "status": "done",
             "result": {"graph": _mock_profile_graph()},
             "error": None,
@@ -61,7 +62,8 @@ class TestShapeMatrixExport(unittest.TestCase):
 
     def tearDown(self):
         import app as app_module
-        app_module._profile_state = self._saved_state
+        from breakdown import profiling as profiling_module
+        profiling_module._profile_state = self._saved_state
 
     def _export(self, data: dict):
         """Helper to call the endpoint."""
@@ -117,9 +119,10 @@ class TestShapeMatrixExport(unittest.TestCase):
     def test_quantization_in_filename(self, mock_fetch):
         """Filename should include quantization tag."""
         import app as app_module
+        from breakdown import profiling as profiling_module
         # The Shape Matrix reuses the last run only when the quantization
         # matches, so profile settings must report the same fp8 quantization.
-        app_module._profile_state["settings"]["quantization"] = "fp8"
+        profiling_module._profile_state["settings"]["quantization"] = "fp8"
         resp = self._export({
             "model_id": "Qwen/Qwen3-4B",
             "prefill_seq_lens": [128],
@@ -443,8 +446,9 @@ class TestShapeMatrixProfileSource(unittest.TestCase):
         self.client = app.test_client()
         # Inject a completed profiling run as the derivation template.
         import app as app_module
-        self._saved_state = app_module._profile_state
-        app_module._profile_state = {
+        from breakdown import profiling as profiling_module
+        self._saved_state = profiling_module._profile_state
+        profiling_module._profile_state = {
             "status": "done",
             "result": {"graph": _mock_profile_graph()},
             "error": None,
@@ -455,7 +459,8 @@ class TestShapeMatrixProfileSource(unittest.TestCase):
 
     def tearDown(self):
         import app as app_module
-        app_module._profile_state = self._saved_state
+        from breakdown import profiling as profiling_module
+        profiling_module._profile_state = self._saved_state
 
     def _export(self, data: dict):
         return self.client.post(
@@ -637,7 +642,8 @@ class TestShapeMatrixProfileSource(unittest.TestCase):
     def test_profile_requires_completed_run(self):
         """source=profile with no completed run returns 400."""
         import app as app_module
-        app_module._profile_state = {
+        from breakdown import profiling as profiling_module
+        profiling_module._profile_state = {
             "status": "idle", "result": None, "error": None,
             "model_id": None, "settings": None,
         }

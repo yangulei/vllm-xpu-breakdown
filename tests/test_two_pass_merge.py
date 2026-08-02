@@ -15,7 +15,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import _merge_two_pass_result
+from breakdown.profiling import _merge_two_pass_result
 
 
 def _fake_result(prefill_tree, decode_tree, symbols, *, batch_size):
@@ -109,18 +109,18 @@ class TestSchedulerPin(unittest.TestCase):
     """
 
     def test_admits_the_whole_batch(self):
-        from app import _scheduler_pin
+        from breakdown.profiling import _scheduler_pin
         pin = _scheduler_pin(prefill_batch=1, decode_batch=32, query_len=2048)
         self.assertEqual(pin["max_num_seqs"], 32)
 
     def test_admits_a_whole_batch_prefill_in_one_step(self):
-        from app import _scheduler_pin
+        from breakdown.profiling import _scheduler_pin
         # A prefill pass of 4 sequences x 2048 new tokens must not be chunked.
         pin = _scheduler_pin(prefill_batch=4, decode_batch=4, query_len=2048)
         self.assertGreaterEqual(pin["max_num_batched_tokens"], 4 * 2048)
 
     def test_never_below_the_engine_floor(self):
-        from app import _scheduler_pin
+        from breakdown.profiling import _scheduler_pin
         pin = _scheduler_pin(prefill_batch=1, decode_batch=1, query_len=1)
         self.assertEqual(pin["max_num_seqs"], 1)
         self.assertGreaterEqual(pin["max_num_batched_tokens"], 2048)

@@ -20,16 +20,26 @@ from typing import Any
 #: and is discovered by the CLI itself, so only its name is plumbed.
 OPTIMIZER_SKILL = "xpu-kernel-optimizer"
 
-#: Actions that are not worth a kernel session, and why.
-_REFUSED_ACTIONS = {
-    "at_roofline": (
-        "already at the hardware roof - the ranker found no structural "
-        "headroom left, so a kernel session has nothing to win"),
-    "check_cost_model": (
-        "measured utilization is above peak, so the analytic FLOPs/bytes "
-        "overstate this op's traffic and its headroom cannot be trusted - "
-        "fix the cost model before opening a session"),
-}
+#: Why a ranked target may not be worth a GPU: ``(predicate, reason)``, in
+#: order, first match wins. A table rather than a chain of ifs because these
+#: are the *policy* - one GPU is exclusive to one session for its whole life,
+#: so opening a session on an op with nothing to win costs a card - and a
+#: policy should be readable in one place.
+_REFUSALS: tuple[tuple[Any, str], ...] = (
+    (lambda t, k: t.get("action") == "at_roofline",
+     "already at the hardware roof - the ranker found no structural "
+     "headroom left, so a kernel session has nothing to win"),
+    (lambda t, k: t.get("action") == "check_cost_model",
+     "measured utilization is above peak, so the analytic FLOPs/bytes "
+     "overstate this op's traffic and its headroom cannot be trusted - "
+     "fix the cost model before opening a session"),
+    (lambda t, k: not k.get("kernel_dir") or k.get("kernel_dir") == "-",
+     "no editable kernel source is registered for this op "
+     "(add an entry to breakdown/bench/kernel_sources.json)"),
+    (lambda t, k: not k.get("build_cmd"),
+     "this backend has no build command - its kernel is not editable here "
+     "(the fix is usually to dispatch elsewhere, not to edit it)"),
+)
 
 
 def _kernel(target: dict[str, Any]) -> dict[str, Any]:
@@ -42,23 +52,12 @@ def launchability(target: dict[str, Any]) -> tuple[bool, str]:
     ``reason`` is always populated: for a refusal it says why, for a launchable
     target it says what the session is expected to do.
     """
-    action = target.get("action") or ""
-    refused = _REFUSED_ACTIONS.get(action)
-    if refused:
-        return False, refused
-
     kernel = _kernel(target)
-    if not kernel.get("kernel_dir") or kernel.get("kernel_dir") == "-":
-        return False, (
-            "no editable kernel source is registered for this op "
-            "(add an entry to breakdown/bench/kernel_sources.json)")
-    if not kernel.get("build_cmd"):
-        return False, (
-            f"the {kernel.get('language') or kernel.get('repo') or 'backend'} "
-            "backend has no build command - its kernel is not editable here "
-            "(the fix is usually to dispatch elsewhere, not to edit it)")
+    for refuses, reason in _REFUSALS:
+        if refuses(target, kernel):
+            return False, reason
 
-    if action == "tune_config":
+    if target.get("action") == "tune_config":
         return True, (
             "library/collective op: expect a configuration or dispatch change "
             "rather than a kernel rewrite")

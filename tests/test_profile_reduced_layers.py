@@ -144,7 +144,7 @@ class TestReducedLayerProfiling:
 
     def test_full_profile_pipeline_with_reduced_layers(self):
         """End-to-end test of _run_profile with reduced layers."""
-        from app import _run_profile, _profile_state
+        from breakdown.profiling import _run_profile, _profile_state
 
         # _run_profile writes to output/traces/ — clean up after to avoid
         # interfering with TestRealTrace in test_pipeline.py

@@ -18,7 +18,9 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import app as app_module
-from app import app, _merge_two_pass_result
+from breakdown import profiling as profiling_module
+from app import app
+from breakdown.profiling import _merge_two_pass_result
 
 
 def _write_trace(tmpdir: str, name: str, marker: str) -> str:
@@ -31,15 +33,15 @@ def _write_trace(tmpdir: str, name: str, marker: str) -> str:
 class TestTraceDownload(unittest.TestCase):
     def setUp(self):
         self.client = app.test_client()
-        self._saved_state = app_module._profile_state
+        self._saved_state = profiling_module._profile_state
         self.tmp = tempfile.TemporaryDirectory()
 
     def tearDown(self):
-        app_module._profile_state = self._saved_state
+        profiling_module._profile_state = self._saved_state
         self.tmp.cleanup()
 
     def _set_state(self, result: dict):
-        app_module._profile_state = {
+        profiling_module._profile_state = {
             "status": "done",
             "result": result,
             "error": None,
@@ -135,13 +137,13 @@ class TestRank0Selection(unittest.TestCase):
     """
 
     def test_trace_rank_from_rank_marker(self):
-        self.assertEqual(app_module._trace_rank(
+        self.assertEqual(profiling_module._trace_rank(
             "dp0_pp0_tp2_dcp0_ep2_rank2.178.pt.trace.json.gz"), 2)
-        self.assertEqual(app_module._trace_rank(
+        self.assertEqual(profiling_module._trace_rank(
             "dp0_pp0_tp0_dcp0_ep0_rank0.178.pt.trace.json.gz"), 0)
 
     def test_trace_rank_none_for_merged_name(self):
-        self.assertIsNone(app_module._trace_rank("merged.json.gz"))
+        self.assertIsNone(profiling_module._trace_rank("merged.json.gz"))
 
     def test_trace_rank_from_dash_separated_marker(self):
         """vLLM also writes ``<id>-rank-<N>.<id>.pt.trace.json.gz``.
@@ -153,9 +155,9 @@ class TestRank0Selection(unittest.TestCase):
         collective device time is inflated by waiting on rank 0. Observed on a
         real TP=4 MiniMax-M3 run, which built its graph from rank 2.
         """
-        self.assertEqual(app_module._trace_rank(
+        self.assertEqual(profiling_module._trace_rank(
             "1785662706823108191-rank-2.1785662753086711882.pt.trace.json.gz"), 2)
-        self.assertEqual(app_module._trace_rank(
+        self.assertEqual(profiling_module._trace_rank(
             "1785662706823108191-rank-0.1785662753086711882.pt.trace.json.gz"), 0)
 
     def test_rank0_first_reorders_dash_separated(self):
@@ -165,8 +167,8 @@ class TestRank0Selection(unittest.TestCase):
             "1785662706823108191-rank-0.c.pt.trace.json.gz",
             "1785662706823108191-rank-1.d.pt.trace.json.gz",
         ]
-        out = app_module._rank0_first(files)
-        self.assertEqual([app_module._trace_rank(f) for f in out], [0, 1, 2, 3])
+        out = profiling_module._rank0_first(files)
+        self.assertEqual([profiling_module._trace_rank(f) for f in out], [0, 1, 2, 3])
 
     def test_rank0_first_reorders(self):
         files = [
@@ -175,16 +177,16 @@ class TestRank0Selection(unittest.TestCase):
             "dp0_pp0_tp3_dcp0_ep3_rank3.c.pt.trace.json.gz",
             "dp0_pp0_tp1_dcp0_ep1_rank1.d.pt.trace.json.gz",
         ]
-        out = app_module._rank0_first(files)
-        self.assertEqual(app_module._trace_rank(out[0]), 0)
-        self.assertEqual([app_module._trace_rank(f) for f in out], [0, 1, 2, 3])
+        out = profiling_module._rank0_first(files)
+        self.assertEqual(profiling_module._trace_rank(out[0]), 0)
+        self.assertEqual([profiling_module._trace_rank(f) for f in out], [0, 1, 2, 3])
 
     def test_rank0_first_no_markers_unchanged(self):
         files = ["a.json.gz", "b.json.gz"]
-        self.assertEqual(app_module._rank0_first(files), files)
+        self.assertEqual(profiling_module._rank0_first(files), files)
 
     def test_rank0_first_single_file(self):
-        self.assertEqual(app_module._rank0_first(["only.json.gz"]),
+        self.assertEqual(profiling_module._rank0_first(["only.json.gz"]),
                          ["only.json.gz"])
 
 

@@ -16,7 +16,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app import app  # noqa: E402
+from app import app# noqa: E402
 from breakdown.bench import store  # noqa: E402
 
 
@@ -78,8 +78,9 @@ class BenchApiTest(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         os.environ["BREAKDOWN_BENCH_ROOT"] = self.tmp.name
         import app as app_module
-        self._saved = app_module._profile_state
-        app_module._profile_state = {
+        from breakdown import profiling as profiling_module
+        self._saved = profiling_module._profile_state
+        profiling_module._profile_state = {
             "status": "done", "result": {"graph": _graph()}, "error": None,
             "model_id": "Qwen/Qwen3-4B",
             "settings": {"query_len": 128, "context_len": 0,
@@ -89,7 +90,8 @@ class BenchApiTest(unittest.TestCase):
 
     def tearDown(self):
         import app as app_module
-        app_module._profile_state = self._saved
+        from breakdown import profiling as profiling_module
+        profiling_module._profile_state = self._saved
         os.environ.pop("BREAKDOWN_BENCH_ROOT", None)
         self.tmp.cleanup()
 
@@ -124,7 +126,8 @@ class TestPlan(BenchApiTest):
 
     def test_plan_refuses_without_a_matching_profile(self):
         import app as app_module
-        app_module._profile_state = {"status": "idle", "result": None}
+        from breakdown import profiling as profiling_module
+        profiling_module._profile_state = {"status": "idle", "result": None}
         self.assertEqual(self._plan().status_code, 400)
 
     def test_plan_writes_the_run_artifacts(self):
@@ -319,20 +322,22 @@ class TestBenchOps(BenchApiTest):
 
     def test_ops_endpoint_excludes_framework_plumbing(self):
         import app as app_module
+        from breakdown import profiling as profiling_module
         graph = _graph()
         graph["prefill"]["ops"] = [{
             "name": "aten::t", "role": "", "backend": "framework",
             "input_shapes": [], "recorded_shapes": [], "input_dtypes": [],
             "input_args": [], "memory_bytes": 0, "flops": 0,
             "device_time_us": 1.0}]
-        app_module._profile_state = {**app_module._profile_state,
+        profiling_module._profile_state = {**profiling_module._profile_state,
                                      "result": {"graph": graph}}
         data = json.loads(self.client.get("/api/bench/ops").data)
         self.assertNotIn("aten::t", [o["op"] for o in data["ops"]])
 
     def test_ops_endpoint_is_empty_without_a_profile(self):
         import app as app_module
-        app_module._profile_state = {"status": "idle", "result": None,
+        from breakdown import profiling as profiling_module
+        profiling_module._profile_state = {"status": "idle", "result": None,
                                      "model_id": None}
         data = json.loads(self.client.get("/api/bench/ops").data)
         self.assertTrue(data["ok"])

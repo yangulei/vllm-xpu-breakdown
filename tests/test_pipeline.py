@@ -27,9 +27,11 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from breakdown.cost import dtype_size, estimate_flops, estimate_memory
+from breakdown import profiling
 from breakdown.classifier import Backend, classify_op
 from breakdown.model_info import fetch_model_config, summarize_config
 from breakdown.profiler import _is_overhead_event
+from breakdown import profiling
 from breakdown.trace import build_graph_from_trace
 from tests.helpers import device_time, find_op, graph_of, iter_ops
 
@@ -387,7 +389,7 @@ class TestQueryContextProfiling(unittest.TestCase):
     """Wiring for the Query Len / Context Len prefix-cache profiling knobs."""
 
     def test_make_token_ids_deterministic_and_valid(self):
-        from app import _make_token_ids
+        from breakdown.profiling import _make_token_ids
         a = _make_token_ids(48, 32000, seed=0)
         b = _make_token_ids(48, 32000, seed=0)
         c = _make_token_ids(48, 32000, seed=7)
@@ -398,7 +400,7 @@ class TestQueryContextProfiling(unittest.TestCase):
         self.assertEqual(_make_token_ids(0, 32000, 0), [])
 
     def test_get_block_size_and_vocab_fallbacks(self):
-        from app import _get_block_size, _get_vocab_size
+        from breakdown.profiling import _get_block_size, _get_vocab_size
 
         class _CC:
             block_size = 64
@@ -419,6 +421,7 @@ class TestQueryContextProfiling(unittest.TestCase):
 
     def test_start_profile_passes_query_context_and_bumps_maxlen(self):
         import app as app_module
+        from breakdown import profiling as profiling_module
         captured = {}
 
         def _fake_thread(target=None, args=(), daemon=None):
@@ -431,7 +434,7 @@ class TestQueryContextProfiling(unittest.TestCase):
 
         client = app_module.app.test_client()
         with patch.object(app_module.threading, "Thread", _fake_thread), \
-                patch.object(app_module, "_profile_state",
+                patch.object(profiling_module, "_profile_state",
                              {"status": "idle", "result": None, "error": None,
                               "model_id": None}):
             resp = client.post("/api/profile", json={
@@ -544,7 +547,6 @@ class TestGraphFromTrace(unittest.TestCase):
     }
 
     def _build(self, steps):
-        from breakdown.trace import build_graph_from_trace
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(_synthetic_trace(steps), f)
             path = f.name
@@ -591,7 +593,6 @@ class TestGraphFromTrace(unittest.TestCase):
         # both children. This mirrors the MiniMax-M3 case where the decoder
         # layer's post-attention ``c10d::allreduce_`` (a direct op, launched
         # after the attention submodule) was floating to the top of the layer.
-        from breakdown.trace import build_graph_from_trace
         events = []
         ext = [0]
         corr = [0]
@@ -673,7 +674,6 @@ class TestGraphFromTrace(unittest.TestCase):
         # sits before ``post_attention_layernorm``. Grouping ops only by
         # (name, shapes) collapsed both into one node at the leading position,
         # hiding the post-attention allreduce. Both must now survive, ordered.
-        from breakdown.trace import build_graph_from_trace
         events = []
         ext = [0]
         tid = 7
@@ -747,7 +747,6 @@ class TestGraphFromTrace(unittest.TestCase):
         # its gate_up/down projections) used to vanish from the graph. The hoist
         # must lift it out to sit beside the op as a child of ``FusedMoE``, with
         # its own device time counted once (moved out of the op's rollup).
-        from breakdown.trace import build_graph_from_trace
         events = []
         ext = [0]
         corr = [0]
@@ -840,7 +839,6 @@ class TestGraphFromTrace(unittest.TestCase):
         # neither the router nor the experts. They must surface as ``router`` and
         # ``moe`` children of ``FusedMoE`` (order: router → moe), with their ops
         # and device time moved out of the wrapping op.
-        from breakdown.trace import build_graph_from_trace
         events = []
         ext = [0]
         corr = [0]
@@ -948,7 +946,6 @@ class TestGraphFromTrace(unittest.TestCase):
         # real one. They must collapse to a single node holding the MLP, with
         # device time conserved. The empty-first order here mirrors the CUDA
         # prefill trace (decode has empty-last — coalescing is order-agnostic).
-        from breakdown.trace import build_graph_from_trace
         events = []
         ext = [0]
         corr = [0]
@@ -1037,7 +1034,6 @@ class TestGraphFromTrace(unittest.TestCase):
         # label — a Gemma decoder layer has two ``fused_allreduce_gemma_rms_norm``
         # (pre- and post-attention). They must stay as two separate siblings, not
         # collapse into one.
-        from breakdown.trace import build_graph_from_trace
         events = []
         ext = [0]
         corr = [0]
@@ -1126,7 +1122,6 @@ class TestGraphFromTrace(unittest.TestCase):
         # lone norm), which reads as an unexplained "norm" at the layer edge.
         # Promoting the frame must make it a parent node
         # ``fused_allreduce_gemma_rms_norm → {allreduce, norm}``.
-        from breakdown.trace import build_graph_from_trace
         events = []
         ext = [0]
         corr = [0]
@@ -1213,7 +1208,6 @@ class TestGraphFromTrace(unittest.TestCase):
         # Both operate on the residual ``[tokens, H]`` in the activation dtype, so
         # both must come out with shape ``[S, H]`` and dtype ``bfloat16`` inferred
         # from the neighbouring hidden-state op.
-        from breakdown.trace import build_graph_from_trace
         events = []
         ext = [0]
         corr = [0]
@@ -1307,7 +1301,6 @@ class TestGraphFromTrace(unittest.TestCase):
         # category so the Triton kernel is attributed to its real launch site
         # (inside ``moe``) instead of falling back to External id and collapsing
         # into ``moe_forward_shared``'s start.
-        from breakdown.trace import build_graph_from_trace
         events = []
         ext = [0]
         corr = [0]
@@ -1468,7 +1461,6 @@ class TestGraphFromTrace(unittest.TestCase):
         # latency average. Here its kernel is 10x heavier than steady state;
         # the reported decode op time must be the steady-state value, not a
         # mean that includes the warmup step.
-        from breakdown.trace import build_graph_from_trace
         events, ext, corr, tid, midx = [], [0], [0], 7, [0]
         clock = [0.0]
 
@@ -1545,7 +1537,6 @@ class TestGraphFromTrace(unittest.TestCase):
         # fewer than `batch_size` sequences (partial rows like 2/30). Only the
         # steady-state full-batch (32) steps must survive, so the decode op row
         # dim symbolizes to B=32 rather than leaking literal 2/30 nodes.
-        from breakdown.trace import build_graph_from_trace
         summary = dict(self.SUMMARY)
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             # 1 prefill (40 tok) + ramp decode (2, 30) + steady decode (32, 32)
@@ -1588,7 +1579,6 @@ class TestGraphFromTrace(unittest.TestCase):
     def test_context_len_symbolized_as_C(self):
         # When a prefix-cached prefill is profiled, the context length (and the
         # full attended KV length context+query) must symbolize as C / S+C.
-        from breakdown.trace import build_graph_from_trace
         events, ext, corr, tid, midx = [], [0], [0], 7, [0]
 
         def kern(e, ts, dur):
@@ -1657,7 +1647,6 @@ class TestGraphFromTrace(unittest.TestCase):
         # key/value inputs ([S, n_kv, d]); the context length is never a tensor
         # dim. With a context, key/value rows must be rewritten to the full
         # attended KV length S+C while query/output rows stay S.
-        from breakdown.trace import build_graph_from_trace
         events, ext, corr, tid, midx = [], [0], [0], 7, [0]
 
         def op(name, ts, dur, shapes):
@@ -1723,7 +1712,6 @@ class TestGraphFromTrace(unittest.TestCase):
         # worker with SIGFPE, the MoE grouped GEMM rejected its operands).
         # Paged attention never records the context as a tensor dim, so a
         # config dim must always win.
-        from breakdown.trace import build_graph_from_trace
         events, ext, tid, midx = [], [0], 7, [0]
 
         def op(name, ts, dur, shapes):
@@ -1778,7 +1766,6 @@ class TestGraphFromTrace(unittest.TestCase):
         # matching the token operand as soon as the Shape Matrix swept S, and
         # the kernels rejected their own shapes ("remapped_hidden_states must be
         # [num_rows * TopK, hidden_size]").
-        from breakdown.trace import build_graph_from_trace
         events, ext, tid, midx = [], [0], 7, [0]
 
         def op(name, ts, dur, shapes, types=None):
@@ -1918,7 +1905,6 @@ class TestGraphFromTrace(unittest.TestCase):
         self.assertEqual(rows[0]["FLOPs"], one_seq)
 
     def test_empty_trace(self):
-        from breakdown.trace import build_graph_from_trace
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump({"traceEvents": []}, f)
             path = f.name
@@ -1934,7 +1920,6 @@ class TestGraphFromTrace(unittest.TestCase):
         # A Triton-compiled kernel launches straight from Python with no cpu_op
         # wrapper (e.g. an RMSNorm). It must still surface as a ``triton::`` op on
         # its enclosing module, attributed by launch-site containment.
-        from breakdown.trace import build_graph_from_trace
         tid = 7
         events = [
             {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
@@ -1985,7 +1970,6 @@ class TestGraphFromTrace(unittest.TestCase):
         # a device ``kernel`` whose symbol embeds "flashinfer". The kernel must
         # surface as a FlashInfer op; the launch-API runtime event must NOT
         # appear as a duplicate ``triton::cudaLaunchKernelExC`` op.
-        from breakdown.trace import build_graph_from_trace
         tid = 7
         fi_kernel = ("kernel_cutlass_kernel_flashinfernormkernelsrmsnorm"
                      "RMSNormKernel_object_at__T_0")
@@ -2046,7 +2030,6 @@ class TestGraphFromTrace(unittest.TestCase):
         # frame (``flashinfer/norm/__init__.py(...): gemma_fused_add_rmsnorm``),
         # the synthetic op is named after that API — short and matching the
         # readable XPU kernel names — instead of the raw cutlass functor symbol.
-        from breakdown.trace import build_graph_from_trace
         tid = 7
         fi_kernel = ("kernel_cutlass_kernel_flashinfernormkernels"
                      "fused_add_rmsnormFusedAddRMSNormKernel_object_at__T_0")
@@ -2124,7 +2107,6 @@ class TestGraphFromTrace(unittest.TestCase):
         # synthetic op must instead be named after the public xattention API
         # frame (``flash_xpu::minimax_m3_index_score``) and classify as the
         # ``flash_xpu`` backend.
-        from breakdown.trace import build_graph_from_trace
         tid = 7
         fx_kernel = "flash_xpu::(anonymous namespace)::index_score_kernel_t"
         events = [
@@ -2189,7 +2171,6 @@ class TestGraphFromTrace(unittest.TestCase):
         # ``[total_q, num_index_heads, index_head_dim]``. The reconstruction must
         # rebuild both from the config + the step's token count (leading dim of a
         # neighbouring activation) — ``[S, n_h, d]`` and ``[S, n_idx, idx_d]``.
-        from breakdown.trace import build_graph_from_trace
         summary = dict(self.SUMMARY, head_dim=8, sparse_num_index_heads=2,
                        sparse_index_dim=4)
         tid = 7
@@ -2268,7 +2249,6 @@ class TestGraphFromTrace(unittest.TestCase):
         # ``[S, n_h/TP, d]`` for the block-sparse attend, ``[S, n_idx/TP, d]`` for
         # the indexer block score and ``[n_idx/TP, S, K_topk]`` (int32) for the
         # top-k block ids.
-        from breakdown.trace import build_graph_from_trace
         summary = dict(self.SUMMARY, hidden_size=32, num_heads=4, num_kv_heads=2,
                        head_dim=8, sparse_attention=True,
                        sparse_num_index_heads=2, sparse_index_dim=8,
@@ -2341,7 +2321,6 @@ class TestGraphFromTrace(unittest.TestCase):
     def test_layer_extrapolation_to_config_count(self):
         # Reduced-layer profiling captures 2 decoder layers; the config says the
         # model has 5. The unprofiled layers fold into the last decoder group.
-        from breakdown.trace import build_graph_from_trace
         summary = dict(self.SUMMARY, num_layers=5)
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
             json.dump(_synthetic_trace([8]), f)
@@ -2555,7 +2534,6 @@ class TestSymbolicShapeCompleteness(unittest.TestCase):
         # prefill + decode): after reconstruction no op input shape may carry a
         # concrete integer above the trivial threshold (2) - every structural
         # dim must have symbolized, or the Shape Matrix cannot sweep it.
-        from breakdown.trace import build_graph_from_trace
         from tests import data as fixtures
         checked = 0
         for fx in fixtures.available():
@@ -2734,7 +2712,7 @@ class TestPhasePartition(unittest.TestCase):
 
 
 class TestLayerOverride(unittest.TestCase):
-    """Reduced-layer ``hf_overrides`` construction (app._build_layer_override).
+    """Reduced-layer ``hf_overrides`` construction (profiling._build_layer_override).
 
     Regression coverage for the FP8/quantization failure: vLLM's
     ``get_quant_config`` requires ``hf_overrides`` to be a *dict* when
@@ -2746,7 +2724,7 @@ class TestLayerOverride(unittest.TestCase):
 
     def _build(self, *args, **kwargs):
         import app
-        return app._build_layer_override(*args, **kwargs)
+        return profiling._build_layer_override(*args, **kwargs)
 
     def test_no_quant_returns_callable(self):
         # Without quantization we keep the picklable callable override.
@@ -2781,7 +2759,7 @@ class TestLayerOverride(unittest.TestCase):
         class _Cfg:
             num_hidden_layers = 36
         cfg = _Cfg()
-        app._build_layer_override(4, None, False)(cfg)
+        profiling._build_layer_override(4, None, False)(cfg)
         self.assertEqual(cfg.num_hidden_layers, 4)
 
     def test_callable_sets_nested_layers(self):
@@ -2794,7 +2772,7 @@ class TestLayerOverride(unittest.TestCase):
             num_hidden_layers = 999
             text_config = _TextCfg()
         cfg = _Cfg()
-        app._build_layer_override(5, None, True)(cfg)
+        profiling._build_layer_override(5, None, True)(cfg)
         # The nested count is what actually drives the model build.
         self.assertEqual(cfg.text_config.num_hidden_layers, 5)
 
