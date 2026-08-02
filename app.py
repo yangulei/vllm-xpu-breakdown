@@ -1574,7 +1574,8 @@ def bench_plan():
     status: dict[str, Any] = {}
     for case in cases:
         if case.op not in status:
-            st, detail = bench_resolve.classify(case.op, case.args)
+            st, detail = bench_resolve.classify(case.op, case.args,
+                                                launch=case.launch)
             status[case.op] = {"status": st, "detail": detail,
                                "backend": case.backend}
     by_status: dict[str, list] = {}

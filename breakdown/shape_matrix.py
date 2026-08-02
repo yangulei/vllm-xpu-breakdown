@@ -165,6 +165,7 @@ def build_rows(template: dict, configs: list[dict]) -> list[dict[str, Any]]:
                     "_input_args": op.get("input_args") or [],
                     "_recorded_shapes": op.get("recorded_shapes") or [],
                     "_device_time_us": op.get("device_time_us", 0),
+                    "_launch": op.get("launch") or None,
                     "_op_role": role,
                     "_module_type": node_info.get("module_type", ""),
                 })

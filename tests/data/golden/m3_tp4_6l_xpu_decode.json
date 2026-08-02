@@ -21,6 +21,7 @@
             "backend": "cpu",
             "carries_device_time": false,
             "dtypes": [],
+            "launch": null,
             "name": "TorchDynamo Cache Lookup",
             "order": 0,
             "role": "embedding",
@@ -30,6 +31,7 @@
             "backend": "framework",
             "carries_device_time": true,
             "dtypes": [],
+            "launch": null,
             "name": "Torch-Compiled Region: 0/1",
             "order": 1,
             "role": "embedding",
@@ -41,6 +43,7 @@
             "dtypes": [
              "long int"
             ],
+            "launch": null,
             "name": "aten::to",
             "order": 2,
             "role": "embedding",
@@ -57,6 +60,7 @@
              "bfloat16",
              "long int"
             ],
+            "launch": null,
             "name": "aten::embedding",
             "order": 3,
             "role": "embedding",
@@ -77,6 +81,7 @@
              "bfloat16",
              "bool"
             ],
+            "launch": null,
             "name": "aten::masked_fill_",
             "order": 4,
             "role": "embedding",
@@ -97,6 +102,7 @@
             "dtypes": [
              "bfloat16"
             ],
+            "launch": null,
             "name": "aten::clone",
             "order": 5,
             "role": "embedding",
@@ -113,6 +119,7 @@
             "dtypes": [
              "bfloat16"
             ],
+            "launch": null,
             "name": "c10d::allreduce_",
             "order": 6,
             "role": "embedding",
@@ -141,6 +148,10 @@
               "dtypes": [
                "bfloat16"
               ],
+              "launch": {
+               "file": "gemma_rmsnorm.py",
+               "func": "gemma_rmsnorm"
+              },
               "name": "triton::_gemma_rmsnorm_kernel",
               "order": 0,
               "role": "norm",
@@ -170,6 +181,7 @@
                  "bfloat16",
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "aten::linear",
                 "order": 0,
                 "role": "qkv_proj",
@@ -200,6 +212,7 @@
                  "bfloat16",
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "vllm::unified_kv_cache_update",
                 "order": 0,
                 "role": "cache_store",
@@ -226,6 +239,7 @@
                  "bfloat16",
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "vllm::unified_attention_with_output",
                 "order": 1,
                 "role": "attention",
@@ -271,6 +285,7 @@
                  "bfloat16",
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "aten::linear",
                 "order": 0,
                 "role": "o_proj",
@@ -302,6 +317,7 @@
                "bfloat16",
                "long int"
               ],
+              "launch": null,
               "name": "_C::fused_minimax_m3_qknorm_rope_kv_insert",
               "order": 1,
               "role": "attention_norm",
@@ -343,6 +359,10 @@
                 "dtypes": [
                  "bfloat16"
                 ],
+                "launch": {
+                 "file": "gemma_rmsnorm.py",
+                 "func": "gemma_fused_add_rmsnorm"
+                },
                 "name": "triton::_gemma_fused_add_rmsnorm_kernel",
                 "order": 0,
                 "role": "norm",
@@ -366,6 +386,7 @@
               "dtypes": [
                "bfloat16"
               ],
+              "launch": null,
               "name": "aten::clone",
               "order": 0,
               "role": "norm",
@@ -382,6 +403,7 @@
               "dtypes": [
                "bfloat16"
               ],
+              "launch": null,
               "name": "c10d::allreduce_",
               "order": 1,
               "role": "norm",
@@ -411,6 +433,7 @@
                  "bfloat16",
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "aten::linear",
                 "order": 0,
                 "role": "gate_up_proj",
@@ -441,6 +464,7 @@
                  "bfloat16",
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "_C::silu_and_mul_with_clamp",
                 "order": 0,
                 "role": "activation",
@@ -471,6 +495,7 @@
                  "bfloat16",
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "aten::linear",
                 "order": 0,
                 "role": "down_proj",
@@ -518,6 +543,10 @@
                 "dtypes": [
                  "bfloat16"
                 ],
+                "launch": {
+                 "file": "gemma_rmsnorm.py",
+                 "func": "gemma_fused_add_rmsnorm"
+                },
                 "name": "triton::_gemma_fused_add_rmsnorm_kernel",
                 "order": 0,
                 "role": "norm",
@@ -541,6 +570,7 @@
               "dtypes": [
                "bfloat16"
               ],
+              "launch": null,
               "name": "aten::clone",
               "order": 0,
               "role": "norm",
@@ -557,6 +587,7 @@
               "dtypes": [
                "bfloat16"
               ],
+              "launch": null,
               "name": "c10d::allreduce_",
               "order": 1,
               "role": "norm",
@@ -586,6 +617,7 @@
                  "bfloat16",
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "aten::linear",
                 "order": 0,
                 "role": "qkv_proj",
@@ -616,6 +648,7 @@
                  "bfloat16",
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "vllm::unified_kv_cache_update",
                 "order": 0,
                 "role": "cache_store",
@@ -642,6 +675,7 @@
                  "bfloat16",
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "vllm::unified_attention_with_output",
                 "order": 1,
                 "role": "attention",
@@ -687,6 +721,7 @@
                  "bfloat16",
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "aten::linear",
                 "order": 0,
                 "role": "o_proj",
@@ -718,6 +753,7 @@
                "bfloat16",
                "long int"
               ],
+              "launch": null,
               "name": "_C::fused_minimax_m3_qknorm_rope_kv_insert",
               "order": 1,
               "role": "attention_norm",
@@ -759,6 +795,10 @@
                 "dtypes": [
                  "bfloat16"
                 ],
+                "launch": {
+                 "file": "gemma_rmsnorm.py",
+                 "func": "gemma_fused_add_rmsnorm"
+                },
                 "name": "triton::_gemma_fused_add_rmsnorm_kernel",
                 "order": 0,
                 "role": "norm",
@@ -782,6 +822,7 @@
               "dtypes": [
                "bfloat16"
               ],
+              "launch": null,
               "name": "aten::clone",
               "order": 0,
               "role": "norm",
@@ -798,6 +839,7 @@
               "dtypes": [
                "bfloat16"
               ],
+              "launch": null,
               "name": "c10d::allreduce_",
               "order": 1,
               "role": "norm",
@@ -827,6 +869,7 @@
                  "bfloat16",
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "aten::linear",
                 "order": 0,
                 "role": "gate_up_proj",
@@ -857,6 +900,7 @@
                  "bfloat16",
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "_C::silu_and_mul_with_clamp",
                 "order": 0,
                 "role": "activation",
@@ -887,6 +931,7 @@
                  "bfloat16",
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "aten::linear",
                 "order": 0,
                 "role": "down_proj",
@@ -934,6 +979,10 @@
                 "dtypes": [
                  "bfloat16"
                 ],
+                "launch": {
+                 "file": "gemma_rmsnorm.py",
+                 "func": "gemma_fused_add_rmsnorm"
+                },
                 "name": "triton::_gemma_fused_add_rmsnorm_kernel",
                 "order": 0,
                 "role": "norm",
@@ -957,6 +1006,7 @@
               "dtypes": [
                "bfloat16"
               ],
+              "launch": null,
               "name": "aten::clone",
               "order": 0,
               "role": "norm",
@@ -973,6 +1023,7 @@
               "dtypes": [
                "bfloat16"
               ],
+              "launch": null,
               "name": "c10d::allreduce_",
               "order": 1,
               "role": "norm",
@@ -1002,6 +1053,7 @@
                  "bfloat16",
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "aten::linear",
                 "order": 0,
                 "role": "qkv_proj",
@@ -1034,6 +1086,10 @@
                   "dtypes": [
                    "bfloat16"
                   ],
+                  "launch": {
+                   "file": "xattention.py",
+                   "func": "minimax_m3_index_decode"
+                  },
                   "name": "flash_xpu::minimax_m3_index_decode",
                   "order": 0,
                   "role": "minimax_m3_index_decode",
@@ -1067,6 +1123,7 @@
                  "bfloat16",
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "aten::linear",
                 "order": 0,
                 "role": "o_proj",
@@ -1094,6 +1151,7 @@
               "dtypes": [
                "bfloat16"
               ],
+              "launch": null,
               "name": "aten::new_empty",
               "order": 1,
               "role": "attention",
@@ -1110,6 +1168,7 @@
               "dtypes": [
                "bfloat16"
               ],
+              "launch": null,
               "name": "aten::new_empty",
               "order": 2,
               "role": "attention",
@@ -1138,6 +1197,7 @@
                "bfloat16",
                "bfloat16"
               ],
+              "launch": null,
               "name": "_C::fused_minimax_m3_qknorm_rope_kv_insert",
               "order": 3,
               "role": "attention_norm",
@@ -1199,6 +1259,10 @@
               "dtypes": [
                "bfloat16"
               ],
+              "launch": {
+               "file": "xattention.py",
+               "func": "minimax_m3_sparse_attn_decode"
+              },
               "name": "flash_xpu::minimax_m3_sparse_attn_decode",
               "order": 5,
               "role": "attention",
@@ -1228,6 +1292,10 @@
                 "dtypes": [
                  "bfloat16"
                 ],
+                "launch": {
+                 "file": "gemma_rmsnorm.py",
+                 "func": "gemma_fused_add_rmsnorm"
+                },
                 "name": "triton::_gemma_fused_add_rmsnorm_kernel",
                 "order": 0,
                 "role": "norm",
@@ -1251,6 +1319,7 @@
               "dtypes": [
                "bfloat16"
               ],
+              "launch": null,
               "name": "aten::clone",
               "order": 0,
               "role": "norm",
@@ -1267,6 +1336,7 @@
               "dtypes": [
                "bfloat16"
               ],
+              "launch": null,
               "name": "c10d::allreduce_",
               "order": 1,
               "role": "norm",
@@ -1295,6 +1365,7 @@
                 "dtypes": [
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "aten::to",
                 "order": 0,
                 "role": "to",
@@ -1312,6 +1383,7 @@
                  "float",
                  "float"
                 ],
+                "launch": null,
                 "name": "aten::linear",
                 "order": 1,
                 "role": "linear",
@@ -1348,6 +1420,7 @@
                      "bfloat16",
                      "bfloat16"
                     ],
+                    "launch": null,
                     "name": "aten::linear",
                     "order": 0,
                     "role": "gate_up_proj",
@@ -1378,6 +1451,7 @@
                      "bfloat16",
                      "bfloat16"
                     ],
+                    "launch": null,
                     "name": "_C::silu_and_mul_with_clamp",
                     "order": 0,
                     "role": "activation",
@@ -1408,6 +1482,7 @@
                      "bfloat16",
                      "bfloat16"
                     ],
+                    "launch": null,
                     "name": "aten::linear",
                     "order": 0,
                     "role": "down_proj",
@@ -1441,6 +1516,7 @@
                   "backend": "framework",
                   "carries_device_time": true,
                   "dtypes": [],
+                  "launch": null,
                   "name": "aten::zeros",
                   "order": 0,
                   "role": "zeros",
@@ -1456,6 +1532,7 @@
                    "int",
                    "int"
                   ],
+                  "launch": null,
                   "name": "_moe_C::remap_hidden_states",
                   "order": 1,
                   "role": "remap_hidden_states",
@@ -1490,6 +1567,7 @@
                    "bfloat16",
                    "int"
                   ],
+                  "launch": null,
                   "name": "_xpu_C::cutlass_grouped_gemm_interface",
                   "order": 2,
                   "role": "cutlass_grouped_gemm_interface",
@@ -1519,6 +1597,7 @@
                    "bfloat16",
                    "bfloat16"
                   ],
+                  "launch": null,
                   "name": "_C::swigluoai_and_mul",
                   "order": 3,
                   "role": "swigluoai_and_mul",
@@ -1542,6 +1621,7 @@
                    "bfloat16",
                    "int"
                   ],
+                  "launch": null,
                   "name": "_xpu_C::cutlass_grouped_gemm_interface",
                   "order": 4,
                   "role": "cutlass_grouped_gemm_interface",
@@ -1573,6 +1653,7 @@
                    "float",
                    "int"
                   ],
+                  "launch": null,
                   "name": "_moe_C::moe_gather",
                   "order": 5,
                   "role": "moe_gather",
@@ -1614,6 +1695,7 @@
                    "float",
                    "float"
                   ],
+                  "launch": null,
                   "name": "_moe_C::topk_sigmoid",
                   "order": 0,
                   "role": "topk_sigmoid",
@@ -1654,6 +1736,7 @@
                  "float",
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "vllm::moe_forward_shared",
                 "order": 0,
                 "role": "moe_forward_shared",
@@ -1678,6 +1761,7 @@
                 "dtypes": [
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "aten::mul_",
                 "order": 4,
                 "role": "mul_",
@@ -1695,6 +1779,7 @@
                  "bfloat16",
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "aten::add",
                 "order": 5,
                 "role": "add",
@@ -1715,6 +1800,7 @@
                 "dtypes": [
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "aten::clone",
                 "order": 6,
                 "role": "clone",
@@ -1731,6 +1817,7 @@
                 "dtypes": [
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "c10d::allreduce_",
                 "order": 7,
                 "role": "allreduce_",
@@ -1771,6 +1858,10 @@
               "dtypes": [
                "bfloat16"
               ],
+              "launch": {
+               "file": "gemma_rmsnorm.py",
+               "func": "gemma_fused_add_rmsnorm"
+              },
               "name": "triton::_gemma_fused_add_rmsnorm_kernel",
               "order": 0,
               "role": "norm",
@@ -1800,6 +1891,7 @@
                  "bfloat16",
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "aten::linear",
                 "order": 0,
                 "role": "qkv_proj",
@@ -1832,6 +1924,10 @@
                   "dtypes": [
                    "bfloat16"
                   ],
+                  "launch": {
+                   "file": "xattention.py",
+                   "func": "minimax_m3_index_decode"
+                  },
                   "name": "flash_xpu::minimax_m3_index_decode",
                   "order": 0,
                   "role": "minimax_m3_index_decode",
@@ -1865,6 +1961,7 @@
                  "bfloat16",
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "aten::linear",
                 "order": 0,
                 "role": "o_proj",
@@ -1892,6 +1989,7 @@
               "dtypes": [
                "bfloat16"
               ],
+              "launch": null,
               "name": "aten::new_empty",
               "order": 1,
               "role": "attention",
@@ -1908,6 +2006,7 @@
               "dtypes": [
                "bfloat16"
               ],
+              "launch": null,
               "name": "aten::new_empty",
               "order": 2,
               "role": "attention",
@@ -1936,6 +2035,7 @@
                "bfloat16",
                "bfloat16"
               ],
+              "launch": null,
               "name": "_C::fused_minimax_m3_qknorm_rope_kv_insert",
               "order": 3,
               "role": "attention_norm",
@@ -1997,6 +2097,10 @@
               "dtypes": [
                "bfloat16"
               ],
+              "launch": {
+               "file": "xattention.py",
+               "func": "minimax_m3_sparse_attn_decode"
+              },
               "name": "flash_xpu::minimax_m3_sparse_attn_decode",
               "order": 5,
               "role": "attention",
@@ -2026,6 +2130,10 @@
                 "dtypes": [
                  "bfloat16"
                 ],
+                "launch": {
+                 "file": "gemma_rmsnorm.py",
+                 "func": "gemma_fused_add_rmsnorm"
+                },
                 "name": "triton::_gemma_fused_add_rmsnorm_kernel",
                 "order": 0,
                 "role": "norm",
@@ -2049,6 +2157,7 @@
               "dtypes": [
                "bfloat16"
               ],
+              "launch": null,
               "name": "aten::clone",
               "order": 0,
               "role": "norm",
@@ -2065,6 +2174,7 @@
               "dtypes": [
                "bfloat16"
               ],
+              "launch": null,
               "name": "c10d::allreduce_",
               "order": 1,
               "role": "norm",
@@ -2093,6 +2203,7 @@
                 "dtypes": [
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "aten::to",
                 "order": 0,
                 "role": "to",
@@ -2110,6 +2221,7 @@
                  "float",
                  "float"
                 ],
+                "launch": null,
                 "name": "aten::linear",
                 "order": 1,
                 "role": "linear",
@@ -2146,6 +2258,7 @@
                      "bfloat16",
                      "bfloat16"
                     ],
+                    "launch": null,
                     "name": "aten::linear",
                     "order": 0,
                     "role": "gate_up_proj",
@@ -2176,6 +2289,7 @@
                      "bfloat16",
                      "bfloat16"
                     ],
+                    "launch": null,
                     "name": "_C::silu_and_mul_with_clamp",
                     "order": 0,
                     "role": "activation",
@@ -2206,6 +2320,7 @@
                      "bfloat16",
                      "bfloat16"
                     ],
+                    "launch": null,
                     "name": "aten::linear",
                     "order": 0,
                     "role": "down_proj",
@@ -2239,6 +2354,7 @@
                   "backend": "framework",
                   "carries_device_time": true,
                   "dtypes": [],
+                  "launch": null,
                   "name": "aten::zeros",
                   "order": 0,
                   "role": "zeros",
@@ -2254,6 +2370,7 @@
                    "int",
                    "int"
                   ],
+                  "launch": null,
                   "name": "_moe_C::remap_hidden_states",
                   "order": 1,
                   "role": "remap_hidden_states",
@@ -2288,6 +2405,7 @@
                    "bfloat16",
                    "int"
                   ],
+                  "launch": null,
                   "name": "_xpu_C::cutlass_grouped_gemm_interface",
                   "order": 2,
                   "role": "cutlass_grouped_gemm_interface",
@@ -2317,6 +2435,7 @@
                    "bfloat16",
                    "bfloat16"
                   ],
+                  "launch": null,
                   "name": "_C::swigluoai_and_mul",
                   "order": 3,
                   "role": "swigluoai_and_mul",
@@ -2340,6 +2459,7 @@
                    "bfloat16",
                    "int"
                   ],
+                  "launch": null,
                   "name": "_xpu_C::cutlass_grouped_gemm_interface",
                   "order": 4,
                   "role": "cutlass_grouped_gemm_interface",
@@ -2371,6 +2491,7 @@
                    "float",
                    "int"
                   ],
+                  "launch": null,
                   "name": "_moe_C::moe_gather",
                   "order": 5,
                   "role": "moe_gather",
@@ -2412,6 +2533,7 @@
                    "float",
                    "float"
                   ],
+                  "launch": null,
                   "name": "_moe_C::topk_sigmoid",
                   "order": 0,
                   "role": "topk_sigmoid",
@@ -2452,6 +2574,7 @@
                  "float",
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "vllm::moe_forward_shared",
                 "order": 0,
                 "role": "moe_forward_shared",
@@ -2476,6 +2599,7 @@
                 "dtypes": [
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "aten::mul_",
                 "order": 4,
                 "role": "mul_",
@@ -2493,6 +2617,7 @@
                  "bfloat16",
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "aten::add",
                 "order": 5,
                 "role": "add",
@@ -2513,6 +2638,7 @@
                 "dtypes": [
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "aten::clone",
                 "order": 6,
                 "role": "clone",
@@ -2529,6 +2655,7 @@
                 "dtypes": [
                  "bfloat16"
                 ],
+                "launch": null,
                 "name": "c10d::allreduce_",
                 "order": 7,
                 "role": "allreduce_",
@@ -2566,6 +2693,10 @@
             "dtypes": [
              "bfloat16"
             ],
+            "launch": {
+             "file": "gemma_rmsnorm.py",
+             "func": "gemma_fused_add_rmsnorm"
+            },
             "name": "triton::_gemma_fused_add_rmsnorm_kernel",
             "order": 0,
             "role": "norm",
@@ -2610,6 +2741,7 @@
        "bfloat16",
        "bfloat16"
       ],
+      "launch": null,
       "name": "aten::linear",
       "order": 0,
       "role": "lm_head",
@@ -2631,6 +2763,7 @@
        "bfloat16",
        "bfloat16"
       ],
+      "launch": null,
       "name": "c10d::_allgather_base_",
       "order": 1,
       "role": "lm_head",
@@ -2651,6 +2784,7 @@
       "dtypes": [
        "bfloat16"
       ],
+      "launch": null,
       "name": "aten::movedim",
       "order": 2,
       "role": "lm_head",

@@ -34,8 +34,10 @@ Nothing is guessed: an unknown op raises :class:`ResolveError`.
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import json
 import os
+import sys
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -77,9 +79,22 @@ NOT_REPLAYABLE: dict[str, str] = {
         "as their own ops",
 }
 
-#: Synthetic kernel-op name -> the public Python API that launches it.
-#: ``(module, attribute)``; the reconstruction already named the op after this
-#: frame, so the mapping is a plain lookup rather than a heuristic.
+#: Op name -> ``(module, attribute)`` for the *redirects*: an op whose replay
+#: entry point is a different function from the one the trace recorded.
+#:
+#: This table used to also list every Python-launched kernel (the xattention
+#: SYCL wrappers, the FlashInfer norms) by dotted module path. That was a guess
+#: at something the trace states outright, and it was wrong: the recorded
+#: launcher for MiniMax-M3's indexer is
+#: ``vllm/models/minimax_m3/xpu/ops/xattention.py`` while the table said
+#: ``vllm.model_executor.models.minimax_m3.xattention``, so all four MSA ops
+#: failed to resolve on the very model they were added for. Such kernels are now
+#: resolved from their recorded launcher frame (see :func:`resolve`).
+#:
+#: What legitimately remains are context-bound *wrappers*: they have a real
+#: dispatcher ``cpu_op`` (so no launcher frame is recorded) and cannot run
+#: outside a forward pass, but one level down there is a kernel entry point that
+#: takes the context as plain arguments.
 PYTHON_API: dict[str, tuple[str, str]] = {
     # Context-bound wrappers replayed through their context-free kernel entry
     # point. ``fa_utils`` re-exports the platform's implementation (the
@@ -92,24 +107,6 @@ PYTHON_API: dict[str, tuple[str, str]] = {
         ("vllm.v1.attention.backends.fa_utils", "flash_attn_varlen_func"),
     "vllm::unified_kv_cache_update":
         ("vllm.v1.attention.backends.fa_utils", "reshape_and_cache_flash"),
-    # MiniMax-M3 xattention (SYCL, XPU)
-    "flash_xpu::minimax_m3_index_score":
-        ("vllm.model_executor.models.minimax_m3.xattention", "minimax_m3_index_score"),
-    "flash_xpu::minimax_m3_index_decode":
-        ("vllm.model_executor.models.minimax_m3.xattention", "minimax_m3_index_decode"),
-    "flash_xpu::minimax_m3_index_topk":
-        ("vllm.model_executor.models.minimax_m3.xattention", "minimax_m3_index_topk"),
-    "flash_xpu::minimax_m3_sparse_attn":
-        ("vllm.model_executor.models.minimax_m3.xattention", "minimax_m3_sparse_attn"),
-    "flash_xpu::minimax_m3_sparse_attn_decode":
-        ("vllm.model_executor.models.minimax_m3.xattention",
-         "minimax_m3_sparse_attn_decode"),
-    # FlashInfer norms (CUDA)
-    "flashinfer::rmsnorm": ("flashinfer.norm", "rmsnorm"),
-    "flashinfer::fused_add_rmsnorm": ("flashinfer.norm", "fused_add_rmsnorm"),
-    "flashinfer::gemma_rmsnorm": ("flashinfer.norm", "gemma_rmsnorm"),
-    "flashinfer::gemma_fused_add_rmsnorm":
-        ("flashinfer.norm", "gemma_fused_add_rmsnorm"),
 }
 
 #: Namespaces handled by the collective path, not by direct replay.
@@ -262,13 +259,48 @@ def _from_schema(schema: Any) -> dict[str, Any]:
             "returns_none": len(schema.returns) == 0}
 
 
-def resolve(op: str, slots: list[dict] | None = None) -> Resolved:
+def _import_file(path: str) -> Any:
+    """Import the module that lives at ``path``, by file location.
+
+    The trace records where a kernel's launcher *is*, not what it is importable
+    as, and the two differ: the same xattention wrapper is
+    ``vllm/models/minimax_m3/xpu/ops/xattention.py`` in one checkout and
+    ``vllm/model_executor/models/minimax_m3/xattention.py`` in another. Import
+    by dotted path and the op is unresolvable in half the installs; import by
+    location and it always resolves to the code that actually ran.
+    """
+    if not os.path.isfile(path):
+        raise ResolveError(f"the launcher file no longer exists: {path}")
+    # Prefer an already-imported module for this file: re-importing it under a
+    # synthetic name would create a *second* copy of its globals, and a Triton
+    # kernel's compiled-kernel cache lives in those globals.
+    target = os.path.abspath(path)
+    for mod in list(sys.modules.values()):
+        f = getattr(mod, "__file__", None)
+        if f and os.path.abspath(f) == target:
+            return mod
+    spec = importlib.util.spec_from_file_location(
+        "breakdown_launcher_" + str(abs(hash(path))), path)
+    if spec is None or spec.loader is None:
+        raise ResolveError(f"cannot load a module from {path}")
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    except Exception as exc:  # noqa: BLE001 - any import error is a resolve error
+        raise ResolveError(f"cannot import {path}: {exc}") from exc
+    return mod
+
+
+def resolve(op: str, slots: list[dict] | None = None,
+            launch: dict | None = None) -> Resolved:
     """Resolve a dispatch name to a callable, or explain why it cannot be.
 
     ``slots`` are the call's recorded argument slots; they select the overload
-    (see :func:`_overload`). Raises :class:`NotReplayable` for context-bound
-    wrappers and :class:`ResolveError` for anything genuinely unknown - never a
-    silent fallback, because a wrong callable measures a wrong kernel.
+    (see :func:`_overload`). ``launch`` is the ``{file, line, func}`` frame the
+    profiler recorded for a kernel with no dispatcher op. Raises
+    :class:`NotReplayable` for context-bound wrappers and :class:`ResolveError`
+    for anything genuinely unknown - never a silent fallback, because a wrong
+    callable measures a wrong kernel.
     """
     # PYTHON_API first: an op listed there has a context-free entry point, which
     # beats a NOT_REPLAYABLE refusal for the same dispatch name.
@@ -287,9 +319,20 @@ def resolve(op: str, slots: list[dict] | None = None) -> Resolved:
 
     ns, name = split_name(op)
     if ns in ("triton", "flashinfer", "flash_xpu"):
+        # A kernel launched straight from Python. The profiler recorded the
+        # function that launched it, so there is nothing to look up: import
+        # that file and take that attribute.
+        if launch and launch.get("file") and launch.get("func"):
+            mod = _import_file(launch["file"])
+            fn = getattr(mod, launch["func"], None)
+            if fn is None:
+                raise ResolveError(
+                    f"{launch['file']} has no attribute {launch['func']}")
+            return Resolved(op=op, fn=fn, kind="python_api")
         raise ResolveError(
-            f"synthetic kernel op with no registered Python API; add it to "
-            f"breakdown.bench.resolve.PYTHON_API")
+            "synthetic kernel op with no recorded launcher frame; re-profile "
+            "with a current build, or add it to "
+            "breakdown.bench.resolve.PYTHON_API")
 
     try:
         import torch
@@ -323,7 +366,8 @@ def _lookup(torch_mod, ns: str, name: str):
     return packet
 
 
-def classify(op: str, slots: list[dict] | None = None) -> tuple[str, str]:
+def classify(op: str, slots: list[dict] | None = None,
+             launch: dict | None = None) -> tuple[str, str]:
     """``(status, detail)`` without importing heavy modules where avoidable.
 
     ``status`` is ``replayable`` | ``not_replayable`` | ``unresolved`` |
@@ -339,7 +383,7 @@ def classify(op: str, slots: list[dict] | None = None) -> tuple[str, str]:
     if is_collective(op):
         return "collective", "needs a multi-rank launch"
     try:
-        r = resolve(op, slots)
+        r = resolve(op, slots, launch=launch)
     except NotReplayable as exc:
         return "not_replayable", str(exc)
     except ResolveError as exc:

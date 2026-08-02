@@ -33,6 +33,7 @@ from __future__ import annotations
 import ast
 import gzip
 import json
+import re
 from typing import Any
 
 from .analyzer import DTYPE_BYTES, dtype_size, estimate_flops, estimate_memory
@@ -247,9 +248,11 @@ def _first_dtype(args: dict) -> str:
 
 
 def _collect_kernel_launches(events: list[dict], worker_tid: Any
-                             ) -> list[tuple[float, str, float, str | None]]:
+                             ) -> list[tuple[float, str, float,
+                                             dict[str, Any] | None]]:
     """Collect every device kernel as ``(host_launch_ts, name, device_us,
-    friendly_api_name)``.
+    launcher_frame)``, where the frame is ``{file, line, func}`` of the Python
+    function that launched it (``None`` when a ``cpu_op`` covers it).
 
     Only genuine *device* events (``_DEVICE_KERNEL_CATEGORIES`` — real
     ``kernel``/``gpu_memcpy``/``gpu_memset``) are surfaced. Each is linked to the
@@ -300,22 +303,12 @@ def _collect_kernel_launches(events: list[dict], worker_tid: Any
             if ext is not None:
                 ext_to_ts[ext] = evt.get("ts", 0)
 
-    # Public FlashInfer API frames on the worker thread, so a Python-direct
-    # FlashInfer kernel can be named after its public API entrypoint (e.g.
-    # ``flashinfer/norm/__init__.py(433): gemma_fused_add_rmsnorm``) instead of
-    # the raw cutlass functor symbol.
-    fi_api_frames = _collect_flashinfer_api_frames(events, worker_tid)
-    # Public xattention API frames on the worker thread, so a Python-direct
-    # MiniMax-M3 MSA SYCL kernel can be named after its ``xattention.py``
-    # wrapper (e.g. ``minimax_m3_index_score``, ``minimax_m3_sparse_attn``)
-    # instead of the raw ``flash_xpu::(anonymous namespace)::...`` symbol.
-    fx_api_frames = _collect_flash_xpu_api_frames(events, worker_tid)
+    # The Python frames that can be a kernel's definition site. A kernel with
+    # no ``cpu_op`` was launched straight from Python, and this is the trace's
+    # only record of what it is and where its code lives.
+    launcher_frames = _collect_launcher_frames(events, worker_tid)
 
-    def _friendly(name: str, ts: float) -> str | None:
-        return (_flashinfer_api_name(name, ts, fi_api_frames)
-                or _flash_xpu_api_name(name, ts, fx_api_frames))
-
-    launches: list[tuple[float, str, float, str | None]] = []
+    launches: list[tuple[float, str, float, dict[str, Any] | None]] = []
     for evt in events:
         cat = evt.get("cat")
         args = evt.get("args", {})
@@ -333,7 +326,7 @@ def _collect_kernel_launches(events: list[dict], worker_tid: Any
                 if ext is None or ext not in ext_to_ts:
                     continue
                 ts = ext_to_ts[ext]
-            launches.append((ts, name, dur, _friendly(name, ts)))
+            launches.append((ts, name, dur, _launcher_at(ts, launcher_frames)))
         elif cat in _RUNTIME_CATEGORIES and not has_device_kernel:
             # Runtime-only trace: no device-kernel events were captured, so the
             # launch-API call is the only signal of GPU work. Emit actual launch
@@ -344,103 +337,85 @@ def _collect_kernel_launches(events: list[dict], worker_tid: Any
             if "launch" not in low and "enqueue" not in low:
                 continue
             ts = evt.get("ts", 0)
-            launches.append((ts, name, dur, _friendly(name, ts)))
+            launches.append((ts, name, dur, _launcher_at(ts, launcher_frames)))
     return launches
 
 
-def _collect_flashinfer_api_frames(events: list[dict], worker_tid: Any
-                                   ) -> list[tuple[float, float, str]]:
-    """Enclosing public FlashInfer API frames as ``(ts, end, funcname)``.
+#: Python packages that only *dispatch* a kernel launch rather than define it:
+#: torch's own machinery, Triton's runtime, and the stdlib. The frame that
+#: launched a kernel is the innermost enclosing frame outside these.
+_LAUNCH_MACHINERY = (
+    "/torch/", "/triton/", "/_dynamo/", "/_inductor/",
+    "contextlib.py", "<built-in>", "<string>",
+)
 
-    FlashInfer's public entrypoints live in ``flashinfer/**/__init__.py`` (e.g.
-    ``gemma_fused_add_rmsnorm``, ``gemma_rmsnorm``). We keep only those public
-    (non-underscore) ``__init__.py`` frames on the worker thread so a
-    Python-direct FlashInfer kernel can be named after the API that launched it
-    rather than the raw cutlass functor symbol — matching the readable XPU
-    kernel names.
+#: Function names that identify a *dispatch* wrapper rather than the kernel:
+#: a JIT runner, a callable object's entry point. They name the mechanism, not
+#: the work, and their file is the JIT layer rather than the kernel's source, so
+#: they are useless both as a label and as a replay entry point.
+_DISPATCH_FUNCS = frozenset({
+    "run", "launch", "call", "__call__", "execute", "invoke", "wrapper",
+})
+
+_PY_FRAME_RE = re.compile(r"^(?P<file>.+\.py)\((?P<line>\d+)\): (?P<func>.+)$")
+
+
+def _collect_launcher_frames(events: list[dict], worker_tid: Any
+                             ) -> list[tuple[float, float, str, int, str]]:
+    """Python frames that can be the *definition site* of a kernel launch.
+
+    Returns ``(ts, end, file, line, func)`` for every public Python frame on the
+    worker thread that is not launch machinery (see ``_LAUNCH_MACHINERY``).
+
+    A kernel launched straight from Python — a Triton ``JITFunction``, a
+    pybind11 extension entry point (FlashInfer's cutlass norms, MiniMax-M3's
+    xattention SYCL kernels) — emits no ``cpu_op``, so the trace's only record
+    of *what it is* is the Python frame that called it. That frame gives three
+    things at once: a readable name, the backend (from the source root), and —
+    crucially for the replay benchmark — the exact file and function to import
+    in order to call the kernel again. This replaces the per-library frame
+    collectors (one for FlashInfer, one for xattention), which each hardcoded a
+    path fragment and threw the file away, keeping only the name.
     """
-    frames: list[tuple[float, float, str]] = []
+    frames: list[tuple[float, float, str, int, str]] = []
     for evt in events:
         if evt.get("cat") != "python_function" or evt.get("tid") != worker_tid:
             continue
-        nm = evt.get("name", "")
-        if "flashinfer" not in nm or "__init__.py(" not in nm:
+        match = _PY_FRAME_RE.match(evt.get("name", ""))
+        if not match:
+            continue                     # "nn.Module: X", "<built-in ...>", ...
+        file, func = match.group("file"), match.group("func").strip()
+        if not func or func.startswith("_") or func.endswith(">"):
+            continue                     # private helper or <listcomp>/<lambda>
+        if func in _DISPATCH_FUNCS:
             continue
-        func = nm.rsplit("): ", 1)[-1].strip()
-        if not func or func.startswith("_"):
+        if any(fragment in file for fragment in _LAUNCH_MACHINERY):
             continue
         ts = evt.get("ts", 0)
-        frames.append((ts, ts + (evt.get("dur", 0) or 0), func))
+        frames.append((ts, ts + (evt.get("dur", 0) or 0), file,
+                       int(match.group("line")), func))
+    frames.sort(key=lambda f: (f[0], -(f[1] - f[0])))
     return frames
 
 
-def _flashinfer_api_name(kernel_name: str, launch_ts: float,
-                         fi_api_frames: list[tuple[float, float, str]]
-                         ) -> str | None:
-    """Public FlashInfer API name for a kernel launched at ``launch_ts``.
+def _launcher_at(launch_ts: float,
+                 frames: list[tuple[float, float, str, int, str]]
+                 ) -> dict[str, Any] | None:
+    """The innermost launcher frame containing ``launch_ts``.
 
-    Returns the outermost enclosing public ``__init__.py`` FlashInfer frame's
-    function name (``gemma_fused_add_rmsnorm``), or ``None`` when the kernel is
-    not a FlashInfer kernel or no such frame contains the launch.
+    Innermost, not outermost: the frame closest to the launch is the one that
+    actually called the kernel, so it names the kernel and is the entry point a
+    replay must call. An outer frame is the caller of the launcher, which is a
+    different (usually context-bound) function.
     """
-    if "flashinfer" not in kernel_name.lower():
-        return None
-    best: str | None = None
-    best_dur = -1.0
-    for ts, end, func in fi_api_frames:
+    best: dict[str, Any] | None = None
+    best_dur = float("inf")
+    for ts, end, file, line, func in frames:
         if ts <= launch_ts < end:
             dur = end - ts
-            if dur > best_dur:
-                best, best_dur = func, dur
-    return best
-
-
-def _collect_flash_xpu_api_frames(events: list[dict], worker_tid: Any
-                                  ) -> list[tuple[float, float, str]]:
-    """Enclosing public xattention API frames as ``(ts, end, funcname)``.
-
-    The MiniMax-M3 MSA SYCL kernels (lightning indexer + block-sparse attend)
-    are launched from the thin ``xattention.py`` wrappers
-    (``minimax_m3_index_score``, ``minimax_m3_index_topk``,
-    ``minimax_m3_index_decode``, ``minimax_m3_sparse_attn``,
-    ``minimax_m3_sparse_attn_decode``). We keep only those public
-    (non-underscore) ``xattention.py`` frames on the worker thread so a
-    Python-direct ``flash_xpu`` kernel can be named after the API that launched
-    it rather than the raw ``flash_xpu::(anonymous namespace)::...`` symbol.
-    """
-    frames: list[tuple[float, float, str]] = []
-    for evt in events:
-        if evt.get("cat") != "python_function" or evt.get("tid") != worker_tid:
-            continue
-        nm = evt.get("name", "")
-        if "xattention.py(" not in nm:
-            continue
-        func = nm.rsplit("): ", 1)[-1].strip()
-        if not func or func.startswith("_"):
-            continue
-        ts = evt.get("ts", 0)
-        frames.append((ts, ts + (evt.get("dur", 0) or 0), func))
-    return frames
-
-
-def _flash_xpu_api_name(kernel_name: str, launch_ts: float,
-                        fx_api_frames: list[tuple[float, float, str]]
-                        ) -> str | None:
-    """Public xattention API name for a ``flash_xpu`` kernel at ``launch_ts``.
-
-    Returns the outermost enclosing public ``xattention.py`` frame's function
-    name (``minimax_m3_index_score``), or ``None`` when the kernel is not an
-    xattention (``flash_xpu``) kernel or no such frame contains the launch.
-    """
-    if "flash_xpu" not in kernel_name.lower():
-        return None
-    best: str | None = None
-    best_dur = -1.0
-    for ts, end, func in fx_api_frames:
-        if ts <= launch_ts < end:
-            dur = end - ts
-            if dur > best_dur:
-                best, best_dur = func, dur
+            if dur < best_dur:
+                best_dur = dur
+                best = {"file": file, "line": line, "func": func}
     return best
 
 
@@ -453,7 +428,7 @@ class _Raw:
 
     __slots__ = ("kind", "label", "ts", "end", "dur", "ext", "shapes",
                  "dtype", "dtypes", "children", "self_dev", "sub_dev",
-                 "attr_name", "arg_slots")
+                 "attr_name", "arg_slots", "launch")
 
     def __init__(self, kind: str, label: str, ts: float, dur: float):
         self.kind = kind          # "module" or "op"
@@ -470,6 +445,9 @@ class _Raw:
         self.sub_dev = 0.0        # device us of this node + all descendants
         self.attr_name = ""       # real module attribute name (q_norm, ...)
         self.arg_slots: list[dict] = []  # full ordered call args (replay)
+        # {file, line, func} of the Python frame that launched this kernel;
+        # only set for ops with no cpu_op (Triton / extension kernels).
+        self.launch: dict[str, Any] | None = None
 
 
 def _deepest_at(roots: list[_Raw], ts: float) -> _Raw | None:
@@ -520,29 +498,29 @@ def _clean_kernel_name(name: str) -> str:
 def _synthetic_op_label(name: str, api_name: str | None = None) -> str:
     """Namespaced display label for a Python-direct device kernel (no cpu_op).
 
-    FlashInfer kernels get a ``flashinfer::`` namespace and MiniMax-M3 MSA
-    xattention SYCL kernels get a ``flash_xpu::`` namespace (rather than
-    ``triton::``, which misrepresented them as Triton-compiled); every other
-    orphan kernel keeps ``triton::``. When the launching public API name is
-    known (``api_name``, e.g. ``gemma_fused_add_rmsnorm`` /
-    ``minimax_m3_index_score``) it is used in place of the raw cutlass functor /
-    ``flash_xpu::(anonymous namespace)::...`` symbol so the label is short and
-    matches the readable API; otherwise the ``_object_at...`` object-repr tail
-    is dropped from the raw symbol so the name stays readable.
+    The namespace comes from the *kernel symbol*, which is a fact about where
+    the kernel was compiled: a MiniMax-M3 MSA xattention SYCL kernel reads
+    ``flash_xpu::`` and a FlashInfer cutlass kernel ``flashinfer::`` rather than
+    ``triton::``, which would misrepresent them as Triton-compiled. Everything
+    else keeps ``triton::``.
+
+    For the two extension backends the launching API name is used in place of
+    the raw symbol (``flash_xpu::(anonymous namespace)::index_score_kernel_t``
+    → ``flash_xpu::minimax_m3_index_score``), since the raw functor symbol is
+    unreadable. A Triton kernel's own symbol is already its name, so it is kept
+    as-is; its launcher is recorded separately on the op for replay.
     """
     clean = _clean_kernel_name(name)
     low = clean.lower()
     if "flash_xpu" in low:
         return "flash_xpu::" + (api_name or clean)
-    if api_name:
-        return "flashinfer::" + api_name
     if "flashinfer" in low:
-        return "flashinfer::" + clean
+        return "flashinfer::" + (api_name or clean)
     return "triton::" + clean
 
 
 def _attribute_kernels(roots: list[_Raw],
-                       launches: list[tuple[float, str, float, str | None]]
+                       launches: list[tuple[float, str, float, dict[str, Any] | None]]
                        ) -> None:
     """Attribute every device kernel to its host launch site.
 
@@ -576,7 +554,8 @@ def _attribute_kernels(roots: list[_Raw],
     # Accumulate synthetic op device time per (module, kernel-name) so repeated
     # launches across forward passes collapse into one op node per module.
     synth: dict[tuple[int, str], _Raw] = {}
-    for ts, name, dur, api_name in launches:
+    for ts, name, dur, frame in launches:
+        api_name = (frame or {}).get("func")
         node = _deepest_at(roots, ts)
         if node is None:
             continue
@@ -595,6 +574,10 @@ def _attribute_kernels(roots: list[_Raw],
         op = synth.get(key)
         if op is None:
             op = _Raw("op", _synthetic_op_label(name, api_name), ts, 0.0)
+            # Where this kernel's Python entry point lives. The replay
+            # benchmark imports exactly this file and attribute instead of
+            # guessing a module path from the op name.
+            op.launch = frame
             synth[key] = op
             mod.children.append(op)
             parent[id(op)] = mod
@@ -603,7 +586,7 @@ def _attribute_kernels(roots: list[_Raw],
 
 def _kernel_leaf_coverage(
     roots: list[_Raw],
-    launches: list[tuple[float, str, float, str | None]],
+    launches: list[tuple[float, str, float, dict[str, Any] | None]],
 ) -> dict[str, float]:
     """Read-only classifier: where does each collected device kernel land?
 
@@ -1548,6 +1531,9 @@ def _finalize_node(
             "recorded_shapes": [list(s) for s in shapes],
             "input_dtypes": list(raw.dtypes),
             "input_args": [dict(s) for s in raw.arg_slots],
+            # For a kernel launched straight from Python (no cpu_op), the file
+            # and function that launched it — the replay's entry point.
+            "launch": dict(raw.launch) if raw.launch else None,
             "memory_bytes": mem,
             "flops": flops,
             "ai": round(flops / mem, 2) if mem > 0 else 0,

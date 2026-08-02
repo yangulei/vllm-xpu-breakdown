@@ -2051,7 +2051,7 @@ class TestGraphFromTrace(unittest.TestCase):
         self.assertNotIn("triton::", fi_op["name"])
         self.assertNotIn("_object_at", fi_op["name"])
 
-    def test_flashinfer_kernel_named_after_public_api_frame(self):
+    def test_flashinfer_kernel_named_after_its_launcher_frame(self):
         # When the FlashInfer kernel is launched inside its public API python
         # frame (``flashinfer/norm/__init__.py(...): gemma_fused_add_rmsnorm``),
         # the synthetic op is named after that API — short and matching the
@@ -2077,8 +2077,15 @@ class TestGraphFromTrace(unittest.TestCase):
             {"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
              "ts": 2000, "dur": 5.0, "name": "gemm_cuda_kernel",
              "args": {"correlation": 1}},
-            # Public FlashInfer API frame (outer) + private impl (inner) — the
-            # public ``__init__.py`` name must win.
+            # Public FlashInfer API frame (outer) + the kernel wrapper it
+            # calls (inner). The *innermost public* frame wins: it is the
+            # function that actually launched the kernel, so it is both the
+            # honest name and the entry point a replay can call. Widening to
+            # the outermost frame is only safe when the candidate set is
+            # restricted to one file per library, which is exactly the
+            # per-library hardcoding this rule replaced -- for a Triton kernel
+            # launched from deep inside vLLM it would climb all the way to the
+            # model forward.
             {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
              "ts": 28, "dur": 8,
              "name": "flashinfer/norm/__init__.py(433): gemma_fused_add_rmsnorm"},
@@ -2109,7 +2116,12 @@ class TestGraphFromTrace(unittest.TestCase):
 
         ops = list(all_ops(g["prefill"]))
         fi_op = next(o for o in ops if "flashinfer" in o["name"].lower())
-        self.assertEqual(fi_op["name"], "flashinfer::gemma_fused_add_rmsnorm")
+        self.assertEqual(fi_op["name"], "flashinfer::fused_add_rmsnorm_cute")
+        # The frame is recorded, not just its name: the replay benchmark
+        # imports this exact file and attribute instead of guessing a module
+        # path from the op name.
+        self.assertEqual(fi_op["launch"]["func"], "fused_add_rmsnorm_cute")
+        self.assertTrue(fi_op["launch"]["file"].endswith("fused_add_rmsnorm.py"))
         self.assertEqual(fi_op["backend"], "flashinfer")
         self.assertAlmostEqual(fi_op["device_time_us"], 4.0, places=3)
 

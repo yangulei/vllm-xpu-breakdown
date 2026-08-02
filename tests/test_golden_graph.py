@@ -57,6 +57,10 @@ def _node_digest(node: dict | None) -> dict | None:
                 "shapes": op.get("input_shapes"),
                 "dtypes": op.get("input_dtypes"),
                 "role": op.get("role"),
+                "launch": (lambda f: f and {
+                    "file": os.path.basename(f.get("file", "")),
+                    "func": f.get("func"),
+                })(op.get("launch")),
                 "order": op.get("order"),
                 "carries_device_time": bool(op.get("device_time_us")),
             }

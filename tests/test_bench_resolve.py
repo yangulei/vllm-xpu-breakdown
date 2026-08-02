@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -67,6 +68,34 @@ class TestResolve(unittest.TestCase):
             "replayable")
         self.assertEqual(
             resolve.classify("vllm::unified_kv_cache_update")[0], "replayable")
+
+    def test_a_python_launched_kernel_resolves_from_its_recorded_frame(self):
+        """The trace says where the launcher is; that beats guessing a path.
+
+        A Triton kernel or a pybind11 extension entry point emits no dispatcher
+        op, so there is nothing to look up in ``torch.ops``. The profiler
+        records the Python frame that launched it, and the replay imports that
+        exact file. This used to be a hardcoded dotted-module table, which was
+        wrong for the model it was written for: MiniMax-M3's xattention
+        wrappers live at ``vllm/models/minimax_m3/xpu/ops/xattention.py`` while
+        the table said ``vllm.model_executor.models.minimax_m3.xattention``, so
+        all four MSA ops were unresolvable.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "some_kernel_wrappers.py")
+            with open(path, "w") as fh:
+                fh.write("def my_fused_kernel(x):\n    return x\n")
+            r = resolve.resolve("triton::_my_fused_kernel_impl", None,
+                                launch={"file": path, "line": 1,
+                                        "func": "my_fused_kernel"})
+        self.assertEqual(r.kind, "python_api")
+        self.assertEqual(r.fn.__name__, "my_fused_kernel")
+
+    def test_a_python_launched_kernel_without_a_frame_is_refused(self):
+        # Never guessed: no recorded launcher means no callable, and a wrong
+        # callable would measure a different kernel.
+        with self.assertRaises(resolve.ResolveError):
+            resolve.resolve("triton::_unknown_kernel")
 
     def test_unknown_op_raises_rather_than_guessing(self):
         with self.assertRaises(resolve.ResolveError):

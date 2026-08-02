@@ -79,6 +79,13 @@ class BenchCase:
     traced_device_time_us: float = 0.0
     traced_comparable: bool = False
 
+    #: ``{file, line, func}`` of the Python function that launched this kernel,
+    #: recorded by the profiler for ops with no dispatcher ``cpu_op`` (Triton
+    #: kernels, pybind11 extension entry points). It is how such an op is
+    #: resolved for replay: import *this* file and take *this* attribute,
+    #: instead of guessing a module path from the op name.
+    launch: dict | None = None
+
     case_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -252,6 +259,7 @@ def build_cases(rows: list[dict[str, Any]], device: str = "xpu",
             backend=row.get("Backend", ""), layers=_int(row.get("Layers"), 1),
             flops=_float(row.get("FLOPs")), nbytes=_float(row.get("Memory (bytes)")),
             traced_device_time_us=_float(row.get("_device_time_us")),
+            launch=row.get("_launch") or None,
             traced_comparable=comparable,
         )
         case.case_id = case_signature(case.op, case.args)

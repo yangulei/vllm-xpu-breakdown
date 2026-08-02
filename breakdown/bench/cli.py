@@ -124,7 +124,7 @@ def cmd_plan(a) -> int:
     for case in cases:
         if case.op in status:
             continue
-        st, detail = resolve.classify(case.op, case.args)
+        st, detail = resolve.classify(case.op, case.args, launch=case.launch)
         status[case.op] = {"status": st, "detail": detail,
                            "backend": case.backend}
     cov["ops_by_status"] = {}

@@ -95,7 +95,7 @@ def run_case(case: BenchCase, device: str,
         return _record(case, "collective",
                        detail="needs a multi-rank launch (bench.collective)")
     try:
-        res = resolve.resolve(case.op, case.args)
+        res = resolve.resolve(case.op, case.args, launch=case.launch)
     except resolve.NotReplayable as exc:
         return _record(case, "not_replayable", detail=str(exc))
     except resolve.ResolveError as exc:
