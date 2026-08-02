@@ -35,6 +35,16 @@ from breakdown.analyzer import (
 from breakdown.classifier import Backend, classify_op
 from breakdown.model_info import fetch_model_config, get_dim_symbols, summarize_config
 from breakdown.profiler import _is_overhead_event
+from tests.helpers import device_time, find_op, graph_of, iter_ops
+
+
+def _names_by_parent(node, parent_type=""):
+    """``(parent module_type, child name)`` for every module in a phase tree."""
+    out = []
+    for child in node.get("children", []):
+        out.append((node.get("module_type", ""), child.get("name", "")))
+        out.extend(_names_by_parent(child, node.get("module_type", "")))
+    return out
 
 
 # ---- Qwen3-4B-Instruct-2507 model constants ----
@@ -1442,36 +1452,58 @@ class TestGraphFromTrace(unittest.TestCase):
         self.assertAlmostEqual(moe["total_device_time_us"], 52.0, places=2)
 
     def test_rowparallel_in_mlp_named_down_proj_on_xpu(self):
-        # RowParallelLinear defaults to ``o_proj`` (attention output), but inside
-        # an MLP/expert module it is the ``down_proj``. The disambiguation used
-        # to be gated to CUDA, so on XPU the shared_experts MLP hoisted out of a
-        # fused MoE op (whose down_proj the reference-name overlay can't reach,
-        # since the ref tree lists it under ``MoE.shared_experts`` while the trace
-        # nests it under ``FusedMoE``) mislabeled its down projection as
-        # ``o_proj`` — even though the dense MLP's overlay-named down_proj was
-        # correct. The parent-type disambiguation must be device-agnostic.
-        from breakdown.graph_from_trace import _disambiguate_child_name
-        mlp_parent = {"module_type": "MiniMaxM3MLP",
-                      "child_order": [("MergedColumnParallelLinear", 0),
-                                      ("SiluAndMulWithClamp", 0),
-                                      ("RowParallelLinear", 0)]}
-        attn_parent = {"module_type": "MiniMaxM3Attention",
-                       "child_order": [("RowParallelLinear", 0)]}
-        # XPU (is_cuda=False): RowParallelLinear in an MLP -> down_proj.
-        self.assertEqual(
-            _disambiguate_child_name("RowParallelLinear", 2, mlp_parent,
-                                     is_cuda=False),
-            "down_proj")
-        # ... but in attention it stays o_proj on XPU too.
-        self.assertEqual(
-            _disambiguate_child_name("RowParallelLinear", 0, attn_parent,
-                                     is_cuda=False),
-            "o_proj")
-        # CUDA behavior is unchanged.
-        self.assertEqual(
-            _disambiguate_child_name("RowParallelLinear", 2, mlp_parent,
-                                     is_cuda=True),
-            "down_proj")
+        # RowParallelLinear is both the attention output projection (o_proj) and
+        # the MLP/MoE down projection (down_proj), and a span-less trace records
+        # only the class. The disambiguation is by *parent module type* and must
+        # be device-agnostic: it used to be gated to CUDA, so on XPU the MLP's
+        # down projection was mislabeled o_proj.
+        tid = 7
+
+        def mod(cls, ts, dur):
+            return {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
+                    "ts": ts, "dur": dur, "name": f"nn.Module: {cls}_0"}
+
+        def op(name, ts, dur, shapes, ext):
+            return {"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+                    "ts": ts, "dur": dur, "name": name,
+                    "args": {"External id": ext, "Input Dims": shapes,
+                             "Input type": ["c10::BFloat16", "c10::BFloat16"]}}
+
+        events = [
+            mod("MiniMaxM3SparseForCausalLM", 0, 300),
+            mod("MiniMaxM3Model", 1, 298),
+            mod("MiniMaxM3DecoderLayer", 5, 290),
+            mod("MiniMaxM3Attention", 10, 60),
+            op("aten::linear", 20, 5, [[8, 16], [16, 16]], 1),
+            mod("RowParallelLinear", 40, 10),
+            op("aten::linear", 41, 5, [[8, 16], [16, 16]], 2),
+            mod("MiniMaxM3MLP", 100, 100),
+            mod("MergedColumnParallelLinear", 105, 10),
+            op("aten::linear", 106, 5, [[8, 16], [64, 16]], 3),
+            mod("SiluAndMulWithClamp", 120, 10),
+            op("_C::silu_and_mul_with_clamp", 121, 5, [[8, 32]], 4),
+            mod("RowParallelLinear", 140, 10),
+            op("aten::linear", 141, 5, [[8, 32], [16, 32]], 5),
+        ]
+        summary = {"architecture": "MiniMaxM3SparseForCausalLM",
+                   "hidden_size": 16, "num_heads": 1, "num_kv_heads": 1,
+                   "head_dim": 16, "intermediate_size": 32, "vocab_size": 100,
+                   "num_layers": 1, "dtype": "bfloat16"}
+        for device_hint in ("xpu", "cuda"):
+            evs = list(events)
+            if device_hint == "cuda":
+                evs.append({"ph": "X", "cat": "cuda_runtime", "tid": tid,
+                            "pid": tid, "ts": 21, "dur": 0.1,
+                            "name": "cudaLaunchKernel",
+                            "args": {"correlation": 1, "External id": 1}})
+                evs.append({"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+                            "ts": 5000, "dur": 1.0, "name": "gemm",
+                            "args": {"correlation": 1}})
+            graph = graph_of(evs, summary, tp_size=1, batch_size=1)
+            tree = graph["prefill"] or graph["decode"]
+            names = _names_by_parent(tree)
+            self.assertIn(("MiniMaxM3MLP", "down_proj"), names, device_hint)
+            self.assertIn(("MiniMaxM3Attention", "o_proj"), names, device_hint)
 
     def test_first_decode_step_dropped_from_average(self):
         # The first (warmup) decode step must be excluded from the decode
@@ -2369,11 +2401,8 @@ class TestGraphFromTrace(unittest.TestCase):
     def test_runtime_bookkeeping_not_surfaced_as_kernel(self):
         # A CUDA trace carries host-side runtime bookkeeping events
         # (cudaEventQuery / cudaStreamWaitEvent) that launch NO device kernel.
-        # They must never be collected as kernel launches (and so never surface
-        # as bogus ``triton::cudaEventQuery`` leaf ops): the collected launch
-        # count must equal the real device-kernel count.
-        from breakdown.graph_from_trace import (_build_raw_forest,
-                                                 _collect_kernel_launches)
+        # They must never surface as bogus ``triton::cudaEventQuery`` leaf ops,
+        # and the one real kernel's time must land on the op that launched it.
         tid = 7
         events = [
             {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
@@ -2399,110 +2428,84 @@ class TestGraphFromTrace(unittest.TestCase):
              "ts": 25, "dur": 3.0, "name": "cudaStreamWaitEvent",
              "args": {"correlation": 502}},
         ]
-        roots = _build_raw_forest(events)
-        launches = _collect_kernel_launches(events, tid)
-        n_device = sum(1 for e in events if e.get("cat") == "kernel")
-        self.assertEqual(len(launches), n_device)
-        names = [nm for _, nm, _, _ in launches]
-        self.assertNotIn("cudaEventQuery", names)
-        self.assertNotIn("cudaStreamWaitEvent", names)
+        summary = {"architecture": "TinyForCausalLM", "hidden_size": 16,
+                   "num_heads": 1, "num_kv_heads": 1, "head_dim": 16,
+                   "intermediate_size": 32, "vocab_size": 100,
+                   "num_layers": 1, "dtype": "bfloat16"}
+        graph = graph_of(events, summary, tp_size=1, batch_size=1)
+        tree = graph["prefill"] or graph["decode"]
+        names = [op["name"] for op in iter_ops(tree)]
+        self.assertIn("aten::mm", names)
+        self.assertNotIn("triton::cudaEventQuery", names)
+        self.assertNotIn("triton::cudaStreamWaitEvent", names)
+        # The only device time is the one real kernel, on the op that ran it.
+        self.assertAlmostEqual(device_time(tree), 5.0, places=6)
+        self.assertAlmostEqual(find_op(tree, "aten::mm")["device_time_us"],
+                               5.0, places=6)
 
     def test_module_less_kernel_time_conserved_not_dropped(self):
         # A device kernel launched inside a *module-less* top-level op subtree
-        # (e.g. a bare sampler op with no enclosing module) must not be silently
-        # dropped: its device time is folded into the deepest op so it is
-        # conserved (coverage classifier reports it on a leaf, nothing dropped).
-        from breakdown.graph_from_trace import (_Raw, _attribute_kernels,
-                                                 _kernel_leaf_coverage)
-        # Forest: a module with an mm op, plus a module-less top-level sampler op.
-        mod = _Raw("module", "TinyDecoderLayer", 0.0, 100.0)
-        mm = _Raw("op", "aten::mm", 10.0, 5.0)
-        mod.children.append(mm)
-        sampler = _Raw("op", "aten::topk", 200.0, 20.0)  # top-level, no module
-        roots = [mod, sampler]
-        launches = [
-            (12.0, "gemm", 4.0, None),        # inside mm -> mm.self_dev
-            (205.0, "topk_kernel", 6.0, None),  # inside module-less sampler op
+        # (a bare sampler op with no enclosing module) must not be silently
+        # dropped: its device time is folded into that op so the run's total
+        # device time still accounts for it.
+        tid = 7
+        events = [
+            {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
+             "ts": 0, "dur": 100, "name": "nn.Module: TinyForCausalLM_0"},
+            {"ph": "X", "cat": "python_function", "tid": tid, "pid": tid,
+             "ts": 5, "dur": 60, "name": "nn.Module: TinyDecoderLayer_0"},
+            {"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+             "ts": 10, "dur": 5, "name": "aten::mm",
+             "args": {"External id": 1, "Input Dims": [[8, 16], [16, 16]],
+                      "Input type": ["c10::BFloat16", "c10::BFloat16"]}},
+            {"ph": "X", "cat": "xpu_runtime", "tid": tid, "pid": tid,
+             "ts": 12, "dur": 0.1, "name": "launch",
+             "args": {"correlation": 1, "External id": 1}},
+            {"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+             "ts": 2000, "dur": 4.0, "name": "gemm",
+             "args": {"correlation": 1}},
+            # Module-less top-level op (outside every module span).
+            {"ph": "X", "cat": "cpu_op", "tid": tid, "pid": tid,
+             "ts": 200, "dur": 20, "name": "aten::topk",
+             "args": {"External id": 2, "Input Dims": [[8, 100]],
+                      "Input type": ["c10::BFloat16"]}},
+            {"ph": "X", "cat": "xpu_runtime", "tid": tid, "pid": tid,
+             "ts": 205, "dur": 0.1, "name": "launch",
+             "args": {"correlation": 2, "External id": 2}},
+            {"ph": "X", "cat": "kernel", "tid": 99, "pid": 0,
+             "ts": 3000, "dur": 6.0, "name": "topk_kernel",
+             "args": {"correlation": 2}},
         ]
-        cov = _kernel_leaf_coverage(roots, launches)
-        self.assertEqual(cov["n_dropped_gap"], 0)
-        self.assertAlmostEqual(cov["dropped_gap_us"], 0.0, places=6)
-        self.assertAlmostEqual(cov["on_leaf_us"], 10.0, places=6)
-        # Attribution must conserve both kernels' time onto op leaves.
-        _attribute_kernels(roots, launches)
-        self.assertAlmostEqual(mm.self_dev, 4.0, places=6)
-        self.assertAlmostEqual(sampler.self_dev, 6.0, places=6)
+        summary = {"architecture": "TinyForCausalLM", "hidden_size": 16,
+                   "num_heads": 1, "num_kv_heads": 1, "head_dim": 16,
+                   "intermediate_size": 32, "vocab_size": 100,
+                   "num_layers": 1, "dtype": "bfloat16"}
+        graph = graph_of(events, summary, tp_size=1, batch_size=1)
+        tree = graph["prefill"] or graph["decode"]
+        # The in-module kernel lands on its op ...
+        self.assertAlmostEqual(find_op(tree, "aten::mm")["device_time_us"],
+                               4.0, places=6)
+        # ... and the module-less one is conserved on the run's totals rather
+        # than dropped (it is outside the phase tree by construction).
+        self.assertAlmostEqual(graph["timing_device_us"], 10.0, places=6)
 
-    def test_minimax_m3_traces_every_in_step_kernel_on_leaf(self):
-        # Opt-in end-to-end coverage over the real MiniMax-M3 traces (XPU + CUDA,
-        # prefill + decode): every device kernel launched inside a kept
-        # prefill/decode step must land on a leaf op, and the collected launch
-        # count must equal the real device-kernel count (no bookkeeping noise,
-        # no silent drops). Skipped when the trace files are absent.
-        import glob
-        from breakdown.graph_from_trace import (
-            _build_raw_forest, _classify_steps, _collect_kernel_launches,
-            _deepest_at, _load_trace, _DEVICE_KERNEL_CATEGORIES, _PLUMBING_OPS)
-        from breakdown.trace_common import MODULE_SPAN_PREFIX
-        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        pattern = os.path.join(here, "output", "traces",
-                               "vllm_trace_MiniMax-M3_*")
-        files = sorted(glob.glob(pattern))
-        if not files:
-            self.skipTest("MiniMax-M3 trace files not present")
-
-        def worker_of(events):
-            span: dict = {}
-            for e in events:
-                if (e.get("ph") == "X" and e.get("cat") == "user_annotation"
-                        and str(e.get("name", "")).startswith(
-                            MODULE_SPAN_PREFIX)):
-                    span[e.get("tid")] = span.get(e.get("tid"), 0) + 1
-            if span:
-                return max(span, key=span.get)
-            cc: dict = {}
-            for e in events:
-                if e.get("cat") == "cpu_op":
-                    cc[e.get("tid")] = cc.get(e.get("tid"), 0) + 1
-            return max(cc, key=cc.get)
-
+    def test_fixture_traces_every_in_step_kernel_on_leaf(self):
+        # End-to-end over the committed MiniMax-M3 fixtures (XPU + CUDA,
+        # prefill + decode): the collected launch count must equal the trace's
+        # real device-kernel count (no host bookkeeping collected as a kernel),
+        # and every kernel launched inside a kept prefill/decode step must land
+        # on a leaf op (no silent drops).
+        from breakdown.graph_from_trace import kernel_coverage
+        from tests import data as fixtures
         checked = 0
-        for f in files:
-            # The shared traces dir may hold partial/other-run stub files; skip
-            # anything that isn't a readable trace with events.
-            try:
-                events = _load_trace(f).get("traceEvents", [])
-            except (OSError, ValueError):
+        for fx in fixtures.available():
+            cov = kernel_coverage(fx.trace_path, batch_size=fx.batch_size)
+            if not cov.get("n_total"):
                 continue
-            if not events:
-                continue
-            roots = _build_raw_forest(events)
-            if not roots:
-                continue
-            worker = worker_of(events)
-            launches = _collect_kernel_launches(events, worker)
-            n_device = sum(1 for e in events
-                           if e.get("cat") in _DEVICE_KERNEL_CATEGORIES)
-            # Precision: no bookkeeping events collected as launches.
-            self.assertEqual(len(launches), n_device, os.path.basename(f))
-            bs = 32 if "decode" in os.path.basename(f) else 1
-            prefill, decode, _, _ = _classify_steps(roots, bs)
-            intervals = [(r.ts, r.end) for r in prefill + decode]
-
-            def in_kept(ts, intervals=intervals):
-                return any(a <= ts < b for a, b in intervals)
-
             checked += 1
-            for ts, _nm, _dur, _api in launches:
-                if not in_kept(ts):
-                    continue
-                node = _deepest_at(roots, ts)
-                # Every in-step launch resolves to a node, and either lands on a
-                # real op leaf or on an enclosing module (synthetic leaf op).
-                self.assertIsNotNone(node, os.path.basename(f))
-
-        if not checked:
-            self.skipTest("no readable MiniMax-M3 trace files present")
+            self.assertEqual(cov["n_total"], cov["n_device_events"], fx.name)
+            self.assertEqual(cov["n_in_step_dropped"], 0, fx.name)
+        self.assertTrue(checked, "no fixture traces available")
 
 
 class TestSymbolicShapeCompleteness(unittest.TestCase):

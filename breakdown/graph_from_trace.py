@@ -982,7 +982,31 @@ def _functional_module_class(name: str) -> tuple[str, str | None] | None:
     return None
 
 
-def _build_raw_forest(events: list[dict]) -> list[_Raw]:
+def _worker_tid(events: list[dict]) -> tuple[Any, bool]:
+    """The thread that ran the model forward, and whether it has module spans.
+
+    When capture-time ``module::`` spans are present the thread carrying them
+    is an unambiguous anchor; otherwise the busiest ``cpu_op`` thread is the
+    best available guess (several threads dispatch ops under tensor
+    parallelism). Returns ``(None, False)`` for a trace with no ``cpu_op``.
+    """
+    span_counts: dict[Any, int] = {}
+    for e in events:
+        if (e.get("ph") == "X" and e.get("cat") == "user_annotation"
+                and str(e.get("name", "")).startswith(MODULE_SPAN_PREFIX)):
+            span_counts[e.get("tid")] = span_counts.get(e.get("tid"), 0) + 1
+    if span_counts:
+        return max(span_counts, key=span_counts.get), True
+    counts: dict[Any, int] = {}
+    for e in events:
+        if e.get("cat") == "cpu_op" and e.get("ph") == "X":
+            counts[e.get("tid")] = counts.get(e.get("tid"), 0) + 1
+    if not counts:
+        return None, False
+    return max(counts, key=counts.get), False
+
+
+def _build_raw_forest(events: list[dict]) -> tuple[list[_Raw], float]:
     """Build the module/op nesting forest for the busiest worker thread.
 
     Two capture modes are supported, chosen automatically:
@@ -998,32 +1022,15 @@ def _build_raw_forest(events: list[dict]) -> list[_Raw]:
       third-party trace) falls back to the class-only ``nn.Module: <Cls>_<idx>``
       ``python_function`` events, so the tree is structurally correct but the
       module labels are class heuristics rather than attribute paths.
-    """
-    cpu_ops = [e for e in events if e.get("cat") == "cpu_op"
-               and e.get("ph") == "X"]
-    if not cpu_ops:
-        return []
 
-    # Choose the worker thread that ran the model forward. When capture-time
-    # module spans are present (research R1), the thread carrying them is an
-    # unambiguous anchor to the forward (R6): the "busiest cpu_op thread" guess
-    # can pick the wrong worker under tensor parallelism, where several threads
-    # dispatch ops. Fall back to the busiest cpu_op thread for legacy traces
-    # without spans.
-    span_tid_counts: dict[Any, int] = {}
-    for e in events:
-        if (e.get("ph") == "X" and e.get("cat") == "user_annotation"
-                and str(e.get("name", "")).startswith(MODULE_SPAN_PREFIX)):
-            span_tid_counts[e.get("tid")] = span_tid_counts.get(e.get("tid"), 0) + 1
-    if span_tid_counts:
-        worker_tid = max(span_tid_counts, key=span_tid_counts.get)
-        named_span_mode = True
-    else:
-        tid_counts: dict[Any, int] = {}
-        for e in cpu_ops:
-            tid_counts[e.get("tid")] = tid_counts.get(e.get("tid"), 0) + 1
-        worker_tid = max(tid_counts, key=tid_counts.get)
-        named_span_mode = False
+    Returns ``(roots, device_us)``: the forest with every device kernel already
+    attributed to a leaf, and the run's **total** collected device time, which
+    the caller reports as ``timing_device_us`` so the conservation invariant
+    (no kernel's time is silently dropped) is checkable from outside.
+    """
+    worker_tid, named_span_mode = _worker_tid(events)
+    if worker_tid is None:
+        return [], 0.0
 
     nodes: list[_Raw] = []
     for e in events:
@@ -1070,7 +1077,7 @@ def _build_raw_forest(events: list[dict]) -> list[_Raw]:
             nodes.append(n)
 
     if not nodes:
-        return []
+        return [], 0.0
 
     # Outer intervals first: earlier start, and for equal starts the longer
     # (containing) interval first.
@@ -1087,7 +1094,13 @@ def _build_raw_forest(events: list[dict]) -> list[_Raw]:
             roots.append(n)
         stack.append(n)
 
-    _attribute_kernels(roots, _collect_kernel_launches(events, worker_tid))
+    launches = _collect_kernel_launches(events, worker_tid)
+    # The run's total device time, before attribution. Keeping it lets the
+    # result state the conservation invariant the reconstruction claims: every
+    # collected kernel's time lands on an op leaf (or, for a launch outside
+    # every module, on the deepest op) - none is silently dropped.
+    device_us = sum(dur for _ts, _n, dur, _f in launches)
+    _attribute_kernels(roots, launches)
     # Surface modules that a fused custom op wraps (see _hoist_modules_under_ops)
     # before rolling up device time so their subtree isn't double-counted.
     roots = _hoist_modules_under_ops(roots)
@@ -1095,7 +1108,7 @@ def _build_raw_forest(events: list[dict]) -> list[_Raw]:
     # shared-experts overlap) into a single node before device time rolls up.
     _coalesce_duplicate_child_modules(roots)
     _compute_sub_dev(roots)
-    return roots
+    return roots, device_us
 
 
 def _hoist_modules_under_ops(roots: list[_Raw]) -> list[_Raw]:
@@ -2477,6 +2490,40 @@ def _forest_has_named_modules(roots: list[_Raw]) -> bool:
     return False
 
 
+def kernel_coverage(trace_path: str, batch_size: int = 1) -> dict[str, float]:
+    """Where every device kernel of a trace lands — a public diagnostic.
+
+    The reconstruction claims two things about device time: that no kernel is
+    collected which is not a real kernel (a host-side ``cudaEventQuery``
+    launches nothing), and that no collected kernel's time is silently dropped.
+    Both are properties of a *trace*, so this exposes them without importing
+    the passes that check them.
+
+    Returns the :func:`_kernel_leaf_coverage` totals plus ``n_device_events``
+    (the trace's real device-kernel count, which ``n_total`` must equal) and
+    ``n_in_step`` / ``in_step_us`` (the launches inside a kept prefill/decode
+    step, which must all land on a leaf).
+    """
+    events = _load_trace(trace_path).get("traceEvents", [])
+    roots, _device_us = _build_raw_forest(events)
+    if not roots:
+        return {"n_total": 0, "n_device_events": 0, "n_in_step": 0}
+    worker_tid, _named = _worker_tid(events)
+    launches = _collect_kernel_launches(events, worker_tid)
+    out = dict(_kernel_leaf_coverage(roots, launches))
+    out["n_device_events"] = sum(
+        1 for e in events if e.get("cat") in _DEVICE_KERNEL_CATEGORIES)
+    prefill, decode, _, _ = _classify_steps(roots, batch_size)
+    spans = [(r.ts, r.end) for r in prefill + decode]
+    in_step = [(ts, dur) for ts, _n, dur, _f in launches
+               if any(a <= ts < b for a, b in spans)]
+    out["n_in_step"] = len(in_step)
+    out["in_step_us"] = sum(d for _t, d in in_step)
+    out["n_in_step_dropped"] = sum(
+        1 for ts, _d in in_step if _deepest_at(roots, ts) is None)
+    return out
+
+
 def build_graph_from_trace(
     trace_path: str,
     summary: dict | None = None,
@@ -2515,7 +2562,7 @@ def build_graph_from_trace(
                 "config": {}, "has_timing": False,
                 "error": "empty trace"}
 
-    roots = _build_raw_forest(events)
+    roots, device_us = _build_raw_forest(events)
     if not roots:
         return {"prefill": None, "decode": None, "symbols": {},
                 "config": {}, "has_timing": False,
@@ -2649,6 +2696,7 @@ def build_graph_from_trace(
         },
         "has_timing": True,
         "has_module_names": _forest_has_named_modules(roots),
+        "timing_device_us": round(device_us, 6),
         "timing_matched": total_ops,
         "timing_total_ops": total_ops,
         "timing_method": "trace_reconstruction",
