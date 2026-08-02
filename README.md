@@ -62,7 +62,9 @@ Then open `http://localhost:8080` in your browser.
 **Features:**
 - Three tabs: **Model Graph** (profile + reconstructed graph), **Bench & Rank**
   (one sweep form and one button: shapes → replay → ranked targets) and
-  **Op Detail** (every measured case of the op clicked in the ranked table)
+  **Optimize Kernels** (manage the Copilot CLI kernel sessions opened with
+  🚀 optimize from the ranked table — one GPU per session). A clicked ranked
+  op expands in place with every case measured for it.
 - The model, quantization and **device selection** are set once on *Model
   Graph* and used by both tabs (*Bench & Rank* has its own Devices field for
   when the replay should run elsewhere; blank there inherits Model Graph's). Devices are the comma-separated indexes of the
@@ -198,8 +200,8 @@ replay cases → replay them (one op per process) → rank the results. They wer
 three buttons that could only ever be pressed in that order, so pressing them
 is not a decision worth exposing. `📥 Report` downloads the run's workbook —
 which carries the run's Shape Matrix as one of its sheets, so there is no
-second download to choose between. A clicked target row opens in the
-**Op Detail** tab. (The shape matrix on its own is still available headless via
+second download to choose between. A clicked target row expands under the
+table with its measured cases. (The shape matrix on its own is still available headless via
 `POST /api/export/shape-matrix`; it needs a profile but no benchmark.)
 
 There is **no "budget / case" knob**: how long a case needs to be measured is a
@@ -253,8 +255,9 @@ ranking is done at
 the **profiled** operating point (the sweep point whose shapes are the ones the
 trace recorded) whenever it was benchmarked, so the numbers are comparable to
 the profile. In the web UI the Ranked-targets table shows one phase at a time
-(Prefill / Decode), sorts on any column header, and opens a clicked op in the
-**Op Detail** tab with every case measured for it. Every run
+(Prefill / Decode), sorts on any column header, and expands a clicked op
+**in place, under the table**, with every case measured for it **in that
+phase** — the toggle moves the panel too, and 🚀 optimize sits at its foot. Every run
 also records the git commit of each component that can move a number (kernel
 repos, vLLM, this tool), and its cases are stored in
 `output/bench/history.sqlite` so regressions are detectable across kernel bumps.
@@ -262,6 +265,60 @@ repos, vLLM, this tool), and its cases are stored in
 Needs only torch + vLLM on the machine (the same prerequisites as profiling);
 each op is replayed in its own process, so a kernel that rejects a shape — or
 takes the device down — costs only its own results.
+
+## Optimize Kernels — open a session on what the ranking picked
+
+The ranking says *which* kernel is worth an optimization session; this stage
+opens it. Hit **🚀 optimize** on a ranked row — or in that op's case tile —
+on **Bench & Rank**: the ranked table *is* the selection, so there is no second
+list to pick from. The op gets a headless [Copilot CLI](https://github.com/github/copilot-cli) session
+driven by the `xpu-kernel-optimizer` skill, briefed entirely from `targets.json`:
+the backend and phase, the measured baseline latency at the profiled shape, the
+roofline it is judged against, the kernel's repo/files/`build_cmd`/`test_cmd`,
+and the exact `bench_cmd` / `profile_cmd` that reproduce and profile it. The
+tool contributes no optimization strategy of its own — the skill owns the
+Profile → Analyze → Optimize → Validate loop, the benchmark owns the numbers.
+
+**One session owns one GPU, exclusively.** A session profiles and benchmarks
+continuously, so two agents sharing a device would measure each other's
+interference. Each session leases a single device for its whole lifetime
+(enforced with `ZE_AFFINITY_MASK` / `CUDA_VISIBLE_DEVICES`, so the agent's
+builds, benchmarks and `unitrace` runs all inherit it) and releases it on exit.
+Open more sessions than you have devices and the surplus waits in a FIFO queue.
+The **Optimize Kernels** tab manages them: each one's state, the GPU it holds,
+its queue position, a stop button, and its streamed log (the log follows the tail only while you are at
+the tail, so scrolling up to read something is not undone by new output).
+
+**What it refuses to launch**, mirroring the benchmark's honesty rules: an op
+that is `at_roofline` (no headroom left), one flagged `check_cost_model` (its
+utilization is above peak, so the headroom cannot be trusted), and one with no
+editable kernel source (ATen, collectives). 🚀 optimize on such an op states
+the reason and asks before spending a GPU on it.
+
+Sessions run from the **workspace root** (the parent of this repo, where the
+kernel repos live — the paths in `bench/kernel_sources.json` are relative to
+it) and write to `output/optimize/<run_id>/<op>/`: `prompt.md` (the brief),
+`command.txt` (the same session as a pasteable shell line), `session.log`,
+`session.json` and the agent's own `summary.md`. Spawning is a convenience, not
+a requirement — if the Copilot CLI is not installed, 🚀 optimize prints the
+brief and the command to run the same session in your own terminal.
+
+Or run it headless:
+
+```bash
+# what the ranking picked, and whether each is worth a session
+python -m breakdown.optimize candidates --run <run_id> --phase prefill
+
+# the brief for one kernel (stdout), without starting anything
+python -m breakdown.optimize prompt --run <run_id> --op _C::rms_norm
+
+# open sessions; --devices bounds how many run at once (one each)
+python -m breakdown.optimize start --run <run_id> --ops _C::rms_norm _moe_C::moe_gather \
+    --devices 0,1 --wait
+
+python -m breakdown.optimize status --run <run_id>
+python -m breakdown.optimize stop   --run <run_id>
+```
 
 ## Comparing Eager vs Compiled
 
@@ -296,6 +353,12 @@ breakdown/
     store.py              output/bench/<run_id>/ layout + run provenance
     history.py            SQLite history + regression detection
     cli.py                python -m breakdown.bench {plan,run,rank,report,case,history,all}
+  optimize/             Ranked target -> Copilot CLI kernel session (one GPU each)
+    prompt.py             Target record -> the brief + the refusal rules
+    session.py            Session record, argv, output/optimize/<run_id>/ layout
+    scheduler.py          The GPU pool: exclusive leases, FIFO queue for the surplus
+    manager.py            Spawn/track/stop the per-kernel copilot processes
+    cli.py                python -m breakdown.optimize {candidates,prompt,start,status,stop}
   module_hooks.py       Capture-time module-name spans (forward hooks; research R1)
   module_naming.py      Fallback name overlay from named_modules() (legacy/upload traces)
   model_info.py         HuggingFace model config fetching & summarization

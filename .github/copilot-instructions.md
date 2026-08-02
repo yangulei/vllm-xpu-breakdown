@@ -73,16 +73,20 @@ XMX), and charges a cache-resident op to the last-level-cache bandwidth **and**
 to DRAM, taking the larger utilization as the headroom (a cache-resident kernel
 already at the DRAM roof is `at_roofline`, not a session). Prefill and decode
 are ranked **separately as well as together** (`targets.json` `by_phase`; the
-UI shows one phase at a time, sortable, with a per-op case drill-down in its own
-**Op Detail** tab), the
+UI shows one phase at a time, sortable, with a per-op case drill-down inline
+under the ranked table), the
 ranking is done at the **profiled** operating point when it was benchmarked
 (`rank.profiled_point`), and the report workbook is the run's single
 deliverable: `Info`, `Summary`, per-phase `Targets`, **one sheet per op**,
 `Coverage`, and the run's own **`Shape Matrix`** (the sweep the cases were built
 from, persisted to `rows.json` at plan time). The UI has three tabs — `Model
 Graph`, `Bench & Rank` (one sweep form + one `▶ Bench & Rank` button that
-chains plan → replay → rank) and `Op Detail`; do **not** re-add a Shape Matrix
-tab or the separate ①/②/③ buttons. Model/quantization/**device** are set on
+chains plan → replay → rank) and `Optimize Kernels` (which **manages** sessions
+— it has no candidate list, because the ranked table is the selection); the
+per-op case table lives **under the ranked table** it is opened from, and each
+ranked row has a `🚀 optimize` button (which replaced `copy bench`) that opens
+a session for that op. Do **not** re-add a Shape
+Matrix tab, a standalone `Op Detail` tab, or the separate ①/②/③ buttons. Model/quantization/**device** are set on
 `Model Graph`; the device selection is comma-separated **indexes of devices
 that exist** (validated by `bench.devices`, applied to workers via
 `ZE_AFFINITY_MASK`/`CUDA_VISIBLE_DEVICES`), the *Kernels* filter is a checkbox list
@@ -92,6 +96,30 @@ timeout) from the profiled shapes. Timing repeats the kernel inside
 a device-event window and subtracts the measured empty-window cost, because that
 floor (~60-90 us on Level Zero) dwarfs a small kernel. The old `breakdown/perf/`
 op-map + xpu-perf/micro_perf shell-out was removed; do not reintroduce it.
+
+**Optimize Kernels (`breakdown/optimize/`, `/api/optimize/*`)** — the
+pipeline's 4th stage: the ranking says *which* kernel is worth a session, this
+opens it. A ranked target becomes a markdown brief (built **only** from
+`targets.json`: baseline latency, roofline, kernel repo/build/test, `bench_cmd`
+/`profile_cmd`) handed to a headless `copilot -p … --allow-all-tools
+--allow-all-paths` session running the `xpu-kernel-optimizer` skill; the skill
+owns the optimization loop, this module contributes no strategy. **One session
+owns one GPU, exclusively** — `scheduler.DevicePool` leases device indexes,
+enforces them with `ZE_AFFINITY_MASK`/`CUDA_VISIBLE_DEVICES` in the child env,
+and queues the surplus FIFO (concurrency is the pool size; there is **no**
+`max_parallel` knob, and every exit path must release its lease). It **refuses**
+`at_roofline` / `check_cost_model` / no-editable-source ops with the reason
+instead of burning a GPU. Sessions run from the workspace root (parent of this
+repo) and write `output/optimize/<run_id>/<op>/{prompt.md,command.txt,
+session.log,session.json,summary.md}`; `command.txt` is the pasteable fallback
+when the CLI is absent or the server should not hold an agent. A session's
+artifact root is **pinned at creation** (`OptimizeSession.root`) because the
+reaper thread writes state after the agent exits; a session restored from
+`index.json` is downgraded to `stopped` (its process died with the previous
+server); no endpoint returns `argv` (it embeds the whole brief); and the tab
+manages the **selected** run's sessions, adopting the run that actually has
+sessions when nothing is selected. Headless:
+`python -m breakdown.optimize {candidates,prompt,start,status,stop}`.
 
 **Backend classification priority:** ccl (collective-comm: `c10d::`/`ccl::` or all_reduce/all_gather/reduce_scatter/all_to_all) > vllm-xpu-kernels (exact match from registry) > flashinfer (name contains `flashinfer`) > triton (name patterns) > torch-xpu-ops (aten:: on XPU) > cpu > framework
 
@@ -121,6 +149,14 @@ The model graph is reconstructed from the trace, so no static builder is needed:
    `resolve.PYTHON_API` entry if it is launched straight from Python, and an
    entry in `breakdown/bench/kernel_sources.json` if it has editable source
 
+## Adding an Optimization Session Stage Change
+
+The Optimize tab consumes `targets.json`; it never writes it. Adding a new fact
+to the brief means adding it to `breakdown/optimize/prompt.py` (and a test in
+`tests/test_optimize_prompt.py`), not to the ranker. Changing how sessions are
+scheduled means `breakdown/optimize/scheduler.py` — keep the one-GPU-per-session
+invariant and the FIFO queue.
+
 ## API Endpoints
 
 | Endpoint | Method | Description |
@@ -142,6 +178,12 @@ The model graph is reconstructed from the trace, so no static builder is needed:
 | `/api/bench/targets` | GET | Ranked optimization targets (`targets.json`) |
 | `/api/bench/report` | GET | Download a run's report workbook |
 | `/api/bench/history` | GET | Benchmark history / two-run regression diff |
+| `/api/optimize/candidates` | GET | Ranked ops + whether each is worth a kernel session |
+| `/api/optimize/prompt` | POST | The brief + pasteable command, spawning nothing |
+| `/api/optimize/start` | POST | One Copilot CLI session per selected kernel (one GPU each) |
+| `/api/optimize/status` | GET | Sessions: state, leased device(s), queue position |
+| `/api/optimize/log` | GET | A session's log from `?offset=` |
+| `/api/optimize/stop` | POST | Stop a session / a run's sessions |
 
 
 <!-- headroom:rtk-instructions -->

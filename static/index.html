@@ -220,7 +220,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
   <div class="tab-bar">
     <button class="tab-btn active" id="tab-btn-graph" onclick="switchTab('graph')">Model Graph</button>
     <button class="tab-btn" id="tab-btn-perf" onclick="switchTab('perf')">Bench &amp; Rank</button>
-    <button class="tab-btn" id="tab-btn-opdetail" onclick="switchTab('opdetail')">Op Detail</button>
+    <button class="tab-btn" id="tab-btn-optimize" onclick="switchTab('optimize')">Optimize Kernels</button>
   </div>
 
   <!-- Tab: Model Graph (profiling) -->
@@ -491,20 +491,46 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
         <table id="perf-targets" class="perf-table" style="width:100%;border-collapse:collapse;font-size:12px"></table>
       </div>
     </div>
+
+    <!-- The per-op cases are the evidence behind a ranked row, so they stay on
+         this tab, right under the table they were opened from. -->
+    <div id="perf-op-detail"></div>
   </div>
 
-  <!-- Tab: Op Detail (the selected target's cases — the workbook's op sheet, live) -->
-  <div id="tab-opdetail" class="tab-content hidden">
-    <div id="perf-op-detail">
-      <div class="card">
-        <h2>🔍 Op Detail</h2>
-        <p style="font-size:12px;color:#666;margin:0">
-          Click an op in the <b>Bench &amp; Rank</b> ranked table to inspect every case
-          measured for it, across both phases and every swept shape — the same rows as
-          that op's sheet in the downloaded report.
-        </p>
+  <!-- Tab: Optimize Kernels (the pipeline's 4th stage: hand a ranked target
+       to a Copilot CLI kernel session; one session owns one GPU) -->
+  <div id="tab-optimize" class="tab-content hidden">
+    <div class="card">
+      <h2>🚀 Optimize Kernels</h2>
+      <p style="font-size:12px;color:#666;margin:0 0 10px">
+        The optimization sessions opened from <b>Bench &amp; Rank</b> — hit
+        <b>🚀 optimize</b> on a ranked op there and it gets a headless
+        <b>Copilot CLI</b> session driven by the <code>xpu-kernel-optimizer</code>
+        skill, briefed from this run's ranking: the measured baseline, the
+        roofline, and the kernel's build/test/bench commands.
+        <b>Each session owns one GPU exclusively</b>, so more sessions than
+        devices simply means the surplus waits in the queue.
+      </p>
+      <div class="controls-row" style="gap:12px;align-items:flex-end;flex-wrap:wrap">
+        <div class="control-group">
+          <label>Workspace root</label>
+          <input type="text" id="opt-cwd" style="width:280px"
+                 title="Working directory of each session — the parent of this repo, where the kernel repos live">
+        </div>
+        <div class="control-group">
+          <label>Devices</label>
+          <input type="text" id="opt-devices" style="width:120px" placeholder="all"
+                 title="Comma-separated device indexes. One session runs per device.">
+        </div>
+        <button class="btn" onclick="optimizeStop()">⏹ Stop All</button>
+        <span id="opt-status" style="font-size:12px;color:#666"></span>
       </div>
+      <div id="opt-run" style="margin-top:10px;font-size:12px;color:#666"></div>
+      <div id="opt-pool" style="margin-top:4px;font-size:12px;color:#666"></div>
     </div>
+
+    <div id="opt-commands"></div>
+    <div id="opt-sessions"></div>
   </div>
 </div>
 
@@ -1306,7 +1332,7 @@ function downloadTrace(phase) {
 }
 
 // ---- Tabs ----
-const TABS = ['graph', 'perf', 'opdetail'];
+const TABS = ['graph', 'perf', 'optimize'];
 function switchTab(name) {
   TABS.forEach(t => {
     const pane = document.getElementById('tab-' + t);
@@ -1319,6 +1345,7 @@ function switchTab(name) {
     loadBenchOps();
     syncBenchDevicePlaceholder();   // it mirrors the Model Graph selection
   }
+  if (name === 'optimize') optimizeRefresh();
 }
 
 
@@ -1331,14 +1358,15 @@ let PERF_TARGET_PHASE = 'prefill';
 let PERF_SORT = null;
 let PERF_OPEN_OP = null;
 
-// The Op Detail tab lives beside Model Graph / Bench & Rank, so closing
-// a detail view restores this placeholder rather than blanking the tab.
+// The per-op case table lives under the ranked table it is opened from: an
+// op's cases are the evidence for the row, so closing one restores this note
+// rather than blanking the panel.
 const PERF_OP_DETAIL_PLACEHOLDER = `<div class="card">
-  <h2>🔍 Op Detail</h2>
+  <h3 style="margin:0 0 6px">🔍 Op detail</h3>
   <p style="font-size:12px;color:#666;margin:0">
-    Click an op in the <b>Bench &amp; Rank</b> ranked table to inspect every case
-    measured for it, across both phases and every swept shape — the same rows as
-    that op's sheet in the downloaded report.
+    Click an op in the ranked table above to inspect every case measured for it,
+    across both phases and every swept shape — the same rows as that op's sheet
+    in the downloaded report — and to open a kernel session for it.
   </p>
 </div>`;
 
@@ -1599,8 +1627,18 @@ function setTargetPhase(el) {
     .forEach(b => b.classList.remove('active'));
   el.classList.add('active');
   PERF_TARGET_PHASE = el.dataset.perfPhase;
-  perfClearOpDetail();
   if (PERF_TARGETS_DOC) renderPerfTargets(PERF_TARGETS_DOC);
+  // The open op's cases follow the toggle too, rather than closing: the
+  // question "what does this kernel do in the other phase" is exactly why the
+  // toggle is there.
+  if (PERF_OPEN_OP) showOpDetail(PERF_OPEN_OP);
+  // A session is briefed with the phase's own ranked record (a GEMM at prefill
+  // is a GEMV at decode), so the Optimize tab follows the same toggle — but
+  // only when it is on screen: 🚀 optimize refreshes before it starts anything,
+  // so a hidden tab has nothing to keep current.
+  if (!document.getElementById('tab-optimize').classList.contains('hidden')) {
+    optimizeRefresh();
+  }
 }
 
 // The ranked-targets columns. `get` extracts the sort key from a target.
@@ -1695,7 +1733,6 @@ function renderPerfTargets(doc) {
   const body = rows.map(t => {
     const [color, hint] = PERF_ACTION_STYLE[t.action] || ['#333', ''];
     const shape = perfTopShape(t);
-    const cmd = shape ? shape.bench_cmd.replace(/"/g, '&quot;') : '';
     // The profile's own device time for the same op+shape is the run's
     // built-in fidelity check: a replay far off it is not a valid baseline.
     const ratio = shape && shape.replay_vs_traced != null
@@ -1731,28 +1768,37 @@ function renderPerfTargets(doc) {
       <td style="text-align:right">${t.savings_us.total.toFixed(1)}</td>
       <td><span title="${hint}" style="color:${color};font-weight:600">${t.action}</span></td>
       <td>${t.kernel && t.kernel.kernel_dir ? t.kernel.kernel_dir : '—'}
-        ${cmd ? `<button class="btn" style="font-size:10px;padding:2px 6px;margin-left:6px"
-           onclick="event.stopPropagation();navigator.clipboard.writeText(&quot;${cmd}&quot;)">copy bench</button>` : ''}</td>
+        <button class="btn" style="font-size:10px;padding:2px 6px;margin-left:6px"
+           title="open a Copilot CLI kernel session for this op on a GPU of its own"
+           onclick="event.stopPropagation();optimizeOpNow('${perfEsc(t.op)}')">🚀 optimize</button></td>
     </tr>`;
   }).join('');
   document.getElementById('perf-targets').innerHTML = head + body;
-  if (PERF_OPEN_OP && !targets.some(t => t.op === PERF_OPEN_OP)) {
-    perfClearOpDetail();
-  }
+  // An op ranked in one phase but not the other keeps its panel open — the
+  // panel says so and still lists that phase's cases. Only an op the run does
+  // not know at all (a different run was loaded) closes it.
+  const known = Object.values(doc.by_phase || {})
+    .some(s => (s.targets || []).some(t => t.op === PERF_OPEN_OP))
+    || (doc.targets || []).some(t => t.op === PERF_OPEN_OP);
+  if (PERF_OPEN_OP && !known) perfClearOpDetail();
 }
 
-// ---- Per-op detail: the exported workbook's op sheet, in its own tab ----
+// ---- Per-op detail: the exported workbook's op sheet, under the ranked table ----
 function perfToggleOpDetail(op) {
+  switchTab('perf');
+  // This is also reachable from a session card, which can outlive the ranked
+  // table (sessions are restored from disk on a fresh page), so the doc may
+  // not be loaded yet — the cases still are.
   if (PERF_OPEN_OP === op) {
     perfClearOpDetail();
-    renderPerfTargets(PERF_TARGETS_DOC);
-    switchTab('perf');
+    if (PERF_TARGETS_DOC) renderPerfTargets(PERF_TARGETS_DOC);
     return;
   }
   PERF_OPEN_OP = op;
-  renderPerfTargets(PERF_TARGETS_DOC);
-  switchTab('opdetail');
+  if (PERF_TARGETS_DOC) renderPerfTargets(PERF_TARGETS_DOC);
   showOpDetail(op);
+  const box = document.getElementById('perf-op-detail');
+  if (box) box.scrollIntoView({behavior: 'smooth', block: 'start'});
 }
 
 async function showOpDetail(op) {
@@ -1773,26 +1819,28 @@ async function showOpDetail(op) {
 
 function renderOpDetail(op, data) {
   const box = document.getElementById('perf-op-detail');
-  const section = (PERF_TARGETS_DOC.by_phase || {})[PERF_TARGET_PHASE] || null;
+  // Reachable from a session card on a page that never loaded the ranking, so
+  // the cases render with no target context rather than throwing.
+  const section = ((PERF_TARGETS_DOC || {}).by_phase || {})[PERF_TARGET_PHASE] || null;
   const target = section
     ? (section.targets || []).find(t => t.op === op) : null;
   const pt = (section && section.operating_point) || null;
-  // Same ordering as the workbook's per-op sheet: the phase in view first,
-  // heaviest case first — a case's weight is what puts the op on this list.
   const atPoint = r => pt && r.phase === PERF_TARGET_PHASE
     && r.seq_len === pt.seq_len && r.ctx_len === pt.ctx_len
     && r.batch_size === pt.batch_size;
-  const recs = (data.records || []).slice().sort((a, b) => {
-    const pa = a.phase === PERF_TARGET_PHASE ? 0 : 1;
-    const pb = b.phase === PERF_TARGET_PHASE ? 0 : 1;
-    if (pa !== pb) return pa - pb;
+  // The table follows the Prefill/Decode toggle, like the ranked table above
+  // it: the same kernel is a compute-bound GEMM at prefill and a memory-bound
+  // GEMV at decode, so mixing both phases' cases in one list compares numbers
+  // that are not comparable.
+  const all = data.records || [];
+  const other = all.length - all.filter(r => r.phase === PERF_TARGET_PHASE).length;
+  const recs = all.filter(r => r.phase === PERF_TARGET_PHASE).sort((a, b) => {
     // the ranked operating point first — it is the case the row was scored at
     const oa = atPoint(a) ? 0 : 1, ob = atPoint(b) ? 0 : 1;
     if (oa !== ob) return oa - ob;
     return (b.weighted_us || 0) - (a.weighted_us || 0);
   });
   const cols = [
-    ['phase', 'phase', r => r.phase],
     ['point', 'seq/ctx/bs', r => `${r.seq_len}/${r.ctx_len}/${r.batch_size}`],
     ['shape', 'shape', r => r.shape || '—'],
     ['status', 'status', r => r.status || '—'],
@@ -1821,12 +1869,16 @@ function renderOpDetail(op, data) {
   }).join('');
   const errs = recs.filter(r => r.status !== 'ok' && (r.error || r.detail));
   const rf = target ? target.roofline : null;
-  box.innerHTML = `<div class="card">
-    <div style="display:flex;justify-content:space-between;align-items:center">
-      <h3 style="margin:0">${perfEsc(op)}</h3>
+  const actions = `<div style="display:flex;gap:6px;margin-top:10px">
+      <button class="btn btn-primary" style="font-size:11px;padding:3px 8px"
+        title="open a Copilot CLI kernel session for this op — it takes one GPU exclusively"
+        onclick="optimizeOpNow('${perfEsc(op)}')">🚀 Optimize this kernel</button>
       <button class="btn" style="font-size:11px;padding:3px 8px"
         onclick="perfToggleOpDetail('${perfEsc(op)}')">← back to targets</button>
-    </div>
+    </div>`;
+  box.innerHTML = `<div class="card">
+    <h3 style="margin:0">${perfEsc(op)}
+      <span style="font-size:12px;font-weight:400;color:#666">— ${PERF_TARGET_PHASE} cases</span></h3>
     <div style="font-size:12px;color:#666;margin:6px 0 10px">
       ${target ? `backend <b>${perfEsc(target.backend || '—')}</b> · `
         + `${PERF_TARGET_PHASE} e2e ${target.e2e_us.toFixed(1)} µs `
@@ -1835,28 +1887,353 @@ function renderOpDetail(op, data) {
         + ((rf.unit !== 'DRAM' && rf.util_dram)
             ? ` (DRAM ${(rf.util_dram * 100).toFixed(0)}%)` : '')
         + ` · <b>${target.action}</b>` : 'not ranked in this phase'}
-      · ${recs.length} case${recs.length === 1 ? '' : 's'} measured in this run
+      · ${recs.length} ${PERF_TARGET_PHASE} case${recs.length === 1 ? '' : 's'} measured in this run
+      ${other ? `· <span title="the other phase's cases are on the other side of the Prefill/Decode toggle — a kernel's phases are not comparable">${other} more in the other phase</span>` : ''}
       ${pt ? `· highlighted rows are the ${PERF_TARGET_PHASE} operating point `
         + `(seq=${pt.seq_len} ctx=${pt.ctx_len} bs=${pt.batch_size})` : ''}
     </div>
     ${(target && (target.flags || []).length)
       ? `<div style="font-size:12px;color:#e67e22;margin-bottom:8px">⚠ `
         + target.flags.map(perfEsc).join('<br>⚠ ') + '</div>' : ''}
-    <div style="overflow:auto">
+    ${recs.length ? `<div style="overflow:auto">
       <table class="perf-table" style="width:100%;border-collapse:collapse;font-size:11px">
         ${head}${body}</table>
-    </div>
+    </div>` : `<div style="font-size:12px;color:#c0392b">this op has no measured
+      ${PERF_TARGET_PHASE} case in this run — switch the phase toggle above.</div>`}
     ${errs.length ? `<div style="font-size:11px;color:#c0392b;margin-top:8px">`
       + errs.map(r => perfEsc(`${r.status}: ${r.error || r.detail}`)).join('<br>')
       + '</div>' : ''}
-    ${target && (target.top_shapes || []).length
+    ${target && (target.top_shapes || []).some(s => s.bench_cmd)
       ? `<div style="font-size:11px;color:#666;margin-top:8px">bench this shape:
-         <code>${perfEsc(target.top_shapes[0].bench_cmd)}</code></div>` : ''}
+         <code>${perfEsc(target.top_shapes.find(s => s.bench_cmd).bench_cmd)}</code></div>` : ''}
+    ${actions}
   </div>`;
 }
 
 function fmtNum(v, digits) {
   return (v == null || v === '') ? '—' : Number(v).toFixed(digits);
+}
+
+// ---- Optimize Kernels: hand a ranked target to a Copilot CLI session ----
+// The ranking says which kernel is worth a session; Bench & Rank's 🚀 optimize
+// button opens it, and this tab manages the sessions. One session owns one GPU
+// exclusively, so more sessions than devices queues the surplus — the queue
+// position is shown, not hidden.
+let OPT_CANDIDATES = [];
+let OPT_SESSIONS = [];
+let OPT_POOL = null;
+let OPT_POLL = null;
+let OPT_OPEN_LOG = null;
+// Whether the Copilot CLI was found. Without it a session cannot be spawned,
+// so 🚀 optimize falls back to printing the command to run yourself.
+let OPT_COPILOT = null;
+// How many devices are present — i.e. how many sessions can run at once.
+let OPT_DEVICE_COUNT = 0;
+const OPT_LOG_OFFSET = {};
+const OPT_LOG_BUSY = {};
+const OPT_LOG_TEXT = {};
+// Whether the log pane is pinned to the tail. It stays pinned until the reader
+// scrolls up, so a poll never yanks them away from what they are reading.
+const OPT_LOG_STICK = {};
+// Status polls and a start can be in flight at the same time (starting a
+// session refreshes the candidates first, which polls). A poll issued *before*
+// the session existed used to land *after* it and overwrite the session list
+// with the empty one — and, seeing nothing active, stop the polling that would
+// have corrected it. Every state update takes a ticket; a stale reply is dropped.
+let OPT_STATE_SEQ = 0;
+
+function optStatus(msg) {
+  document.getElementById('opt-status').textContent = msg || '';
+}
+
+// The run whose sessions this tab manages. Opening it without ever visiting
+// Bench & Rank leaves the run selector empty, so the candidates endpoint's
+// default (the latest run) is adopted — otherwise the tab claims a run with
+// live sessions has none.
+let OPT_RUN_ID = '';
+function optRunId() {
+  const sel = document.getElementById('perf-run-select');
+  return (sel && sel.value) || PERF_RUN_ID || OPT_RUN_ID || '';
+}
+
+// Reads the ranking for this run: it fills in where sessions run (workspace
+// root, devices, whether the CLI exists) and carries each op's launchability,
+// which is what 🚀 optimize warns about before spending a GPU.
+// Switching to the tab and hitting 🚀 optimize both refresh, and the button
+// does both in a row — one in-flight refresh is shared rather than issuing the
+// same two requests twice and racing their replies.
+let OPT_REFRESH = null;
+function optimizeRefresh() {
+  if (OPT_REFRESH) return OPT_REFRESH;
+  OPT_REFRESH = _optimizeRefresh().finally(() => { OPT_REFRESH = null; });
+  return OPT_REFRESH;
+}
+
+async function _optimizeRefresh() {
+  const runId = optRunId();
+  const box = document.getElementById('opt-pool');
+  try {
+    const url = '/api/optimize/candidates?phase=' + encodeURIComponent(PERF_TARGET_PHASE)
+      + (runId ? '&run_id=' + encodeURIComponent(runId) : '');
+    const data = await (await fetch(url)).json();
+    OPT_RUN_ID = data.run_id || OPT_RUN_ID;
+    // Where sessions run does not depend on the ranking, so the form is filled
+    // in even when this run has no targets yet.
+    const cwd = document.getElementById('opt-cwd');
+    if (!cwd.value) cwd.value = data.workspace_root || '';
+    const dev = document.getElementById('opt-devices');
+    OPT_DEVICE_COUNT = (data.devices && data.devices.count) || 0;
+    dev.placeholder = OPT_DEVICE_COUNT ? `all (${OPT_DEVICE_COUNT})` : 'none detected';
+    OPT_COPILOT = data.copilot || null;
+    OPT_CANDIDATES = data.ok ? (data.candidates || []) : [];
+    const ready = OPT_CANDIDATES.filter(c => c.launchable).length;
+    box.innerHTML = (OPT_COPILOT
+        ? `<code>${perfEsc(OPT_COPILOT)}</code> with the <code>${perfEsc(data.skill || '')}</code> skill`
+        : '<span style="color:#c0392b">the Copilot CLI was not found on PATH — '
+          + '🚀 optimize will print the command to run yourself instead</span>')
+      + ` · ${OPT_DEVICE_COUNT} device${OPT_DEVICE_COUNT === 1 ? '' : 's'} present, `
+      + `so ${OPT_DEVICE_COUNT || 0} session${OPT_DEVICE_COUNT === 1 ? '' : 's'} can run at once`
+      + (data.ok
+          ? ` · ${ready} of ${OPT_CANDIDATES.length} ranked ${PERF_TARGET_PHASE} ops are worth one`
+          : ` · <span style="color:#c0392b">${perfEsc(data.error)}</span>`);
+  } catch (e) {
+    box.innerHTML = `<span style="color:#c0392b">${perfEsc(String(e))}</span>`;
+  }
+  renderOptSessions();   // the empty-state note, before the first poll answers
+  await optimizePollStatus();
+}
+
+// Open a session for a single op straight from the ranked table / op detail:
+// the ranking already said this kernel is worth a GPU, so there is nothing to
+// select — the row is the selection.
+async function optimizeOpNow(op) {
+  switchTab('optimize');
+  await optimizeRefresh();
+  const cand = OPT_CANDIDATES.find(c => c.op === op);
+  if (cand && !cand.launchable
+      && !confirm(`${op}: ${cand.reason}\n\nOpen a session anyway?`)) return;
+  if (!OPT_COPILOT) { await optimizeShowCommand(op); return; }
+  await optimizeStartOps([op]);
+}
+
+async function optimizeStartOps(ops) {
+  optStatus('starting…');
+  document.getElementById('opt-commands').innerHTML = '';
+  const resp = await fetch('/api/optimize/start', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      run_id: optRunId(), phase: PERF_TARGET_PHASE, ops: ops,
+      cwd: document.getElementById('opt-cwd').value.trim() || null,
+      device_ids: document.getElementById('opt-devices').value.trim(),
+    }),
+  });
+  const data = await resp.json();
+  if (!data.ok) { optStatus(''); alert(data.error || 'could not start'); return; }
+  OPT_STATE_SEQ++;
+  OPT_SESSIONS = data.sessions || [];
+  OPT_POOL = data.pool || null;
+  const running = OPT_SESSIONS.filter(s => s.state === 'running').length;
+  const queued = OPT_SESSIONS.filter(s => s.state === 'pending').length;
+  optStatus(`${running} running${queued ? `, ${queued} waiting for a GPU` : ''}`);
+  renderOptSessions();
+  optimizeSchedulePoll();
+}
+
+async function optimizeStop(op) {
+  await fetch('/api/optimize/stop', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({run_id: optRunId(), op: op || null}),
+  });
+  optimizePollStatus();
+}
+
+// Spawning is a convenience, not a requirement: when the CLI is missing the
+// same session is handed over as a pasteable command plus its brief.
+async function optimizeShowCommand(op) {
+  const resp = await fetch('/api/optimize/prompt', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      run_id: optRunId(), phase: PERF_TARGET_PHASE, ops: [op],
+      cwd: document.getElementById('opt-cwd').value.trim() || null,
+      device_ids: document.getElementById('opt-devices').value.trim(),
+    }),
+  });
+  const data = await resp.json();
+  if (!data.ok) { alert(data.error || 'could not build the command'); return; }
+  const box = document.getElementById('opt-commands');
+  box.innerHTML = (data.sessions || []).map(s => `<div class="card">
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <h3 style="margin:0">${perfEsc(s.op)}</h3>
+      <button class="btn" style="font-size:11px;padding:3px 8px"
+        onclick="navigator.clipboard.writeText(document.getElementById('cmd-${perfEsc(s.op)}').textContent)">
+        📋 copy command</button>
+    </div>
+    <pre id="cmd-${perfEsc(s.op)}" style="font-size:11px;white-space:pre-wrap;background:#f7f7f7;padding:8px;border-radius:4px">${perfEsc(s.command)}</pre>
+    <details><summary style="font-size:12px;cursor:pointer">the brief this session starts from</summary>
+      <pre style="font-size:11px;white-space:pre-wrap;max-height:340px;overflow:auto">${perfEsc(s.prompt)}</pre>
+    </details>
+  </div>`).join('') || '<div class="card">nothing to show</div>';
+}
+
+function optimizeSchedulePoll() {
+  if (OPT_POLL) return;
+  OPT_POLL = setInterval(optimizePollStatus, 3000);
+}
+
+async function optimizePollStatus() {
+  // Without an explicit run (the tab opened before Bench & Rank was), ask for
+  // every session this server holds and adopt the run they belong to. The
+  // latest *benchmark* run is not necessarily the one with sessions open, so
+  // guessing it would hide a live session behind an empty list.
+  const explicit = (document.getElementById('perf-run-select') || {}).value
+    || PERF_RUN_ID || '';
+  const seq = ++OPT_STATE_SEQ;
+  try {
+    const data = await (await fetch(
+      '/api/optimize/status' + (explicit
+        ? '?run_id=' + encodeURIComponent(explicit) : ''))).json();
+    if (!data.ok) return;
+    if (!explicit && (data.sessions || []).length) {
+      OPT_RUN_ID = data.sessions[0].run_id || OPT_RUN_ID;
+    }
+    // A start (or a newer poll) that landed while this one was in flight knows
+    // more than this reply does.
+    if (seq !== OPT_STATE_SEQ) return;
+    OPT_SESSIONS = data.sessions || [];
+    OPT_POOL = data.pool || null;
+    renderOptSessions();
+    const running = OPT_SESSIONS.filter(s => s.state === 'running').length;
+    const queued = OPT_SESSIONS.filter(s => s.state === 'pending').length;
+    optStatus(data.active
+      ? `${running} running${queued ? `, ${queued} waiting for a GPU` : ''}`
+      : (OPT_SESSIONS.length ? 'all sessions finished' : ''));
+    if (data.active) optimizeSchedulePoll();
+    else if (OPT_POLL) { clearInterval(OPT_POLL); OPT_POLL = null; }
+  } catch (e) { /* transient poll errors are not worth surfacing */ }
+}
+
+const OPT_STATE_STYLE = {
+  pending: ['#7f8c8d', 'queued — waiting for a GPU to free up'],
+  running: ['#2980b9', 'running on its own GPU'],
+  done: ['#27ae60', 'the agent finished'],
+  failed: ['#c0392b', 'the agent exited non-zero'],
+  stopped: ['#e67e22', 'stopped from here'],
+};
+
+function renderOptSessions() {
+  const box = document.getElementById('opt-sessions');
+  // Which run these sessions belong to - the tab can be opened before a run is
+  // selected, in which case it adopts the one that actually has sessions.
+  document.getElementById('opt-run').innerHTML = OPT_RUN_ID
+    ? `sessions of run <code>${perfEsc(OPT_RUN_ID)}</code>` : '';
+  if (!OPT_SESSIONS.length) {
+    box.innerHTML = `<div class="card" style="font-size:12px;color:#666">
+      No optimization session has been opened for this run yet — hit
+      <b>🚀 optimize</b> on a ranked op in <b>Bench &amp; Rank</b>, and it shows up
+      here with the GPU it holds and its live log.</div>`;
+    return;
+  }
+  // A poll re-renders this list, which would rebuild the open log pane and drop
+  // the reader back to the top. Carry its scroll position across the re-render.
+  const openPre = OPT_OPEN_LOG ? document.getElementById('opt-log-' + OPT_OPEN_LOG) : null;
+  let keepScroll = null;
+  if (openPre) {
+    keepScroll = openPre.scrollTop;
+    OPT_LOG_STICK[OPT_OPEN_LOG] = optLogAtBottom(openPre);
+  }
+  const free = OPT_POOL ? (OPT_POOL.free || []).length : null;
+  const total = OPT_POOL ? (OPT_POOL.ids || []).length : null;
+  box.innerHTML = OPT_SESSIONS.map(s => {
+    const [color, hint] = OPT_STATE_STYLE[s.state] || ['#333', ''];
+    const gpu = (s.device_ids || []).length
+      ? `${s.device_kind || 'gpu'} ${s.device_ids.join(',')}`
+      : (s.state === 'pending'
+          ? `waiting for a GPU (queue #${s.queue_position || '?'}` +
+            (total != null ? `, ${total - free} of ${total} busy)` : ')')
+          : '—');
+    const open = OPT_OPEN_LOG === s.op;
+    return `<div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px">
+        <h3 style="margin:0;font-size:14px">${perfEsc(s.op)}</h3>
+        <div style="font-size:12px">
+          <span title="${hint}" style="color:${color};font-weight:600">${s.state}</span>
+          · ${perfEsc(gpu)}
+          ${s.exit_code != null ? `· exit ${s.exit_code}` : ''}
+          ${s.pid ? `· pid ${s.pid}` : ''}
+        </div>
+      </div>
+      ${s.error ? `<div style="font-size:11px;color:#c0392b">${perfEsc(s.error)}</div>` : ''}
+      <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">
+        <button class="btn" style="font-size:11px;padding:3px 8px"
+          onclick="optimizeToggleLog('${perfEsc(s.op)}')">${open ? 'hide log' : '📄 log'}</button>
+        <button class="btn" style="font-size:11px;padding:3px 8px"
+          onclick="navigator.clipboard.writeText(${JSON.stringify(s.command || '')})">📋 copy command</button>
+        <button class="btn" style="font-size:11px;padding:3px 8px"
+          onclick="perfToggleOpDetail('${perfEsc(s.op)}')">cases</button>
+        ${(s.state === 'running' || s.state === 'pending')
+          ? `<button class="btn" style="font-size:11px;padding:3px 8px"
+               onclick="optimizeStop('${perfEsc(s.op)}')">⏹ stop</button>` : ''}
+      </div>
+      ${open ? `<pre id="opt-log-${perfEsc(s.op)}" onscroll="optLogScrolled('${perfEsc(s.op)}',this)"
+        style="font-size:11px;white-space:pre-wrap;max-height:320px;overflow:auto;
+               background:#111;color:#ddd;padding:8px;border-radius:4px;margin-top:8px"
+        >${perfEsc(OPT_LOG_TEXT[s.op] || '')}</pre>` : ''}
+    </div>`;
+  }).join('');
+  if (OPT_OPEN_LOG) {
+    const pre = document.getElementById('opt-log-' + OPT_OPEN_LOG);
+    if (pre) {
+      pre.scrollTop = OPT_LOG_STICK[OPT_OPEN_LOG] === false && keepScroll != null
+        ? keepScroll : pre.scrollHeight;
+    }
+    optimizeTailLog(OPT_OPEN_LOG);
+  }
+}
+
+// "At the bottom" is a few pixels of slack, because a wrapped last line and
+// fractional scroll heights rarely land exactly on it.
+function optLogAtBottom(pre) {
+  return pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24;
+}
+
+function optLogScrolled(op, pre) {
+  OPT_LOG_STICK[op] = optLogAtBottom(pre);
+}
+
+function optimizeToggleLog(op) {
+  if (OPT_OPEN_LOG === op) { OPT_OPEN_LOG = null; renderOptSessions(); return; }
+  OPT_OPEN_LOG = op;
+  OPT_LOG_OFFSET[op] = 0;
+  OPT_LOG_TEXT[op] = '';
+  OPT_LOG_STICK[op] = true;
+  renderOptSessions();
+}
+
+// The log is buffered client-side: the panel is re-rendered on every status
+// poll, so re-fetching the whole file each time would grow quadratically.
+async function optimizeTailLog(op) {
+  const pre = document.getElementById('opt-log-' + op);
+  // One read at a time: a render and a status poll can both ask to tail, and
+  // two reads from the same offset would append the same bytes twice.
+  if (!pre || OPT_LOG_BUSY[op]) return;
+  OPT_LOG_BUSY[op] = true;
+  const offset = OPT_LOG_OFFSET[op] || 0;
+  const url = `/api/optimize/log?run_id=${encodeURIComponent(optRunId())}`
+    + `&op=${encodeURIComponent(op)}&offset=${offset}`;
+  try {
+    const data = await (await fetch(url)).json();
+    if (!data.ok) return;
+    if (data.offset < offset) { OPT_LOG_TEXT[op] = ''; pre.textContent = ''; }
+    OPT_LOG_OFFSET[op] = data.offset;
+    if (data.text) {
+      OPT_LOG_TEXT[op] = (OPT_LOG_TEXT[op] || '') + data.text;
+      const stick = OPT_LOG_STICK[op] !== false || optLogAtBottom(pre);
+      pre.textContent += data.text;
+      // Only follow the tail when the reader is already there; if they scrolled
+      // up to read something, new output must not drag them away from it.
+      if (stick) { pre.scrollTop = pre.scrollHeight; OPT_LOG_STICK[op] = true; }
+    }
+  } catch (e) { /* ignore */ } finally { OPT_LOG_BUSY[op] = false; }
 }
 
 // ---- Shape sweep ----

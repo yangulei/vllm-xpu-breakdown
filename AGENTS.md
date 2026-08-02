@@ -54,6 +54,12 @@ breakdown/
     history.py            — SQLite history + regression detection
     kernel_sources.json   — op/backend → repo, files, build and test commands
     cli.py                — python -m breakdown.bench {plan,run,rank,report,case,history,all}
+  optimize/               — Ranked target → Copilot CLI kernel session (one GPU each)
+    prompt.py             — Target record → the brief; the refusal rules
+    session.py            — Session record, argv, output/optimize/<run_id>/ layout
+    scheduler.py          — The GPU pool: exclusive leases + FIFO queue
+    manager.py            — Spawn/track/stop the per-kernel copilot processes
+    cli.py                — python -m breakdown.optimize {candidates,prompt,start,status,stop}
   module_hooks.py         — Capture-time module-name spans (forward hooks)
   module_naming.py        — Fallback: recover names from named_modules() overlay
   model_info.py           — HuggingFace config fetcher/summarizer + min_profile_layers
@@ -78,6 +84,9 @@ tests/
   test_bench_rank.py            — Bench: ranking, timing plan, budgets, history (no GPU)
   test_bench_api.py             — /api/bench/* endpoints (no GPU)
   test_bench_replay.py          — Bench: end-to-end replay on a real device (GPU)
+  test_optimize_prompt.py       — Optimize: the brief + the refusal rules (no GPU)
+  test_optimize_scheduler.py    — Optimize: exclusive GPU leases, FIFO queue (no GPU)
+  test_optimize_api.py          — /api/optimize/* endpoints (no GPU, fake agent)
   test_profile_reduced_layers.py
   test_real_profile.py          — Integration test (requires GPU)
 ```
@@ -107,6 +116,10 @@ pytest tests/test_shape_matrix_export.py -v
 # Replay benchmark tests (no GPU required)
 pytest tests/test_bench_spec.py tests/test_bench_resolve.py \
        tests/test_bench_rank.py tests/test_bench_api.py -v
+
+# Optimize-session tests (no GPU, no real Copilot CLI - a fake agent binary)
+pytest tests/test_optimize_prompt.py tests/test_optimize_scheduler.py \
+       tests/test_optimize_api.py -v
 
 # Full integration (requires Intel XPU hardware)
 pytest tests/ -v
@@ -719,7 +732,7 @@ rows (`shape_matrix`) → replay cases (`spec`) → measured cases (`worker`/
   `/api/bench/results?run_id=&op=` (the `op` filter exists so one row's detail
   does not ship every case of every op). The operating-point row is highlighted
   and sorted first; profiled cases are marked ✓.
-- **The UI has three tabs: `Model Graph`, `Bench & Rank`, `Op Detail`
+- **The UI has three tabs: `Model Graph`, `Bench & Rank`, `Optimize Kernels`
   (`TABS` in `static/index.html`).** There is **no** Shape Matrix tab: the
   matrix and the benchmark are one pipeline (see above), so *Bench & Rank* is
   **one form and one button** — the `sweep-*` inputs (the configuration space)
@@ -731,12 +744,60 @@ rows (`shape_matrix`) → replay cases (`spec`) → measured cases (`worker`/
   buttons: the three stages could only ever be run in that order, so choosing
   between them was never a decision. The long-form explanation of how each
   stage works lives in the README, not in the page. The
-  per-op drill-down (step ④) is its own **top-level tab** (`#tab-opdetail`
-  wrapping `#perf-op-detail`) rather than a panel under the ranked table — it is
-  a 15-column × N-case table that pushed the targets off-screen when inlined.
-  `perfToggleOpDetail` switches to that tab when opening an op and back to
-  `perf` when closing; closing restores `PERF_OP_DETAIL_PLACEHOLDER` (never a
-  blank tab).
+  per-op drill-down lives **under the ranked table it is opened from**
+  (`#perf-op-detail`, inside `#tab-perf`): an op's cases are the evidence for
+  its row, so clicking a row must not throw the reader onto another tab.
+  `perfToggleOpDetail` stays on `perf`, scrolls the panel into view, and on
+  close restores `PERF_OP_DETAIL_PLACEHOLDER` (never a blank panel). Do **not**
+  re-add a standalone `Op Detail` tab, and do **not** move the case table back
+  into `Optimize Kernels`.
+- **The case table shows one phase — the one the toggle selects
+  (`renderOpDetail`).** It used to list both phases with the selected one
+  sorted first, which invites comparing a compute-bound prefill GEMM against
+  the same kernel's memory-bound decode GEMV in one column; the ranked table
+  above it has shown a single phase since the ranking was split. The `phase`
+  column is therefore gone (every row is that phase), the header says which
+  phase and how many cases the *other* one holds, and `setTargetPhase`
+  **re-renders the open panel** instead of closing it — "what does this kernel
+  do in the other phase" is the question the toggle exists for. An op ranked in
+  only one phase keeps its panel (it states so and still lists that phase's
+  cases); only an op the loaded run does not know at all closes it.
+- **The panel's actions sit at the bottom of the card**, after the table:
+  `🚀 Optimize this kernel` and `← back to targets` are what you do *having
+  read* the cases, and in the header they were separated from the evidence by a
+  15-column table.
+- **A kernel session is started from where the evidence is (`optimizeOpNow`).**
+  Every ranked row carries a `🚀 optimize` button (it replaced a `copy bench`
+  button — a bench command on the clipboard was a step towards a session, not a
+  decision), and the op-detail tile carries `🚀 Optimize this kernel`. Both call
+  `optimizeOpNow(op)`, which switches to `Optimize Kernels`, refreshes the
+  candidates (so cwd/devices are filled), asks for confirmation if the ranking
+  refused the op, and starts a session for **that one op** via the same
+  `/api/optimize/start` the selection list uses.
+- **`Optimize Kernels` manages sessions; it does not select them.** There is no
+  candidate list and no "Optimize Selected" button: the ranked table *is* the
+  selection, so a session is opened with 🚀 optimize from `Bench & Rank` and
+  this tab shows the resulting sessions (state, the GPU each holds, queue
+  position, live log, stop) plus where they run — workspace root, devices, and
+  whether the CLI was found (`#opt-pool`). Picking kernels from a second,
+  redundant list of the same ranking was a choice with no consequence. When the
+  Copilot CLI is missing, 🚀 optimize renders the pasteable command + brief
+  (`optimizeShowCommand` → `/api/optimize/prompt`) instead of failing.
+- **A status poll in flight is not allowed to overwrite a newer state
+  (`OPT_STATE_SEQ`).** `optimizeOpNow` refreshes before starting, and that
+  refresh polls; the poll's reply could land *after* the start and replace the
+  new session list with the empty one — then, seeing nothing active, stop the
+  polling that would have corrected it (the session existed but the tab claimed
+  none did, forever). Every state update takes a ticket and a stale reply is
+  dropped.
+- **The session log follows the tail only while the reader is at the tail.**
+  `renderOptSessions` re-renders on every 3 s poll, which rebuilt the `<pre>`
+  and dropped the reader back to the top of the log. The pane's scroll position
+  and its "pinned to the bottom" state (`OPT_LOG_STICK`, updated by the pane's
+  own `onscroll` via `optLogAtBottom`, 24 px of slack) are carried across the
+  re-render, and `optimizeTailLog` only scrolls to the bottom when the pane is
+  pinned. Scrolling up to read something freezes the view; scrolling back to the
+  bottom re-arms following.
 - **The measurement budget is derived, not asked for (`estimate.case_budget` /
   `op_budgets`).** There is no "budget / case" control: how long a case needs
   is a property of the kernel being replayed, and the profile already knows it.
@@ -827,6 +888,97 @@ rows (`shape_matrix`) → replay cases (`spec`) → measured cases (`worker`/
   commit of every component that can move a number, and cases are ingested into
   `output/bench/history.sqlite` so a regression can be attributed to a kernel
   bump (`/api/bench/history?base=&new=`).
+
+### Optimize Kernels (`breakdown/optimize/`, `/api/optimize/*`)
+
+The pipeline's fourth stage, and the reason the ranking exists: the benchmark
+answers *which* kernel is worth an optimization session, this opens it. A
+ranked target is turned into a markdown brief and handed to a headless
+**Copilot CLI** session (`copilot -p <brief> --allow-all-tools
+--allow-all-paths`) that runs the `xpu-kernel-optimizer` skill from
+`~/.copilot/skills/`.
+
+- **Handoff, not re-implementation.** `prompt.py` contains **no** optimization
+  strategy: every fact in the brief comes from `targets.json` (backend, phase,
+  operating point, roofline bound/unit/utilization/AI, measured baseline
+  latency, `bench_cmd`/`profile_cmd`, kernel repo/dir/files/`build_cmd`/
+  `test_cmd`/notes, flags). The skill owns the Profile → Analyze → Optimize →
+  Validate loop; the ranker owns the numbers. Do not grow a strategy layer
+  here — a change in optimization technique belongs in the skill.
+- **The phase's ranking wins over the combined one** (`targets_by_op`). A
+  kernel is a compute-bound GEMM at prefill and a memory-bound GEMV at decode,
+  so a session opened for a phase must be briefed with that phase's record; the
+  combined row belongs to neither and is only a fallback for an op the phase
+  did not rank.
+- **One session owns one GPU, exclusively (`scheduler.py`).** A session
+  profiles and benchmarks continuously, so two agents sharing a device would
+  measure each other's interference and could accept a change on a false
+  number — the same reason the replay benchmark runs one op per process. A
+  session is admitted only when a free device index exists, holds it for its
+  whole lifetime and releases it in the reaper's `finally`; the surplus stays
+  `pending` in FIFO order and is started by the release path. **Concurrency is
+  the size of the device pool, never a `max_parallel` knob.** The lease is
+  *enforced*: the child's env gets `visibility_env` (`ZE_AFFINITY_MASK` /
+  `CUDA_VISIBLE_DEVICES`), so the agent's builds, `bench_cmd` and `unitrace`
+  runs all inherit the single-device view, and the brief names the device it
+  owns. A collective target (`ccl` / `c10d::`) leases `tp` devices at once, or
+  waits; a request the pool could *never* satisfy raises `LeaseError`
+  immediately instead of queuing forever.
+- **Refusals mirror the benchmark's honesty rules (`launchability`).** An op
+  that is `at_roofline` (no headroom), one flagged `check_cost_model` (its
+  utilization is above peak, so its headroom cannot be trusted) or one with no
+  editable kernel source (no `kernel_dir` / no `build_cmd` — ATen, collectives)
+  is **reported with the reason** and its checkbox disabled, rather than
+  burning a GPU on a session with nothing to win. `tune_config` ops are
+  launchable but the brief says to expect a configuration/dispatch change.
+  Launching a refused op explicitly is still possible (the CLI/API allow it);
+  the brief then states the premise the agent must verify first.
+- **Spawning is a convenience, not a requirement.** Every session writes
+  `command.txt` — the same invocation as a pasteable shell line that reads the
+  brief from `prompt.md` (`$(cat …)`, because a brief is thousands of
+  characters and an inlined one is not pasteable). `/api/optimize/prompt`
+  produces it **without** spawning, which is what 🚀 optimize falls back to
+  when the Copilot CLI is not installed (`resolve_copilot` → a clear
+  501, not a `FileNotFoundError` after the GPUs were leased).
+- **Artifacts are owned**, like the benchmark's: `output/optimize/<run_id>/`
+  holds `index.json` plus one directory per op with `prompt.md`,
+  `command.txt`, `session.log` (truncated at spawn, so the streamed pane is
+  *this* session), `session.json` and the agent's own `summary.md`. The
+  session record is rewritten on every state transition, so a killed agent or
+  a restarted server still leaves a readable record of what ran, on which
+  device, and how it ended.
+- **A session's artifact root is pinned when it is created** (`OptimizeSession.
+  root`, set from `optimize_root()` in `OptimizeManager.start`). The reaper
+  thread rewrites `session.json` / `index.json` **after** the agent exits, so
+  re-reading `$BREAKDOWN_OPTIMIZE_ROOT` at write time sends that write wherever
+  the environment points *then* — in the test suite that is the next test's
+  teardown, which leaked a real `output/optimize/R/` tree; in a server it would
+  be a stray tree. Pass `sess.root` to every `session_paths(...)` call in
+  `manager.py`. See `test_artifacts_stay_where_the_session_started`.
+- **A session restored from `index.json` is never reported `running`.**
+  `/api/optimize/status` falls back to the on-disk index when the manager holds
+  nothing for a run — but those sessions belong to a *previous* server process,
+  whose agents the `atexit` hook terminated. Reporting one as `running` makes
+  the UI poll forever for a process that is gone, so the fallback downgrades
+  `pending`/`running` to `stopped` with that reason.
+- **Every endpoint returns sessions in the same shape, without `argv`**
+  (`_optimize_sessions` in `app.py`): `argv` embeds the whole multi-KB brief.
+  `start`, `status` and `stop` all go through it.
+- **The tab manages the sessions of the *selected* run, and says which
+  (`#opt-run`).** Opened before Bench & Rank was, nothing is selected, so
+  `optimizePollStatus` asks for **all** of this server's sessions and adopts
+  the run they belong to (`OPT_RUN_ID`) — guessing the latest *benchmark* run
+  instead would hide a live session behind an empty list, since the newest
+  ranked run is not necessarily the one with sessions open.
+- **The working directory is the workspace root** (parent of this repo), since
+  `bench/kernel_sources.json` paths are relative to it — a session started
+  anywhere else cannot follow them. Override per run in the UI/`--cwd`, or
+  globally with `$BREAKDOWN_WORKSPACE_ROOT`.
+- **`targets.json` is only consumed here**, so adding this stage did not bump
+  its `schema_version` (still 5). Do not write to it from `optimize/`.
+- Headless parity: `python -m breakdown.optimize {candidates,prompt,start,
+  status,stop}` — the API and the tab are wrappers, exactly like
+  `breakdown.bench`.
 
 ### Op Classification (`classifier.py`)
 
@@ -923,6 +1075,12 @@ static builder. Ensure:
 | `/api/bench/targets` | GET | Ranked optimization targets (`?run_id=`, `?refresh=1`, `?target_util=`) |
 | `/api/bench/report` | GET | Download a run's report workbook |
 | `/api/bench/history` | GET | Runs in the history db, or `?base=&new=` per-shape diff |
+| `/api/optimize/candidates` | GET | Ranked ops of a phase + whether each is worth a kernel session (`?run_id=&phase=`) |
+| `/api/optimize/prompt` | POST | The brief and the pasteable command, spawning nothing |
+| `/api/optimize/start` | POST | Open one Copilot CLI session per selected kernel (one GPU each; the surplus queues) |
+| `/api/optimize/status` | GET | A run's sessions: state, leased device(s), queue position, exit code |
+| `/api/optimize/log` | GET | A session's log from `?offset=` (the UI polls it) |
+| `/api/optimize/stop` | POST | Stop one session or a run's; a freed GPU starts the next queued one |
 
 ## Common Pitfalls
 
@@ -1333,6 +1491,24 @@ static builder. Ensure:
   1-MoE-layer reduced trace of MiniMax-M3 reads `x57`. Totals are recomputed via
   `_recompute_totals`. Triggers only when `summary["num_layers"]` exceeds the
   profiled decoder-layer count.
+- **An optimization session must never share its GPU, and a queued one must
+  never be silently dropped.** `optimize/scheduler.py` is the only place that
+  decides concurrency: a session leases device indexes exclusively and the
+  surplus waits FIFO. Do **not** add a `max_parallel` knob, do not start a
+  session without a lease, and keep every exit path (normal, failed, stopped,
+  spawn error, shutdown) going through `DevicePool.release` — a leaked lease
+  strands a GPU for the rest of the server's life, which looks like "the queue
+  is stuck" with nothing running. Stopping a `pending` session removes it from
+  the queue instead of terminating a process that never started.
+- **A session's log is truncated at spawn.** It is opened `"wb"`, not `"ab"`:
+  appending across runs made the streamed pane show the concatenation of every
+  session ever opened for that op (it read as the agent repeating itself), and
+  it breaks the `/api/optimize/log` offset contract.
+- **The Optimize tab's device/workspace fields are filled even when the run has
+  no ranking.** `/api/optimize/candidates` returns `devices`/`workspace_root`/
+  `copilot` alongside a 400 error, because where sessions run does not depend
+  on the ranking — an empty form next to "this run has no targets" left the
+  reader unable to tell the two problems apart.
 - `app.py` is ~1700 lines — use `view_range` to read targeted sections
 - **Profiling reconstructs the graph from the trace** (`graph_from_trace.py`) —
   it does NOT overlay timing onto a static graph. The `annotate_graph_*` and

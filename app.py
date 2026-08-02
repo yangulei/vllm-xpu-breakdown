@@ -68,6 +68,9 @@ from breakdown.bench import (
     spec as bench_spec,
     store as bench_store,
 )
+from breakdown.optimize import prompt as optimize_prompt
+from breakdown.optimize import session as optimize_session
+from breakdown.optimize.manager import MANAGER as OPTIMIZE_MANAGER
 
 app = Flask(__name__, static_folder="static")
 
@@ -1946,7 +1949,222 @@ def bench_history_api():
     return jsonify({"ok": True, "runs": bench_history.runs(conn)})
 
 
+# ---- Optimize Kernels: hand a ranked target to a Copilot CLI session ----
+# The benchmark answers *which* kernel is worth a session; these endpoints open
+# it. One session owns one GPU exclusively (see breakdown/optimize/scheduler.py),
+# so more selected kernels than devices simply queue.
+
+def _optimize_doc(run_id: str) -> tuple[dict | None, str | None]:
+    """A run's ranked targets, or why they cannot be loaded."""
+    if not run_id:
+        return None, "run_id is required"
+    paths = bench_store.run_paths(run_id)
+    if not os.path.isfile(paths.targets):
+        return None, (f"run '{run_id}' has no ranked targets yet - "
+                      "run Bench & Rank first")
+    try:
+        with open(paths.targets) as fh:
+            return json.load(fh), None
+    except (OSError, ValueError) as exc:
+        return None, f"could not read the ranking: {exc}"
+
+
+def _optimize_sessions(run_id: str) -> list[dict]:
+    """A run's sessions as JSON. ``argv`` is dropped: it embeds the whole brief,
+    and every endpoint that returns sessions must return the same shape."""
+    out = []
+    for sess in OPTIMIZE_MANAGER.sessions(run_id or None):
+        data = sess.to_dict()
+        data.pop("argv", None)
+        out.append(data)
+    return out
+
+
+@app.route("/api/optimize/candidates")
+def optimize_candidates():
+    """The ranked ops of a phase and whether each is worth a kernel session."""
+    run_id = request.args.get("run_id")
+    if not run_id:
+        runs = bench_store.list_runs()
+        run_id = runs[0]["run_id"] if runs else ""
+    phase = request.args.get("phase") or "prefill"
+    device = bench_devices.detect_device()
+    # The environment half of the answer (where sessions run, on what, with
+    # which binary) does not depend on the ranking, so it is returned even when
+    # the run has none - the form is then still usable.
+    base = {
+        "run_id": run_id, "phase": phase,
+        "devices": bench_devices.available(device),
+        "workspace_root": optimize_session.default_workspace_root(),
+        "copilot": optimize_session.resolve_copilot(),
+        "skill": optimize_prompt.OPTIMIZER_SKILL,
+    }
+    doc, err = _optimize_doc(run_id)
+    if err:
+        return jsonify({"ok": False, "error": err, **base}), 400
+    return jsonify({"ok": True, **base,
+                    "candidates": optimize_prompt.candidates(doc, phase)})
+
+
+@app.route("/api/optimize/prompt", methods=["POST"])
+def optimize_prompt_api():
+    """The brief and the exact command, without spawning anything.
+
+    Spawning is a convenience: the same session can always be run by hand,
+    which is the fallback when the server should not hold a long-lived agent.
+    """
+    data = request.json or {}
+    doc, err = _optimize_doc(data.get("run_id"))
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    phase = data.get("phase") or "prefill"
+    by_op = optimize_prompt.targets_by_op(doc, phase)
+    cwd = data.get("cwd") or optimize_session.default_workspace_root()
+    try:
+        ids = bench_devices.parse_device_ids(data.get("device_ids"))
+    except ValueError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    out = []
+    for op in data.get("ops") or []:
+        target = by_op.get(op)
+        if target is None:
+            return jsonify({"ok": False,
+                            "error": f"'{op}' is not a ranked target"}), 400
+        paths = optimize_session.session_paths(data["run_id"], op).ensure()
+        can, reason = optimize_prompt.launchability(target)
+        text = optimize_prompt.build_prompt(
+            target, doc, run_id=data["run_id"], phase=phase,
+            device_ids=ids or None, workspace_root=cwd,
+            artifact_dir=paths.dir)
+        # The command reads the brief from disk, so the brief has to be there:
+        # the fallback must work as-is, not only after a spawn.
+        with open(paths.prompt, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        argv = optimize_session.session_argv(text)
+        out.append({
+            "op": op, "launchable": can, "reason": reason, "prompt": text,
+            "command": optimize_session.command_line(
+                argv, cwd=cwd,
+                env=bench_devices.visibility_env(
+                    bench_devices.detect_device(), ids),
+                prompt_file=paths.prompt),
+            "prompt_file": paths.prompt,
+        })
+    return jsonify({"ok": True, "run_id": data["run_id"], "sessions": out})
+
+
+@app.route("/api/optimize/start", methods=["POST"])
+def optimize_start():
+    """Open a session per selected kernel; each owns one GPU exclusively."""
+    data = request.json or {}
+    run_id = data.get("run_id")
+    doc, err = _optimize_doc(run_id)
+    if err:
+        return jsonify({"ok": False, "error": err}), 400
+    device = bench_devices.detect_device()
+    ok, ids, dev_err = _bench_device_ids(data, device)
+    if not ok:
+        return jsonify({"ok": False, "error": dev_err}), 400
+    try:
+        state = OPTIMIZE_MANAGER.start(
+            run_id=run_id, doc=doc, ops=data.get("ops") or [],
+            phase=data.get("phase") or "prefill",
+            workspace_root=data.get("cwd") or None,
+            device_kind=device, device_ids=ids or None,
+            spawn=not data.get("dry_run"))
+    except (ValueError, NotADirectoryError) as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    except KeyError as exc:
+        # KeyError's str() quotes its argument; the message is user-facing.
+        return jsonify({"ok": False, "error": exc.args[0]}), 400
+    except FileNotFoundError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 501
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 409
+    return jsonify({"ok": True, "run_id": state["run_id"],
+                    "pool": state["pool"],
+                    "sessions": _optimize_sessions(run_id)})
+
+
+@app.route("/api/optimize/status")
+def optimize_status():
+    """Every session of a run: state, the GPU it holds, its queue position."""
+    run_id = request.args.get("run_id") or ""
+    sessions = _optimize_sessions(run_id)
+    if not sessions and run_id:
+        index = optimize_session.session_paths(run_id, "_index").index
+        if os.path.isfile(index):
+            try:
+                with open(index) as fh:
+                    sessions = json.load(fh).get("sessions", [])
+            except (OSError, ValueError):
+                sessions = []
+            # These are from a previous server process, whose agents were
+            # terminated with it (see the atexit hook). Reporting one as
+            # "running" would poll forever for a process that is gone.
+            for s in sessions:
+                if s.get("state") in ("pending", "running"):
+                    s["state"] = "stopped"
+                    s["error"] = (s.get("error")
+                                  or "the server restarted while this session "
+                                     "was open, so its agent was terminated")
+    if not sessions and run_id:
+        index = optimize_session.session_paths(run_id, "_index").index
+        if os.path.isfile(index):
+            try:
+                with open(index) as fh:
+                    sessions = json.load(fh).get("sessions", [])
+            except (OSError, ValueError):
+                sessions = []
+    return jsonify({"ok": True, "run_id": run_id, "sessions": sessions,
+                    "pool": OPTIMIZE_MANAGER.pool_snapshot(),
+                    "active": any(s.get("state") in ("pending", "running")
+                                  for s in sessions)})
+
+
+@app.route("/api/optimize/log")
+def optimize_log():
+    """A session's log from ``offset`` - the UI polls this while it runs."""
+    run_id, op = request.args.get("run_id"), request.args.get("op")
+    if not run_id or not op:
+        return jsonify({"ok": False, "error": "run_id and op are required"}), 400
+    path = optimize_session.session_paths(run_id, op).log
+    try:
+        offset = max(0, int(request.args.get("offset", 0)))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "offset must be an integer"}), 400
+    if not os.path.isfile(path):
+        return jsonify({"ok": True, "offset": 0, "text": "", "eof": True})
+    size = os.path.getsize(path)
+    if offset > size:      # the log was truncated/restarted - resend it whole
+        offset = 0
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        chunk = fh.read()
+    return jsonify({"ok": True, "offset": offset + len(chunk),
+                    "text": chunk.decode("utf-8", "replace"),
+                    "eof": offset + len(chunk) >= size})
+
+
+@app.route("/api/optimize/stop", methods=["POST"])
+def optimize_stop():
+    """Stop one session or all of a run's; a freed GPU starts the next one."""
+    data = request.json or {}
+    run_id = data.get("run_id")
+    if not run_id:
+        return jsonify({"ok": False, "error": "run_id is required"}), 400
+    stopped = OPTIMIZE_MANAGER.stop(run_id, data.get("op"))
+    return jsonify({"ok": True, "run_id": run_id, "stopped": stopped,
+                    "sessions": _optimize_sessions(run_id)})
+
+
 if __name__ == "__main__":
+    import atexit
+
+    # A session is a long-lived agent holding a GPU; do not leave orphans
+    # (and their leases) behind when the server exits.
+    atexit.register(OPTIMIZE_MANAGER.shutdown)
+
     parser = argparse.ArgumentParser(description="vLLM Breakdown Web UI")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
