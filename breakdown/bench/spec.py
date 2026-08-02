@@ -164,28 +164,31 @@ def _substitute_dims(slots: list[dict], swept: list[list[int]]) -> list[dict]:
     *tensor* operands in slot order (``TensorList`` entries flattened) - the
     same ordering :func:`breakdown.graph_from_trace._parse_input_dims_types`
     produces, so index ``i`` of ``swept`` is the ``i``-th tensor operand.
+    A 0-dim tensor slot is *not* in that list (the shape extraction keeps only
+    non-empty tensors), so it must not consume a sweep entry either - otherwise
+    every operand after it is given the wrong shape.
     """
     out: list[dict] = []
     i = 0
+
+    def sub(entry: dict) -> dict:
+        nonlocal i
+        new = dict(entry)
+        if not (entry.get("dims") or []):
+            return new                     # 0-dim: not part of the shape list
+        if i < len(swept):
+            new["dims"] = [int(d) for d in swept[i]]
+            new.pop("strides", None)       # dims changed: strides no longer valid
+        i += 1
+        return new
+
     for slot in slots:
         kind = slot.get("kind")
         if kind == "tensor":
-            new = dict(slot)
-            if i < len(swept):
-                new["dims"] = [int(d) for d in swept[i]]
-                new.pop("strides", None)   # dims changed: strides no longer valid
-            i += 1
-            out.append(new)
+            out.append(sub(slot))
         elif kind == "tensorlist":
-            items = []
-            for it in slot.get("items") or []:
-                new_it = dict(it)
-                if i < len(swept):
-                    new_it["dims"] = [int(d) for d in swept[i]]
-                    new_it.pop("strides", None)
-                i += 1
-                items.append(new_it)
-            out.append({"kind": "tensorlist", "items": items})
+            out.append({"kind": "tensorlist", "name": slot.get("name"),
+                        "items": [sub(it) for it in slot.get("items") or []]})
         else:
             out.append(dict(slot))
     return out

@@ -204,11 +204,44 @@ def _rows_per_expert(ctx: Ctx):
 @synthesizer("seq_lens", "context_lens", "kv_lens", "seq_lens_tensor",
              "query_lens", "num_computed_tokens")
 def _seq_lens(ctx: Ctx):
+    """Per-sequence KV length: the cached context plus this pass's new tokens.
+
+    An attention kernel reads ``seq_lens`` as the *total* length a sequence
+    attends, so charging it only the context understates the work — and, paired
+    with ``prefix_lens``, would leave a zero-length new-token region and measure
+    a degenerate kernel.
+    """
     torch = _torch()
-    ctx_len = int(ctx.values.get("ctx_len") or 0) or 1
+    total = (int(ctx.values.get("ctx_len") or 0)
+             + int(ctx.values.get("seq_len") or 0)) or 1
+    t = torch.full((ctx.numel,), total, dtype=_dtype_of(ctx), device=ctx.device)
+    return t.reshape(ctx.dims) if ctx.dims else t
+
+
+@synthesizer("prefix_lens", "prefix_len", "cached_lens", "num_cached_tokens")
+def _prefix_lens(ctx: Ctx):
+    """Per-sequence *cached* prefix length — the operating point's context."""
+    torch = _torch()
+    ctx_len = max(int(ctx.values.get("ctx_len") or 0), 0)
     t = torch.full((ctx.numel,), ctx_len, dtype=_dtype_of(ctx),
                    device=ctx.device)
     return t.reshape(ctx.dims) if ctx.dims else t
+
+
+@synthesizer("topk_idx", "topk_block_idx", "block_idx", "selected_blocks")
+def _topk_blocks(ctx: Ctx):
+    """Block ids chosen by a sparse-attention indexer.
+
+    They index the sibling *block table*, so they must stay inside it: a random
+    id sends the paged gather outside the cache. The table is the call's 2-D
+    integer operand, so its width is the valid range.
+    """
+    blocks = 0
+    for dims in ctx.tensor_dims(
+            lambda s: len(s.get("dims") or []) == 2
+            and "int" in (s.get("dtype") or "")):
+        blocks = max(blocks, dims[-1])
+    return _arange(ctx, blocks or None)
 
 
 @synthesizer("cu_seqlens", "cu_seqlens_q", "cu_seqlens_k", "query_start_loc",
@@ -411,7 +444,8 @@ def build_args(case, resolved: Resolved, device: str,
     slots = list(case.args)
     outputs = set(output_names or ())
     if resolved.kind != "torch_op" or not resolved.arg_names:
-        return _build_positional(case, slots, device, resolved, extra_values)
+        return _build_positional(case, slots, device, resolved, extra_values,
+                                 outputs)
 
     names, types = resolved.arg_names, resolved.arg_types
     values = _context_values(case, slots, names, types, extra_values)
@@ -482,26 +516,52 @@ def _place(call: Call, built: list[Any], index: int, name: str, value: Any,
         call.args.append(value)
 
 
+#: Parameter names that are an *output* buffer by near-universal convention.
+#: A kernel wrapper that writes into a caller-allocated tensor (``out=``,
+#: ``output=``) must get a zeroed one, never index-synthesized data, and it must
+#: be restored between measurement windows.
+_OUTPUT_PARAMS = frozenset({"out", "output", "out_", "result"})
+
+
 def _build_positional(case, slots: list[dict], device: str,
-                      resolved: Resolved, extra_values: dict | None) -> Call:
-    """No schema (a Python-API kernel): materialize the slots in order."""
-    values = dict(extra_values or {})
+                      resolved: Resolved, extra_values: dict | None,
+                      output_names: Iterable[str] = ()) -> Call:
+    """No schema (a Python-launched kernel): materialize the slots in order.
+
+    The slots come from a capture-time kernel span, so each carries the
+    launcher's own **parameter name** — which is what makes the index
+    synthesizers usable here: a ``block_table`` / ``cu_seqlens_q`` / ``seq_lens``
+    operand is built by the registered synthesizer instead of being filled with
+    random integers that would send a paged kernel out of bounds.
+    """
+    values = _context_values(
+        case, slots, [s.get("name") or f"arg{i}" for i, s in enumerate(slots)],
+        [], extra_values)
+    outputs = set(output_names or ()) | _OUTPUT_PARAMS
     call = Call()
     built: list[Any] = []
     for i, slot in enumerate(slots):
         kind = slot.get("kind")
-        name = f"arg{i}"
+        name = slot.get("name") or f"arg{i}"
         if kind == "tensor":
             value = _tensor_arg(slot, name, values, case.op, device,
-                                resolved, slots, built)
+                                resolved, slots, built,
+                                zeroed=name in outputs)
         elif kind == "tensorlist":
             value = [_tensor_arg(it, name, values, case.op, device,
-                                 resolved, slots, built)
+                                 resolved, slots, built,
+                                 zeroed=name in outputs)
                      for it in slot.get("items") or []]
         elif kind == "scalar":
             value = parse_scalar(slot.get("value"))
+        elif kind == "opaque":
+            raise ArgBuildError(
+                f"{case.op}: argument '{name}' is a {slot.get('type')} the "
+                f"capture could not describe, so the call cannot be rebuilt")
         else:
             value = None
+        if kind in ("tensor", "tensorlist") and name in outputs:
+            call.mutated.extend(value if isinstance(value, list) else [value])
         built.append(value)
         call.args.append(value)
     return call

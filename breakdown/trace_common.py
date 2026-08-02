@@ -91,6 +91,82 @@ def module_span_display_name(qualified_name: str, cls: str) -> str:
     return leaf
 
 
+# ===================================================================
+# Kernel-launch spans (``kernel::<json>``)
+# ===================================================================
+# A kernel launched straight from Python — a Triton ``JITFunction``, a pybind11
+# extension entry point — emits no ``cpu_op``, so the trace records neither its
+# operands nor the function that launched it. ``breakdown.kernel_hooks`` opens a
+# ``record_function`` span at the launch carrying both, as base64-encoded JSON:
+#
+#     kernel::<base64(json)>
+#
+# Base64 rather than raw JSON because torch's chrome-trace writer emits an
+# event's name **unescaped**: a quote in the label produces a trace file that is
+# not valid JSON. The payload is ``{"file","line","func","args":[<slot>, ...]}``
+# and the slots use the same schema as ``graph_from_trace._parse_input_args``
+# (kind ``tensor`` / ``tensorlist`` / ``scalar`` / ``none`` / ``opaque``), so the
+# replay benchmark consumes a Python-launched kernel exactly like a dispatched
+# one.
+
+KERNEL_SPAN_PREFIX = "kernel::"
+
+
+def kernel_span_label(payload: dict) -> str:
+    """Build the ``record_function`` label for a kernel-launch span."""
+    import base64
+    import json
+    blob = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return KERNEL_SPAN_PREFIX + base64.b64encode(blob).decode("ascii")
+
+
+def parse_kernel_span(name: str) -> dict | None:
+    """Parse a ``kernel::<base64(json)>`` label, or ``None`` if it is not one."""
+    if not name.startswith(KERNEL_SPAN_PREFIX):
+        return None
+    import base64
+    import binascii
+    import json
+    try:
+        blob = base64.b64decode(name[len(KERNEL_SPAN_PREFIX):], validate=True)
+        payload = json.loads(blob)
+    except (ValueError, binascii.Error):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+#: Python packages that only *dispatch* a kernel launch rather than define it:
+#: torch's own machinery, Triton's runtime, and the stdlib. The frame that
+#: launched a kernel is the innermost enclosing frame outside these.
+LAUNCH_MACHINERY = (
+    "/torch/", "/triton/", "/_dynamo/", "/_inductor/",
+    "contextlib.py", "<built-in>", "<string>",
+)
+
+#: Function names that identify a *dispatch* wrapper rather than the kernel: a
+#: JIT runner, a callable object's entry point. They name the mechanism, not the
+#: work, and their file is the JIT layer rather than the kernel's source, so
+#: they are useless both as a label and as a replay entry point.
+DISPATCH_FUNCS = frozenset({
+    "run", "launch", "call", "__call__", "execute", "invoke", "wrapper",
+})
+
+
+def is_launcher_frame(file: str, func: str) -> bool:
+    """Can ``file``/``func`` be the *definition site* of a kernel launch?
+
+    The single rule shared by the capture-time hook (which walks the live
+    Python stack) and the trace reader (which walks recorded
+    ``python_function`` events), so a span and a recovered frame always name
+    the same function.
+    """
+    if not func or func.startswith("_") or func.endswith(">"):
+        return False                     # private helper or <listcomp>/<lambda>
+    if func in DISPATCH_FUNCS:
+        return False
+    return not any(fragment in file for fragment in LAUNCH_MACHINERY)
+
+
 def _is_overhead_event(name: str) -> bool:
     """Return True if this event is profiler/framework overhead to filter out."""
     if name in _OVERHEAD_EVENTS:

@@ -148,6 +148,7 @@
               "backend": "triton",
               "carries_device_time": true,
               "dtypes": [
+               "bfloat16",
                "bfloat16"
               ],
               "launch": {
@@ -160,6 +161,9 @@
               "shapes": [
                [
                 "S",
+                "H"
+               ],
+               [
                 "H"
                ]
               ]
@@ -359,6 +363,8 @@
                 "backend": "triton",
                 "carries_device_time": true,
                 "dtypes": [
+                 "bfloat16",
+                 "bfloat16",
                  "bfloat16"
                 ],
                 "launch": {
@@ -371,6 +377,13 @@
                 "shapes": [
                  [
                   "S",
+                  "H"
+                 ],
+                 [
+                  "S",
+                  "H"
+                 ],
+                 [
                   "H"
                  ]
                 ]
@@ -543,6 +556,8 @@
                 "backend": "triton",
                 "carries_device_time": true,
                 "dtypes": [
+                 "bfloat16",
+                 "bfloat16",
                  "bfloat16"
                 ],
                 "launch": {
@@ -555,6 +570,13 @@
                 "shapes": [
                  [
                   "S",
+                  "H"
+                 ],
+                 [
+                  "S",
+                  "H"
+                 ],
+                 [
                   "H"
                  ]
                 ]
@@ -795,6 +817,8 @@
                 "backend": "triton",
                 "carries_device_time": true,
                 "dtypes": [
+                 "bfloat16",
+                 "bfloat16",
                  "bfloat16"
                 ],
                 "launch": {
@@ -807,6 +831,13 @@
                 "shapes": [
                  [
                   "S",
+                  "H"
+                 ],
+                 [
+                  "S",
+                  "H"
+                 ],
+                 [
                   "H"
                  ]
                 ]
@@ -979,6 +1010,8 @@
                 "backend": "triton",
                 "carries_device_time": true,
                 "dtypes": [
+                 "bfloat16",
+                 "bfloat16",
                  "bfloat16"
                 ],
                 "launch": {
@@ -991,6 +1024,13 @@
                 "shapes": [
                  [
                   "S",
+                  "H"
+                 ],
+                 [
+                  "S",
+                  "H"
+                 ],
+                 [
                   "H"
                  ]
                 ]
@@ -1086,7 +1126,12 @@
                   "backend": "flash_xpu",
                   "carries_device_time": true,
                   "dtypes": [
-                   "bfloat16"
+                   "bfloat16",
+                   "bfloat16",
+                   "int32",
+                   "int32",
+                   "int32",
+                   "int32"
                   ],
                   "launch": {
                    "file": "xattention.py",
@@ -1100,6 +1145,24 @@
                     "S",
                     "n_idx/TP",
                     "d"
+                   ],
+                   [
+                    "N",
+                    "d",
+                    "d"
+                   ],
+                   [
+                    "n_kv/TP",
+                    "N2"
+                   ],
+                   [
+                    2
+                   ],
+                   [
+                    "n_kv/TP"
+                   ],
+                   [
+                    "n_kv/TP"
                    ]
                   ]
                  },
@@ -1107,6 +1170,8 @@
                   "backend": "flash_xpu",
                   "carries_device_time": true,
                   "dtypes": [
+                   "float32",
+                   "int32",
                    "int32"
                   ],
                   "launch": {
@@ -1120,7 +1185,13 @@
                    [
                     "n_idx/TP",
                     "S",
-                    "K_topk"
+                    "d/TP"
+                   ],
+                   [
+                    2
+                   ],
+                   [
+                    "n_kv/TP"
                    ]
                   ]
                  }
@@ -1280,6 +1351,13 @@
               "backend": "flash_xpu",
               "carries_device_time": true,
               "dtypes": [
+               "bfloat16",
+               "bfloat16",
+               "int32",
+               "int32",
+               "int32",
+               "int32",
+               "int32",
                "bfloat16"
               ],
               "launch": {
@@ -1290,6 +1368,36 @@
               "order": 5,
               "role": "attention",
               "shapes": [
+               [
+                "S",
+                "n_h/TP",
+                "d"
+               ],
+               [
+                "N",
+                2,
+                "d",
+                "n_kv/TP",
+                "d"
+               ],
+               [
+                "n_kv/TP",
+                "n_h\u00b7d/TP",
+                "n_h/TP"
+               ],
+               [
+                "n_kv/TP",
+                "N2"
+               ],
+               [
+                2
+               ],
+               [
+                "n_kv/TP"
+               ],
+               [
+                "n_kv/TP"
+               ],
                [
                 "S",
                 "n_h/TP",
@@ -1313,6 +1421,8 @@
                 "backend": "triton",
                 "carries_device_time": true,
                 "dtypes": [
+                 "bfloat16",
+                 "bfloat16",
                  "bfloat16"
                 ],
                 "launch": {
@@ -1325,6 +1435,13 @@
                 "shapes": [
                  [
                   "S",
+                  "H"
+                 ],
+                 [
+                  "S",
+                  "H"
+                 ],
+                 [
                   "H"
                  ]
                 ]
@@ -1879,6 +1996,8 @@
               "backend": "triton",
               "carries_device_time": true,
               "dtypes": [
+               "bfloat16",
+               "bfloat16",
                "bfloat16"
               ],
               "launch": {
@@ -1891,6 +2010,13 @@
               "shapes": [
                [
                 "S",
+                "H"
+               ],
+               [
+                "S",
+                "H"
+               ],
+               [
                 "H"
                ]
               ]
@@ -1945,7 +2071,12 @@
                   "backend": "flash_xpu",
                   "carries_device_time": true,
                   "dtypes": [
-                   "bfloat16"
+                   "bfloat16",
+                   "bfloat16",
+                   "int32",
+                   "int32",
+                   "int32",
+                   "int32"
                   ],
                   "launch": {
                    "file": "xattention.py",
@@ -1959,6 +2090,24 @@
                     "S",
                     "n_idx/TP",
                     "d"
+                   ],
+                   [
+                    "N",
+                    "d",
+                    "d"
+                   ],
+                   [
+                    "n_kv/TP",
+                    "N2"
+                   ],
+                   [
+                    2
+                   ],
+                   [
+                    "n_kv/TP"
+                   ],
+                   [
+                    "n_kv/TP"
                    ]
                   ]
                  },
@@ -1966,6 +2115,8 @@
                   "backend": "flash_xpu",
                   "carries_device_time": true,
                   "dtypes": [
+                   "float32",
+                   "int32",
                    "int32"
                   ],
                   "launch": {
@@ -1979,7 +2130,13 @@
                    [
                     "n_idx/TP",
                     "S",
-                    "K_topk"
+                    "d/TP"
+                   ],
+                   [
+                    2
+                   ],
+                   [
+                    "n_kv/TP"
                    ]
                   ]
                  }
@@ -2139,6 +2296,13 @@
               "backend": "flash_xpu",
               "carries_device_time": true,
               "dtypes": [
+               "bfloat16",
+               "bfloat16",
+               "int32",
+               "int32",
+               "int32",
+               "int32",
+               "int32",
                "bfloat16"
               ],
               "launch": {
@@ -2149,6 +2313,36 @@
               "order": 5,
               "role": "attention",
               "shapes": [
+               [
+                "S",
+                "n_h/TP",
+                "d"
+               ],
+               [
+                "N",
+                2,
+                "d",
+                "n_kv/TP",
+                "d"
+               ],
+               [
+                "n_kv/TP",
+                "n_h\u00b7d/TP",
+                "n_h/TP"
+               ],
+               [
+                "n_kv/TP",
+                "N2"
+               ],
+               [
+                2
+               ],
+               [
+                "n_kv/TP"
+               ],
+               [
+                "n_kv/TP"
+               ],
                [
                 "S",
                 "n_h/TP",
@@ -2172,6 +2366,8 @@
                 "backend": "triton",
                 "carries_device_time": true,
                 "dtypes": [
+                 "bfloat16",
+                 "bfloat16",
                  "bfloat16"
                 ],
                 "launch": {
@@ -2184,6 +2380,13 @@
                 "shapes": [
                  [
                   "S",
+                  "H"
+                 ],
+                 [
+                  "S",
+                  "H"
+                 ],
+                 [
                   "H"
                  ]
                 ]
@@ -2735,6 +2938,8 @@
             "backend": "triton",
             "carries_device_time": true,
             "dtypes": [
+             "bfloat16",
+             "bfloat16",
              "bfloat16"
             ],
             "launch": {
@@ -2747,6 +2952,13 @@
             "shapes": [
              [
               "S",
+              "H"
+             ],
+             [
+              "S",
+              "H"
+             ],
+             [
               "H"
              ]
             ]
@@ -2857,7 +3069,8 @@
   "H": 6144,
   "I": 12288,
   "I_moe": 3072,
-  "K_topk": 16,
+  "N": 13813,
+  "N2": 33,
   "N_kv": 13813,
   "P": 1048576,
   "QKV": 9216,

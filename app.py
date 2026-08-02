@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import functools
+import importlib
 import io
 import json
 import logging
@@ -741,21 +742,39 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
                     return False
                 logger.info("module span hooks: installed %d hooks across %d "
                             "worker(s)", total, len(counts or []))
-                return True
             except Exception:
                 logger.error("module span hooks: install FAILED; the trace will "
                              "carry no module:: spans and module names will fall "
                              "back to the name overlay", exc_info=True)
                 return False
+            # Kernel-launch spans: the operands of kernels launched straight
+            # from Python (Triton, pybind11 extensions), which leave no cpu_op
+            # and so no recorded shapes. Not fatal - without them such ops stay
+            # shape-less and the replay benchmark reports them as uncovered.
+            try:
+                from breakdown.kernel_hooks import install_kernel_span_hooks_on
+                kcounts = llm.apply_model(install_kernel_span_hooks_on)
+                ktotal = sum(c for c in (kcounts or []) if isinstance(c, int))
+                logger.info("kernel span hooks: installed %d hooks across %d "
+                            "worker(s)", ktotal, len(kcounts or []))
+            except Exception:
+                logger.warning("kernel span hooks: install failed; "
+                               "Python-launched kernels will have no recorded "
+                               "operands", exc_info=True)
+            return True
 
         def _remove_span_hooks(installed: bool) -> None:
             if not installed:
                 return
-            try:
-                from breakdown.module_hooks import remove_module_span_hooks_on
-                llm.apply_model(remove_module_span_hooks_on)
-            except Exception:
-                logger.warning("module span hooks: remove failed", exc_info=True)
+            for mod_name, fn_name in (("breakdown.module_hooks",
+                                       "remove_module_span_hooks_on"),
+                                      ("breakdown.kernel_hooks",
+                                       "remove_kernel_span_hooks_on")):
+                try:
+                    mod = importlib.import_module(mod_name)
+                    llm.apply_model(getattr(mod, fn_name))
+                except Exception:
+                    logger.warning("%s: remove failed", mod_name, exc_info=True)
 
         def _profiled_pass(pass_batch: int, pass_query_len: int,
                            pass_max_tokens: int):

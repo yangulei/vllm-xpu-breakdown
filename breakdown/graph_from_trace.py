@@ -44,7 +44,9 @@ from .trace_common import (
     _infer_role,
     _is_overhead_event,
     _strip_instance_idx,
+    is_launcher_frame,
     module_span_display_name,
+    parse_kernel_span,
     parse_module_span,
 )
 
@@ -304,9 +306,16 @@ def _collect_kernel_launches(events: list[dict], worker_tid: Any
                 ext_to_ts[ext] = evt.get("ts", 0)
 
     # The Python frames that can be a kernel's definition site. A kernel with
-    # no ``cpu_op`` was launched straight from Python, and this is the trace's
-    # only record of what it is and where its code lives.
-    launcher_frames = _collect_launcher_frames(events, worker_tid)
+    # no ``cpu_op`` was launched straight from Python; a capture-time
+    # ``kernel::`` span records both the frame and the operands, and the frame
+    # heuristic recovers just the frame from an un-hooked trace.
+    kernel_spans = _collect_kernel_spans(events, worker_tid)
+    launcher_frames = ([] if kernel_spans
+                       else _collect_launcher_frames(events, worker_tid))
+
+    def launcher(ts: float) -> dict[str, Any] | None:
+        return (_span_at(ts, kernel_spans) if kernel_spans
+                else _launcher_at(ts, launcher_frames))
 
     launches: list[tuple[float, str, float, dict[str, Any] | None]] = []
     for evt in events:
@@ -326,7 +335,7 @@ def _collect_kernel_launches(events: list[dict], worker_tid: Any
                 if ext is None or ext not in ext_to_ts:
                     continue
                 ts = ext_to_ts[ext]
-            launches.append((ts, name, dur, _launcher_at(ts, launcher_frames)))
+            launches.append((ts, name, dur, launcher(ts)))
         elif cat in _RUNTIME_CATEGORIES and not has_device_kernel:
             # Runtime-only trace: no device-kernel events were captured, so the
             # launch-API call is the only signal of GPU work. Emit actual launch
@@ -337,27 +346,50 @@ def _collect_kernel_launches(events: list[dict], worker_tid: Any
             if "launch" not in low and "enqueue" not in low:
                 continue
             ts = evt.get("ts", 0)
-            launches.append((ts, name, dur, _launcher_at(ts, launcher_frames)))
+            launches.append((ts, name, dur, launcher(ts)))
     return launches
 
 
-#: Python packages that only *dispatch* a kernel launch rather than define it:
-#: torch's own machinery, Triton's runtime, and the stdlib. The frame that
-#: launched a kernel is the innermost enclosing frame outside these.
-_LAUNCH_MACHINERY = (
-    "/torch/", "/triton/", "/_dynamo/", "/_inductor/",
-    "contextlib.py", "<built-in>", "<string>",
-)
-
-#: Function names that identify a *dispatch* wrapper rather than the kernel:
-#: a JIT runner, a callable object's entry point. They name the mechanism, not
-#: the work, and their file is the JIT layer rather than the kernel's source, so
-#: they are useless both as a label and as a replay entry point.
-_DISPATCH_FUNCS = frozenset({
-    "run", "launch", "call", "__call__", "execute", "invoke", "wrapper",
-})
+#: The launch-machinery vocabulary lives in :mod:`breakdown.trace_common` so the
+#: capture-time hook (:mod:`breakdown.kernel_hooks`, which walks the *live*
+#: stack) and this reader (which walks recorded ``python_function`` events) pick
+#: the same frame by the same rule.
 
 _PY_FRAME_RE = re.compile(r"^(?P<file>.+\.py)\((?P<line>\d+)\): (?P<func>.+)$")
+
+
+def _collect_kernel_spans(events: list[dict], worker_tid: Any
+                          ) -> list[tuple[float, float, dict[str, Any]]]:
+    """Capture-time ``kernel::`` launch spans, as ``(ts, end, payload)``.
+
+    A span records what the trace cannot: the launcher frame *and* the operands
+    it was called with (see :mod:`breakdown.kernel_hooks`). When present it is
+    authoritative — the frame heuristic below is the fallback for traces
+    captured without the hooks.
+    """
+    spans: list[tuple[float, float, dict[str, Any]]] = []
+    for evt in events:
+        if evt.get("cat") != "user_annotation" or evt.get("tid") != worker_tid:
+            continue
+        payload = parse_kernel_span(evt.get("name", ""))
+        if payload is None:
+            continue
+        ts = evt.get("ts", 0)
+        spans.append((ts, ts + (evt.get("dur", 0) or 0), payload))
+    spans.sort(key=lambda s: (s[0], -(s[1] - s[0])))
+    return spans
+
+
+def _span_at(launch_ts: float,
+             spans: list[tuple[float, float, dict[str, Any]]]
+             ) -> dict[str, Any] | None:
+    """The innermost kernel span containing ``launch_ts``."""
+    best: dict[str, Any] | None = None
+    best_dur = float("inf")
+    for ts, end, payload in spans:
+        if ts <= launch_ts < end and (end - ts) < best_dur:
+            best_dur, best = end - ts, payload
+    return best
 
 
 def _collect_launcher_frames(events: list[dict], worker_tid: Any
@@ -365,17 +397,13 @@ def _collect_launcher_frames(events: list[dict], worker_tid: Any
     """Python frames that can be the *definition site* of a kernel launch.
 
     Returns ``(ts, end, file, line, func)`` for every public Python frame on the
-    worker thread that is not launch machinery (see ``_LAUNCH_MACHINERY``).
+    worker thread that is not launch machinery (see
+    :func:`breakdown.trace_common.is_launcher_frame`).
 
-    A kernel launched straight from Python — a Triton ``JITFunction``, a
-    pybind11 extension entry point (FlashInfer's cutlass norms, MiniMax-M3's
-    xattention SYCL kernels) — emits no ``cpu_op``, so the trace's only record
-    of *what it is* is the Python frame that called it. That frame gives three
-    things at once: a readable name, the backend (from the source root), and —
-    crucially for the replay benchmark — the exact file and function to import
-    in order to call the kernel again. This replaces the per-library frame
-    collectors (one for FlashInfer, one for xattention), which each hardcoded a
-    path fragment and threw the file away, keeping only the name.
+    This is the **fallback** for a trace captured without the kernel-launch
+    hooks: it recovers the launcher's name and file (so the op is readable and
+    the replay knows what to import) but not its operands. A hooked capture
+    carries both in a ``kernel::`` span.
     """
     frames: list[tuple[float, float, str, int, str]] = []
     for evt in events:
@@ -385,11 +413,7 @@ def _collect_launcher_frames(events: list[dict], worker_tid: Any
         if not match:
             continue                     # "nn.Module: X", "<built-in ...>", ...
         file, func = match.group("file"), match.group("func").strip()
-        if not func or func.startswith("_") or func.endswith(">"):
-            continue                     # private helper or <listcomp>/<lambda>
-        if func in _DISPATCH_FUNCS:
-            continue
-        if any(fragment in file for fragment in _LAUNCH_MACHINERY):
+        if not is_launcher_frame(file, func):
             continue
         ts = evt.get("ts", 0)
         frames.append((ts, ts + (evt.get("dur", 0) or 0), file,
@@ -574,14 +598,46 @@ def _attribute_kernels(roots: list[_Raw],
         op = synth.get(key)
         if op is None:
             op = _Raw("op", _synthetic_op_label(name, api_name), ts, 0.0)
-            # Where this kernel's Python entry point lives. The replay
-            # benchmark imports exactly this file and attribute instead of
-            # guessing a module path from the op name.
-            op.launch = frame
+            # Where this kernel's Python entry point lives, and what it was
+            # called with. The replay benchmark imports exactly this file and
+            # attribute and rebuilds exactly these operands, instead of
+            # guessing a module path from the op name and a layout from the
+            # model config.
+            op.launch = {k: frame[k] for k in ("file", "line", "func")
+                         if k in (frame or {})} or None
+            _apply_recorded_args(op, (frame or {}).get("args"))
             synth[key] = op
             mod.children.append(op)
             parent[id(op)] = mod
         op.self_dev += dur
+
+
+def _apply_recorded_args(op: _Raw, slots: Any) -> None:
+    """Attach a kernel span's recorded operands to a synthetic op.
+
+    Fills the same three fields a ``cpu_op`` would: the full ordered argument
+    slots (for replay), and the tensor shapes / dtypes (for the shape, memory
+    and FLOPs analysis), kept aligned. A slot the hook could not describe
+    (``opaque``) is kept in its position so the argument list stays aligned with
+    the function's signature — the replay reports it rather than guessing.
+    """
+    if not isinstance(slots, list) or not slots:
+        return
+    op.arg_slots = [dict(s) for s in slots if isinstance(s, dict)]
+    shapes: list[list[int]] = []
+    dtypes: list[str] = []
+    for slot in op.arg_slots:
+        items = (slot.get("items") or []) if slot.get("kind") == "tensorlist" \
+            else ([slot] if slot.get("kind") == "tensor" else [])
+        for item in items:
+            dims = [int(d) for d in item.get("dims") or []]
+            if not dims:
+                continue
+            shapes.append(dims)
+            dtypes.append(str(item.get("dtype") or ""))
+    op.shapes = shapes
+    op.dtypes = dtypes
+    op.dtype = dtypes[0] if dtypes else ""
 
 
 def _kernel_leaf_coverage(
@@ -671,9 +727,14 @@ def _infer_hidden_activation_ops(roots: list[_Raw], hidden_size: int | None
                                  ) -> None:
     """Fill missing shape/dtype on residual-stream ops from a neighbour.
 
-    Norm kernels (Triton/FlashInfer, launched straight from Python) carry no
-    ``cpu_op`` and so no shape, and TP collectives record only a dtype-less
-    ``TensorList``. Both operate on the residual hidden state ``[tokens, H]``, so
+    Two different gaps, one fix. A TP collective records only a dtype-less
+    ``TensorList``, which no capture-time hook changes — the shape is genuinely
+    absent from the dispatcher's own record. A Python-launched norm kernel
+    carries no ``cpu_op`` at all; a capture made with
+    :mod:`breakdown.kernel_hooks` records its real operands, so only an un-hooked
+    trace reaches this pass for that case.
+
+    Both operate on the residual hidden state ``[tokens, H]``, so
     for each such op missing a shape and/or a real dtype we borrow both from the
     op nearest in execution order that carries a genuine ``[tokens, H]`` tensor
     (2-D, trailing dim == ``hidden_size``, real dtype) — picking the nearest by
@@ -763,9 +824,17 @@ def _infer_attention_kernel_shapes(roots: list[_Raw], summary: dict,
                                    tp_size: int) -> None:
     """Reconstruct shape/dtype for shape-less MiniMax-M3 MSA / indexer kernels.
 
-    The MSA sparse-attention and lightning-indexer kernels carry no ``cpu_op`` on
-    either backend (XPU ``flash_xpu`` SYCL kernels launched from
-    ``xattention.py``; CUDA ``triton.jit`` kernels launched from
+    **Fallback only.** A capture made with :mod:`breakdown.kernel_hooks` records
+    these kernels' real operands in a ``kernel::`` span, so they arrive here
+    already shaped and this pass skips them. It exists for traces captured
+    without the hooks (archived CUDA references, third-party traces), where the
+    alternative is an op with no shape at all — and therefore no memory, no
+    FLOPs, no roofline and no replay.
+
+    It is a *guess from the wrapper signature*, not a measurement: the MSA
+    sparse-attention and lightning-indexer kernels carry no ``cpu_op`` on either
+    backend (XPU ``flash_xpu`` SYCL kernels launched from ``xattention.py``;
+    CUDA ``triton.jit`` kernels launched from
     ``common/ops/{sparse_attn,index_topk}.py``), so ``_attribute_kernels``
     surfaces them with no shape at all. Their primary-tensor layout is fixed by
     the wrapper signatures, so we rebuild it from the config (per-rank
@@ -776,6 +845,8 @@ def _infer_attention_kernel_shapes(roots: list[_Raw], summary: dict,
     op (so prefill gets ``S`` and decode ``B``). Kernels with no known layout
     fall back to borrowing the neighbour's activation shape so they at least
     carry the token dim + dtype. No-op without neighbour activations.
+
+    Do not extend this table for a new kernel: capture with the hooks instead.
     """
     ops: list[_Raw] = []
     stack = list(roots)
