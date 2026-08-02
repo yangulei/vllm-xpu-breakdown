@@ -1456,13 +1456,13 @@
                   "shapes": [
                    [
                     "B",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "n_h\u00b7d/TP"
                    ],
                    [
-                    "d"
+                    "topk\u00b7B"
                    ],
                    [
                     "n_kv/TP"
@@ -1482,11 +1482,11 @@
                   "role": "activation",
                   "shapes": [
                    [
-                    "d",
+                    "topk\u00b7B",
                     "I_moe/TP"
                    ],
                    [
-                    "d",
+                    "topk\u00b7B",
                     "H/TP"
                    ]
                   ]
@@ -1553,22 +1553,22 @@
                   "shapes": [
                    [
                     "B",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "B",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "B",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "B",
-                    "d"
+                    "topk\u00b7B"
                    ],
                    [
-                    "d"
+                    "topk\u00b7B"
                    ]
                   ]
                  }
@@ -1598,7 +1598,7 @@
                  ],
                  [
                   "B",
-                  "d"
+                  "topk\u00b7B"
                  ],
                  [
                   "B",

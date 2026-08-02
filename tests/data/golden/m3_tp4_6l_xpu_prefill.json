@@ -1381,9 +1381,9 @@
                 "d"
                ],
                [
-                "n_kv/TP",
-                "n_h\u00b7d/TP",
-                "n_h/TP"
+                "n_idx/TP",
+                "S",
+                "K_topk"
                ],
                [
                 "n_kv/TP",
@@ -1580,7 +1580,7 @@
                     "H"
                    ],
                    [
-                    "n_h\u00b7d",
+                    "topk\u00b7S",
                     "H"
                    ],
                    [
@@ -1588,11 +1588,11 @@
                    ],
                    [
                     "S",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "S",
-                    "n_kv"
+                    "topk"
                    ]
                   ]
                  },
@@ -1611,7 +1611,7 @@
                   "role": "cutlass_grouped_gemm_interface",
                   "shapes": [
                    [
-                    "n_h\u00b7d",
+                    "topk\u00b7S",
                     "H"
                    ],
                    [
@@ -1620,7 +1620,7 @@
                     "H/TP"
                    ],
                    [
-                    "n_h\u00b7d",
+                    "topk\u00b7S",
                     "H/TP"
                    ],
                    [
@@ -1641,11 +1641,11 @@
                   "role": "swigluoai_and_mul",
                   "shapes": [
                    [
-                    "n_h\u00b7d",
+                    "topk\u00b7S",
                     "I_moe/TP"
                    ],
                    [
-                    "n_h\u00b7d",
+                    "topk\u00b7S",
                     "H/TP"
                    ]
                   ]
@@ -1665,7 +1665,7 @@
                   "role": "cutlass_grouped_gemm_interface",
                   "shapes": [
                    [
-                    "n_h\u00b7d",
+                    "topk\u00b7S",
                     "I_moe/TP"
                    ],
                    [
@@ -1674,7 +1674,7 @@
                     "H"
                    ],
                    [
-                    "n_h\u00b7d",
+                    "topk\u00b7S",
                     "H"
                    ],
                    [
@@ -1701,16 +1701,16 @@
                     "H"
                    ],
                    [
-                    "n_h\u00b7d",
+                    "topk\u00b7S",
                     "H"
                    ],
                    [
                     "S",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "S",
-                    "n_kv"
+                    "topk"
                    ]
                   ]
                  }
@@ -1740,15 +1740,15 @@
                   "shapes": [
                    [
                     "S",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "S",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "S",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "S",
@@ -2326,9 +2326,9 @@
                 "d"
                ],
                [
-                "n_kv/TP",
-                "n_h\u00b7d/TP",
-                "n_h/TP"
+                "n_idx/TP",
+                "S",
+                "K_topk"
                ],
                [
                 "n_kv/TP",
@@ -2525,7 +2525,7 @@
                     "H"
                    ],
                    [
-                    "n_h\u00b7d",
+                    "topk\u00b7S",
                     "H"
                    ],
                    [
@@ -2533,11 +2533,11 @@
                    ],
                    [
                     "S",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "S",
-                    "n_kv"
+                    "topk"
                    ]
                   ]
                  },
@@ -2556,7 +2556,7 @@
                   "role": "cutlass_grouped_gemm_interface",
                   "shapes": [
                    [
-                    "n_h\u00b7d",
+                    "topk\u00b7S",
                     "H"
                    ],
                    [
@@ -2565,7 +2565,7 @@
                     "H/TP"
                    ],
                    [
-                    "n_h\u00b7d",
+                    "topk\u00b7S",
                     "H/TP"
                    ],
                    [
@@ -2586,11 +2586,11 @@
                   "role": "swigluoai_and_mul",
                   "shapes": [
                    [
-                    "n_h\u00b7d",
+                    "topk\u00b7S",
                     "I_moe/TP"
                    ],
                    [
-                    "n_h\u00b7d",
+                    "topk\u00b7S",
                     "H/TP"
                    ]
                   ]
@@ -2610,7 +2610,7 @@
                   "role": "cutlass_grouped_gemm_interface",
                   "shapes": [
                    [
-                    "n_h\u00b7d",
+                    "topk\u00b7S",
                     "I_moe/TP"
                    ],
                    [
@@ -2619,7 +2619,7 @@
                     "H"
                    ],
                    [
-                    "n_h\u00b7d",
+                    "topk\u00b7S",
                     "H"
                    ],
                    [
@@ -2646,16 +2646,16 @@
                     "H"
                    ],
                    [
-                    "n_h\u00b7d",
+                    "topk\u00b7S",
                     "H"
                    ],
                    [
                     "S",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "S",
-                    "n_kv"
+                    "topk"
                    ]
                   ]
                  }
@@ -2685,15 +2685,15 @@
                   "shapes": [
                    [
                     "S",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "S",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "S",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "S",
@@ -3069,6 +3069,7 @@
   "H": 6144,
   "I": 12288,
   "I_moe": 3072,
+  "K_topk": 16,
   "N": 13813,
   "N2": 33,
   "N_kv": 13813,

@@ -1340,9 +1340,9 @@
                 "d"
                ],
                [
-                "n_kv/TP",
-                "d/TP",
-                "n_h/TP"
+                "n_idx/TP",
+                "B",
+                "K_topk"
                ],
                [
                 "B",
@@ -1635,19 +1635,19 @@
                     "H"
                    ],
                    [
-                    "d",
+                    "topk\u00b7B",
                     "H"
                    ],
                    [
-                    "d"
+                    "topk\u00b7B"
                    ],
                    [
                     "B",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "B",
-                    "n_kv"
+                    "topk"
                    ]
                   ]
                  },
@@ -1666,20 +1666,20 @@
                   "role": "cutlass_grouped_gemm_interface",
                   "shapes": [
                    [
-                    "d",
+                    "topk\u00b7B",
                     "H"
                    ],
                    [
-                    "d",
+                    "topk\u00b7B",
                     "H",
                     "H/TP"
                    ],
                    [
-                    "d",
+                    "topk\u00b7B",
                     "H/TP"
                    ],
                    [
-                    "d"
+                    "topk\u00b7B"
                    ]
                   ]
                  },
@@ -1696,11 +1696,11 @@
                   "role": "swigluoai_and_mul",
                   "shapes": [
                    [
-                    "d",
+                    "topk\u00b7B",
                     "I_moe/TP"
                    ],
                    [
-                    "d",
+                    "topk\u00b7B",
                     "H/TP"
                    ]
                   ]
@@ -1720,20 +1720,20 @@
                   "role": "cutlass_grouped_gemm_interface",
                   "shapes": [
                    [
-                    "d",
+                    "topk\u00b7B",
                     "I_moe/TP"
                    ],
                    [
-                    "d",
+                    "topk\u00b7B",
                     "I_moe/TP",
                     "H"
                    ],
                    [
-                    "d",
+                    "topk\u00b7B",
                     "H"
                    ],
                    [
-                    "d"
+                    "topk\u00b7B"
                    ]
                   ]
                  },
@@ -1756,16 +1756,16 @@
                     "H"
                    ],
                    [
-                    "d",
+                    "topk\u00b7B",
                     "H"
                    ],
                    [
                     "B",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "B",
-                    "n_kv"
+                    "topk"
                    ]
                   ]
                  }
@@ -1795,22 +1795,22 @@
                   "shapes": [
                    [
                     "B",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "B",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "B",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "B",
-                    "d"
+                    "topk\u00b7B"
                    ],
                    [
-                    "d"
+                    "topk\u00b7B"
                    ]
                   ]
                  }
@@ -1840,7 +1840,7 @@
                  ],
                  [
                   "B",
-                  "d"
+                  "topk\u00b7B"
                  ],
                  [
                   "B",
@@ -2240,9 +2240,9 @@
                 "d"
                ],
                [
-                "n_kv/TP",
-                "d/TP",
-                "n_h/TP"
+                "n_idx/TP",
+                "B",
+                "K_topk"
                ],
                [
                 "B",
@@ -2535,19 +2535,19 @@
                     "H"
                    ],
                    [
-                    "d",
+                    "topk\u00b7B",
                     "H"
                    ],
                    [
-                    "d"
+                    "topk\u00b7B"
                    ],
                    [
                     "B",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "B",
-                    "n_kv"
+                    "topk"
                    ]
                   ]
                  },
@@ -2566,20 +2566,20 @@
                   "role": "cutlass_grouped_gemm_interface",
                   "shapes": [
                    [
-                    "d",
+                    "topk\u00b7B",
                     "H"
                    ],
                    [
-                    "d",
+                    "topk\u00b7B",
                     "H",
                     "H/TP"
                    ],
                    [
-                    "d",
+                    "topk\u00b7B",
                     "H/TP"
                    ],
                    [
-                    "d"
+                    "topk\u00b7B"
                    ]
                   ]
                  },
@@ -2596,11 +2596,11 @@
                   "role": "swigluoai_and_mul",
                   "shapes": [
                    [
-                    "d",
+                    "topk\u00b7B",
                     "I_moe/TP"
                    ],
                    [
-                    "d",
+                    "topk\u00b7B",
                     "H/TP"
                    ]
                   ]
@@ -2620,20 +2620,20 @@
                   "role": "cutlass_grouped_gemm_interface",
                   "shapes": [
                    [
-                    "d",
+                    "topk\u00b7B",
                     "I_moe/TP"
                    ],
                    [
-                    "d",
+                    "topk\u00b7B",
                     "I_moe/TP",
                     "H"
                    ],
                    [
-                    "d",
+                    "topk\u00b7B",
                     "H"
                    ],
                    [
-                    "d"
+                    "topk\u00b7B"
                    ]
                   ]
                  },
@@ -2656,16 +2656,16 @@
                     "H"
                    ],
                    [
-                    "d",
+                    "topk\u00b7B",
                     "H"
                    ],
                    [
                     "B",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "B",
-                    "n_kv"
+                    "topk"
                    ]
                   ]
                  }
@@ -2695,22 +2695,22 @@
                   "shapes": [
                    [
                     "B",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "B",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "B",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "B",
-                    "d"
+                    "topk\u00b7B"
                    ],
                    [
-                    "d"
+                    "topk\u00b7B"
                    ]
                   ]
                  }
@@ -2740,7 +2740,7 @@
                  ],
                  [
                   "B",
-                  "d"
+                  "topk\u00b7B"
                  ],
                  [
                   "B",
@@ -2980,6 +2980,7 @@
   "H": 6144,
   "I": 12288,
   "I_moe": 3072,
+  "K_topk": 16,
   "N": 13813,
   "N2": 33,
   "N_kv": 13813,

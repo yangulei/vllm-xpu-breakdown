@@ -12,7 +12,6 @@ from .rules import (
     _KNOWN_MODULE_ROLES, _PLUMBING_OPS, _disambiguate_child_name,
     _module_display_name, _output_shape, _rowparallel_shape_role)
 from .forest import _Raw
-from .symbols import _symbolize
 
 
 # ===================================================================
@@ -200,11 +199,12 @@ def _finalize_node(
         role = op_role \
             or _infer_role(module_path + [merged["module_type"]], raw.label) \
             or raw.label.split("::")[-1]
-        sym_shapes = [
-            _symbolize(s, symbols_val, token_symbol, token_val) for s in shapes
-        ]
-        out_shape = _symbolize(_output_shape(raw.label, shapes),
-                               symbols_val, token_symbol, token_val)
+        # Shapes stay numeric here. Symbolization is a single ordered pass
+        # over the finished trees (:mod:`breakdown.trace.symbols`) - doing it
+        # per node would mean resolving a dim without knowing which other dims
+        # the run produced, which is exactly what step 5 needs.
+        sym_shapes = [list(s) for s in shapes]
+        out_shape = _output_shape(raw.label, shapes)
         op_order_pos = order_index.get(("op", gkey))
         if op_order_pos is None:
             op_order_pos = order_by_name.get(raw.label)

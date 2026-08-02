@@ -21,8 +21,7 @@ from .shapes import (
     _infer_attention_kernel_shapes, _infer_hidden_activation_ops)
 from .phases import _classify_steps, _pass_token_dim
 from .symbols import (
-    _build_symbol_tables, _dim_is, _symbolize_moe_routed_rows,
-    _symbolize_msa_dims, _symbolize_runtime_dims)
+    SymbolTable, _dim_is, symbolize_allocations, symbolize_trees)
 from .collapse import _build_phase_tree
 
 
@@ -306,7 +305,8 @@ def build_graph_from_trace(
 
     dtype = summary.get("dtype", "bfloat16")
     dtype_bytes = dtype_size(dtype)
-    val_to_sym, sym_to_val = _build_symbol_tables(summary, tp_size)
+    table = SymbolTable(summary, tp_size)
+    val_to_sym, sym_to_val = table.value, table.legend
 
     prefill_tokens = max((_pass_token_dim(p) for p in prefill_passes), default=0)
     decode_tokens = max((_pass_token_dim(p) for p in decode_passes), default=0)
@@ -341,6 +341,17 @@ def build_graph_from_trace(
         decode_passes, n_dec, val_to_sym, dtype_bytes, "B", decode_tokens,
         device_type=device_type)
 
+    # One ordered resolution of every dim (token -> derived expression ->
+    # scoped constant -> constant). Step 5, the run-specific allocation sizes,
+    # runs after the attention KV annotation below, which needs those rows
+    # still expressed in terms of the token dim.
+    if prefill_tokens:
+        sym_to_val["S"] = prefill_tokens
+    if decode_tokens:
+        sym_to_val["B"] = decode_tokens
+    symbolize_trees([(prefill_tree, "S", prefill_tokens),
+                     (decode_tree, "B", decode_tokens)], table, summary)
+
     # Reduced-layer profiling (app.py caps num_hidden_layers to save memory)
     # captures only a few decoder layers. Extrapolate the repeat counts back to
     # the model's true layer count so the tree reads e.g. ``x57`` MoE layers.
@@ -370,24 +381,7 @@ def build_graph_from_trace(
                                n_seqs=decode_tokens, dtype_bytes=dtype_bytes)
         _recompute_totals(decode_tree)
 
-    if prefill_tokens:
-        sym_to_val["S"] = prefill_tokens
-    if decode_tokens:
-        sym_to_val["B"] = decode_tokens
-
-    # Symbolize any remaining concrete integer dims that aren't derivable from
-    # the model config or S/B/C — chiefly run-specific allocation sizes: the
-    # paged KV-cache slot count (``N_kv``) and the CUDA Triton-MoE routed-token /
-    # block-align scratch buffers (``M_moe`` / ``N_moe``). Each distinct value is
-    # assigned an observed-value symbol recorded in the legend so the shape reads
-    # a symbol while the concrete number stays available for tooltips/exports.
-    _symbolize_msa_dims([(prefill_tree, "S", prefill_tokens),
-                         (decode_tree, "B", decode_tokens)],
-                        sym_to_val, summary, tp_size)
-    _symbolize_moe_routed_rows([(prefill_tree, "S", prefill_tokens),
-                                (decode_tree, "B", decode_tokens)],
-                               sym_to_val, summary)
-    _symbolize_runtime_dims([prefill_tree, decode_tree], sym_to_val)
+    symbolize_allocations([prefill_tree, decode_tree], sym_to_val)
 
     total_ops = 0
     for tree in (prefill_tree, decode_tree):

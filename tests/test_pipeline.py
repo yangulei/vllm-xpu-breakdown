@@ -1889,18 +1889,18 @@ class TestGraphFromTrace(unittest.TestCase):
         # rule would match the router's own [tokens, topk] operand and turn the
         # expert fan-out into topk*B - a width that scales with the swept batch,
         # which is the very bug the pass exists to prevent.
-        from breakdown.trace.symbols import _symbolize_moe_routed_rows
+        from breakdown.trace.symbols import SymbolTable, symbolize_trees
 
         summary = {"num_experts": 8, "num_experts_per_tok": 4}
         tree = {
             "name": "moe", "module_type": "MoE", "path": "moe",
             "repeat_count": 1, "children": [],
             "ops": [{"name": "_moe_C::remap_hidden_states",
-                     "input_shapes": [["B", "H"], [4, "H"], ["B", 4]],
+                     "input_shapes": [[1, "H"], [4, "H"], [1, 4]],
                      "output_shape": None}],
         }
-        syms: dict = {}
-        _symbolize_moe_routed_rows([(tree, "B", 1)], syms, summary)
+        table = SymbolTable(summary, 1)
+        symbolize_trees([(tree, "B", 1)], table, summary)
         shapes = tree["ops"][0]["input_shapes"]
         self.assertEqual(shapes[2], ["B", "topk"])       # not ["B", "topk·B"]
         self.assertEqual(shapes[1], ["topk·B", "H"])     # routed rows still scale
@@ -2525,8 +2525,9 @@ class TestSymbolicShapeCompleteness(unittest.TestCase):
     }
 
     def test_config_symbols_include_sparse_qkv_and_rope_cache(self):
-        from breakdown.trace.symbols import _build_symbol_tables
-        val_to_sym, sym_to_val = _build_symbol_tables(self.M3_SUMMARY, 4)
+        from breakdown.trace.symbols import SymbolTable
+        table = SymbolTable(self.M3_SUMMARY, 4)
+        val_to_sym, sym_to_val = table.value, table.legend
         # Rope cos/sin cache length = max_position_embeddings → P (not /TP).
         self.assertEqual(sym_to_val["P"], 1048576)
         self.assertEqual(val_to_sym[1048576], "P")
@@ -2544,7 +2545,7 @@ class TestSymbolicShapeCompleteness(unittest.TestCase):
         self.assertEqual(val_to_sym[1], "n_kv/TP")
 
     def test_runtime_dims_symbolized_with_observed_values(self):
-        from breakdown.trace.symbols import _symbolize_runtime_dims
+        from breakdown.trace.symbols import symbolize_allocations
         # A minimal tree carrying the run-specific allocation dims that aren't
         # config-derivable: paged KV-cache slots, MoE routed-token rows, and the
         # 1-D moe_align_block_size scratch buffers.
@@ -2567,7 +2568,7 @@ class TestSymbolicShapeCompleteness(unittest.TestCase):
         # Fix the placeholder above: both kv rows share the same slot count.
         tree["children"][0]["ops"][0]["input_shapes"][0][0] = 17286
         sym_to_val: dict = {}
-        _symbolize_runtime_dims([tree], sym_to_val)
+        symbolize_allocations([tree], sym_to_val)
 
         kv_op = tree["children"][0]["ops"][0]
         self.assertEqual(kv_op["input_shapes"][0], ["N_kv", 2, "d", "n_kv/TP", "d"])
@@ -2584,12 +2585,12 @@ class TestSymbolicShapeCompleteness(unittest.TestCase):
         self.assertEqual(experts[1]["input_shapes"], [["N_moe"], ["N_moe2"]])
 
     def test_trivial_dims_left_concrete(self):
-        from breakdown.trace.symbols import _symbolize_runtime_dims
+        from breakdown.trace.symbols import symbolize_allocations
         # The k/v-pair constant 2 (and 0/1 placeholders) must stay literal.
         tree = {"module_type": "M", "children": [], "ops": [
             {"name": "_C::kv_cache_update", "input_shapes": [[2], [1], [0]]}]}
         sym_to_val: dict = {}
-        _symbolize_runtime_dims([tree], sym_to_val)
+        symbolize_allocations([tree], sym_to_val)
         self.assertEqual(tree["ops"][0]["input_shapes"], [[2], [1], [0]])
 
     def test_fixture_traces_no_concrete_structural_dims(self):

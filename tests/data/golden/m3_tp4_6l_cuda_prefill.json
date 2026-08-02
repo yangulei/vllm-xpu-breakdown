@@ -1458,7 +1458,7 @@
                   "shapes": [
                    [
                     "S",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "N_moe"
@@ -1555,15 +1555,15 @@
                   "shapes": [
                    [
                     "S",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "S",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "S",
-                    "n_kv"
+                    "topk"
                    ],
                    [
                     "S",
