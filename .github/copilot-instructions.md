@@ -1,230 +1,54 @@
-# Copilot Instructions — vllm-xpu-breakdown
+# Copilot instructions — vllm-xpu-breakdown
 
-## First Steps
+**Read `AGENTS.md` first.** It is the authoritative index: project structure,
+build/test commands, conventions, the API table, and the pitfall index
+(symptom -> the function that holds the invariant -> the test that guards it).
 
-Always read `AGENTS.md` in the project root before exploring or making changes. It contains the authoritative project structure, architecture, and conventions.
+Then read the deep dive for whatever you are changing:
 
-## Build & Run
+- `breakdown/trace/README.md` — how a trace becomes a model graph.
+- `breakdown/bench/README.md` — how those ops become measured, ranked targets.
+- `breakdown/optimize/README.md` — how a ranked target becomes a kernel session.
+
+## The shape of the thing
+
+Four stages, each of which also runs headless:
+
+1. **Profile** — run vLLM once on Intel XPU and reconstruct the module/op tree
+   directly from the torch-profiler trace (`breakdown/trace/`).
+2. **Sweep + replay** — turn those ops into a shape matrix and re-invoke the
+   ops vLLM actually dispatched, at every swept point (`breakdown/bench/`).
+3. **Rank** — `calls x latency x roofline headroom` -> `targets.json`.
+4. **Optimize** — hand a ranked target to a Copilot CLI kernel session, one GPU
+   each (`breakdown/optimize/`).
+
+The web UI (`app.py` + `static/index.html`) is a wrapper over the same code the
+CLIs call. `app.py` is routes; the work is in `breakdown/`.
+
+## Rules of thumb
+
+- **Reasons are the specification.** Nearly every non-obvious rule in this
+  codebase exists because the naive version produced a specific wrong number.
+  Those numbers are in the docstrings. Do not delete a docstring while changing
+  the code it guards; update both.
+- **Nothing is guessed.** An op whose operands cannot be rebuilt is *reported*
+  with the reason, never filled with plausible data. A utilization above peak is
+  flagged as a cost-model problem, not silently retired.
+- **The golden fixtures are the safety net.** Any change to reconstruction must
+  be reviewed as a diff of `tests/data/golden/`
+  (`pytest tests/test_golden_graph.py --update-golden` to accept).
+- **The canonical example is MiniMax-M3, TP=4, 6 layers, XPU.** It exercises
+  hybrid dense/MoE, sparse attention, tensor-parallel collectives and
+  Python-launched kernels; its traces are committed fixtures.
+
+## Before you finish
 
 ```bash
-pip install -r requirements.txt
-
-# Web UI (static analysis works without loading model weights)
-python app.py --port 8080
-
-# CLI profiling (requires Intel XPU + vLLM installed)
-python run_profile.py --model Qwen/Qwen3-4B-Instruct-2507 --max-model-len 32768
+pytest tests -q -p no:cacheprovider \
+  --ignore=tests/test_real_profile.py \
+  --ignore=tests/test_bench_replay.py \
+  --ignore=tests/test_profile_reduced_layers.py
 ```
 
-## Testing
-
-```bash
-# Unit tests (no GPU required)
-pytest tests/test_pipeline.py -v
-
-# Single test
-pytest tests/test_pipeline.py::TestClassifier::test_vllm_xpu_kernels -v -s
-
-# All tests including GPU integration
-pytest tests/ -v
-```
-
-No linter or pre-commit is configured for this project.
-
-## Architecture
-
-Flask web app (`app.py`) + static SPA (`static/index.html`) backed by a `breakdown/` analysis engine.
-
-**Analysis model** — the in-app Model Graph is **always reconstructed from a profiling run**; there is no interactive static-graph view and no config-driven graph builder. **Dynamic (profile-first)** — Runs vLLM inference on Intel XPU with `torch.profiler` (`with_stack` + `record_shapes`), then **reconstructs the model graph directly from the trace** in `graph_from_trace.py` (nn.Module call stack + `Input Dims` shapes + `Input type` dtypes + kernel device time via `correlation → runtime → External id`). The reconstructed tree reflects what actually executed, so it doesn't drift as vLLM/backends change. Both the web UI graph and the Shape Matrix Excel export (`/api/export/shape-matrix`) are built from this reconstruction.
-
-**Key data flow:**
-- `profiler.py` runs inference → `graph_from_trace.py` reconstructs the module/op tree from the trace (reusing `analyzer.py` shapes/memory/FLOPs + `classifier.py` backends) → `app.py` serializes to JSON → `index.html` renders tree. The removed `annotate_graph_*` / `parse_trace_with_modules` static-overlay path and the deleted `model_graph.py` config builder are not used anymore.
-- **Module names — capture-time spans (primary, `module_hooks.py`).** During profiling, `_run_profile` installs forward hooks (via `LLM.apply_model(install_module_span_hooks_on)`) that emit `record_function("module::<qualified_name>::<Cls>")` `user_annotation` spans around every module's forward. `graph_from_trace._build_raw_forest` auto-detects those spans and builds module nodes with **real attribute names straight from the trace** — no alignment, no registration-order assumption, correct even under async. Label helpers (`module_span_label`/`parse_module_span`/`module_span_display_name`) live torch-free in `trace_common.py`.
-- **Module names — `named_modules()` overlay (fallback, `module_naming.py`).** For legacy/upload traces without spans, `module_naming.py` recovers names from the live model's `named_modules()` (`ref_tree_from_llm`) and overlays them (`graph_from_trace._apply_ref_names`, before repeat-collapse). `build_graph_from_trace` applies it **only** when the forest has no captured names (`_forest_has_named_modules`). Alignment unwraps reference `*Model` levels absent from the trace (`_effective_ref_children`) — vLLM's inner `*Model.forward` often emits no module event, and without unwrapping, matching stalls and names fall back to `norm`.
-
-**Two subtle invariants (don't regress):** (1) `_partition_steps` picks the main model class by **largest module subtree** (`_subtree_module_count`), NOT device time — the `LogitsProcessor` `lm_head` matmul can dominate `sub_dev`, which previously mis-selected it, dropped the prefill phase (`prefill: None`) and made both phases identical. (2) The frontend (`applyProfileResult`) auto-selects a phase that has a reconstructed tree so the graph shows immediately.
-
-**Query Len / Context Len profiling (Method 1 / APC):** `_run_profile` builds exact-length synthetic token prompts (`_make_token_ids`) instead of a fixed text prompt. `query_len` = new prefill tokens (`S`); `context_len` (floored to `block_size`) is pre-computed in an un-profiled warm pass and served from the prefix cache (`enable_prefix_caching=True`) during the profiled run, so the profiled prefill sees `S` new tokens attending to a `context_len`-token KV. Warm the context prefix alone first, warm kernels with distinct query seeds, and profile with yet another seed (`900000+b`) so profiled queries are never cache-hit; each batch item gets a distinct query over a shared context. A cache miss (`outputs[0].num_cached_tokens < ctx_aligned`) is surfaced as `cache_hit_note`. `start_profile` bumps `max_model_len` to `context+query+max_tokens`. Absent `query_len` → legacy text-prompt path.
-
-**Replay benchmark + Shape Matrix (`breakdown/bench/`, `breakdown/shape_matrix.py`)** —
-**one module, not two features.** The Shape Matrix rows become
-**replay cases**: the trace records each op's dispatch name, per-tensor
-shapes/dtypes/strides and its non-tensor argument values, so the benchmark
-**re-invokes the op vLLM actually dispatched** (`torch.ops.<ns>.<op>`, or the
-recorded Python API frame for Triton/FlashInfer/SYCL-extension kernels) instead
-of benchmarking a substitute. There is no adapter table: coverage follows the
-profile. Each op is replayed in its own process (a bad shape can wedge the
-device), collectives are replayed on `TP` peer ranks with rank 0 recorded, and
-a ranker scores ops by calls × latency × roofline headroom, producing
-`output/bench/<run_id>/targets.json` for the `xpu-kernel-optimizer` skill. Runs
-headless via `python -m breakdown.bench {plan,run,rank,report,case,history,all}`.
-Integer/index operands are **never** filled randomly — an op without a
-registered synthesizer is reported, not guessed. A context-bound wrapper with a
-**context-free kernel entry point** is replayed through it — attention and the
-KV-cache write rebuild a paged KV cache + block table + sequence metadata
-(`bench/recipes/attention.py`), so the heaviest op in the model is measured
-rather than refused; a wrapper with no such entry point (`vllm::moe_forward*`)
-is still reported with a reason, and the kernels it launches are benchmarked as
-their own ops. The roofline classifies an op as compute- or memory-bound by its
-**arithmetic intensity vs the machine balance** (not by whichever utilization
-came out larger), names the bounding **hardware unit** (`XMX`/`XVE`/`DRAM`/
-`L3-Cache` — a non-matrix op is scored against the vector-engine peak, not
-XMX), and charges a cache-resident op to the last-level-cache bandwidth **and**
-to DRAM, taking the larger utilization as the headroom (a cache-resident kernel
-already at the DRAM roof is `at_roofline`, not a session). Prefill and decode
-are ranked **separately as well as together** (`targets.json` `by_phase`; the
-UI shows one phase at a time, sortable, with a per-op case drill-down inline
-under the ranked table), the
-ranking is done at the **profiled** operating point when it was benchmarked
-(`rank.profiled_point`), and the report workbook is the run's single
-deliverable: `Info`, `Summary`, per-phase `Targets`, **one sheet per op**,
-`Coverage`, and the run's own **`Shape Matrix`** (the sweep the cases were built
-from, persisted to `rows.json` at plan time). The UI has three tabs — `Model
-Graph`, `Bench & Rank` (one sweep form + one `▶ Bench & Rank` button that
-chains plan → replay → rank) and `Optimize Kernels` (which **manages** sessions
-— it has no candidate list, because the ranked table is the selection); the
-per-op case table lives **under the ranked table** it is opened from, and each
-ranked row has a `🚀 optimize` button (which replaced `copy bench`) that opens
-a session for that op. Do **not** re-add a Shape
-Matrix tab, a standalone `Op Detail` tab, or the separate ①/②/③ buttons. Model/quantization/**device** are set on
-`Model Graph`; the device selection is comma-separated **indexes of devices
-that exist** (validated by `bench.devices`, applied to workers via
-`ZE_AFFINITY_MASK`/`CUDA_VISIBLE_DEVICES`), the *Kernels* filter is a checkbox list
-fed by `/api/bench/ops`, and there is **no budget knob**: `estimate.case_budget`
-/ `op_budgets` derive the per-case measurement budget (and hence each worker's
-timeout) from the profiled shapes. Timing repeats the kernel inside
-a device-event window and subtracts the measured empty-window cost, because that
-floor (~60-90 us on Level Zero) dwarfs a small kernel. The old `breakdown/perf/`
-op-map + xpu-perf/micro_perf shell-out was removed; do not reintroduce it.
-
-**Optimize Kernels (`breakdown/optimize/`, `/api/optimize/*`)** — the
-pipeline's 4th stage: the ranking says *which* kernel is worth a session, this
-opens it. A ranked target becomes a markdown brief (built **only** from
-`targets.json`: baseline latency, roofline, kernel repo/build/test, `bench_cmd`
-/`profile_cmd`) handed to a headless `copilot -p … --allow-all-tools
---allow-all-paths` session running the `xpu-kernel-optimizer` skill; the skill
-owns the optimization loop, this module contributes no strategy. **One session
-owns one GPU, exclusively** — `scheduler.DevicePool` leases device indexes,
-enforces them with `ZE_AFFINITY_MASK`/`CUDA_VISIBLE_DEVICES` in the child env,
-and queues the surplus FIFO (concurrency is the pool size; there is **no**
-`max_parallel` knob, and every exit path must release its lease). It **refuses**
-`at_roofline` / `check_cost_model` / no-editable-source ops with the reason
-instead of burning a GPU. Sessions run from the workspace root (parent of this
-repo) and write `output/optimize/<run_id>/<op>/{prompt.md,command.txt,
-session.log,session.json,summary.md}`; `command.txt` is the pasteable fallback
-when the CLI is absent or the server should not hold an agent. A session's
-artifact root is **pinned at creation** (`OptimizeSession.root`) because the
-reaper thread writes state after the agent exits; a session restored from
-`index.json` is downgraded to `stopped` (its process died with the previous
-server); no endpoint returns `argv` (it embeds the whole brief); and the tab
-manages the **selected** run's sessions, adopting the run that actually has
-sessions when nothing is selected. Headless:
-`python -m breakdown.optimize {candidates,prompt,start,status,stop}`.
-
-**Backend classification priority:** ccl (collective-comm: `c10d::`/`ccl::` or all_reduce/all_gather/reduce_scatter/all_to_all) > vllm-xpu-kernels (exact match from registry) > flashinfer (name contains `flashinfer`) > triton (name patterns) > torch-xpu-ops (aten:: on XPU) > cpu > framework
-
-## Key Conventions
-
-- All Python files start with `# SPDX-License-Identifier: Apache-2.0`
-- Use `from __future__ import annotations` and modern type syntax (`dict[str, Any]`, `list[int] | None`)
-- Assume torch-xpu + vLLM are installed and an Intel XPU is available; `model_info.py` stays import-light but a torch-free CPU-only install is no longer a design goal
-- Op shapes use string symbols (`"H"`, `"S"`, `"n_h·d"`) resolved to concrete values at display/export time
-- Graph reconstruction accepts `tp_size` and produces per-rank shapes (dimensions divided by TP)
-- The web UI is a single HTML file with inline CSS/JS — no bundler or build step
-- `app.py` is large (~1700 lines) — use `view_range` to read targeted sections
-
-## Adding a New Model Architecture
-
-The model graph is reconstructed from the trace, so no static builder is needed:
-1. Ensure `breakdown/model_info.py` `summarize_config` extracts the model's key dims so shapes symbolize (`S`/`B`/`C`/`H`/`I`/`n_h·d`/…).
-2. Classify any novel ops (see below).
-3. Profile it and confirm the reconstructed graph + Shape Matrix look right.
-
-## Adding a New Op/Kernel
-
-1. Add op name to `ALL_VLLM_XPU_OPS` set in `breakdown/registry.py`
-2. If the op has a unique classification pattern, update `breakdown/classifier.py`
-3. Benchmarking needs no adapter. Add an input synthesizer
-   (`breakdown/bench/inputs.py` / `recipes/`) if it takes an index tensor, a
-   `resolve.PYTHON_API` entry if it is launched straight from Python, and an
-   entry in `breakdown/bench/kernel_sources.json` if it has editable source
-
-## Adding an Optimization Session Stage Change
-
-The Optimize tab consumes `targets.json`; it never writes it. Adding a new fact
-to the brief means adding it to `breakdown/optimize/prompt.py` (and a test in
-`tests/test_optimize_prompt.py`), not to the ranker. Changing how sessions are
-scheduled means `breakdown/optimize/scheduler.py` — keep the one-GPU-per-session
-invariant and the FIFO queue.
-
-## API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/model/<hf_id>` | GET | Fetch/summarize HF model config (+ `min_profile_layers`) |
-| `/api/profile` | POST | Start async profiling |
-| `/api/profile/upload` | POST | Reconstruct graph + op breakdown from uploaded trace file(s) |
-| `/api/profile/status` | GET | Poll profiling status |
-| `/api/profile/result` | GET | Fetch profiling result (ops + reconstructed graph) |
-| `/api/profile/trace` | GET | Download raw trace file |
-| `/api/export/shape-matrix` | POST | Export config-driven shape sweep to Excel |
-| `/api/devices` | GET | Accelerators present on this host (for the Device selector) |
-| `/api/bench/ops` | GET | Dispatch names the latest profile ran (Ops filter) |
-| `/api/bench/plan` | POST | Sweep the profiled graph into replay cases |
-| `/api/bench/run` | POST | Replay a run's cases (async) |
-| `/api/bench/status` | GET | Poll the benchmark run |
-| `/api/bench/runs` | GET | List bench runs |
-| `/api/bench/results` | GET | Measured cases + summary + coverage |
-| `/api/bench/targets` | GET | Ranked optimization targets (`targets.json`) |
-| `/api/bench/report` | GET | Download a run's report workbook |
-| `/api/bench/history` | GET | Benchmark history / two-run regression diff |
-| `/api/optimize/candidates` | GET | Ranked ops + whether each is worth a kernel session |
-| `/api/optimize/prompt` | POST | The brief + pasteable command, spawning nothing |
-| `/api/optimize/start` | POST | One Copilot CLI session per selected kernel (one GPU each) |
-| `/api/optimize/status` | GET | Sessions: state, leased device(s), queue position |
-| `/api/optimize/log` | GET | A session's log from `?offset=` |
-| `/api/optimize/stop` | POST | Stop a session / a run's sessions |
-
-
-<!-- headroom:rtk-instructions -->
-# RTK (Rust Token Killer) - Token-Optimized Commands
-
-When running shell commands, **always prefix with `rtk`**. This reduces context
-usage by 60-90% with zero behavior change. If rtk has no filter for a command,
-it passes through unchanged — so it is always safe to use.
-
-## Key Commands
-```bash
-# Git (59-80% savings)
-rtk git status          rtk git diff            rtk git log
-
-# Files & Search (60-75% savings)
-rtk ls <path>           rtk read <file>         rtk grep <pattern>
-rtk find <pattern>      rtk diff <file>
-
-# Test (90-99% savings) — shows failures only
-rtk pytest tests/       rtk cargo test          rtk test <cmd>
-
-# Build & Lint (80-90% savings) — shows errors only
-rtk tsc                 rtk lint                rtk cargo build
-rtk prettier --check    rtk mypy                rtk ruff check
-
-# Analysis (70-90% savings)
-rtk err <cmd>           rtk log <file>          rtk json <file>
-rtk summary <cmd>       rtk deps                rtk env
-
-# GitHub (26-87% savings)
-rtk gh pr view <n>      rtk gh run list         rtk gh issue list
-
-# Infrastructure (85% savings)
-rtk docker ps           rtk kubectl get         rtk docker logs <c>
-
-# Package managers (70-90% savings)
-rtk pip list            rtk pnpm install        rtk npm run <script>
-```
-
-## Rules
-- In command chains, prefix each segment: `rtk git add . && rtk git commit -m "msg"`
-- For debugging, use raw command without rtk prefix
-- `rtk proxy <cmd>` runs command without filtering but tracks usage
-<!-- /headroom:rtk-instructions -->
+Then update the documentation that your change invalidates — see "Updating
+documentation" at the end of `AGENTS.md`.

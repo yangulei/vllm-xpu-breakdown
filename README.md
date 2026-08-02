@@ -12,6 +12,13 @@ Profile vLLM inference on Intel XPU and visualize which backend handles each ope
 | **cpu** | Operations running on CPU |
 | **framework** | Tensor reshaping, memory ops, profiler overhead |
 
+## Reading Order
+
+- **`breakdown/trace/README.md`** — how a trace becomes a model graph.
+- **`breakdown/bench/README.md`** — how those ops become measured, ranked targets.
+- **`breakdown/optimize/README.md`** — how a ranked target becomes a kernel session.
+- **`AGENTS.md`** — structure, conventions, endpoints, and the pitfall index.
+
 ## Analysis Model
 
 The in-app **Model Graph is always reconstructed from a profiling run** — there
@@ -24,11 +31,14 @@ is no static graph view.
   is attributed to each op through the `correlation → runtime → External id`
   chain. Module nodes carry their **real attribute names** (`q_norm`/`k_norm`,
   `self_attn`, ...) because profiling installs forward hooks that emit
-  `record_function("module::<path>::<Cls>")` spans at capture time; a
-  `named_modules()` overlay is the fallback for legacy/uploaded traces without
-  those spans. Because the tree is derived from what actually executed, it tracks
-  whatever vLLM/the backends dispatched and does not drift as vLLM evolves.
-  Requires a working Intel XPU with torch-xpu and vLLM installed.
+  `record_function("module::<path>::<Cls>")` spans at capture time. A second
+  set of hooks records the *operands* of kernels launched straight from Python
+  (Triton, pybind11 extensions), which leave no `cpu_op` and would otherwise
+  have no shapes at all. A trace captured without either falls back to
+  class-only module names and config-derived shapes. Because the tree is
+  derived from what actually executed, it tracks whatever vLLM and the backends
+  dispatched and does not drift as vLLM evolves. Requires a working Intel XPU
+  with torch-xpu and vLLM installed.
 - **Shape Matrix export** — sweeps op shapes/memory/FLOPs across
   seq/context/batch/TP configurations, grounded in a real profiling run (the
   reconstructed ops are re-resolved per config). See below.
@@ -44,9 +54,8 @@ GLM-MoE-DSA) are now supported on XPU too — dense MLA routes to the
 with sparse attention) is supported on XPU as well — its nested
 `text_config`/`vision_config` layout, per-layer dense/MoE split, shared
 experts, and Triton lightning-indexer sparse attention (index score + top-k
-block selection + block-sparse attend, the actual XPU dispatch) are modeled in
-the static graph. Diffusion (T2I/T2V) models support
-static analysis only (not vLLM-served).
+block selection + block-sparse attend, the actual XPU dispatch) all reconstruct
+from a profiling run, and every one of its ops replays in the benchmark.
 
 ## Web UI (Recommended)
 
@@ -316,58 +325,75 @@ python -m breakdown.optimize stop   --run <run_id>
 ## Architecture
 
 ```
-app.py                  Web server (Flask) — model config, profiling, exports, REST API
+app.py                  Web server (Flask) — routes only
 static/index.html       Interactive frontend (SPA, vanilla JS)
 breakdown/
-  graph_from_trace.py   Profile-first graph reconstruction (from torch profiler trace)
-  op_breakdown.py       Flat op breakdown (iter_ops, summarize_ops, backend_totals) derived from the graph
+  profiling.py          Run vLLM once and turn the traces into a result
+  service.py            What a route does between request and response
+  runs.py               output/<stage>/<run_id>/state.json — a run survives a restart
+  cost.py               The one cost model: bytes, FLOPs, AI, and the roofline
+  trace/                Profile-first graph reconstruction — see its README.md
+    rules.py              Model/backend vocabulary — the only place names live
+    events.py             Reading the trace file
+    forest.py             The time-containment tree of modules and ops
+    kernels.py            Device time -> leaf ops
+    shapes.py             Span-less shape fallbacks
+    phases.py             Steps -> prefill / decode
+    symbols.py            Concrete dims -> symbolic expressions (one resolution)
+    collapse.py           Merge instances, name children, collapse repeats
+    graph.py              The orchestration
+  module_hooks.py       Capture-time module-name spans (real attribute paths)
+  kernel_hooks.py       Capture-time kernel-launch spans (operands of Python-launched kernels)
+  op_breakdown.py       Flat op breakdown derived from the graph
   shape_derive.py       Symbolic shape resolution (shared by the export + benchmark)
-  shape_matrix.py       Graph + config sweep -> matrix rows (the export serializes these)
+  shape_matrix.py       Graph + config sweep -> matrix rows
   shape_matrix_xlsx.py  Excel serialization of those rows
-  bench/                Replay benchmark: dispatched ops -> measured -> ranked targets
+  bench/                Replay benchmark — see its README.md
     spec.py               Matrix rows -> replay cases (skip/dedup rules)
+    types.py              The data contracts and the one record builder
     resolve.py            Dispatch name -> callable + schema (launch-frame resolution)
-    inputs.py             Schema-driven operands + index-synthesizer registry
-    recipes/              Per-op overrides, output args, skip reasons (xpu + cuda)
-                          + attention.py: paged attention / KV write, context-free
+    inputs.py             Schema-driven operands + the index-synthesizer registry
+    recipes/table.py      The one per-op recipe table (entry/build/values/outputs/skip)
+    recipes/              Per-op recipes (common, xpu, cuda, attention)
     timing.py             Device-event windows, overhead subtraction, operand restore
     worker.py             Benchmark one op in its own process -> results.jsonl
     runner.py             Orchestration, per-op timeouts, incremental run_result.json
     collective.py         Multi-rank replay of c10d ops (rank 0 is recorded)
-    estimate.py           Roofline (AI-based bound, DRAM/cache roof) + time budgets
+    estimate.py           Per-op time budgets (the roofline lives in cost.py)
     rank.py               calls x latency x roofline headroom -> targets.json
     reports.py            results.jsonl -> summary / coverage / workbook
     store.py              output/bench/<run_id>/ layout + run provenance
     history.py            SQLite history + regression detection
     cli.py                python -m breakdown.bench {plan,run,rank,report,case,history,all}
-  optimize/             Ranked target -> Copilot CLI kernel session (one GPU each)
+  optimize/             Ranked target -> Copilot CLI kernel session — see its README.md
     prompt.py             Target record -> the brief + the refusal rules
     session.py            Session record, argv, output/optimize/<run_id>/ layout
     scheduler.py          The GPU pool: exclusive leases, FIFO queue for the surplus
     manager.py            Spawn/track/stop the per-kernel copilot processes
     cli.py                python -m breakdown.optimize {candidates,prompt,start,status,stop}
-  module_hooks.py       Capture-time module-name spans (forward hooks; research R1)
   model_info.py         HuggingFace model config fetching & summarization
-  analyzer.py           Shape symbolization, memory/FLOPs estimation (dtype_size, estimate_memory, estimate_flops, DTYPE_BYTES)
   profiler.py           torch.profiler wrapper (XPU activity, shapes, stacks)
-  classifier.py         Op classification: vllm-xpu-kernels | triton | torch-xpu-ops | cpu
-  registry.py           Known op list from vllm-xpu-kernels (68 ops across 4 modules)
-  trace_common.py       Torch-free trace helpers (overhead filter, module-span labels, device/role inference, _strip_instance_idx)
+  classifier.py         Op classification: vllm-xpu-kernels | triton | torch-xpu-ops | ...
+  registry.py           Known op list from vllm-xpu-kernels
+  trace_common.py       Torch-free trace helpers (span labels, overhead filter, device/role)
 tools/
-  make_fixture.py       Trim a full trace to ~90 KB fixture (refuses if graph differs)
+  make_fixture.py       Trim a full trace to a committable fixture (refuses if the graph differs)
   capture_fixture.py    Re-capture the canonical MiniMax-M3 TP4 6-layer profile
 tests/
   conftest.py                 Repo root on sys.path + --update-golden flag
+  helpers.py                  graph_of / find_op / iter_ops / device_time
   data/                       Golden fixtures (trimmed rank-0 traces + configs + snapshots)
   test_pipeline.py            Unit tests (incl. graph reconstruction; requires torch)
-  test_golden_graph.py        Golden-snapshot tests over MiniMax-M3 TP4 6-layer fixtures
-  test_module_spans.py        Capture-time module-span emission + reconstruction tests
-  test_shape_matrix_export.py Shape Matrix Export endpoint tests
+  test_golden_graph.py        Golden snapshots over the MiniMax-M3 TP4 6-layer fixtures
+  test_module_spans.py        Capture-time module spans + reconstruction
+  test_kernel_spans.py        Capture-time kernel-launch spans + reconstruction
+  test_shape_matrix_export.py Shape Matrix export endpoint
   test_bench_spec.py          Rows -> replay cases (skip/dedup, swept dims)
   test_bench_resolve.py       Dispatch resolution + operand materialization
   test_bench_rank.py          Ranking, timing plan, budgets, history
   test_bench_api.py           /api/bench/* endpoints
   test_bench_replay.py        End-to-end replay on a real device (requires GPU)
+  test_optimize_*.py          The brief, the GPU leases, /api/optimize/*
   test_real_profile.py        Integration test (requires GPU)
 ```
 
