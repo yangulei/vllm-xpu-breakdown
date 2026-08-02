@@ -173,7 +173,7 @@ class TestRunAndTargets(BenchApiTest):
                     "phase": "decode", "seq_len": 1, "ctx_len": 0,
                     "batch_size": 1, "tp": 1, "backend": "torch-xpu-ops",
                     "layers": 36, "latency_us": lat, "flops": 1e6,
-                    "bytes": 1e5, "shape": "[1, 2560]",
+                    "nbytes": 1e5, "shape": "[1, 2560]",
                     "shape_key": op, "case_id": op,
                     "traced_device_time_us": 0, "traced_comparable": False,
                 }) + "\n")
@@ -201,7 +201,7 @@ class TestRunAndTargets(BenchApiTest):
                 "phase": "decode", "seq_len": 1, "ctx_len": 0,
                 "batch_size": 1, "tp": 1, "backend": "torch-xpu-ops",
                 "layers": 36, "latency_us": 50.0, "flops": 1e6,
-                "bytes": 1e5, "shape": "[1, 2560]",
+                "nbytes": 1e5, "shape": "[1, 2560]",
                 "shape_key": "aten::linear", "case_id": "aten::linear",
             }) + "\n")
         resp = self.client.get(f"/api/bench/report?run_id={run_id}")
@@ -240,7 +240,7 @@ class TestRunAndTargets(BenchApiTest):
             for op in ("_C::rms_norm", "aten::linear"):
                 fh.write(json.dumps({
                     "op": op, "status": "ok", "latency_us": 5.0,
-                    "layers": 36, "bytes": 1000.0, "flops": 0.0,
+                    "layers": 36, "nbytes": 1000.0, "flops": 0.0,
                     "phase": "decode", "seq_len": 1, "ctx_len": 2048,
                     "batch_size": 32, "tp": 1, "device": "xpu",
                 }) + "\n")

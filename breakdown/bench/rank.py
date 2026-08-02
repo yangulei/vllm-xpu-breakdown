@@ -279,7 +279,7 @@ def _rank_phases(recs: list[dict], rc: RankConfig, phases: tuple[str, ...],
             op_time[op][ph] += weighted
             op_backend[op][r.get("backend") or ""] += 1
             detail = estimate.roofline_detail(
-                lat, float(r.get("flops") or 0), float(r.get("bytes") or 0),
+                lat, float(r.get("flops") or 0), float(r.get("nbytes") or 0),
                 peaks, op)
             op_util[op].append((weighted, detail))
             ratio, note = _fidelity(r)

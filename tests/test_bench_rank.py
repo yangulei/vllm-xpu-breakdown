@@ -20,7 +20,7 @@ def _rec(op, latency, layers=1, flops=0.0, nbytes=0.0, phase="decode",
         "op": op, "status": "ok", "device": "xpu", "phase": phase,
         "seq_len": 1, "ctx_len": 2048, "batch_size": 32, "tp": 4,
         "backend": backend, "layers": layers, "latency_us": latency,
-        "flops": flops, "bytes": nbytes, "shape": "[32, 6144]",
+        "flops": flops, "nbytes": nbytes, "shape": "[32, 6144]",
         "shape_key": f"{op}-key", "case_id": f"{op}-case",
         "traced_device_time_us": traced, "traced_comparable": comparable,
     }

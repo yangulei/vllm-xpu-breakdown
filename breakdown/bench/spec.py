@@ -19,6 +19,8 @@ import json
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable
 
+from breakdown.bench.types import matrix_get
+
 #: Ops that are pure framework plumbing: they dispatch no device work worth
 #: optimizing, and replaying them measures allocator/bookkeeping noise.
 SKIP_OPS = frozenset({
@@ -260,7 +262,8 @@ def build_cases(rows: list[dict[str, Any]], device: str = "xpu",
             tp=_int(row.get("TP"), 1), module=row.get("Module", ""),
             module_type=row.get("_module_type", ""), role=row.get("_op_role", ""),
             backend=row.get("Backend", ""), layers=_int(row.get("Layers"), 1),
-            flops=_float(row.get("FLOPs")), nbytes=_float(row.get("Memory (bytes)")),
+            flops=_float(matrix_get(row, "flops")),
+            nbytes=_float(matrix_get(row, "nbytes")),
             traced_device_time_us=_float(row.get("_device_time_us")),
             launch=row.get("_launch") or None,
             traced_comparable=comparable,

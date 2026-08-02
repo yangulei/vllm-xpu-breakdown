@@ -30,6 +30,7 @@ from typing import Any, Callable
 
 from breakdown.bench import timing
 from breakdown.bench.spec import BenchCase, shape_key
+from breakdown.bench.types import case_record
 
 #: dispatch name -> ``torch.distributed`` function name. Aliases included
 #: because the trace records whichever wrapper the backend dispatched.
@@ -182,26 +183,12 @@ def rank_main(argv: list[str] | None = None) -> int:
 
 def _rec(case: BenchCase, status: str, world: int,
          m: timing.Measurement | None = None, error: str = "") -> dict[str, Any]:
-    rec = {
-        "case_id": case.case_id, "op": case.op,
-        "shape_key": shape_key(case.op, case.args), "shape": case.shape_label,
-        "status": status, "device": case.device, "phase": case.phase,
-        "seq_len": case.seq_len, "ctx_len": case.ctx_len,
-        "batch_size": case.batch_size, "points": case.points,
-        "tp": case.tp, "world_size": world,
-        "module": case.module, "role": case.role, "backend": case.backend,
-        "layers": case.layers, "flops": case.flops, "bytes": case.nbytes,
-        "traced_device_time_us": case.traced_device_time_us,
-        "traced_comparable": case.traced_comparable, "error": error,
-        "detail": "rank 0 measurement",
-    }
-    if m is not None:
-        rec.update({"latency_us": m.latency_us, "mean_us": m.mean_us,
-                    "min_us": m.min_us, "p10_us": m.p10_us, "p90_us": m.p90_us,
-                    "stdev_us": m.stdev_us, "iters": m.iters, "reps": m.reps,
-                    "windows": m.windows, "overhead_us": m.overhead_us,
-                    "notes": m.notes})
-    return rec
+    """Rank 0's record. Ranks 1..N-1 absorb the wait to synchronize with it, so
+    their latency is inflated; only rank 0's is recorded."""
+    return case_record(case, status, shape_key(case.op, case.args),
+                       measurement=m, error=error,
+                       detail="rank 0 measurement", world_size=world)
+
 
 
 def launch(op: str, world_size: int, cases_path: str, out_path: str,

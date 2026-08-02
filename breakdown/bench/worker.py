@@ -24,6 +24,7 @@ from typing import Any, Iterable
 from breakdown.bench import inputs as inputs_mod
 from breakdown.bench import recipes, resolve, timing
 from breakdown.bench.spec import BenchCase, shape_key
+from breakdown.bench.types import case_record
 
 
 def bench_env(cache_dir: str, base: dict | None = None) -> dict[str, str]:
@@ -47,39 +48,8 @@ def bench_env(cache_dir: str, base: dict | None = None) -> dict[str, str]:
 
 def _record(case: BenchCase, status: str, m: timing.Measurement | None = None,
             error: str = "", detail: str = "") -> dict[str, Any]:
-    rec: dict[str, Any] = {
-        "case_id": case.case_id,
-        "op": case.op,
-        "shape_key": shape_key(case.op, case.args),
-        "shape": case.shape_label,
-        "status": status,
-        "device": case.device,
-        "phase": case.phase,
-        "seq_len": case.seq_len,
-        "ctx_len": case.ctx_len,
-        "batch_size": case.batch_size,
-        "points": case.points,
-        "tp": case.tp,
-        "module": case.module,
-        "role": case.role,
-        "backend": case.backend,
-        "layers": case.layers,
-        "flops": case.flops,
-        "bytes": case.nbytes,
-        "traced_device_time_us": case.traced_device_time_us,
-        "traced_comparable": case.traced_comparable,
-        "error": error,
-        "detail": detail,
-    }
-    if m is not None:
-        rec.update({
-            "latency_us": m.latency_us, "mean_us": m.mean_us,
-            "min_us": m.min_us, "p10_us": m.p10_us, "p90_us": m.p90_us,
-            "stdev_us": m.stdev_us, "iters": m.iters, "reps": m.reps,
-            "windows": m.windows, "overhead_us": m.overhead_us,
-            "notes": m.notes,
-        })
-    return rec
+    return case_record(case, status, shape_key(case.op, case.args),
+                       measurement=m, error=error, detail=detail)
 
 
 def run_case(case: BenchCase, device: str,

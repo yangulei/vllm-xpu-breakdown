@@ -99,22 +99,19 @@ class Ctx:
 Synth = Callable[[Ctx], Any]
 
 #: ``(op, arg_name)`` -> synthesizer. Consulted before the name-only registry.
+#: ``(op, arg_name) -> synthesizer``. ``op`` is ``""`` for a synthesizer that
+#: applies to every op using that argument-name convention (``positions``,
+#: ``slot_mapping``, ``seq_lens``, ...); an op-specific entry wins over it.
+#: One registry rather than two, so "which synthesizer fills this operand" has
+#: a single lookup and a single precedence rule.
 SYNTHESIZERS: dict[tuple[str, str], Synth] = {}
-
-#: ``arg_name`` -> synthesizer, shared across ops that use the same convention
-#: (``positions``, ``slot_mapping``, ``topk_ids``, …).
-NAME_SYNTHESIZERS: dict[str, Synth] = {}
-
 
 def synthesizer(*names: str, op: str | None = None) -> Callable[[Synth], Synth]:
     """Register a synthesizer for one or more argument names."""
 
     def deco(fn: Synth) -> Synth:
         for n in names:
-            if op:
-                SYNTHESIZERS[(op, n)] = fn
-            else:
-                NAME_SYNTHESIZERS[n] = fn
+            SYNTHESIZERS[(op or "", n)] = fn
         return fn
 
     return deco
@@ -383,7 +380,8 @@ def make_tensor(dims: list[int], dtype_name: str, device: str,
 
 
 def _synth_for(op: str, name: str) -> Synth | None:
-    return SYNTHESIZERS.get((op, name)) or NAME_SYNTHESIZERS.get(name)
+    """The synthesizer for one operand: op-specific first, convention second."""
+    return SYNTHESIZERS.get((op, name)) or SYNTHESIZERS.get(("", name))
 
 
 def _tensor_arg(slot: dict, name: str, ctx_values: dict, case_op: str,

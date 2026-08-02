@@ -147,7 +147,7 @@ class TestBuildArgs(unittest.TestCase):
         self.assertIsInstance(call.args[1], float)
 
     def test_integer_operand_without_a_synthesizer_is_a_hard_error(self):
-        saved = inputs_mod.NAME_SYNTHESIZERS.pop("index", None)
+        saved = inputs_mod.SYNTHESIZERS.pop(("", "index"), None)
         try:
             case = self._case("aten::index_select",
                               [_t([16, 4], "float"),
@@ -160,7 +160,7 @@ class TestBuildArgs(unittest.TestCase):
             self.assertIn("synthesizer", str(cm.exception))
         finally:
             if saved is not None:
-                inputs_mod.NAME_SYNTHESIZERS["index"] = saved
+                inputs_mod.SYNTHESIZERS[("", "index")] = saved
 
     def test_gather_index_stays_inside_the_table_it_indexes(self):
         case = self._case("aten::index_select",

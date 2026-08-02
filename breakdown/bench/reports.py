@@ -48,7 +48,7 @@ COLUMNS = [
     ("layers", "Layers"), ("weighted_us", "Weighted (us)"),
     ("seq_len", "Seq Len"), ("ctx_len", "Ctx Len"),
     ("batch_size", "Batch"), ("tp", "TP"),
-    ("flops", "FLOPs"), ("bytes", "Memory (bytes)"),
+    ("flops", "FLOPs"), ("nbytes", "Memory (bytes)"),
     ("reps", "Reps"), ("windows", "Windows"), ("iters", "Iters"),
     ("module", "Module"), ("error", "Error"), ("detail", "Detail"),
 ]
@@ -68,7 +68,7 @@ def enrich(records: Iterable[dict], peaks: dict[str, float] | None = None
         calls = max(int(r.get("layers") or 1), 1)
         if lat > 0:
             d = estimate.roofline_detail(
-                lat, float(r.get("flops") or 0), float(r.get("bytes") or 0),
+                lat, float(r.get("flops") or 0), float(r.get("nbytes") or 0),
                 peaks, r.get("op"))
             r["util"] = round(d["util"], 3)
             r["util_dram"] = round(d["util_dram"], 3) or None
