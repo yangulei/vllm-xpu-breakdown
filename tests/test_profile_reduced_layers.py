@@ -120,7 +120,9 @@ class TestReducedLayerProfiling:
         """Trace from reduced-layer profiling must be parseable by our parser."""
         from vllm import SamplingParams
 
+        from breakdown.model_info import fetch_model_config, summarize_config
         from breakdown.op_breakdown import summarize_ops
+        from breakdown.trace import build_graph_from_trace
 
         llm = _create_engine(num_hidden_layers=1)
         sampling = SamplingParams(max_tokens=8)
@@ -135,8 +137,11 @@ class TestReducedLayerProfiling:
         trace_files = _get_trace_files()
         assert trace_files, "No trace files produced"
 
-        ops = parse_trace_file(trace_files[0])
-        assert len(ops) > 0, "No ops parsed from trace"
+        summary = summarize_config(fetch_model_config(MODEL_ID))
+        graph = build_graph_from_trace(trace_files[0], summary,
+                                       tp_size=1, batch_size=1)
+        ops = summarize_ops(graph)
+        assert len(ops) > 0, "No ops reconstructed from the trace"
 
         # Should contain typical ops (matmul, linear, etc.)
         op_names = {o["name"] for o in ops}

@@ -127,31 +127,20 @@ def main():
         for name, total_dur in sorted(kernel_names.items(), key=lambda x: -x[1])[:10]:
             print(f"    {name:60s}  total_dur={total_dur:>10.0f}µs")
 
-    # Now parse with our trace_parser
+    # Reconstruct the graph, which is what the rest of the pipeline consumes.
+    from breakdown.model_info import fetch_model_config, summarize_config
     from breakdown.op_breakdown import summarize_ops
-    from breakdown.model_info import fetch_model_config, summarize_config, get_dim_symbols
-    from breakdown.cost import analyze_ops
+    from breakdown.trace import build_graph_from_trace
 
-    ops = parse_trace_file(trace_file)
-    print(f"\n  Parsed ops (after filtering): {len(ops)}")
-    for op in sorted(ops, key=lambda o: o["device_time_us"], reverse=True)[:15]:
-        print(f"    {op['name']:40s} {op['backend']:18s} calls={op['count']:>4d} "
-              f"dev={op['device_time_us']:>10.0f}µs cpu={op['cpu_time_us']:>10.0f}µs")
-
-    # Full analysis
-    config = fetch_model_config(model_id)
-    summary = summarize_config(config)
-    dim_symbols = get_dim_symbols(summary)
-
-    analyzed = analyze_ops(ops, dim_symbols=dim_symbols, batch_size=1, seq_len=None,
-                           model_dtype=summary.get("dtype", "bfloat16"),
-                           num_layers=summary.get("num_layers"))
-    print(f"\n  Analyzed ops (after merge): {len(analyzed)}")
-    for op in analyzed[:15]:
-        d = op.to_dict()
-        shapes_str = str(d["input_shapes"])[:50] if d["input_shapes"] else "—"
-        print(f"    {d['name']:40s} {d['backend']:18s} ×{d['layer_count']:<3d} "
-              f"calls={d['call_count']:>4d} shapes={shapes_str}")
+    summary = summarize_config(fetch_model_config(model_id))
+    graph = build_graph_from_trace(trace_file, summary, tp_size=1, batch_size=1)
+    ops = summarize_ops(graph)
+    print(f"\n  Reconstructed ops: {len(ops)}")
+    for op in sorted(ops, key=lambda o: -o["device_time_us"])[:15]:
+        print(f"    {op['name']:40s} {op['backend']:18s} "
+              f"calls={op['count']:>4d} dev={op['device_time_us']:>10.0f}us")
+    print(f"\n  Phases: "
+          f"{[k for k in ('prefill', 'decode') if graph.get(k)]}")
 
     print("\n✓ Done!")
 

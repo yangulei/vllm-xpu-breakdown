@@ -238,25 +238,18 @@ def start_profile():
         if needed > int(max_model_len):
             max_model_len = needed
 
-    with _profile_lock:
-        profiling._profile_state = {
-            "status": "running",
-            "result": None,
-            "error": None,
-            "model_id": model_id,
-            "settings": {
-                "mode": mode,
-                "batch_size": batch_size,
-                "prefill_batch_size": prefill_batch_size,
-                "decode_batch_size": decode_batch_size,
-                "max_model_len": max_model_len,
-                "tp_size": tp_size,
-                "quantization": quantization,
-                "query_len": query_len,
-                "context_len": context_len,
-                "device_ids": device_ids,
-            },
-        }
+    run_id = profiling.begin(model_id, {
+        "mode": mode,
+        "batch_size": batch_size,
+        "prefill_batch_size": prefill_batch_size,
+        "decode_batch_size": decode_batch_size,
+        "max_model_len": max_model_len,
+        "tp_size": tp_size,
+        "quantization": quantization,
+        "query_len": query_len,
+        "context_len": context_len,
+        "device_ids": device_ids,
+    })
 
     thread = threading.Thread(
         target=_run_profile,
@@ -267,7 +260,7 @@ def start_profile():
     )
     thread.start()
 
-    return jsonify({"ok": True, "status": "running"})
+    return jsonify({"ok": True, "status": "running", "run_id": run_id})
 
 
 @app.route("/api/profile/upload", methods=["POST"])
