@@ -41,7 +41,7 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from breakdown.analyzer import (
+from breakdown.cost import (
     dtype_size,
     estimate_flops,
     estimate_memory,
@@ -52,7 +52,6 @@ from breakdown.trace import build_graph_from_trace
 from breakdown.trace_common import _detect_device_via_torch
 from breakdown.model_info import (
     fetch_model_config,
-    get_dim_symbols,
     min_profile_layers,
     summarize_config,
 )
@@ -389,7 +388,6 @@ def _build_result_from_traces(
     *,
     model_id: str,
     summary: dict,
-    dim_symbols: dict,
     tp_size: int,
     batch_size: int,
     mode: str = "eager",
@@ -559,11 +557,9 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
         try:
             config = fetch_model_config(model_id)
             summary = summarize_config(config)
-            dim_symbols = get_dim_symbols(summary)
         except Exception:
             config = {}
             summary = {}
-            dim_symbols = {}
 
         actual_layers = summary.get("num_layers") or 1
         if num_profile_layers == "min":
@@ -925,7 +921,6 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
                 files,
                 model_id=model_id,
                 summary=summary,
-                dim_symbols=dim_symbols,
                 tp_size=tp_size,
                 batch_size=bsz,
                 mode=mode,
@@ -1178,10 +1173,8 @@ def upload_profile():
     # Fetch model config for shape symbols / summary (best-effort).
     try:
         summary = summarize_config(fetch_model_config(model_id)) if model_id else {}
-        dim_symbols = get_dim_symbols(summary) if summary else {}
     except Exception:
         summary = {}
-        dim_symbols = {}
 
     actual_layers = form.get("actual_layers") or summary.get("num_layers")
     actual_layers = int(actual_layers) if actual_layers else None
@@ -1217,7 +1210,6 @@ def upload_profile():
             rank_files[:tp_size] if len(rank_files) >= tp_size else rank_files,
             model_id=model_id,
             summary=summary,
-            dim_symbols=dim_symbols,
             tp_size=tp_size,
             batch_size=bsz,
             mode=mode,

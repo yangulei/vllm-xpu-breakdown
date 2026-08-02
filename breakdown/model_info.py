@@ -247,61 +247,6 @@ def summarize_config(config: dict[str, Any]) -> dict[str, Any]:
 
 
 # Known config dimension names for shape symbolization
-def get_dim_symbols(summary: dict[str, Any]) -> dict[int, str]:
-    """Build a mapping from literal dimension values to symbolic names.
-
-    Returns {dim_value: symbol_name} for dimensions known from the config.
-    """
-    symbols: dict[int, str] = {}
-    if summary.get("hidden_size"):
-        symbols[summary["hidden_size"]] = "H"
-    if summary.get("num_heads"):
-        symbols[summary["num_heads"]] = "n_h"
-    if summary.get("num_kv_heads") and summary["num_kv_heads"] != summary.get("num_heads"):
-        symbols[summary["num_kv_heads"]] = "n_kv"
-    if summary.get("head_dim"):
-        symbols[summary["head_dim"]] = "d"
-    if summary.get("intermediate_size"):
-        symbols[summary["intermediate_size"]] = "I"
-    if summary.get("vocab_size"):
-        symbols[summary["vocab_size"]] = "V"
-    if summary.get("num_experts"):
-        symbols[summary["num_experts"]] = "E"
-
-    # Derived dimensions
-    h = summary.get("hidden_size") or 0
-    n_h = summary.get("num_heads") or 0
-    n_kv = summary.get("num_kv_heads") or n_h
-    d_head = summary.get("head_dim") or 0
-    inter = summary.get("intermediate_size") or 0
-
-    if n_h and d_head:
-        qkv = n_h * d_head + 2 * n_kv * d_head
-        if qkv not in symbols:
-            symbols[qkv] = "QKV"
-        kv_dim = 2 * n_kv * d_head
-        if kv_dim not in symbols:
-            symbols[kv_dim] = "2·n_kv·d"
-    if inter:
-        if inter * 2 not in symbols:
-            symbols[inter * 2] = "2·I"
-
-    # MLA dimensions (DeepSeek-V2/V3)
-    kv_lora = summary.get("kv_lora_rank")
-    if kv_lora:
-        symbols[kv_lora] = "kv_lora"
-    q_lora = summary.get("q_lora_rank")
-    if q_lora:
-        symbols[q_lora] = "q_lora"
-
-    # Vision encoder dimensions (VL models)
-    vit_h = summary.get("vit_hidden_size")
-    if vit_h and vit_h not in symbols:
-        symbols[vit_h] = "H_vit"
-
-    return symbols
-
-
 def min_profile_layers(model_summary: dict) -> int:
     """Compute minimum layers to profile to capture all unique layer types.
 

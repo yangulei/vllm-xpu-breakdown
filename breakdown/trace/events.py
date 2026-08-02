@@ -9,7 +9,7 @@ import json
 import re
 
 from typing import Any
-from ..analyzer import DTYPE_BYTES
+from ..cost import DTYPE_BYTES
 from ..trace_common import MODULE_SPAN_PREFIX
 
 

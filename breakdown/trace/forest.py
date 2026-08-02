@@ -7,7 +7,7 @@ from __future__ import annotations
 
 
 from typing import Any
-from ..analyzer import DTYPE_BYTES
+from ..cost import DTYPE_BYTES
 from ..trace_common import (
     _is_overhead_event, _strip_instance_idx, module_span_display_name,
     parse_module_span)

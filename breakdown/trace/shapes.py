@@ -9,7 +9,7 @@ traces - and for the one gap no hook closes, a collective's dtype-less
 from __future__ import annotations
 
 
-from ..analyzer import DTYPE_BYTES
+from ..cost import DTYPE_BYTES
 from .rules import (
     _WEIGHT_PLUMBING_OPS, _is_hidden_state_op, _msa_kernel_layout)
 from .forest import _Raw

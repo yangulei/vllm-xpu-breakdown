@@ -492,7 +492,7 @@ class TestAnalyticCostModel(unittest.TestCase):
         # Attention is normally the heaviest op in the profile. With no cost
         # model it had zero FLOPs and zero bytes, so its bound came out
         # "unknown" and it was ranked as if it had 100 % headroom.
-        from breakdown.analyzer import estimate_flops
+        from breakdown.cost import estimate_flops
 
         # decode: 32 queries, 32x2048 total KV rows, 32 heads x 128
         flops = estimate_flops("vllm::unified_attention_with_output",

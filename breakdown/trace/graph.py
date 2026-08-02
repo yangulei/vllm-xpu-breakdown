@@ -7,7 +7,7 @@ The pass order is flat and sequential on purpose; see
 from __future__ import annotations
 
 
-from ..analyzer import dtype_size, estimate_flops, estimate_memory
+from ..cost import dtype_size, estimate_flops, estimate_memory
 from ..trace_common import _infer_device_from_trace
 from .rules import _DEVICE_KERNEL_CATEGORIES, _is_attention_op
 from .events import _load_trace, _worker_tid

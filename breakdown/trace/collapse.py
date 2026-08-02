@@ -5,7 +5,7 @@ name its children, and collapse structurally-identical repeated siblings.
 from __future__ import annotations
 
 
-from ..analyzer import estimate_flops, estimate_memory
+from ..cost import estimate_flops, estimate_memory
 from ..classifier import classify_op
 from ..trace_common import _infer_role, _strip_instance_idx
 from .rules import (

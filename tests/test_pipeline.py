@@ -26,14 +26,9 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from breakdown.analyzer import (
-    dtype_size,
-    estimate_flops,
-    estimate_memory,
-    symbolize_shape,
-)
+from breakdown.cost import dtype_size, estimate_flops, estimate_memory
 from breakdown.classifier import Backend, classify_op
-from breakdown.model_info import fetch_model_config, get_dim_symbols, summarize_config
+from breakdown.model_info import fetch_model_config, summarize_config
 from breakdown.profiler import _is_overhead_event
 from breakdown.trace import build_graph_from_trace
 from tests.helpers import device_time, find_op, graph_of, iter_ops
@@ -148,16 +143,16 @@ class TestModelInfo(unittest.TestCase):
         self.assertFalse(summary["is_moe"])
         self.assertEqual(summary["dtype"], QWEN3_4B_EXPECTED["dtype"])
 
-    def test_dim_symbols(self):
-        config = fetch_model_config(QWEN3_4B_MODEL_ID)
-        summary = summarize_config(config)
-        dim_symbols = get_dim_symbols(summary)
-
-        self.assertEqual(dim_symbols[2560], "H")
-        self.assertEqual(dim_symbols[9728], "I")
-        self.assertEqual(dim_symbols[151936], "V")
-        self.assertIn(32, dim_symbols)     # n_h
-        self.assertIn(8, dim_symbols)      # n_kv
+    def test_config_dims_become_symbols(self):
+        # The config's structural dims are what a swept shape is written in.
+        from breakdown.trace.symbols import SymbolTable
+        table = SymbolTable(summarize_config(
+            fetch_model_config(QWEN3_4B_MODEL_ID)), tp_size=1)
+        self.assertEqual(table.value[2560], "H")
+        self.assertEqual(table.value[9728], "I")
+        self.assertEqual(table.value[151936], "V")
+        self.assertEqual(table.legend["n_h"], 32)
+        self.assertEqual(table.legend["n_kv"], 8)
 
     def test_summarize_config_normalizes_layerwise_moe_lists(self):
         summary = summarize_config(HUNYUAN_MOE_LIST_CONFIG)
@@ -315,47 +310,6 @@ class TestOverheadFilter(unittest.TestCase):
 
 
 # ===================================================================
-# Shape Symbolization Tests
-# ===================================================================
-
-class TestShapeSymbolization(unittest.TestCase):
-
-    def setUp(self):
-        config = fetch_model_config(QWEN3_4B_MODEL_ID)
-        summary = summarize_config(config)
-        self.dim_symbols = get_dim_symbols(summary)
-
-    def test_hidden_size(self):
-        shape = symbolize_shape([128, 2560], self.dim_symbols,
-                                batch_size=1, seq_len=128)
-        self.assertEqual(shape, ["S", "H"])
-
-    def test_attention_qkv(self):
-        # Use seq_len=256 to avoid collision with head_dim=128
-        shape = symbolize_shape([1, 256, 32, 128], self.dim_symbols,
-                                batch_size=1, seq_len=256)
-        self.assertEqual(shape, ["B", "S", "n_h", "d"])
-
-    def test_kv_heads(self):
-        shape = symbolize_shape([1, 256, 8, 128], self.dim_symbols,
-                                batch_size=1, seq_len=256)
-        self.assertEqual(shape, ["B", "S", "n_kv", "d"])
-
-    def test_intermediate(self):
-        shape = symbolize_shape([128, 9728], self.dim_symbols,
-                                batch_size=1, seq_len=128)
-        self.assertEqual(shape, ["S", "I"])
-
-    def test_vocab(self):
-        shape = symbolize_shape([151936, 2560], self.dim_symbols)
-        self.assertEqual(shape, ["V", "H"])
-
-    def test_unknown_dims_preserved(self):
-        shape = symbolize_shape([7, 42], self.dim_symbols)
-        self.assertEqual(shape, [7, 42])
-
-
-# ===================================================================
 # Memory & FLOP Estimation Tests
 # ===================================================================
 
@@ -369,8 +323,11 @@ class TestEstimation(unittest.TestCase):
         self.assertEqual(mem, expected_read + expected_write)
 
     def test_rms_norm_memory(self):
+        # Every operand read once, output written once: the activation, the
+        # (much smaller) weight vector, and the result. The old per-family rule
+        # charged "input x 3", counting the weight as a second full activation.
         mem = estimate_memory("rms_norm", [[128, 2560], [2560]], dtype_bytes=2)
-        self.assertEqual(mem, 128 * 2560 * 2 * 3)
+        self.assertEqual(mem, (128 * 2560 + 2560 + 128 * 2560) * 2)
 
     def test_silu_and_mul_memory(self):
         mem = estimate_memory("silu_and_mul", [[128, 19456]], dtype_bytes=2)
@@ -1930,7 +1887,7 @@ class TestGraphFromTrace(unittest.TestCase):
         # The sequence divisor exists for decode's B·C KV rows; a prefill row is
         # already per-sequence (S+C), so dividing it would understate attention
         # by exactly the prefill batch size.
-        from breakdown.analyzer import estimate_flops
+        from breakdown.cost import estimate_flops
         from breakdown import shape_matrix
 
         shapes = [[8, 4, 16], [72, 1, 16], [72, 1, 16], [8, 4, 16]]

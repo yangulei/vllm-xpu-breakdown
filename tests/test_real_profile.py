@@ -130,7 +130,7 @@ def main():
     # Now parse with our trace_parser
     from breakdown.op_breakdown import summarize_ops
     from breakdown.model_info import fetch_model_config, summarize_config, get_dim_symbols
-    from breakdown.analyzer import analyze_ops
+    from breakdown.cost import analyze_ops
 
     ops = parse_trace_file(trace_file)
     print(f"\n  Parsed ops (after filtering): {len(ops)}")
