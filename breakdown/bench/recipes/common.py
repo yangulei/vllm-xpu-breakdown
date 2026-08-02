@@ -11,6 +11,12 @@ random ``rows_per_expert`` makes a grouped GEMM read past its input.
 from __future__ import annotations
 
 from breakdown.bench.inputs import Ctx, synthesizer
+from breakdown.bench.recipes.table import register
+
+
+def skip(op: str, reason: str) -> None:
+    """Declare that ``op`` must not be replayed, and why."""
+    register(op, skip=reason)
 
 #: Elementwise operands that happen to be integer tensors (position counters,
 #: token id vectors). They are *data*, not indices, so a dense ascending fill is
@@ -64,3 +70,17 @@ def _plain_tensor(ctx: Ctx):
     """Named weight-like operands: ordinary values, never index treatment."""
     from breakdown.bench.inputs import make_tensor
     return make_tensor(ctx.dims, ctx.dtype, ctx.device)
+
+
+# Dispatch *wrappers* that cannot be invoked outside a live vLLM forward pass.
+# The kernels they launch are separate ops in the reconstructed graph and are
+# benchmarked directly, so refusing the wrapper loses nothing - and saying so
+# is the point: the plan reports it with the reason instead of dropping it.
+skip("vllm::unified_attention",
+     "reads KV cache + attention metadata from vLLM's forward context")
+skip("vllm::moe_forward_shared",
+     "fused MoE dispatch wrapper; its router/expert/shared-expert kernels "
+     "are benchmarked as their own ops")
+skip("vllm::moe_forward",
+     "fused MoE dispatch wrapper; its constituent kernels are benchmarked "
+     "as their own ops")

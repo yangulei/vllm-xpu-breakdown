@@ -86,7 +86,7 @@ def run_case(case: BenchCase, device: str,
              budget: float = timing.DEFAULT_BUDGET_S,
              flush_cache: bool = True) -> dict[str, Any]:
     """Resolve, materialize and time one case; never raises."""
-    reason = recipes.SKIP_REASONS.get(case.op)
+    reason = recipes.recipe(case.op).skip
     if reason:
         return _record(case, "skipped", error="", detail=reason)
     if resolve.is_collective(case.op):
@@ -110,7 +110,7 @@ def run_case(case: BenchCase, device: str,
                        error=f"{type(exc).__name__}: {exc}",
                        detail=traceback.format_exc(limit=3))
 
-    single = recipes.SINGLE_REP.get(case.op)
+    single = recipes.recipe(case.op).single_rep
     try:
         m = timing.measure(res.fn, call.args, device, kwargs=call.kwargs,
                            mutated=call.mutated, budget=budget,

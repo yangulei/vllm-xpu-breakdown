@@ -38,7 +38,7 @@ import os
 from typing import Any
 
 from breakdown.bench.inputs import ArgBuildError, Call, make_tensor
-from breakdown.bench.recipes import override
+from breakdown.bench.recipes import entry, override
 
 #: Paged KV-cache block size. Not recorded in the trace (it is engine
 #: configuration, not an operand), but it changes the gather pattern the kernel
@@ -164,6 +164,16 @@ def _cu_seqlens(lens: list[int], device: str):
     out = torch.zeros(len(lens) + 1, dtype=torch.int32, device=device)
     out[1:] = torch.tensor(lens, dtype=torch.int32, device=device).cumsum(0)
     return out
+
+
+# The context-free kernel entry points these wrappers are replayed through.
+# ``fa_utils`` re-exports the platform's implementation (the vllm-xpu-kernels
+# varlen FlashAttention on XPU, vllm_flash_attn on CUDA), so one mapping covers
+# both devices.
+entry("vllm::unified_attention_with_output",
+      "vllm.v1.attention.backends.fa_utils", "flash_attn_varlen_func")
+entry("vllm::unified_kv_cache_update",
+      "vllm.v1.attention.backends.fa_utils", "reshape_and_cache_flash")
 
 
 @override("vllm::unified_attention_with_output")

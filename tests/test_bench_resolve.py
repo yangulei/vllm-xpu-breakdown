@@ -104,7 +104,7 @@ class TestResolve(unittest.TestCase):
     def test_synthetic_kernel_without_api_entry_is_unresolved(self):
         status, detail = resolve.classify("triton::_some_jit_kernel")
         self.assertEqual(status, "unresolved")
-        self.assertIn("PYTHON_API", detail)
+        self.assertIn("entry()", detail)
 
     def test_collectives_are_routed_to_the_multi_rank_path(self):
         self.assertEqual(resolve.classify("c10d::allreduce_")[0], "collective")
@@ -184,8 +184,9 @@ class TestBuildArgs(unittest.TestCase):
         # rows_per_expert is an *output* accumulated with atomics; filling it
         # with a balanced partition would make the kernel scatter out of bounds.
         self.assertIn("rows_per_expert",
-                      recipes.OUTPUT_ARGS["_moe_C::remap_hidden_states"])
-        self.assertIn("_moe_C::remap_hidden_states", recipes.SINGLE_REP)
+                      recipes.recipe("_moe_C::remap_hidden_states").outputs)
+        self.assertTrue(
+            recipes.recipe("_moe_C::remap_hidden_states").single_rep)
 
 
 class TestScalarParsing(unittest.TestCase):
@@ -263,7 +264,7 @@ class TestSamplerRecipe(unittest.TestCase):
     def test_sampler_is_replayed_rather_than_skipped(self):
         # Nothing about the sampler is context-bound: the "generator state" it
         # is handed is a two-element philox (seed, offset) CPU tensor.
-        self.assertNotIn("vllm::xpu_topk_topp_sampler", recipes.SKIP_REASONS)
+        self.assertFalse(recipes.recipe("vllm::xpu_topk_topp_sampler").skip)
         case = BenchCase(op="vllm::xpu_topk_topp_sampler", device="cpu",
                          phase="decode", batch_size=32,
                          args=[{"kind": "tensor", "dims": [32],
@@ -278,7 +279,7 @@ class TestSamplerRecipe(unittest.TestCase):
                                 "dtype": "long int"},
                                {"kind": "scalar", "type": "Scalar",
                                 "value": "1."}])
-        call = recipes.OVERRIDES["vllm::xpu_topk_topp_sampler"](case, None,
+        call = recipes.recipe("vllm::xpu_topk_topp_sampler").build(case, None,
                                                                 "cpu")
         random_sampled, to_return, logits, k, p, mode, seeds, lam = call.args
         self.assertEqual(list(logits.shape), [32, 151936])

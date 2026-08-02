@@ -15,19 +15,20 @@ Two things are not plain dispatcher ops:
   FlashInfer / the xattention SYCL extension have no ``cpu_op``, so the
   reconstruction names them after the public API frame that launched them
   (``triton::_gemma_rmsnorm_kernel``, ``flash_xpu::minimax_m3_sparse_attn``).
-  Those resolve through :data:`PYTHON_API` to the wrapper function.
+  Those resolve through the *launcher frame the trace recorded* - import that
+  file, take that attribute.
 * **Context-bound wrappers.** ``vllm::unified_attention_with_output`` takes a
   ``layer_name`` and reads the KV cache and attention metadata out of vLLM's
   *forward context*; the dispatcher op cannot be invoked standalone. Where the
   wrapper has a **context-free kernel entry point** (the paged FlashAttention
   varlen call, the KV-cache write), it is replayed through that entry point with
-  a synthesized paged KV cache - see
-  :mod:`breakdown.bench.recipes.attention`; :data:`PYTHON_API` is consulted
-  *before* :data:`NOT_REPLAYABLE` precisely so such an entry point wins. A
-  wrapper with no context-free entry point (the fused MoE dispatch) is still
-  refused with an explicit reason (:data:`NOT_REPLAYABLE`) and reported in the
-  plan - the kernels it launches are separate ops in the graph and are
-  benchmarked on their own.
+  a synthesized paged KV cache (see
+  :mod:`breakdown.bench.recipes.attention`). Both facts live in that op's
+  :class:`breakdown.bench.recipes.table.OpRecipe`: its ``entry`` is consulted
+  *before* its ``skip`` precisely so an entry point wins. A wrapper with no
+  context-free entry point (the fused MoE dispatch) carries only ``skip`` and
+  is refused with that reason and reported in the plan - the kernels it
+  launches are separate ops in the graph and are benchmarked on their own.
 
 Nothing is guessed: an unknown op raises :class:`ResolveError`.
 """
@@ -60,81 +61,8 @@ REGISTRAR_MODULES: dict[str, tuple[str, ...]] = {
     ),
 }
 
-#: Ops that cannot be invoked outside a live vLLM forward pass, with the reason
-#: reported in the plan. These are dispatch *wrappers*: the kernels they launch
-#: are separate ops in the reconstructed graph and are benchmarked directly.
-#:
-#: An entry here is only reached when the op has **no** :data:`PYTHON_API`
-#: entry; attention and the KV-cache write do have one (their kernels take the
-#: cache and the sequence metadata as plain arguments), so they are replayed
-#: rather than refused.
-NOT_REPLAYABLE: dict[str, str] = {
-    "vllm::unified_attention":
-        "reads KV cache + attention metadata from vLLM's forward context",
-    "vllm::moe_forward_shared":
-        "fused MoE dispatch wrapper; its router/expert/shared-expert kernels "
-        "are benchmarked as their own ops",
-    "vllm::moe_forward":
-        "fused MoE dispatch wrapper; its constituent kernels are benchmarked "
-        "as their own ops",
-}
-
-#: Op name -> ``(module, attribute)`` for the *redirects*: an op whose replay
-#: entry point is a different function from the one the trace recorded.
-#:
-#: This table used to also list every Python-launched kernel (the xattention
-#: SYCL wrappers, the FlashInfer norms) by dotted module path. That was a guess
-#: at something the trace states outright, and it was wrong: the recorded
-#: launcher for MiniMax-M3's indexer is
-#: ``vllm/models/minimax_m3/xpu/ops/xattention.py`` while the table said
-#: ``vllm.model_executor.models.minimax_m3.xattention``, so all four MSA ops
-#: failed to resolve on the very model they were added for. Such kernels are now
-#: resolved from their recorded launcher frame (see :func:`resolve`).
-#:
-#: What legitimately remains are context-bound *wrappers*: they have a real
-#: dispatcher ``cpu_op`` (so no launcher frame is recorded) and cannot run
-#: outside a forward pass, but one level down there is a kernel entry point that
-#: takes the context as plain arguments.
-PYTHON_API: dict[str, tuple[str, str]] = {
-    # Context-bound wrappers replayed through their context-free kernel entry
-    # point. ``fa_utils`` re-exports the platform's implementation (the
-    # vllm-xpu-kernels varlen FlashAttention on XPU, vllm_flash_attn on CUDA),
-    # so this one mapping covers both devices. The paged KV cache, block table
-    # and sequence metadata the wrapper would have read from the forward
-    # context are synthesized by
-    # :mod:`breakdown.bench.recipes.attention`.
-    "vllm::unified_attention_with_output":
-        ("vllm.v1.attention.backends.fa_utils", "flash_attn_varlen_func"),
-    "vllm::unified_kv_cache_update":
-        ("vllm.v1.attention.backends.fa_utils", "reshape_and_cache_flash"),
-}
-
 #: Namespaces handled by the collective path, not by direct replay.
 COLLECTIVE_NAMESPACES = ("c10d", "ccl", "nccl", "xccl")
-
-#: Extra ``PYTHON_API`` entries, so a kernel that lives outside vLLM (a research
-#: branch, a private extension) can be registered without editing this file::
-#:
-#:     BREAKDOWN_BENCH_PYTHON_API=/path/api.json
-#:     {"flash_xpu::my_kernel": ["my_pkg.wrappers", "my_kernel"]}
-_API_ENV = "BREAKDOWN_BENCH_PYTHON_API"
-
-
-def _load_api_overrides() -> None:
-    path = os.environ.get(_API_ENV)
-    if not path or not os.path.isfile(path):
-        return
-    try:
-        with open(path) as fh:
-            extra = json.load(fh)
-    except (OSError, ValueError):
-        return
-    for op, target in (extra or {}).items():
-        if isinstance(target, (list, tuple)) and len(target) == 2:
-            PYTHON_API[str(op)] = (str(target[0]), str(target[1]))
-
-
-_load_api_overrides()
 
 
 class ResolveError(RuntimeError):
@@ -302,10 +230,12 @@ def resolve(op: str, slots: list[dict] | None = None,
     for anything genuinely unknown - never a silent fallback, because a wrong
     callable measures a wrong kernel.
     """
-    # PYTHON_API first: an op listed there has a context-free entry point, which
-    # beats a NOT_REPLAYABLE refusal for the same dispatch name.
-    if op in PYTHON_API:
-        mod_name, attr = PYTHON_API[op]
+    # A declared entry point comes first: an op that has one is replayable
+    # through it, which beats the skip reason on the same dispatch name.
+    from breakdown.bench.recipes.table import recipe as _recipe
+    rec = _recipe(op)
+    if rec.entry:
+        mod_name, attr = rec.entry
         try:
             mod = importlib.import_module(mod_name)
         except ImportError as exc:
@@ -314,8 +244,8 @@ def resolve(op: str, slots: list[dict] | None = None,
         if fn is None:
             raise ResolveError(f"{mod_name} has no attribute {attr}")
         return Resolved(op=op, fn=fn, kind="python_api")
-    if op in NOT_REPLAYABLE:
-        raise NotReplayable(NOT_REPLAYABLE[op])
+    if rec.skip:
+        raise NotReplayable(rec.skip)
 
     ns, name = split_name(op)
     if ns in ("triton", "flashinfer", "flash_xpu"):
@@ -331,8 +261,8 @@ def resolve(op: str, slots: list[dict] | None = None,
             return Resolved(op=op, fn=fn, kind="python_api")
         raise ResolveError(
             "synthetic kernel op with no recorded launcher frame; re-profile "
-            "with a current build, or add it to "
-            "breakdown.bench.resolve.PYTHON_API")
+            "with a current build, or declare its entry point with "
+            "breakdown.bench.recipes.entry()")
 
     try:
         import torch
@@ -373,13 +303,11 @@ def classify(op: str, slots: list[dict] | None = None,
     ``status`` is ``replayable`` | ``not_replayable`` | ``unresolved`` |
     ``collective``.
     """
-    if op in NOT_REPLAYABLE and op not in PYTHON_API:
-        return "not_replayable", NOT_REPLAYABLE[op]
     from breakdown.bench import recipes
 
-    reason = recipes.SKIP_REASONS.get(op)
-    if reason:
-        return "skipped", reason
+    rec = recipes.recipe(op)
+    if rec.skip and not rec.entry:
+        return "not_replayable", rec.skip
     if is_collective(op):
         return "collective", "needs a multi-rank launch"
     try:
