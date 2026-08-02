@@ -288,3 +288,45 @@ class TestSamplerRecipe(unittest.TestCase):
         self.assertIsNone(to_return)
         self.assertEqual(mode, "raw_logprobs")
         self.assertEqual(lam, 1.0)
+
+
+class TestWorkerEnvironment(unittest.TestCase):
+    """Environment invariants that only surface as a slow or dead run."""
+
+    def test_persistent_kernel_caches_are_pinned(self):
+        # Without them every worker re-pays SYCL AOT / Triton JIT on its first
+        # case, which dominates a short sweep and poisons its first
+        # measurement.
+        import tempfile
+
+        from breakdown.bench.worker import bench_env
+        with tempfile.TemporaryDirectory() as d:
+            env = bench_env(d, base={})
+        self.assertEqual(env["SYCL_CACHE_PERSISTENT"], "1")
+        self.assertTrue(env["SYCL_CACHE_DIR"].startswith(d))
+        self.assertTrue(env["TRITON_CACHE_DIR"].startswith(d))
+
+    def test_collectives_disable_the_persistent_cache(self):
+        # oneCCL segfaults with no Python traceback when SYCL_CACHE_PERSISTENT
+        # is set, so the peer ranks must run without it.
+        import inspect
+
+        from breakdown.bench import collective
+        src = inspect.getsource(collective)
+        self.assertIn("SYCL_CACHE_PERSISTENT", src)
+
+
+class TestOperandAllocation(unittest.TestCase):
+    def test_float_operands_are_built_in_their_target_dtype(self):
+        # Materializing a several-hundred-MB weight in fp32 and casting doubles
+        # the allocation and dominates the case's wall time (it timed out the
+        # worker before this was fixed).
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("torch required")
+        from breakdown.bench.inputs import make_tensor
+        for name, want in (("bfloat16", torch.bfloat16),
+                           ("float16", torch.float16)):
+            t = make_tensor([4, 8], name, "cpu")
+            self.assertIs(t.dtype, want)

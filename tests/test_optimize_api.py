@@ -165,6 +165,22 @@ class TestStartStop(OptimizeApiTest):
             f"&offset={log['offset']}").get_json()
         self.assertEqual(again["text"], "")
 
+    def test_a_second_session_does_not_append_to_the_first_log(self):
+        # The log is opened "wb", not "ab": appending across runs made the
+        # streamed pane show the concatenation of every session ever opened for
+        # that op (it read as the agent repeating itself), and it breaks the
+        # /api/optimize/log offset contract.
+        os.environ["FAKE_AGENT_SECONDS"] = "1"
+        for _ in range(2):
+            self.client.post("/api/optimize/start", json={
+                "run_id": self.run_id, "phase": "prefill", "ops": ["op::a"]})
+            end = time.time() + 20
+            while time.time() < end and MANAGER.any_active(self.run_id):
+                time.sleep(0.2)
+        log = self.client.get(
+            f"/api/optimize/log?run_id={self.run_id}&op=op::a").get_json()
+        self.assertEqual(log["text"].count("mask="), 1, log["text"])
+
     def test_stopping_releases_the_devices(self):
         os.environ["FAKE_AGENT_SECONDS"] = "10"
         self.client.post("/api/optimize/start", json={

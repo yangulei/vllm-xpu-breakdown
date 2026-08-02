@@ -383,6 +383,33 @@ def _parse_trace_filename(name: str) -> dict:
     }
 
 
+def _scheduler_pin(prefill_batch: int, decode_batch: int,
+                   query_len: int) -> dict[str, int]:
+    """Engine settings that make every step run the *full* requested batch.
+
+    Left to its defaults, vLLM's continuous-batching scheduler caps
+    per-iteration concurrency (by ``max_num_seqs``, and by how many sequences'
+    KV fits in cache) and runs an oversized batch in *partial-batch waves* - a
+    batch of 32 dispatched as 29 + 3. Each wave has a different row count, so
+    its ops neither symbolize to ``B`` nor merge with the full-batch ops, and
+    the reconstructed decode graph grows duplicated ``29``/``3`` nodes.
+
+    ``max_num_seqs`` admits the whole batch in one iteration;
+    ``max_num_batched_tokens`` is sized to also admit a whole batch's prefill
+    tokens in a single step (prefill pass: ``prefill_batch x query_len``;
+    decode pass: ``decode_batch`` single-token prefills) so a full-shape step
+    is never chunked. If the batch's KV does not fit device memory, raise
+    ``gpu_memory_utilization`` or lower Context/Batch rather than letting the
+    run silently split.
+    """
+    max_batch = max(int(prefill_batch), int(decode_batch))
+    prefill_step_tokens = int(prefill_batch) * max(int(query_len), 1)
+    return {
+        "max_num_seqs": max_batch,
+        "max_num_batched_tokens": max(prefill_step_tokens, max_batch, 2048),
+    }
+
+
 def _build_result_from_traces(
     rank_files: list[str],
     *,
@@ -677,25 +704,8 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
         two_pass = pf_batch != dc_batch
         max_batch = max(pf_batch, dc_batch)
 
-        # Pin the scheduler so every decode step runs the *full* requested batch
-        # (``B = decode_batch``). Left to its defaults, vLLM's continuous-batching
-        # scheduler caps per-iteration concurrency (by ``max_num_seqs`` and by how
-        # many sequences' KV fits in cache) and runs an oversized batch in
-        # *partial-batch waves* — e.g. a batch of 32 dispatched as 29 + 3. Each
-        # wave has a different row count, so its ops neither symbolize to ``B``
-        # nor merge with the full-batch ops, surfacing as duplicated ``29``/``3``
-        # nodes in the reconstructed decode graph. ``max_num_seqs = max_batch``
-        # forces the scheduler to admit the whole batch in one iteration;
-        # ``max_num_batched_tokens`` is sized to also admit a whole batch's
-        # prefill tokens in a single step (prefill pass: ``pf_batch × query_len``;
-        # decode pass: ``dc_batch`` single-token prefills) so a full-shape step is
-        # never chunked. If the batch's KV cannot fit device memory, raise
-        # ``gpu_memory_utilization`` or lower Context/Batch rather than letting the
-        # run silently split.
-        engine_kwargs["max_num_seqs"] = max_batch
-        _prefill_step_tokens = pf_batch * max(int(query_len), 1)
-        engine_kwargs["max_num_batched_tokens"] = max(
-            _prefill_step_tokens, max_batch, 2048)
+        engine_kwargs.update(
+            _scheduler_pin(pf_batch, dc_batch, int(query_len or 1)))
 
         llm = LLM(**engine_kwargs)
 
