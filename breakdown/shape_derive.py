@@ -12,6 +12,7 @@ the row builder that consumes it.
 """
 from __future__ import annotations
 
+from breakdown.core import dims
 from breakdown.core.dtypes import label as dtype_label, label_for_bytes
 from breakdown.cost import _prod, op_bytes
 
@@ -142,179 +143,12 @@ def _format_op_shape_with_dtypes(
     return " × ".join(parts)
 
 
-def _safe_arithmetic_eval(expr: str) -> int:
-    """Safely evaluate a simple arithmetic expression (integers, +, -, *, /).
+#: Resolving a symbolic dim is :mod:`breakdown.core.dims`; these two names are
+#: how the shape pipeline has always spelled it, kept so call sites read the
+#: same. The parser replaced a textual substitution feeding an ``eval``.
+_resolve_dim = dims.resolve
+_partially_resolve_dim = dims.resolve_display
 
-    Only allows integer literals and the operators +, -, *, /.
-    Division is performed as integer (floor) division.
-    Raises ValueError for anything else.
-    """
-    import ast
-
-    # Normalize "/" to "//" for integer division in eval
-    expr = expr.replace("//", "/").replace("/", "//")
-
-    tree = ast.parse(expr, mode="eval")
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Expression):
-            continue
-        if isinstance(node, ast.BinOp):
-            if not isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv)):
-                raise ValueError(f"Unsupported operator: {type(node.op).__name__}")
-        elif isinstance(node, ast.UnaryOp):
-            if not isinstance(node.op, (ast.USub, ast.UAdd)):
-                raise ValueError(f"Unsupported unary op: {type(node.op).__name__}")
-        elif isinstance(node, (ast.Constant,)):
-            if not isinstance(node.value, (int, float)):
-                raise ValueError(f"Non-numeric constant: {node.value}")
-        elif not isinstance(node, (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv,
-                                   ast.USub, ast.UAdd)):
-            raise ValueError(f"Unsupported node: {type(node).__name__}")
-    return int(eval(compile(tree, "<dim>", "eval")))  # noqa: S307
-
-
-def _resolve_dim(dim, symbols: dict[str, int]):
-    """Resolve a dimension value to a concrete integer if possible.
-
-    A dim that is *sharded* over TP (``4/TP``) is clamped to at least 1: when
-    TP exceeds the number of KV heads/experts, the engine replicates the shard
-    across ranks instead of giving some ranks an empty tensor, so a resolved 0
-    is a division artefact that would otherwise emit degenerate benchmark
-    shapes (``kv_head_num=0``, ``K=0``) that every kernel rejects.
-    """
-    if isinstance(dim, int):
-        return dim
-    if isinstance(dim, str):
-        # Direct lookup
-        if dim in symbols:
-            return symbols[dim]
-        # Try evaluating composite expressions like "S+C", "2·I"
-        # Replace symbol names with their values and evaluate
-        expr = dim
-        sharded = "TP" in dim and "/" in dim
-        # Sort by length descending to avoid partial replacements
-        for name in sorted(symbols.keys(), key=len, reverse=True):
-            expr = expr.replace(name, str(symbols[name]))
-        # Replace middle-dot with *
-        expr = expr.replace("·", "*")
-        try:
-            value = _safe_arithmetic_eval(expr)
-        except (ValueError, SyntaxError, ZeroDivisionError, OverflowError):
-            return dim
-        return max(1, value) if sharded else value
-    return dim
-
-
-# Config-dependent variable symbols that should stay symbolic
-_VARIABLE_SYMS = {"S", "B", "C", "TP"}
-
-
-def _is_variable_composite(expr: str) -> bool:
-    """Check if an expression is composed entirely of variable symbols.
-
-    Handles both additive (S+C) and multiplicative (B·S) composites.
-    """
-    # Split on + and · to get individual parts
-    parts = expr.replace("·", "+").split("+")
-    return all(p.strip() in _VARIABLE_SYMS for p in parts)
-
-
-def _partially_resolve_dim(dim, symbols: dict[str, int],
-                           full_symbols: dict[str, int] | None = None,
-                           tp_divided: set[str] | None = None):
-    """Resolve dim keeping only S/B/C/TP symbolic, resolving all else to numbers.
-
-    Model constants from config.json are shown as numbers. When a dimension
-    contains "/TP", it's shown as "value/TP" using the full undivided config
-    value from the symbols dict.
-
-    The full_symbols and tp_divided params are accepted for backwards
-    compatibility but ignored — the graph now embeds /TP directly in shapes
-    and symbols already contain original (undivided) values.
-    """
-    if isinstance(dim, (int, float)):
-        return str(int(dim))
-
-    s = str(dim)
-
-    # Pure variable symbol → keep as-is
-    if s in _VARIABLE_SYMS:
-        return s
-
-    # Composite of only variable symbols (e.g. "S+C", "B·S") → keep as-is
-    if _is_variable_composite(s):
-        return s
-
-    # Handle "/TP" suffix: resolve the base part, keep /TP
-    if s.endswith("/TP"):
-        base = s[:-3]  # strip "/TP"
-        resolved_base = _resolve_constant_expr(base, symbols)
-        return f"{resolved_base}/TP"
-
-    # Check if s is a known symbol directly (handles names with · like "n_h·D_qh")
-    if s in symbols:
-        return str(symbols[s])
-
-    # Check for multiply composites containing a variable (e.g., "B·S·K")
-    if "·" in s:
-        parts = s.split("·")
-        has_variable = any(p in _VARIABLE_SYMS for p in parts)
-        if has_variable:
-            # Partially resolve: keep variable parts, resolve constants
-            resolved_parts = []
-            for p in parts:
-                if p in _VARIABLE_SYMS:
-                    resolved_parts.append(p)
-                elif p in symbols:
-                    resolved_parts.append(str(symbols[p]))
-                elif p.isdigit():
-                    resolved_parts.append(p)
-                else:
-                    resolved_parts.append(p)
-            return "·".join(resolved_parts)
-        else:
-            # All parts are constants — compute product
-            product = 1
-            for p in parts:
-                val = symbols.get(p)
-                if val is not None:
-                    product *= val
-                elif p.isdigit():
-                    product *= int(p)
-            return str(product)
-
-    # Pure constant — fully resolve
-    if s in symbols:
-        return str(symbols[s])
-    resolved = _resolve_dim(s, symbols)
-    return str(resolved)
-
-
-def _resolve_constant_expr(expr: str, symbols: dict[str, int]) -> str:
-    """Resolve a constant expression (no variables) to its numeric value.
-
-    Handles symbols like "QKV", "n_h·d", "2·I", and plain numbers.
-    """
-    if expr in symbols:
-        return str(symbols[expr])
-    if "·" in expr:
-        parts = expr.split("·")
-        product = 1
-        for p in parts:
-            val = symbols.get(p)
-            if val is not None:
-                product *= val
-            elif p.isdigit():
-                product *= int(p)
-            else:
-                return expr  # can't resolve
-        return str(product)
-    if expr.isdigit():
-        return expr
-    return expr
-
-
-# ---- Profile-derived Shape Matrix helpers ----
 
 def _prod_ints(shape) -> int:
     """Product of a shape's dims; 0 if any is symbolic (kept for callers)."""
