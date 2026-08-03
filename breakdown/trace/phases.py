@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 
+from ..core.opnames import MATMUL_BASES
 from ..trace_common import _strip_instance_idx
 from .forest import _Raw
 
@@ -24,7 +25,7 @@ def _pass_token_dim(root: _Raw) -> int:
         n = stack.pop()
         if n.kind == "op":
             base = n.label.split("::")[-1].lower()
-            if base in ("mm", "addmm", "linear", "matmul", "bmm") and n.shapes:
+            if base in MATMUL_BASES and n.shapes:
                 first = n.shapes[0]
                 if len(first) >= 2:
                     best = max(best, first[0] if base != "addmm" else

@@ -41,28 +41,8 @@ import sys
 from dataclasses import dataclass
 from typing import Any, Callable
 
-#: namespace -> modules whose import registers that namespace's custom ops.
-#: vLLM registers lazily, so ``torch.ops.vllm.<op>`` only exists once the layer
-#: module that defines it has been imported.
-REGISTRAR_MODULES: dict[str, tuple[str, ...]] = {
-    "_C": ("vllm._custom_ops",),
-    "_C_cache_ops": ("vllm._custom_ops",),
-    "_moe_C": ("vllm._custom_ops", "vllm.model_executor.layers.fused_moe"),
-    "_xpu_C": ("vllm._custom_ops", "vllm._ipex_ops"),
-    "vllm": (
-        "vllm._custom_ops",
-        "vllm._xpu_ops",
-        "vllm.attention.layer",
-        "vllm.model_executor.layers.fused_moe.layer",
-        "vllm.model_executor.layers.fused_moe",
-        "vllm.v1.sample.ops.topk_topp_sampler",
-        "vllm.distributed.parallel_state",
-    ),
-}
-
-#: Namespaces handled by the collective path, not by direct replay.
-COLLECTIVE_NAMESPACES = ("c10d", "ccl", "nccl", "xccl")
-
+from breakdown.core.opnames import (
+    COLLECTIVE_NAMESPACES, PYTHON_LAUNCHED_NAMESPACES, REGISTRAR_MODULES)
 
 class ResolveError(RuntimeError):
     """The op could not be resolved to something callable."""
@@ -104,8 +84,13 @@ def split_name(op: str) -> tuple[str, str]:
 
 
 def is_collective(op: str) -> bool:
-    ns = split_name(op)[0]
-    return ns in COLLECTIVE_NAMESPACES
+    """True if replaying this op needs more than one rank.
+
+    Namespace only, deliberately: the launch path this gates spawns a process
+    group, so it must fire on the ops that really are ``c10d`` calls and not on
+    a compute kernel whose *name* happens to contain "all_reduce".
+    """
+    return split_name(op)[0] in COLLECTIVE_NAMESPACES
 
 
 def _import_registrars(ns: str) -> None:
@@ -247,7 +232,7 @@ def resolve(op: str, slots: list[dict] | None = None,
         raise NotReplayable(rec.skip)
 
     ns, name = split_name(op)
-    if ns in ("triton", "flashinfer", "flash_xpu"):
+    if ns in PYTHON_LAUNCHED_NAMESPACES:
         # A kernel launched straight from Python. The profiler recorded the
         # function that launched it, so there is nothing to look up: import
         # that file and take that attribute.

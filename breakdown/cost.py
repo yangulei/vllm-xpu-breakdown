@@ -59,10 +59,12 @@ Two refinements make the answer name a *hardware unit* rather than a category:
 """
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from .core.dtypes import size as _element_bytes
+from .core.opnames import (
+    GEMM_BASES, MM_OUTPUT_BASES, base_of, flops_per_element, is_attention,
+    table_lookup, uses_matrix_engine)
 
 def dtype_size(dtype_str: str) -> float:
     """Bytes per element for a dtype string (default bf16).
@@ -98,40 +100,6 @@ def _prod_loose(shape: Any) -> int:
 # Bytes
 # ===================================================================
 
-_MM_BASES = frozenset({
-    "mm", "addmm", "linear", "matmul", "bmm", "_scaled_mm", "fp8_gemm",
-    "fp4_gemm", "int4_gemm_w4a16", "int4_gemm_w4a8",
-    "cutlass_grouped_gemm_interface",
-})
-
-#: Ops that *index into a large operand* rather than stream it:
-#: ``base -> (indexed operand, operand whose element count is the number of
-#: rows touched, whether those rows are also written)``.
-#:
-#: This is the same structure in three guises - an embedding table indexed by
-#: token ids, a rope cos/sin cache indexed by positions, and a **paged KV
-#: cache** indexed by a block table - and getting it wrong is not a rounding
-#: error. Charging the whole operand made an embedding read the entire
-#: vocabulary matrix, a rope call the entire ``[max_position, head_dim]``
-#: cache, and MiniMax-M3's block-sparse attention its whole 450 MB block pool
-#: when it touches 33 blocks: "utilization 3902 % of peak", a number that says
-#: nothing about the kernel and retires the op into ``check_cost_model``
-#: instead of giving it an honest roofline.
-_TABLE_LOOKUP_OPS: dict[str, tuple[int, int, bool]] = {
-    "embedding": (0, 1, True),          # (weight [V, H], indices [T])
-    "rotary_embedding": (3, 0, True),   # (cos_sin_cache [P, d], positions [T])
-    # The fused qk-norm + rope + KV insert carries the same rope cache,
-    # indexed by the same positions.
-    "fused_minimax_m3_qknorm_rope_kv_insert": (3, 4, True),
-    # Paged caches, indexed by a block table: read only, and the output is
-    # already one of the operands.
-    "minimax_m3_index_score": (1, 2, False),
-    "minimax_m3_index_decode": (1, 2, False),
-    "minimax_m3_sparse_attn": (1, 3, False),
-    "minimax_m3_sparse_attn_decode": (1, 3, False),
-}
-
-
 def _tensor_bytes(shape: Any, index: int, dtypes: list[str] | None,
                   act_bytes: int) -> int:
     n = _prod(shape)
@@ -145,7 +113,7 @@ def _tensor_bytes(shape: Any, index: int, dtypes: list[str] | None,
 def _lookup_bytes(base: str, shapes: list, dtypes: list[str] | None,
                   act_bytes: int) -> int | None:
     """Bytes a table-lookup op really moves, or ``None`` if the rule misfits."""
-    spec = _TABLE_LOOKUP_OPS.get(base)
+    spec = table_lookup(base)
     if spec is None:
         return None
     t_i, i_i, writes_rows = spec
@@ -181,13 +149,13 @@ def op_bytes(op_name: str, shapes: list, dtypes: list[str] | None = None,
     """
     if not shapes:
         return 0
-    base = op_name.split("::")[-1].lower()
+    base = base_of(op_name)
     lookup = _lookup_bytes(base, shapes, dtypes, act_bytes)
     if lookup is not None:
         return lookup
     reads = sum(_tensor_bytes(s, i, dtypes, act_bytes)
                 for i, s in enumerate(shapes))
-    if (base in _MM_BASES and len(shapes) >= 2
+    if (base in MM_OUTPUT_BASES and len(shapes) >= 2
             and len(shapes[0]) >= 2 and len(shapes[1]) >= 2
             and isinstance(shapes[1][-1], int)):
         out = _prod(shapes[0][:-1]) * shapes[1][-1]
@@ -199,15 +167,6 @@ def op_bytes(op_name: str, shapes: list, dtypes: list[str] | None = None,
 # ===================================================================
 # FLOPs
 # ===================================================================
-
-_ATTENTION_BASES = ("unified_attention", "flash_attn", "paged_attention",
-                    "sparse_attn", "attention_with_output")
-
-
-def is_attention(op_name: str) -> bool:
-    base = op_name.split("::")[-1].lower()
-    return any(k in base for k in _ATTENTION_BASES)
-
 
 def _attention_flops(shapes: list, n_seqs: int = 1) -> int:
     """QK^T + PV for a ``[tokens, heads, head_dim]`` attention call.
@@ -229,21 +188,56 @@ def _attention_flops(shapes: list, n_seqs: int = 1) -> int:
     return int(2 * 2 * tokens * kv_per_seq * heads * dim)
 
 
-#: Elementwise / reduction op families and their FLOPs per element.
-_PER_ELEMENT: tuple[tuple[frozenset[str], int], ...] = (
-    (frozenset({"mul", "add", "sub", "div", "relu"}), 1),
-    (frozenset({"rsqrt", "sqrt", "exp", "log"}), 2),
-    (frozenset({"silu", "sigmoid", "tanh", "gelu"}), 4),
-    (frozenset({"softmax", "_softmax", "log_softmax"}), 5),
-    (frozenset({"silu_and_mul", "mul_and_silu", "gelu_and_mul",
-                "gelu_tanh_and_mul", "swigluoai_and_mul",
-                "swiglustep_and_mul"}), 5),
-)
+def _int(v: Any, default: int = 1) -> int:
+    """A shape dim as an integer, or ``default`` when it is still symbolic."""
+    return v if isinstance(v, int) else default
 
-#: Name *substrings* and their FLOPs per element, probed after the exact names.
-_PER_ELEMENT_SUBSTR: tuple[tuple[str, int], ...] = (
-    ("norm", 5), ("rotary", 6), ("rope", 6), ("topk", 10),
-)
+
+def _gemm_flops(base: str, shapes: list) -> int | None:
+    """``2*M*K*N`` for a matmul-family op, or ``None`` if this is not one.
+
+    Seven dispatch names -- ``mm``, ``linear``, ``_scaled_mm`` and the four
+    quantized GEMM entry points -- were seven identical branches computing the
+    same product from the same two operands, differing only in operand dtype,
+    which the byte count already accounts for. ``bmm``, ``addmm``, ``matmul``
+    and the grouped GEMM read their dims from different positions, so they stay
+    separate; they are the cases that genuinely differ, not seven copies.
+    """
+    if len(shapes) < 2:
+        return None
+
+    if base in GEMM_BASES - {"bmm", "addmm", "matmul"}:
+        if len(shapes[0]) >= 2 and len(shapes[1]) >= 2:
+            return (2 * _prod_loose(shapes[0][:-1])
+                    * _int(shapes[0][-1]) * _int(shapes[1][-1]))
+        return None
+
+    if base == "matmul" and shapes[0] and shapes[1]:
+        return (2 * _prod_loose(shapes[0][:-1])
+                * _int(shapes[0][-1]) * _int(shapes[1][-1]))
+
+    if base == "bmm" and len(shapes[0]) >= 3 and len(shapes[1]) >= 3:
+        b, m, k = (_int(d) for d in shapes[0][:3])
+        return 2 * b * m * k * _int(shapes[1][2])
+
+    if base == "addmm" and len(shapes) >= 3:
+        if len(shapes[1]) >= 2 and len(shapes[2]) >= 2:
+            m, k = _int(shapes[1][0]), _int(shapes[1][1])
+            n = _int(shapes[2][1])
+            return 2 * m * k * n + m * n  # matmul + bias add
+        return None
+
+    if "grouped_gemm" in base:
+        # A [M, K] x B [E, K, N] -> D [M, N]: every row goes through exactly
+        # one expert, so the work is a plain M*K*N - the expert count
+        # multiplies the *weights read*, not the arithmetic. Without this the
+        # dominant kernel of an MoE model had zero FLOPs, hence an arithmetic
+        # intensity of 0 and an unconditional "memory-bound" verdict.
+        if len(shapes[0]) == 2 and len(shapes[1]) == 3:
+            return 2 * _prod(shapes[0]) * _int(shapes[1][2])
+        return None
+
+    return None
 
 
 def op_flops(op_name: str, shapes: list, n_seqs: int = 1) -> int:
@@ -254,49 +248,15 @@ def op_flops(op_name: str, shapes: list, n_seqs: int = 1) -> int:
     """
     if not shapes:
         return 0
-    base = op_name.split("::")[-1].lower()
+    base = base_of(op_name)
 
-    if base in ("mm", "linear", "_scaled_mm", "fp8_gemm", "fp4_gemm",
-                "int4_gemm_w4a16", "int4_gemm_w4a8"):
-        if len(shapes) >= 2 and len(shapes[0]) >= 2 and len(shapes[1]) >= 2:
-            M = _prod_loose(shapes[0][:-1])
-            K = shapes[0][-1] if isinstance(shapes[0][-1], int) else 1
-            N = shapes[1][-1] if isinstance(shapes[1][-1], int) else 1
-            return 2 * M * K * N
-    if base == "bmm":
-        if len(shapes) >= 2 and len(shapes[0]) >= 3 and len(shapes[1]) >= 3:
-            dims = [d if isinstance(d, int) else 1
-                    for d in (shapes[0][0], shapes[0][1], shapes[0][2],
-                              shapes[1][2])]
-            return 2 * dims[0] * dims[1] * dims[2] * dims[3]
-    if base == "addmm":
-        if len(shapes) >= 3 and len(shapes[1]) >= 2 and len(shapes[2]) >= 2:
-            M = shapes[1][0] if isinstance(shapes[1][0], int) else 1
-            K = shapes[1][1] if isinstance(shapes[1][1], int) else 1
-            N = shapes[2][1] if isinstance(shapes[2][1], int) else 1
-            return 2 * M * K * N + M * N  # matmul + add
-    if "grouped_gemm" in base:
-        # A [M, K] x B [E, K, N] -> D [M, N]: every row goes through exactly
-        # one expert, so the work is a plain M*K*N - the expert count
-        # multiplies the *weights read*, not the arithmetic. Without this the
-        # dominant kernel of an MoE model had zero FLOPs, hence an arithmetic
-        # intensity of 0 and an unconditional "memory-bound" verdict.
-        if len(shapes) >= 2 and len(shapes[0]) == 2 and len(shapes[1]) == 3:
-            return 2 * _prod(shapes[0]) * (shapes[1][2]
-                                           if isinstance(shapes[1][2], int)
-                                           else 1)
-    if base == "matmul":
-        if len(shapes) >= 2 and shapes[0] and shapes[1]:
-            K = shapes[0][-1] if isinstance(shapes[0][-1], int) else 1
-            N = shapes[1][-1] if isinstance(shapes[1][-1], int) else 1
-            return 2 * _prod_loose(shapes[0][:-1]) * K * N
+    gemm = _gemm_flops(base, shapes)
+    if gemm is not None:
+        return gemm
 
-    for names, per in _PER_ELEMENT:
-        if base in names:
-            return _prod_loose(shapes[0]) * per
-    for substr, per in _PER_ELEMENT_SUBSTR:
-        if substr in base:
-            return _prod_loose(shapes[0]) * per
+    per = flops_per_element(op_name)
+    if per:
+        return _prod_loose(shapes[0]) * per
     if is_attention(op_name):
         return _attention_flops(shapes, n_seqs)
     return 0
@@ -310,22 +270,6 @@ def arithmetic_intensity(flops: float, nbytes: float) -> float:
 # ===================================================================
 # The roofline
 # ===================================================================
-
-#: An op reaches the matrix-engine (XMX / Tensor) peak only if it issues matrix
-#: instructions. Everything else - norms, activations, gathers, collectives -
-#: is bounded by the vector engine, which on Xe2 is 8x slower.
-_MATRIX_OP_RE = re.compile(
-    r"(^|_)((b?add)?(b)?mm|matmul|linear|gemm|einsum|attn|attention"
-    r"|conv\d?d?)(_|$)")
-
-
-def uses_matrix_engine(op: str | None) -> bool:
-    """Does this dispatch name denote a matrix-engine (GEMM-family) op?"""
-    if not op:
-        return False
-    name = str(op).split("::")[-1].lower().lstrip("_")
-    return bool(_MATRIX_OP_RE.search(name))
-
 
 def compute_peak(peaks: dict[str, float],
                  op: str | None = None) -> tuple[float, str]:

@@ -21,30 +21,7 @@ from typing import Any, Iterable
 
 from breakdown.bench.types import matrix_get
 from breakdown.core.dtypes import label as dtype_label
-
-#: Ops that are pure framework plumbing: they dispatch no device work worth
-#: optimizing, and replaying them measures allocator/bookkeeping noise.
-SKIP_OPS = frozenset({
-    "TorchDynamo Cache Lookup",
-    "aten::detach", "aten::detach_", "aten::t", "aten::transpose",
-    "aten::permute", "aten::view", "aten::reshape", "aten::expand",
-    "aten::slice", "aten::select", "aten::unbind", "aten::squeeze",
-    "aten::unsqueeze", "aten::contiguous", "aten::item", "aten::_to_copy",
-    "aten::empty", "aten::empty_like", "aten::new_empty", "aten::movedim",
-    "aten::flatten", "aten::narrow", "aten::alias", "aten::as_strided",
-    # allocation / dtype plumbing: the trace records these against a factory
-    # overload whose recorded slots (ScalarList sizes, ScalarType enums,
-    # Device, MemoryFormat) describe *how to allocate*, not a kernel worth
-    # optimizing.
-    "aten::to", "aten::clone", "aten::zeros", "aten::ones", "aten::arange",
-    "aten::full", "aten::zeros_like", "aten::ones_like", "aten::copy_",
-    "aten::pin_memory", "aten::lift_fresh",
-})
-
-#: Op-name prefixes that are compiled-region markers, not ops.
-SKIP_PREFIXES = ("Torch-Compiled Region", "ProfilerStep", "Optimizer.",
-                 "cudaLaunch", "Memcpy", "Memset")
-
+from breakdown.core.opnames import is_skipped as _is_skipped
 
 @dataclass
 class BenchCase:
@@ -120,9 +97,8 @@ class BenchCase:
 
 
 def is_skipped(op_name: str) -> bool:
-    if op_name in SKIP_OPS:
-        return True
-    return any(op_name.startswith(p) for p in SKIP_PREFIXES)
+    """True if the benchmark should not try to replay this op."""
+    return _is_skipped(op_name)
 
 
 def case_signature(op: str, args: Iterable[dict]) -> str:

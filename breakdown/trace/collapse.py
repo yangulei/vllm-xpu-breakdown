@@ -7,9 +7,11 @@ from __future__ import annotations
 
 from ..cost import estimate_flops, estimate_memory
 from ..classifier import classify_op
+from ..core.opnames import MATMUL_BASES
 from ..trace_common import _infer_role, _strip_instance_idx
+from ..core.opnames import PLUMBING_OPS
 from .rules import (
-    _KNOWN_MODULE_ROLES, _PLUMBING_OPS, _disambiguate_child_name,
+    _KNOWN_MODULE_ROLES, _disambiguate_child_name,
     _module_display_name, _output_shape, _rowparallel_shape_role)
 from .forest import _Raw
 
@@ -29,7 +31,7 @@ def _module_children(node: _Raw) -> list[_Raw]:
 def _direct_ops(node: _Raw) -> list[_Raw]:
     """Op children that belong to this module (not nested in a child module)."""
     return [c for c in node.children if c.kind == "op"
-            and c.label not in _PLUMBING_OPS]
+            and c.label not in PLUMBING_OPS]
 
 
 def _merge_modules(instances: list[_Raw], n_forward: int) -> dict:
@@ -102,7 +104,7 @@ def _merge_modules(instances: list[_Raw], n_forward: int) -> dict:
     pos = 0
     for c in sorted(base.children, key=lambda n: n.ts):
         if c.kind == "op":
-            if c.label in _PLUMBING_OPS:
+            if c.label in PLUMBING_OPS:
                 continue
             sig = _op_signature(c)
             occ = seen_op.get(sig, 0)
@@ -193,8 +195,7 @@ def _finalize_node(
             op_role = "all_gather"
         elif "reduce_scatter" in low_op or "reducescatter" in low_op:
             op_role = "reduce_scatter"
-        elif module_role_override and op_base in (
-                "mm", "addmm", "linear", "matmul", "bmm"):
+        elif module_role_override and op_base in MATMUL_BASES:
             op_role = module_role_override
         role = op_role \
             or _infer_role(module_path + [merged["module_type"]], raw.label) \

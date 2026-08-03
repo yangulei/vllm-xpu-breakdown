@@ -10,8 +10,8 @@ from __future__ import annotations
 
 
 from ..core.dtypes import is_known as is_dtype
-from .rules import (
-    _WEIGHT_PLUMBING_OPS, _is_hidden_state_op, _msa_kernel_layout)
+from ..core.opnames import WEIGHT_PLUMBING_BASES
+from .rules import _is_hidden_state_op, _msa_kernel_layout
 from .forest import _Raw
 
 
@@ -120,7 +120,7 @@ def _infer_attention_kernel_shapes(roots: list[_Raw], summary: dict,
         # otherwise hand the MSA kernels the weight's out-features as their row
         # count (the symptom: ``[n_h·d/TP, n_idx/TP, d]`` instead of ``[B, ...]``).
         if (H and len(shp) == 2 and shp[1] == int(H)
-                and o.label.split("::")[-1].lower() not in _WEIGHT_PLUMBING_OPS):
+                and o.label.split("::")[-1].lower() not in WEIGHT_PLUMBING_BASES):
             tok_refs.append((o.ts, shp[0]))
     if not act_refs:
         return

@@ -9,6 +9,10 @@ and so the passes stay free of names.
 """
 from __future__ import annotations
 
+from ..core.opnames import (
+    MATMUL_BASES, MSA_KERNEL_LAYOUTS, base_of, first_family,
+    is_attention as _name_is_attention)
+
 
 
 
@@ -37,19 +41,6 @@ _DEVICE_KERNEL_CATEGORIES = {"kernel", "gpu_memcpy", "gpu_memset", "xpu_op",
 # enclosing custom op's start (collapsing all expert GEMM time into
 # ``vllm::moe_forward_shared`` instead of the ``moe`` node).
 _RUNTIME_CATEGORIES = {"cuda_runtime", "cuda_driver", "xpu_runtime"}
-
-
-# Ops that are pure tensor plumbing — kept out of the reconstructed op lists to
-# avoid drowning the real compute ops. They carry no device time anyway.
-_PLUMBING_OPS = frozenset({
-    "aten::slice", "aten::as_strided", "aten::view", "aten::reshape",
-    "aten::select", "aten::expand", "aten::unsqueeze", "aten::squeeze",
-    "aten::t", "aten::transpose", "aten::permute", "aten::contiguous",
-    "aten::detach", "aten::empty", "aten::empty_like", "aten::empty_strided",
-    "aten::resize_", "aten::narrow", "aten::split", "aten::split_with_sizes",
-    "aten::chunk", "aten::flatten", "aten::_unsafe_view", "aten::alias",
-    "aten::lift_fresh", "aten::set_", "aten::_reshape_alias",
-})
 
 
 # Module display names that are valid semantic roles for their contained ops.
@@ -141,35 +132,9 @@ def _is_hidden_state_op(label: str) -> bool:
 #   ``attn``  — block-sparse GQA attend query/output ``[total_q, n_h, d]``
 #   ``index`` — lightning-indexer query ``[total_q, n_idx, idx_d]``
 #   ``topk``  — indexer top-k block ids ``[n_idx, total_q, topk_blocks]``
-# Matching is by substring on the op's base name so it is device-agnostic;
-# ``topk`` is probed first because the XPU API name ``minimax_m3_index_topk``
-# also contains the ``index`` family's prefix.
-_MSA_KERNEL_LAYOUTS: tuple[tuple[tuple[str, ...], str], ...] = (
-    # indexer top-k (XPU: minimax_m3_index_topk; CUDA: _topk_index[_partial
-    # |_merge]_kernel)
-    (("index_topk", "topk_index"), "topk"),
-    # block-sparse GQA attend (XPU: minimax_m3_sparse_attn[_decode];
-    # CUDA: _gqa_sparse_{fwd,decode}_kernel + _merge_topk_attn_out_kernel)
-    (("sparse_attn", "gqa_sparse", "merge_topk_attn"), "attn"),
-    # lightning-indexer block score (XPU: minimax_m3_index_score /
-    # minimax_m3_index_decode; CUDA: _index_block_score / _decode_index_score)
-    (("index_score", "index_block_score", "index_decode"), "index"),
-)
-
-
-# Ops that merely re-view a *weight* tensor. A weight is ``[out_features, H]``,
-# i.e. shaped exactly like a residual hidden state, so these must be excluded
-# when inferring a step's token count from a neighbouring ``[tokens, H]`` op.
-_WEIGHT_PLUMBING_OPS = {"t", "transpose", "permute", "detach"}
-
-
 def _msa_kernel_layout(op_label: str) -> str | None:
     """Return the MSA primary-tensor layout for an op label, if it is one."""
-    base = op_label.split("::")[-1].lower()
-    for subs, layout in _MSA_KERNEL_LAYOUTS:
-        if any(s in base for s in subs):
-            return layout
-    return None
+    return first_family(base_of(op_label), MSA_KERNEL_LAYOUTS) or None
 
 
 # vLLM V1 runs the sampler (and similar post-processing) functionally rather
@@ -252,8 +217,9 @@ def _functional_module_class(name: str) -> tuple[str, str | None] | None:
 
 def _output_shape(op_name: str, shapes: list[list[int]]) -> list[int]:
     """Best-effort output shape for common ops (matmul → [M, N])."""
-    base = op_name.split("::")[-1].lower()
-    if base in ("mm", "linear", "matmul") and len(shapes) >= 2:
+    base = base_of(op_name)
+    # addmm and bmm read their dims from other positions; they follow.
+    if base in MATMUL_BASES - {"addmm", "bmm"} and len(shapes) >= 2:
         if len(shapes[0]) >= 1 and len(shapes[1]) >= 1:
             return list(shapes[0][:-1]) + [shapes[1][-1]]
     if base == "addmm" and len(shapes) >= 3:
@@ -303,8 +269,9 @@ def _rowparallel_shape_role(cls: str, child_merged: dict,
         return None
     for sig in child_merged["op_order"]:
         raw = child_merged["op_groups"][sig]["raw"]
-        base = raw.label.split("::")[-1].lower()
-        if base not in ("mm", "addmm", "linear", "matmul"):
+        base = base_of(raw.label)
+        # bmm has no [M, K] activation to read the row count from.
+        if base not in MATMUL_BASES - {"bmm"}:
             continue
         # Activation input: [M, K]; for addmm it's the 2nd arg.
         act = raw.shapes[1] if base == "addmm" and len(raw.shapes) > 1 \
@@ -410,16 +377,12 @@ def _disambiguate_child_name(cls: str, occ_idx: int, parent_merged: dict) -> str
     return _module_display_name(cls)
 
 
-_ATTENTION_OP_NAMES = frozenset({
-    "vllm::unified_attention_with_output",
-    "vllm::unified_attention",
-})
-
-
 def _is_attention_op(op: dict) -> bool:
+    """True for a paged-attention dispatch, for the KV annotation pass.
+
+    The role is honoured as well as the name because a Python-launched sparse
+    attention kernel is named after its symbol, not after "attention".
+    """
     name = op.get("name", "")
-    if name in _ATTENTION_OP_NAMES:
-        return True
-    low = name.lower()
-    return ("attention" in low or "flash_attn" in low
+    return (_name_is_attention(name) or "attention" in name.lower()
             or op.get("role") == "attention")

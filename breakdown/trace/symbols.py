@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from ..core.opnames import ALLOCATION_FAMILIES, is_moe
 from .rules import _msa_kernel_layout
 
 # Concrete dims at or below this value are structural constants (k/v pair,
@@ -196,13 +197,10 @@ def _is_attn_kernel(op_name: str) -> bool:
 #: collides with ordinary model dims: at S=2048/topk=4 it is 8192 = ``n_h*d``,
 #: and at B=32/topk=4 it is 128 = ``d``. Claiming it globally would rename an
 #: attention head dim after the router.
-_MOE_OP_SUBSTRINGS = ("moe", "expert", "silu_and_mul", "swiglu",
-                      "remap_hidden_states", "grouped_gemm", "topk_")
-
-
-def _is_moe_op(op_name: str) -> bool:
-    low = op_name.lower()
-    return any(s in low for s in _MOE_OP_SUBSTRINGS)
+#: The list itself lives in :mod:`breakdown.core.opnames`, shared with the
+#: allocation family that names an MoE scratch buffer: they were two lists that
+#: agreed on three entries and disagreed about the rest.
+_is_moe_op = is_moe
 
 
 # ===================================================================
@@ -214,19 +212,10 @@ def _is_moe_op(op_name: str) -> bool:
 # distinct value gets a stable observed-value symbol whose number lives in the
 # legend. The family only decides the symbol's *name*, so a reader can tell a
 # KV-cache slot count from an MoE buffer; the first matching substring wins.
-_ALLOCATION_FAMILIES: tuple[tuple[tuple[str, ...], str], ...] = (
-    # Probed first so it isn't absorbed by the MoE family via ``topk``.
-    (("index_topk", "topk_index"), "K_topk"),
-    (("kv_insert", "reshape_and_cache", "kv_cache", "paged_attention",
-      "block_table", "kv_update"), "N_kv"),
-    (("moe", "expert", "silu_and_mul", "fused_moe", "topk_bias"), "M_moe"),
-)
-
-
 def _allocation_base(op_name: str, ndim: int) -> str:
     """The observed-symbol base for a run-specific allocation dim."""
     low = op_name.lower()
-    for subs, base in _ALLOCATION_FAMILIES:
+    for subs, base in ALLOCATION_FAMILIES:
         if any(s in low for s in subs):
             # A 1-D MoE buffer is block-align scratch, not an expert-GEMM row
             # count, so it gets its own base rather than a suffixed M_moe.

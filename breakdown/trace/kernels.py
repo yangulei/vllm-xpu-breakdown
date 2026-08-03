@@ -11,8 +11,9 @@ from __future__ import annotations
 
 from typing import Any
 from ..trace_common import is_launcher_frame, parse_kernel_span
+from ..core.opnames import PLUMBING_OPS
 from .rules import (
-    _DEVICE_KERNEL_CATEGORIES, _PLUMBING_OPS, _RUNTIME_CATEGORIES,
+    _DEVICE_KERNEL_CATEGORIES, _RUNTIME_CATEGORIES,
     _clean_kernel_name, _synthetic_op_label)
 from .events import _PY_FRAME_RE
 from .forest import _Raw, _deepest_at, _enclosing_module
@@ -244,7 +245,7 @@ def _attribute_kernels(roots: list[_Raw],
         node = _deepest_at(roots, ts)
         if node is None:
             continue
-        if node.kind == "op" and node.label not in _PLUMBING_OPS:
+        if node.kind == "op" and node.label not in PLUMBING_OPS:
             node.self_dev += dur
             continue
         mod = _enclosing_module(node, parent)
@@ -340,7 +341,7 @@ def _kernel_leaf_coverage(
             dropped += dur
             n_drop += 1
             continue
-        if node.kind == "op" and node.label not in _PLUMBING_OPS:
+        if node.kind == "op" and node.label not in PLUMBING_OPS:
             on_leaf += dur
             n_leaf += 1
             continue
