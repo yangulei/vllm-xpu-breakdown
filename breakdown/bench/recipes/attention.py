@@ -37,7 +37,8 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from breakdown.bench.inputs import ArgBuildError, Call, make_tensor
+from breakdown.bench.inputs import (
+    ArgBuildError, Call, Ctx, make_tensor, synthesizer)
 from breakdown.bench.recipes import entry, override
 
 #: Paged KV-cache block size. Not recorded in the trace (it is engine
@@ -235,3 +236,13 @@ def _kv_cache_update(case, resolved, device: str) -> Call:
 def _torch_dtype(name: str):
     from breakdown.bench.inputs import torch_dtype
     return torch_dtype(name)
+
+
+# ---------------------------------------------------------------------------
+# MiniMax-M3 fused QK-norm + RoPE + KV insert
+# ---------------------------------------------------------------------------
+@synthesizer("kv_cache", "index_cache", "key_cache", "value_cache",
+             "qkv", "q_out", "index_q_out")
+def _cache_operand(ctx: Ctx):
+    from breakdown.bench.inputs import make_tensor
+    return make_tensor(ctx.dims, ctx.dtype, ctx.device)

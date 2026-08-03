@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-from breakdown.bench import estimate
+from breakdown import cost
 from breakdown.core import devices
 
 #: Bump when the meaning of a ``targets.json`` field changes; the optimizer
@@ -74,7 +74,7 @@ FIDELITY_FLOOR = 0.25
 #: kernel is done. Such ops are reported as ``check_cost_model`` rather than
 #: silently retired as ``at_roofline``. This is now the *last* resort: an op
 #: that merely ran out of a cache is no longer flagged here, because the
-#: cache-bandwidth roof explains it (:func:`estimate.effective_bw_gbs`).
+#: cache-bandwidth roof explains it (:func:`cost.effective_bw_gbs`).
 MAX_CREDIBLE_UTIL = 1.2
 
 _KERNEL_SOURCES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -95,6 +95,13 @@ class RankConfig:
     peak_tflops: float = 0.0
     top: int = 0
     min_share: float = 0.0
+    #: Below this replay/traced ratio the baseline is not trusted, and above
+    #: this utilization the roofline is not. Both were module constants, so a
+    #: run could not be re-ranked with a different tolerance without editing
+    #: the source -- which is the one thing you want to do when investigating
+    #: whether an op really is at the roof.
+    fidelity_floor: float = FIDELITY_FLOOR
+    max_credible_util: float = MAX_CREDIBLE_UTIL
     shapes_per_target: int = 3
     run_id: str = ""
     provenance: dict[str, Any] = field(default_factory=dict)
@@ -171,14 +178,15 @@ def pick_point(records: list[dict], phase: str,
     return pts.most_common(1)[0][0]
 
 
-def _fidelity(rec: dict) -> tuple[float, str]:
+def _fidelity(rec: dict, floor: float = FIDELITY_FLOOR
+              ) -> tuple[float, str]:
     """``(replayed / traced, note)`` for a case measured at the profiled shape."""
     traced = float(rec.get("traced_device_time_us") or 0)
     lat = float(rec.get("latency_us") or 0)
     if not rec.get("traced_comparable") or traced <= 0 or lat <= 0:
         return 0.0, ""
     ratio = lat / traced
-    if ratio < FIDELITY_FLOOR:
+    if ratio < floor:
         return ratio, (f"replay is {1 / max(ratio, 1e-9):.1f}x faster than the "
                        f"profiled device time - the replayed arguments may not "
                        f"reproduce the model's work")
@@ -279,11 +287,11 @@ def _rank_phases(recs: list[dict], rc: RankConfig, phases: tuple[str, ...],
             weighted = lat * calls
             op_time[op][ph] += weighted
             op_backend[op][r.get("backend") or ""] += 1
-            detail = estimate.roofline_detail(
+            detail = cost.roofline_detail(
                 lat, float(r.get("flops") or 0), float(r.get("nbytes") or 0),
                 peaks, op)
             op_util[op].append((weighted, detail))
-            ratio, note = _fidelity(r)
+            ratio, note = _fidelity(r, rc.fidelity_floor)
             if note:
                 op_flags[op].append(note)
             op_cases[op].append({
@@ -334,7 +342,7 @@ def _rank_phases(recs: list[dict], rc: RankConfig, phases: tuple[str, ...],
                    if op_backend[op] else "")
         info = kernel_info(sources, op, backend)
         buildable = bool(info.get("build_cmd"))
-        credible = util <= MAX_CREDIBLE_UTIL
+        credible = util <= rc.max_credible_util
         headroom = max(0.0, 1.0 - eff_util / rc.target_util)
         save = t * headroom if (buildable and credible) else 0.0
         if not credible:

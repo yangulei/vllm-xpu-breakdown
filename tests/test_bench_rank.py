@@ -9,6 +9,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from breakdown import cost
 from breakdown.bench import (  # noqa: E402
     estimate, history, rank, reports, spec, timing,
 )
@@ -39,7 +40,7 @@ CACHE_PEAKS = {"bw_gbs": 456.0, "tflops": 98.3,
 class TestUtilization(unittest.TestCase):
     def test_memory_bound_utilization_is_against_the_bandwidth_peak(self):
         # 456 GB/s for 1 us moves 456e3 bytes; half of that is 50 % of peak.
-        util, bound = estimate.utilization(1.0, 0.0, 228_000, PEAKS)
+        util, bound = cost.utilization(1.0, 0.0, 228_000, PEAKS)
         self.assertEqual(bound, "memory")
         self.assertAlmostEqual(util, 0.5, places=2)
 
@@ -48,17 +49,17 @@ class TestUtilization(unittest.TestCase):
         # compute-bound *however well or badly the kernel ran* - the old
         # "whichever utilization is larger" rule labelled a GEMM running at 30 %
         # of peak FLOPS "memory-bound" and a pure gather "compute-bound".
-        ridge = estimate.ridge_ai(PEAKS)
+        ridge = cost.ridge_ai(PEAKS)
         self.assertAlmostEqual(ridge, 98.3e12 / 456e9, places=3)
 
         # A GEMM: AI well above the ridge, but only a third of peak FLOPS.
         flops, nbytes = 300.0 * 1e6, 1e6
-        util, bound = estimate.utilization(10.0, flops, nbytes, PEAKS)
+        util, bound = cost.utilization(10.0, flops, nbytes, PEAKS)
         self.assertEqual(bound, "compute")
         self.assertAlmostEqual(util, (flops / 10e-6) / 98.3e12, places=3)
 
         # A gather: two bytes of traffic per flop, far below the ridge.
-        util, bound = estimate.utilization(1.0, 1_000.0, 456_000, PEAKS)
+        util, bound = cost.utilization(1.0, 1_000.0, 456_000, PEAKS)
         self.assertEqual(bound, "memory")
         self.assertAlmostEqual(util, 1.0, places=2)
 
@@ -67,16 +68,16 @@ class TestUtilization(unittest.TestCase):
         # operands inside one window, so it is served by the cache. Charging it
         # to DRAM produced "300 % of peak" nonsense.
         nbytes = 1024 ** 2
-        util, bound, level = estimate.utilization_detail(
+        util, bound, level = cost.utilization_detail(
             1.0, 0.0, nbytes, CACHE_PEAKS)
         self.assertEqual((bound, level), ("memory", "cache"))
         self.assertAlmostEqual(util, (nbytes / 1e-6) / 1200e9, places=3)
         # ... and would have been reported as >2x of the DRAM peak.
-        self.assertGreater(estimate.utilization(1.0, 0.0, nbytes, PEAKS)[0], 2.0)
+        self.assertGreater(cost.utilization(1.0, 0.0, nbytes, PEAKS)[0], 2.0)
 
     def test_an_op_larger_than_the_cache_is_charged_to_dram(self):
         nbytes = 64 * 1024 ** 2
-        _, bound, level = estimate.utilization_detail(1.0, 0.0, nbytes,
+        _, bound, level = cost.utilization_detail(1.0, 0.0, nbytes,
                                                       CACHE_PEAKS)
         self.assertEqual((bound, level), ("memory", "dram"))
 
@@ -247,12 +248,12 @@ class TestAdaptiveBudget(unittest.TestCase):
                                estimate.case_budget(dear, CACHE_PEAKS))
 
     def test_roofline_bound_is_the_fastest_possible_time(self):
-        us, bound = estimate.roofline_bound_us(0.0, 456_000, PEAKS)
+        us, bound = cost.roofline_bound_us(0.0, 456_000, PEAKS)
         self.assertEqual(bound, "memory")
         self.assertAlmostEqual(us, 1.0, places=2)
 
     def test_roofline_bound_uses_the_cache_roof_when_it_applies(self):
-        us, bound = estimate.roofline_bound_us(0.0, 1_200_000, CACHE_PEAKS)
+        us, bound = cost.roofline_bound_us(0.0, 1_200_000, CACHE_PEAKS)
         self.assertEqual(bound, "memory")
         self.assertAlmostEqual(us, 1.0, places=2)
 
@@ -285,33 +286,33 @@ class TestHardwareUnitRoofs(unittest.TestCase):
         for op in ("aten::mm", "aten::bmm", "aten::addmm", "aten::linear",
                    "aten::_scaled_mm", "_moe_C::grouped_gemm",
                    "vllm::unified_attention_with_output"):
-            self.assertTrue(estimate.uses_matrix_engine(op), op)
+            self.assertTrue(cost.uses_matrix_engine(op), op)
         for op in ("_C::rms_norm", "_C::silu_and_mul", "aten::embedding",
                    "_moe_C::moe_gather", "c10d::allreduce_"):
-            self.assertFalse(estimate.uses_matrix_engine(op), op)
+            self.assertFalse(cost.uses_matrix_engine(op), op)
 
     def test_a_vector_op_is_scored_against_the_vector_peak(self):
         # A norm issues vector instructions; charging it to the 98.3 TFLOPS XMX
         # peak made every elementwise kernel look like it had ~99 % headroom.
-        peak, unit = estimate.compute_peak(self.UNIT_PEAKS, "_C::rms_norm")
+        peak, unit = cost.compute_peak(self.UNIT_PEAKS, "_C::rms_norm")
         self.assertEqual((peak, unit), (12.3, "XVE"))
-        peak, unit = estimate.compute_peak(self.UNIT_PEAKS, "aten::linear")
+        peak, unit = cost.compute_peak(self.UNIT_PEAKS, "aten::linear")
         self.assertEqual((peak, unit), (98.3, "XMX"))
         # ... and the ridge point moves with it.
-        self.assertLess(estimate.ridge_ai(self.UNIT_PEAKS, 456.0,
+        self.assertLess(cost.ridge_ai(self.UNIT_PEAKS, 456.0,
                                           "_C::rms_norm"),
-                        estimate.ridge_ai(self.UNIT_PEAKS, 456.0,
+                        cost.ridge_ai(self.UNIT_PEAKS, 456.0,
                                           "aten::linear"))
 
     def test_the_roof_is_named_as_a_unit(self):
-        d = estimate.roofline_detail(1.0, 0.0, 64 * 1024 ** 2, self.UNIT_PEAKS,
+        d = cost.roofline_detail(1.0, 0.0, 64 * 1024 ** 2, self.UNIT_PEAKS,
                                      "_C::rms_norm")
         self.assertEqual(d["unit"], "DRAM")
-        d = estimate.roofline_detail(1.0, 0.0, 1024 ** 2, self.UNIT_PEAKS,
+        d = cost.roofline_detail(1.0, 0.0, 1024 ** 2, self.UNIT_PEAKS,
                                      "_C::rms_norm")
         self.assertEqual(d["unit"], "L3-Cache")
         # 300 MFLOP in 10 us on a vector op: AI 300 >> the XVE ridge.
-        d = estimate.roofline_detail(10.0, 300e6, 1e6, self.UNIT_PEAKS,
+        d = cost.roofline_detail(10.0, 300e6, 1e6, self.UNIT_PEAKS,
                                      "_C::silu_and_mul")
         self.assertEqual((d["bound"], d["unit"]), ("compute", "XVE"))
 
@@ -321,7 +322,7 @@ class TestHardwareUnitRoofs(unittest.TestCase):
         # have headroom the model can never use. ``effective_util`` keeps the
         # honest cache number *and* the DRAM one.
         nbytes = 456_000  # 1 us of DRAM peak, and it fits the LLC
-        d = estimate.roofline_detail(1.0, 0.0, nbytes, self.UNIT_PEAKS,
+        d = cost.roofline_detail(1.0, 0.0, nbytes, self.UNIT_PEAKS,
                                      "_C::rms_norm")
         self.assertEqual(d["memory_level"], "cache")
         self.assertAlmostEqual(d["util"], 456.0 / 1200.0, places=2)

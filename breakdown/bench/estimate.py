@@ -14,8 +14,10 @@ from previous runs' actual wall time** when any exist, so the estimate improves
 with use instead of staying a constant someone picked once.
 
 The roofline that turns an op's analytic work into a predicted latency lives
-in :mod:`breakdown.cost`, with the rest of the cost model; this module imports
-what it needs from there.
+in :mod:`breakdown.cost`, with the rest of the cost model. This module used to
+re-export a dozen of its names so callers had "one import site"; that only
+made ``estimate`` look like it owned a cost model it does not, and half the
+re-exports had no caller. Callers ask :mod:`breakdown.cost` directly.
 """
 from __future__ import annotations
 
@@ -23,12 +25,7 @@ import json
 import os
 from typing import Any, Iterable
 
-# Re-exported so ``bench.rank`` / ``bench.reports`` keep one import site for
-# "how expensive is this op, and against which roof".
-from ..cost import (  # noqa: F401
-    compute_peak, effective_bw_gbs, kernel_seconds, ridge_ai,
-    roofline_bound_us, roofline_detail, uses_matrix_engine, utilization,
-    utilization_detail)
+from ..cost import compute_peak, effective_bw_gbs, kernel_seconds
 
 #: Seconds a worker spends importing torch/vLLM before its first case.
 DEFAULT_STARTUP_S = 60.0

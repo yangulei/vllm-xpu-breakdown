@@ -32,7 +32,7 @@ import re
 from collections import Counter, defaultdict
 from typing import Any, Iterable
 
-from breakdown.bench import estimate
+from breakdown import cost
 from breakdown.core import devices
 from breakdown.shape_matrix import MATRIX_HEADERS
 
@@ -68,7 +68,7 @@ def enrich(records: Iterable[dict], peaks: dict[str, float] | None = None
         lat = float(r.get("latency_us") or 0)
         calls = max(int(r.get("layers") or 1), 1)
         if lat > 0:
-            d = estimate.roofline_detail(
+            d = cost.roofline_detail(
                 lat, float(r.get("flops") or 0), float(r.get("nbytes") or 0),
                 peaks, r.get("op"))
             r["util"] = round(d["util"], 3)

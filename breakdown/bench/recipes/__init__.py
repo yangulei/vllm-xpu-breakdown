@@ -7,9 +7,13 @@ is the escape hatch for the rest, and there is exactly one record per op - see
 :mod:`.table` for what a recipe may say and why each field exists. This module
 is the registration API and the one place a call is materialized.
 
-Device-specific registrations live in :mod:`.xpu` and :mod:`.cuda`; both are
-imported here so a recipe is available regardless of which device the run
-targets (registering is cheap and import-safe - nothing touches a device).
+Recipes are grouped by what they are *about* -- :mod:`.attention`, :mod:`.moe`,
+:mod:`.sampling`, and :mod:`.common` for the operand shapes any op can have --
+not by device. They used to be split into ``xpu`` and ``cuda``, which looked
+like a device split but was not one: a synthesizer is registered by *argument
+name* into a single global table, so a CUDA run inherited the XPU
+registrations regardless. All are imported here; registering is cheap and
+import-safe, since nothing touches a device.
 """
 from __future__ import annotations
 
@@ -70,8 +74,8 @@ def build_args(case, resolved: Resolved, device: str):
 
 from breakdown.bench.recipes import common  # noqa: E402,F401  (registers)
 from breakdown.bench.recipes import attention  # noqa: E402,F401
-from breakdown.bench.recipes import cuda  # noqa: E402,F401
-from breakdown.bench.recipes import xpu  # noqa: E402,F401
+from breakdown.bench.recipes import moe  # noqa: E402,F401
+from breakdown.bench.recipes import sampling  # noqa: E402,F401
 
 __all__ = ["RECIPES", "OpRecipe", "build_args", "entry", "outputs",
            "override", "recipe", "register", "skip", "values"]
