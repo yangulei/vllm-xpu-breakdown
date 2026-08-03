@@ -28,21 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
 from breakdown.bench.resolve import Resolved
-
-#: trace dtype token -> torch dtype attribute name
-DTYPE_MAP: dict[str, str] = {
-    "bfloat16": "bfloat16", "float16": "float16", "half": "float16",
-    "float": "float32", "float32": "float32", "double": "float64",
-    "float64": "float64", "long int": "int64", "long": "int64",
-    "int64": "int64", "int": "int32", "int32": "int32", "short": "int16",
-    "int16": "int16", "char": "int8", "int8": "int8",
-    "unsigned char": "uint8", "uint8": "uint8", "byte": "uint8",
-    "bool": "bool", "c10::bfloat16": "bfloat16",
-    "float8_e4m3fn": "float8_e4m3fn", "float8_e5m2": "float8_e5m2",
-    "float8_e4m3fnuz": "float8_e4m3fnuz",
-}
-
-_INT_DTYPES = {"int64", "int32", "int16", "int8", "uint8"}
+from breakdown.core import dtypes
 
 _OPTIONAL = re.compile(r"\?$")
 _LIST = re.compile(r"\[\d*\]$")
@@ -127,7 +113,7 @@ def _torch():
 
 def _dtype_of(ctx: Ctx):
     torch = _torch()
-    return getattr(torch, DTYPE_MAP.get((ctx.dtype or "").lower(), "int64"))
+    return getattr(torch, dtypes.name_or(ctx.dtype, "int64"))
 
 
 def _arange(ctx: Ctx, high: int | None = None):
@@ -338,10 +324,7 @@ def _coerce(value: Any, type_str: str) -> Any:
 # ---------------------------------------------------------------------------
 def torch_dtype(name: str):
     torch = _torch()
-    attr = DTYPE_MAP.get((name or "").lower())
-    if attr is None:
-        return torch.bfloat16
-    return getattr(torch, attr, torch.bfloat16)
+    return getattr(torch, dtypes.torch_name(name), torch.bfloat16)
 
 
 def make_tensor(dims: list[int], dtype_name: str, device: str,
@@ -395,8 +378,7 @@ def _tensor_arg(slot: dict, name: str, ctx_values: dict, case_op: str,
                            dtype=torch_dtype(dtype))
     ctx = Ctx(op=case_op, arg_name=name, dims=dims, dtype=dtype, device=device,
               resolved=resolved, slots=slots, built=built, values=ctx_values)
-    attr = DTYPE_MAP.get(dtype.lower(), "")
-    if attr in _INT_DTYPES:
+    if dtypes.is_integer(dtype):
         fn = _synth_for(case_op, name)
         if fn is None:
             raise MissingSynthesizer(

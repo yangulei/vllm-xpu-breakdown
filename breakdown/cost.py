@@ -62,29 +62,16 @@ from __future__ import annotations
 import re
 from typing import Any
 
-# dtype -> bytes per element
-DTYPE_BYTES: dict[str, int] = {
-    "float32": 4, "fp32": 4, "float": 4,
-    "float16": 2, "fp16": 2, "half": 2,
-    "bfloat16": 2, "bf16": 2,
-    "float8_e4m3fn": 1, "float8_e5m2": 1, "fp8": 1,
-    "int8": 1, "uint8": 1,
-    "int4": 1,  # packed, but use 0.5 effectively
-    "int32": 4, "int64": 8, "int16": 2,
-    "bool": 1,
-    # The profiler records ``Input type`` with C++ type names, so an index
-    # tensor arrives as ``long int``, not ``int64``. Without these it fell back
-    # to 2 bytes and every index/position operand was undercounted 4x.
-    "long int": 8, "long": 8, "long long": 8, "unsigned long": 8,
-    "int": 4, "unsigned int": 4, "short": 2, "unsigned short": 2,
-    "char": 1, "signed char": 1, "unsigned char": 1, "byte": 1,
-    "double": 8, "float64": 8,
-}
+from .core.dtypes import size as _element_bytes
 
+def dtype_size(dtype_str: str) -> float:
+    """Bytes per element for a dtype string (default bf16).
 
-def dtype_size(dtype_str: str) -> int:
-    """Bytes per element for a dtype string (default bf16)."""
-    return DTYPE_BYTES.get((dtype_str or "").lower().replace("torch.", ""), 2)
+    The table lives in :mod:`breakdown.core.dtypes`; this is the cost model's
+    name for it. Fractional for sub-byte packed types, so an int4 weight is
+    counted at the 0.5 bytes/element it actually occupies.
+    """
+    return _element_bytes(dtype_str)
 
 
 def _prod(shape: Any) -> int:

@@ -22,6 +22,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Iterable
 
+from breakdown.core.dtypes import size as dtype_bytes
+
 from breakdown.bench import devices, estimate, resolve, store
 from breakdown.bench.spec import BenchCase, group_by_op
 from breakdown.bench.worker import bench_env
@@ -270,17 +272,12 @@ def _drop_records(path: str, ops: set[str]) -> None:
 
 def _operand_bytes(case: BenchCase) -> float:
     """Bytes the case's operands allocate, for the worker's time budget."""
-    from breakdown.bench.inputs import DTYPE_MAP
-
-    width = {"float64": 8, "int64": 8, "float32": 4, "int32": 4,
-             "bfloat16": 2, "float16": 2, "int16": 2}
     total = 0.0
     for t in case.tensor_args:
         n = 1
         for d in t.get("dims") or []:
             n *= max(int(d), 1)
-        total += n * width.get(DTYPE_MAP.get((t.get("dtype") or "").lower(),
-                                             ""), 1)
+        total += n * dtype_bytes(t.get("dtype"))
     return total
 
 

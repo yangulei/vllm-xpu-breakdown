@@ -12,6 +12,7 @@ the row builder that consumes it.
 """
 from __future__ import annotations
 
+from breakdown.core.dtypes import label as dtype_label, label_for_bytes
 from breakdown.cost import _prod, op_bytes
 
 
@@ -28,8 +29,8 @@ _WEIGHT_ROLES = {
 
 
 def _bytes_to_dtype(nbytes: int) -> str:
-    """Convert byte count to short dtype name."""
-    return {4: "fp32", 2: "bf16", 1: "fp8"}.get(nbytes, f"{nbytes * 8}bit")
+    """The dtype label a configured element width implies."""
+    return label_for_bytes(nbytes)
 
 
 def _quant_dtype_name(quant: str | None) -> str | None:
@@ -127,7 +128,7 @@ def _format_op_shape_with_dtypes(
         if isinstance(shape, list):
             tensor_dtype = None
             if recorded_dtypes and shape_idx < len(recorded_dtypes):
-                tensor_dtype = _friendly_dtype(recorded_dtypes[shape_idx])
+                tensor_dtype = dtype_label(recorded_dtypes[shape_idx])
             if not tensor_dtype:
                 tensor_dtype = _get_tensor_dtype(shape_idx, role, graph_cfg)
             dims = []
@@ -314,24 +315,6 @@ def _resolve_constant_expr(expr: str, symbols: dict[str, int]) -> str:
 
 
 # ---- Profile-derived Shape Matrix helpers ----
-
-_FRIENDLY_DTYPE = {
-    "bfloat16": "bf16", "bf16": "bf16",
-    "float16": "fp16", "fp16": "fp16",
-    "float32": "fp32", "float": "fp32", "fp32": "fp32",
-    "float8_e4m3fn": "fp8e4m3", "float8_e5m2": "fp8e5m2", "fp8": "fp8",
-    "int8": "int8", "uint8": "uint8",
-    "int64": "i64", "int32": "i32", "int16": "i16", "long": "i64", "int": "i32",
-    "bool": "bool",
-}
-
-
-def _friendly_dtype(name: str) -> str:
-    """Short display name for a recorded trace dtype ('bfloat16' → 'bf16')."""
-    if not name:
-        return ""
-    return _FRIENDLY_DTYPE.get(name.lower(), name.lower())
-
 
 def _prod_ints(shape) -> int:
     """Product of a shape's dims; 0 if any is symbolic (kept for callers)."""

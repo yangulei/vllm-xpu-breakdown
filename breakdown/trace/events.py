@@ -9,7 +9,7 @@ import json
 import re
 
 from typing import Any
-from ..cost import DTYPE_BYTES
+from ..core.dtypes import is_known as is_dtype
 from ..trace_common import MODULE_SPAN_PREFIX
 
 
@@ -26,7 +26,7 @@ def _load_trace(path: str) -> dict:
 
 
 def _normalize_dtype(t: Any) -> str:
-    """Normalize a trace dtype token to a ``DTYPE_BYTES`` key.
+    """Normalize a trace dtype token to a canonical dtype spelling.
 
     ``'c10::BFloat16' → 'bfloat16'``, ``'Float' → 'float'``,
     ``'c10::Float8_e4m3fn' → 'float8_e4m3fn'``. Unknown tokens are lowered and
@@ -79,7 +79,7 @@ def _parse_input_args(args: dict) -> list[dict]:
         if isinstance(entry, (list, tuple)) and entry and all(
                 isinstance(x, (list, tuple)) for x in entry):
             # TensorList: one nesting level deeper (c10d::allreduce_, foreach).
-            elem_dt = dt if dt in DTYPE_BYTES else ""
+            elem_dt = dt if is_dtype(dt) else ""
             items = []
             for j, sub in enumerate(entry):
                 items.append({
@@ -91,7 +91,7 @@ def _parse_input_args(args: dict) -> list[dict]:
         elif isinstance(entry, (list, tuple)) and entry:
             out.append({"kind": "tensor", "dims": ints(entry), "dtype": dt,
                         "strides": ints(st)})
-        elif dt in DTYPE_BYTES:
+        elif is_dtype(dt):
             # A 0-dim tensor: empty dims but a real dtype token.
             out.append({"kind": "tensor", "dims": [], "dtype": dt,
                         "strides": []})
@@ -137,7 +137,7 @@ def _parse_input_dims_types(args: dict) -> tuple[list[list[int]], list[str]]:
         # shape; the container label is not an element dtype, so leave the dtype
         # empty for the residual-stream inference pass to fill from a neighbour.
         if all(isinstance(t, (list, tuple)) for t in tensor):
-            list_dt = "" if raw_dt not in DTYPE_BYTES else raw_dt
+            list_dt = raw_dt if is_dtype(raw_dt) else ""
             for sub in tensor:
                 shape = [int(d) for d in sub if isinstance(d, (int, float))]
                 if shape:

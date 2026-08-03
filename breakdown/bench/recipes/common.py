@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from breakdown.bench.inputs import Ctx, synthesizer
 from breakdown.bench.recipes.table import register
+from breakdown.core import dtypes
 
 
 def skip(op: str, reason: str) -> None:
@@ -31,12 +32,11 @@ _ELEMENTWISE = (
 @synthesizer(*_ELEMENTWISE)
 def _elementwise(ctx: Ctx):
     import torch
-    from breakdown.bench.inputs import DTYPE_MAP, make_tensor
+    from breakdown.bench.inputs import make_tensor
 
-    attr = DTYPE_MAP.get((ctx.dtype or "").lower(), "")
-    if attr not in ("int64", "int32", "int16", "int8", "uint8"):
+    if not dtypes.is_integer(ctx.dtype):
         return make_tensor(ctx.dims, ctx.dtype, ctx.device)
-    dt = getattr(torch, attr)
+    dt = getattr(torch, dtypes.torch_name(ctx.dtype))
     n = ctx.numel
     t = torch.arange(1, n + 1, dtype=dt, device=ctx.device)
     return t.reshape(ctx.dims) if ctx.dims else t.reshape(())
@@ -51,9 +51,7 @@ def _gather_index(ctx: Ctx):
     everything to 0 would measure a single cache line instead of a real gather.
     """
     import torch
-    from breakdown.bench.inputs import DTYPE_MAP
-
-    dt = getattr(torch, DTYPE_MAP.get((ctx.dtype or "").lower(), "int64"))
+    dt = getattr(torch, dtypes.name_or(ctx.dtype, "int64"))
     rows = 0
     for dims in ctx.tensor_dims():
         if len(dims) >= 2:

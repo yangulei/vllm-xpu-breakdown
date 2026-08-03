@@ -7,7 +7,7 @@ from __future__ import annotations
 
 
 from typing import Any
-from ..cost import DTYPE_BYTES
+from ..core.dtypes import is_known as is_dtype
 from ..trace_common import (
     _is_overhead_event, _strip_instance_idx, module_span_display_name,
     parse_module_span)
@@ -144,7 +144,7 @@ def _build_raw_forest(events: list[dict]) -> list[_Raw]:
             n.ext = a.get("External id")
             n.shapes, n.dtypes = _parse_input_dims_types(a)
             n.arg_slots = _parse_input_args(a)
-            n.dtype = next((d for d in n.dtypes if d in DTYPE_BYTES), "")
+            n.dtype = next((d for d in n.dtypes if is_dtype(d)), "")
             nodes.append(n)
 
     if not nodes:

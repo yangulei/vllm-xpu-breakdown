@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from breakdown.bench.inputs import Ctx, synthesizer
+from breakdown.core import dtypes
 
 # ---------------------------------------------------------------------------
 # Triton fused-MoE alignment buffers
@@ -15,9 +16,7 @@ from breakdown.bench.inputs import Ctx, synthesizer
 @synthesizer("sorted_token_ids", "sorted_ids")
 def _sorted_token_ids(ctx: Ctx):
     import torch
-    from breakdown.bench.inputs import DTYPE_MAP
-
-    dt = getattr(torch, DTYPE_MAP.get((ctx.dtype or "").lower(), "int32"))
+    dt = getattr(torch, dtypes.name_or(ctx.dtype, "int32"))
     n = ctx.numel
     tokens = 0
     for dims in ctx.tensor_dims():
@@ -33,9 +32,7 @@ def _sorted_token_ids(ctx: Ctx):
 @synthesizer("expert_ids_ptr", "num_tokens_post_pad", "num_tokens_post_padded")
 def _post_pad(ctx: Ctx):
     import torch
-    from breakdown.bench.inputs import DTYPE_MAP
-
-    dt = getattr(torch, DTYPE_MAP.get((ctx.dtype or "").lower(), "int32"))
+    dt = getattr(torch, dtypes.name_or(ctx.dtype, "int32"))
     n = max(ctx.numel, 1)
     t = torch.zeros((n,), dtype=dt, device=ctx.device)
     return t.reshape(ctx.dims) if ctx.dims else t

@@ -20,6 +20,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable
 
 from breakdown.bench.types import matrix_get
+from breakdown.core.dtypes import label as dtype_label
 
 #: Ops that are pure framework plumbing: they dispatch no device work worth
 #: optimizing, and replaying them measures allocator/bookkeeping noise.
@@ -114,20 +115,8 @@ class BenchCase:
         parts = []
         for t in self.tensor_args:
             dims = ",".join(str(d) for d in t.get("dims") or [])
-            parts.append(f"[{dims}]{_short_dtype(t.get('dtype'))}")
+            parts.append(f"[{dims}]{dtype_label(t.get('dtype'))}")
         return " x ".join(parts) or "—"
-
-
-_DTYPE_SHORT = {
-    "bfloat16": "bf16", "float16": "f16", "float": "f32", "float32": "f32",
-    "double": "f64", "long int": "i64", "long": "i64", "int": "i32",
-    "int32": "i32", "int64": "i64", "char": "i8", "unsigned char": "u8",
-    "bool": "b8", "float8_e4m3fn": "fp8", "float8_e5m2": "fp8",
-}
-
-
-def _short_dtype(dt: str | None) -> str:
-    return _DTYPE_SHORT.get((dt or "").lower(), (dt or ""))
 
 
 def is_skipped(op_name: str) -> bool:

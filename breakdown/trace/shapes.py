@@ -9,7 +9,7 @@ traces - and for the one gap no hook closes, a collective's dtype-less
 from __future__ import annotations
 
 
-from ..cost import DTYPE_BYTES
+from ..core.dtypes import is_known as is_dtype
 from .rules import (
     _WEIGHT_PLUMBING_OPS, _is_hidden_state_op, _msa_kernel_layout)
 from .forest import _Raw
@@ -48,7 +48,7 @@ def _infer_hidden_activation_ops(roots: list[_Raw], hidden_size: int | None
     refs: list[tuple[float, list[int], str]] = []
     for o in ops:
         for sh, dt in zip(o.shapes, o.dtypes):
-            if len(sh) == 2 and sh[1] == H and dt in DTYPE_BYTES:
+            if len(sh) == 2 and sh[1] == H and is_dtype(dt):
                 refs.append((o.ts, list(sh), dt))
                 break
     if not refs:
@@ -56,7 +56,7 @@ def _infer_hidden_activation_ops(roots: list[_Raw], hidden_size: int | None
 
     for o in ops:
         need_shape = not o.shapes
-        need_dtype = not any(d in DTYPE_BYTES for d in o.dtypes)
+        need_dtype = not any(is_dtype(d) for d in o.dtypes)
         if not (need_shape or need_dtype) or not _is_hidden_state_op(o.label):
             continue
         _ts, ref_shape, ref_dt = min(refs, key=lambda r: abs(r[0] - o.ts))
@@ -111,7 +111,7 @@ def _infer_attention_kernel_shapes(roots: list[_Raw], summary: dict,
     for o in ops:
         if not o.shapes or len(o.shapes[0]) < 2:
             continue
-        dt = next((d for d in o.dtypes if d in DTYPE_BYTES), "")
+        dt = next((d for d in o.dtypes if is_dtype(d)), "")
         shp = list(o.shapes[0])
         act_refs.append((o.ts, shp[0], shp, dt or "bfloat16"))
         # Token-count references are restricted to genuine residual hidden
