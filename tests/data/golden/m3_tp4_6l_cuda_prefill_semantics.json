@@ -1,0 +1,453 @@
+{
+ "dims": {
+  "H": 6144,
+  "H/TP": 1536,
+  "I/TP": 3072,
+  "I_moe/TP": 768,
+  "K_topk": 16,
+  "N_kv": 114848,
+  "N_moe": 32640,
+  "N_moe2": 255,
+  "P": 1048576,
+  "QKV/TP": 2304,
+  "QKV_idx/TP": 2560,
+  "S": 4096,
+  "S+C": 6144,
+  "V": 200064,
+  "V/TP": 50016,
+  "d": 128,
+  "n_h": 64,
+  "n_h/TP": 16,
+  "n_h\u00b7d/TP": 2048,
+  "n_idx/TP": 1,
+  "n_kv": 4,
+  "n_kv/TP": 1,
+  "topk": 4,
+  "topk\u00b7S": 16384
+ },
+ "ops": {
+  "Torch-Compiled Region: 0/1": {
+   "backend": "framework",
+   "category": "unknown",
+   "cost": {
+    "flops": 0,
+    "is_attention": false,
+    "nbytes": 0,
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "framework"
+  },
+  "TorchDynamo Cache Lookup": {
+   "backend": "cpu",
+   "category": "cpu",
+   "cost": {
+    "flops": 0,
+    "is_attention": false,
+    "nbytes": 0,
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "cpu"
+  },
+  "_C::fused_minimax_m3_qknorm_rope_kv_insert": {
+   "backend": "vllm-xpu-kernels",
+   "category": "vllm-xpu-kernels (general)",
+   "cost": {
+    "ai": 2.364471,
+    "bound": "memory",
+    "flops": 47185920,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 19956224,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "vllm-cuda-kernels"
+  },
+  "_C::silu_and_mul_with_clamp": {
+   "backend": "vllm-xpu-kernels",
+   "category": "vllm-kernels",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 100663296,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "vllm-cuda-kernels"
+  },
+  "_moe_C::moe_align_block_size": {
+   "backend": "vllm-xpu-kernels",
+   "category": "vllm-xpu-kernels (MoE)",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "cache",
+    "nbytes": 229888,
+    "unit": "cache",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "vllm-cuda-kernels"
+  },
+  "_moe_C::moe_sum": {
+   "backend": "vllm-xpu-kernels",
+   "category": "vllm-xpu-kernels (MoE)",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 452984832,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "vllm-cuda-kernels"
+  },
+  "_moe_C::topk_sigmoid": {
+   "backend": "vllm-xpu-kernels",
+   "category": "vllm-xpu-kernels (MoE)",
+   "cost": {
+    "ai": 0.070407,
+    "bound": "memory",
+    "flops": 163840,
+    "is_attention": false,
+    "memory_level": "cache",
+    "nbytes": 2327040,
+    "unit": "cache",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "vllm-cuda-kernels"
+  },
+  "aten::add": {
+   "backend": "torch-xpu-ops",
+   "category": "aten-xpu",
+   "cost": {
+    "ai": 0.166667,
+    "bound": "memory",
+    "flops": 25165824,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 150994944,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "torch-cuda-ops"
+  },
+  "aten::argmax": {
+   "backend": "torch-xpu-ops",
+   "category": "aten-xpu",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "cache",
+    "nbytes": 1200384,
+    "unit": "cache",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "torch-cuda-ops"
+  },
+  "aten::div_": {
+   "backend": "torch-xpu-ops",
+   "category": "aten-xpu",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "cache",
+    "nbytes": 1200388,
+    "unit": "cache",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "torch-cuda-ops"
+  },
+  "aten::embedding": {
+   "backend": "torch-xpu-ops",
+   "category": "aten-xpu",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 100696064,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "torch-cuda-ops"
+  },
+  "aten::exponential_": {
+   "backend": "torch-xpu-ops",
+   "category": "aten-xpu",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "cache",
+    "nbytes": 1200384,
+    "unit": "cache",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "torch-cuda-ops"
+  },
+  "aten::linear": {
+   "backend": "torch-xpu-ops",
+   "category": "aten-xpu",
+   "cost": {
+    "ai": 2397.658537,
+    "bound": "compute",
+    "flops": 309237645312,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 128974848,
+    "unit": "matrix",
+    "uses_matrix_engine": true
+   },
+   "graph_backend": "torch-cuda-ops"
+  },
+  "aten::masked_fill_": {
+   "backend": "torch-xpu-ops",
+   "category": "aten-xpu",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 100667392,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "torch-cuda-ops"
+  },
+  "aten::mul_": {
+   "backend": "torch-xpu-ops",
+   "category": "aten-xpu",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 100663296,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "torch-cuda-ops"
+  },
+  "aten::new_empty": {
+   "backend": "framework",
+   "category": "aten-overhead",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 41943040,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "framework"
+  },
+  "aten::softmax": {
+   "backend": "torch-xpu-ops",
+   "category": "aten-xpu",
+   "cost": {
+    "ai": 0.833333,
+    "bound": "memory",
+    "flops": 1000320,
+    "is_attention": false,
+    "memory_level": "cache",
+    "nbytes": 1200384,
+    "unit": "cache",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "torch-cuda-ops"
+  },
+  "aten::to": {
+   "backend": "framework",
+   "category": "framework-overhead",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "cache",
+    "nbytes": 40960,
+    "unit": "cache",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "framework"
+  },
+  "flashinfer::fused_add_rmsnorm_cute": {
+   "backend": "flashinfer",
+   "category": "flashinfer-kernel",
+   "cost": {
+    "ai": 1.25,
+    "bound": "memory",
+    "flops": 125829120,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 100663296,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "flashinfer"
+  },
+  "flashinfer::rmsnorm_cute": {
+   "backend": "flashinfer",
+   "category": "flashinfer-kernel",
+   "cost": {
+    "ai": 1.25,
+    "bound": "memory",
+    "flops": 125829120,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 100663296,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "flashinfer"
+  },
+  "triton::_gqa_sparse_fwd_kernel": {
+   "backend": "triton",
+   "category": "triton-compiled",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 33554432,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "triton"
+  },
+  "triton::_index_block_score_kernel": {
+   "backend": "triton",
+   "category": "triton-compiled",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "cache",
+    "nbytes": 3145728,
+    "unit": "cache",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "triton"
+  },
+  "triton::_topk_index_kernel": {
+   "backend": "triton",
+   "category": "triton-compiled",
+   "cost": {
+    "ai": 1.666667,
+    "bound": "memory",
+    "flops": 655360,
+    "is_attention": false,
+    "memory_level": "cache",
+    "nbytes": 393216,
+    "unit": "cache",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "triton"
+  },
+  "triton::fused_moe_kernel": {
+   "backend": "triton",
+   "category": "triton-compiled",
+   "cost": {
+    "flops": 0,
+    "is_attention": false,
+    "nbytes": 0,
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "triton"
+  },
+  "vllm::all_gather": {
+   "backend": "ccl",
+   "category": "collective-comm",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "cache",
+    "nbytes": 200064,
+    "unit": "cache",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "ccl"
+  },
+  "vllm::all_reduce": {
+   "backend": "ccl",
+   "category": "collective-comm",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 100663296,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "ccl"
+  },
+  "vllm::moe_forward_shared": {
+   "backend": "vllm-xpu-kernels",
+   "category": "vllm-kernels",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 153092096,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "vllm-cuda-kernels"
+  },
+  "vllm::unified_attention_with_output": {
+   "backend": "vllm-xpu-kernels",
+   "category": "vllm-kernels",
+   "cost": {
+    "ai": 2621.44,
+    "bound": "compute",
+    "flops": 137438953472,
+    "is_attention": true,
+    "memory_level": "dram",
+    "nbytes": 52428800,
+    "unit": "matrix",
+    "uses_matrix_engine": true
+   },
+   "graph_backend": "vllm-cuda-kernels"
+  },
+  "vllm::unified_kv_cache_update": {
+   "backend": "vllm-xpu-kernels",
+   "category": "vllm-kernels",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "cache",
+    "nbytes": 3145728,
+    "unit": "cache",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "vllm-cuda-kernels"
+  }
+ }
+}

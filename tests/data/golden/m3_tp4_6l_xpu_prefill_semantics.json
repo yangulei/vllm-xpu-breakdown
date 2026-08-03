@@ -1,0 +1,453 @@
+{
+ "dims": {
+  "H": 6144,
+  "H/TP": 1536,
+  "I/TP": 3072,
+  "I_moe/TP": 768,
+  "K_topk": 16,
+  "N": 13813,
+  "N2": 33,
+  "N_kv": 13813,
+  "P": 1048576,
+  "QKV/TP": 2304,
+  "QKV_idx/TP": 2560,
+  "S": 2048,
+  "S+C": 4096,
+  "V/TP": 50016,
+  "d": 128,
+  "d/TP": 32,
+  "n_h": 64,
+  "n_h/TP": 16,
+  "n_h\u00b7d/TP": 2048,
+  "n_idx/TP": 1,
+  "n_kv": 4,
+  "n_kv/TP": 1,
+  "topk": 4,
+  "topk\u00b7S": 8192
+ },
+ "ops": {
+  "Torch-Compiled Region: 0/1": {
+   "backend": "framework",
+   "category": "unknown",
+   "cost": {
+    "flops": 0,
+    "is_attention": false,
+    "nbytes": 0,
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "framework"
+  },
+  "TorchDynamo Cache Lookup": {
+   "backend": "cpu",
+   "category": "cpu",
+   "cost": {
+    "flops": 0,
+    "is_attention": false,
+    "nbytes": 0,
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "cpu"
+  },
+  "_C::fused_minimax_m3_qknorm_rope_kv_insert": {
+   "backend": "vllm-xpu-kernels",
+   "category": "vllm-xpu-kernels (general)",
+   "cost": {
+    "ai": 2.364411,
+    "bound": "memory",
+    "flops": 23592960,
+    "is_attention": false,
+    "memory_level": "cache",
+    "nbytes": 9978368,
+    "unit": "cache",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "vllm-xpu-kernels"
+  },
+  "_C::silu_and_mul_with_clamp": {
+   "backend": "vllm-xpu-kernels",
+   "category": "vllm-kernels",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 50331648,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "vllm-xpu-kernels"
+  },
+  "_C::swigluoai_and_mul": {
+   "backend": "vllm-xpu-kernels",
+   "category": "vllm-xpu-kernels (general)",
+   "cost": {
+    "ai": 0.625,
+    "bound": "memory",
+    "flops": 31457280,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 50331648,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "vllm-xpu-kernels"
+  },
+  "_moe_C::moe_gather": {
+   "backend": "vllm-xpu-kernels",
+   "category": "vllm-xpu-kernels (MoE)",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 151060480,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "vllm-xpu-kernels"
+  },
+  "_moe_C::remap_hidden_states": {
+   "backend": "vllm-xpu-kernels",
+   "category": "vllm-xpu-kernels (MoE)",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 151060992,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "vllm-xpu-kernels"
+  },
+  "_moe_C::topk_sigmoid": {
+   "backend": "vllm-xpu-kernels",
+   "category": "vllm-xpu-kernels (MoE)",
+   "cost": {
+    "ai": 0.070392,
+    "bound": "memory",
+    "flops": 81920,
+    "is_attention": false,
+    "memory_level": "cache",
+    "nbytes": 1163776,
+    "unit": "cache",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "vllm-xpu-kernels"
+  },
+  "_xpu_C::cutlass_grouped_gemm_interface": {
+   "backend": "vllm-xpu-kernels",
+   "category": "vllm-xpu-kernels (XPU-specific)",
+   "cost": {
+    "ai": 60.235282,
+    "bound": "memory",
+    "flops": 154618822656,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 2566914560,
+    "unit": "DRAM",
+    "uses_matrix_engine": true
+   },
+   "graph_backend": "vllm-xpu-kernels"
+  },
+  "aten::add": {
+   "backend": "torch-xpu-ops",
+   "category": "aten-xpu",
+   "cost": {
+    "ai": 0.166667,
+    "bound": "memory",
+    "flops": 12582912,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 75497472,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "torch-xpu-ops"
+  },
+  "aten::clone": {
+   "backend": "framework",
+   "category": "framework-overhead",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 50331648,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "framework"
+  },
+  "aten::embedding": {
+   "backend": "torch-xpu-ops",
+   "category": "aten-xpu",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 50348032,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "torch-xpu-ops"
+  },
+  "aten::linear": {
+   "backend": "torch-xpu-ops",
+   "category": "aten-xpu",
+   "cost": {
+    "ai": 1966.08,
+    "bound": "compute",
+    "flops": 154618822656,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 78643200,
+    "unit": "matrix",
+    "uses_matrix_engine": true
+   },
+   "graph_backend": "torch-xpu-ops"
+  },
+  "aten::masked_fill_": {
+   "backend": "torch-xpu-ops",
+   "category": "aten-xpu",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 50333696,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "torch-xpu-ops"
+  },
+  "aten::movedim": {
+   "backend": "framework",
+   "category": "aten-overhead",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "cache",
+    "nbytes": 800256,
+    "unit": "cache",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "framework"
+  },
+  "aten::mul_": {
+   "backend": "torch-xpu-ops",
+   "category": "aten-xpu",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 50331648,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "torch-xpu-ops"
+  },
+  "aten::new_empty": {
+   "backend": "framework",
+   "category": "aten-overhead",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 20971520,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "framework"
+  },
+  "aten::to": {
+   "backend": "framework",
+   "category": "framework-overhead",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "cache",
+    "nbytes": 20480,
+    "unit": "cache",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "framework"
+  },
+  "aten::zeros": {
+   "backend": "framework",
+   "category": "framework-overhead",
+   "cost": {
+    "flops": 0,
+    "is_attention": false,
+    "nbytes": 0,
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "framework"
+  },
+  "c10d::_allgather_base_": {
+   "backend": "ccl",
+   "category": "collective-comm",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "cache",
+    "nbytes": 900288,
+    "unit": "cache",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "ccl"
+  },
+  "c10d::allreduce_": {
+   "backend": "ccl",
+   "category": "collective-comm",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 50331648,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "ccl"
+  },
+  "flash_xpu::minimax_m3_index_score": {
+   "backend": "flash_xpu",
+   "category": "xattention-kernel",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "cache",
+    "nbytes": 1605780,
+    "unit": "cache",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "flash_xpu"
+  },
+  "flash_xpu::minimax_m3_index_topk": {
+   "backend": "flash_xpu",
+   "category": "xattention-kernel",
+   "cost": {
+    "ai": 1.666616,
+    "bound": "memory",
+    "flops": 655360,
+    "is_attention": false,
+    "memory_level": "cache",
+    "nbytes": 393228,
+    "unit": "cache",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "flash_xpu"
+  },
+  "flash_xpu::minimax_m3_sparse_attn": {
+   "backend": "flash_xpu",
+   "category": "xattention-kernel",
+   "cost": {
+    "ai": 0.879718,
+    "bound": "memory",
+    "flops": 16777216,
+    "is_attention": true,
+    "memory_level": "dram",
+    "nbytes": 19071124,
+    "unit": "DRAM",
+    "uses_matrix_engine": true
+   },
+   "graph_backend": "flash_xpu"
+  },
+  "triton::_gemma_fused_add_rmsnorm_kernel": {
+   "backend": "triton",
+   "category": "triton-compiled",
+   "cost": {
+    "ai": 0.833198,
+    "bound": "memory",
+    "flops": 62914560,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 75509760,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "triton"
+  },
+  "triton::_gemma_rmsnorm_kernel": {
+   "backend": "triton",
+   "category": "triton-compiled",
+   "cost": {
+    "ai": 1.249695,
+    "bound": "memory",
+    "flops": 62914560,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 50343936,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "triton"
+  },
+  "vllm::moe_forward_shared": {
+   "backend": "vllm-xpu-kernels",
+   "category": "vllm-kernels",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "dram",
+    "nbytes": 76546048,
+    "unit": "DRAM",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "vllm-xpu-kernels"
+  },
+  "vllm::unified_attention_with_output": {
+   "backend": "vllm-xpu-kernels",
+   "category": "vllm-kernels",
+   "cost": {
+    "ai": 1310.72,
+    "bound": "compute",
+    "flops": 34359738368,
+    "is_attention": true,
+    "memory_level": "dram",
+    "nbytes": 26214400,
+    "unit": "matrix",
+    "uses_matrix_engine": true
+   },
+   "graph_backend": "vllm-xpu-kernels"
+  },
+  "vllm::unified_kv_cache_update": {
+   "backend": "vllm-xpu-kernels",
+   "category": "vllm-kernels",
+   "cost": {
+    "ai": 0.0,
+    "bound": "memory",
+    "flops": 0,
+    "is_attention": false,
+    "memory_level": "cache",
+    "nbytes": 1572864,
+    "unit": "cache",
+    "uses_matrix_engine": false
+   },
+   "graph_backend": "vllm-xpu-kernels"
+  }
+ }
+}
