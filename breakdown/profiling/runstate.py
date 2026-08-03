@@ -47,10 +47,16 @@ def _cache_key(model_id: str) -> str:
 
 
 def _save_config_cache(model_id: str, config: dict[str, Any]) -> None:
-    """Persist config.json to disk cache."""
+    """Persist config.json to disk cache.
+
+    Creates the directory: a fresh clone has no ``breakdown/output/``, and the
+    caller is the model-config route, which would otherwise answer 400 with a
+    "No such file or directory" for a config it had successfully fetched.
+    """
     key = _cache_key(model_id)
     path = _CONFIG_CACHE_DIR / f"{key}.json"
     with _config_cache_lock:
+        _CONFIG_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
 
 
