@@ -244,3 +244,55 @@ def _validate_derived_shapes(template: dict) -> dict:
                             f"{op.get('name', '')} {ss}\u2192{resolved} vs {rec}")
     return {"total": total, "matched": matched,
             "mismatched": total - matched, "examples": examples}
+
+
+def annotate_display_shapes(graph: dict) -> dict:
+    """Give every op in a graph the shapes a reader should see.
+
+    The browser used to work this out for itself: it had its own symbol
+    resolver (``symTooltip``), its own byte-width-to-dtype table, its own copy
+    of the quantization name map and of the set of roles whose second operand
+    is a weight -- four transcriptions of Python that already existed, and one
+    of them disagreed. ``symTooltip`` split on the multiply sign only, so an
+    additive composite like ``S+C`` resolved to nothing and the reader was
+    shown a symbol where every other dimension showed a number.
+
+    So the server says it once. Each op gains::
+
+        op["display"] = {"sym": [[dim, ...], ...],      # display form
+                         "concrete": [[int, ...], ...] | None,
+                         "dtypes": [label, ...]}
+
+    Structured, not markup: what a dimension *is* belongs to the pipeline, how
+    it looks belongs to the page.
+    """
+    symbols = dict(graph.get("symbols") or {})
+    cfg = graph.get("config") or {}
+
+    def annotate(node: dict) -> None:
+        for op in node.get("ops") or []:
+            shapes = op.get("input_shapes") or []
+            sym = [[dims.resolve_display(d, symbols) for d in row]
+                   if isinstance(row, list) else [dims.resolve_display(row, symbols)]
+                   for row in shapes]
+            concrete: list[list[int]] | None = []
+            for row in shapes:
+                cells = row if isinstance(row, list) else [row]
+                resolved = [dims.resolve(d, symbols) for d in cells]
+                if not all(isinstance(v, int) for v in resolved):
+                    concrete = None
+                    break
+                concrete.append(resolved)
+            op["display"] = {
+                "sym": sym,
+                "concrete": concrete,
+                "dtypes": [_get_tensor_dtype(i, op.get("role") or "", cfg)
+                           for i in range(len(shapes))],
+            }
+        for child in node.get("children") or []:
+            annotate(child)
+
+    for phase in ("prefill", "decode"):
+        if graph.get(phase):
+            annotate(graph[phase])
+    return graph

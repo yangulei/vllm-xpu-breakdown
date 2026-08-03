@@ -33,6 +33,7 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from breakdown.op_breakdown import summarize_ops
+from breakdown.shape_derive import annotate_display_shapes
 from breakdown.trace_common import _detect_device_via_torch
 from breakdown import profiling, service
 from breakdown.profiling import (
@@ -307,6 +308,8 @@ def profile_result():
         return jsonify({"ok": False, "status": st["status"],
                         "error": st.get("error")}), 202
     result = st["result"]
+    if isinstance(result.get("graph"), dict):
+        annotate_display_shapes(result["graph"])
     # Don't expose internal trace_file path(s); indicate availability instead.
     _internal = {"trace_file", "prefill_trace_file", "decode_trace_file"}
     client_result = {k: v for k, v in result.items() if k not in _internal}

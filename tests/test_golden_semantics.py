@@ -24,6 +24,7 @@ Regenerate after a deliberate change:
 from __future__ import annotations
 
 import json
+import unittest
 import os
 
 import pytest
@@ -188,3 +189,52 @@ def test_every_symbolic_dim_resolves(fixture):
     assert not unresolved, (
         f"{fixture.name}: symbolic dims that do not resolve to an integer, so "
         f"they cannot be swept or costed: {unresolved}")
+
+
+class TestDisplayShapes(unittest.TestCase):
+    """The server resolves shapes so the browser does not re-derive them.
+
+    The page had its own symbol resolver, its own byte-width-to-dtype table,
+    its own copy of the quantization name map and of the weight-role set --
+    four transcriptions of Python that already existed. The resolver disagreed
+    with its Python twin on additive composites (``S+C``), so the same
+    dimension read as a number on one surface and a bare symbol on the other.
+    """
+
+    @pytest.mark.skipif(not FIXTURES, reason="no trace fixtures present")
+    def test_every_op_with_shapes_is_annotated_for_display(self):
+        from breakdown.shape_derive import annotate_display_shapes
+        fixture = FIXTURES[0]
+        graph = annotate_display_shapes(
+            build_graph_from_trace(fixture.trace_path,
+                                   **fixture.build_kwargs()))
+        seen = 0
+        for op in _iter_ops(graph.get(fixture.phase)):
+            if not op.get("input_shapes"):
+                continue
+            seen += 1
+            display = op.get("display")
+            self.assertIsNotNone(display, op.get("name"))
+            self.assertEqual(len(display["sym"]), len(op["input_shapes"]))
+            self.assertEqual(len(display["dtypes"]), len(op["input_shapes"]))
+        self.assertGreater(seen, 0)
+
+    @pytest.mark.skipif(not FIXTURES, reason="no trace fixtures present")
+    def test_a_concrete_shape_is_all_integers_or_absent(self):
+        """``concrete`` is the resolved form or ``None`` -- never partial.
+
+        A half-resolved shape would render as a row of numbers with one symbol
+        hiding in it, which reads as a number the reader can act on.
+        """
+        from breakdown.shape_derive import annotate_display_shapes
+        for fixture in FIXTURES:
+            graph = annotate_display_shapes(
+                build_graph_from_trace(fixture.trace_path,
+                                       **fixture.build_kwargs()))
+            for op in _iter_ops(graph.get(fixture.phase)):
+                concrete = (op.get("display") or {}).get("concrete")
+                if concrete is None:
+                    continue
+                for row in concrete:
+                    self.assertTrue(all(isinstance(v, int) for v in row),
+                                    f"{fixture.name}: {op.get('name')} {row}")

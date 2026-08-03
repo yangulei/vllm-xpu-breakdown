@@ -1032,6 +1032,10 @@ function applyProfileResult(data) {
     renderGraph();
     // The Bench & Rank op filter lists what this profile dispatched.
     loadBenchOps();
+    // ...and its sweep starts where this profile was taken. This ran only on
+    // page restore, so a freshly finished profile left the sweep on the
+    // defaults - the trap applyProfileToSweep exists to prevent.
+    applyProfileToSweep(data);
   }
   showTabPrecondition('graph');
   showTabPrecondition('perf');
@@ -1181,113 +1185,27 @@ function renderGraph() {
   container.appendChild(buildTreeNode(tree, true, hasTiming));
 }
 
-function symTooltip(dimStr) {
-  const symbols = GRAPH_DATA?.symbols || {};
-  const s = String(dimStr);
-
-  // Handle "/TP" suffix: resolve base, show as "base/TP = value/tp_size = result"
-  if (s.endsWith('/TP')) {
-    const base = s.slice(0, -3);
-    const baseResult = symTooltip(base);
-    const tp = symbols['TP'];
-    const html = `<span class="sym-dim">${baseResult.html}/TP</span>`;
-    if (baseResult.concrete && tp !== undefined) {
-      const concrete = String(Math.floor(Number(baseResult.concrete) / tp));
-      return { html, concrete };
-    }
-    return { html, concrete: null };
-  }
-
-  const val = symbols[s];
-  if (val !== undefined) {
-    return { html: `<span class="sym-dim">${s}</span>`, concrete: String(val) };
-  }
-  // Handle composite like "S·8" or "n_h·d"
-  const parts = s.split('·');
-  if (parts.length > 1) {
-    let numericProd = 1;
-    let allResolved = true;
-    const htmlParts = parts.map(p => {
-      const v = symbols[p];
-      if (v !== undefined) { numericProd *= v; return `<span class="sym-dim">${p}</span>`; }
-      const n = parseInt(p);
-      if (!isNaN(n)) { numericProd *= n; return p; }
-      allResolved = false;
-      return p;
-    });
-    return { html: htmlParts.join('·'), concrete: allResolved ? String(numericProd) : null };
-  }
-  return { html: s, concrete: s };
-}
-
-// Determine dtype name from byte count
-function bytesToDtype(bytes) {
-  return {4: 'fp32', 2: 'bf16', 1: 'fp8'}[bytes] || (bytes * 8 + 'bit');
-}
-
-// Get quant method display name
-function quantDtypeName(quant) {
-  if (!quant || quant === 'None') return null;
-  const names = {fp8:'fp8', gptq:'int4', gptq_marlin:'int4', awq:'int4',
-                 awq_marlin:'int4', marlin:'int4', squeezellm:'int4',
-                 bitsandbytes:'nf4', gguf:'q4', int4:'int4', int8:'int8'};
-  return names[quant.toLowerCase()] || quant.toLowerCase();
-}
-
-// Roles that have a weight matrix as the 2nd input tensor
-const WEIGHT_ROLES = new Set([
-  'qkv_proj', 'o_proj', 'gate_up_proj', 'down_proj',
-  'expert_gate_up', 'expert_down',
-  'shared_expert_gate_up', 'shared_expert_down',
-  'q_compress', 'q_decompress', 'kv_compress',
-  'router_gate', 'lm_head', 'vl_projector',
-  'vit_qkv_proj', 'vit_o_proj', 'vit_mlp_up', 'vit_mlp_down',
-  'patch_embed', 'mlp_up', 'mlp_down',
-]);
-
-// Get per-tensor dtype labels for an op
-function getOpDtypes(op, numInputs) {
-  const cfg = GRAPH_DATA?.config || {};
-  const actDtype = bytesToDtype(cfg.dtype_bytes || 2);
-  const quant = cfg.quantization;
-  const wDtype = quant
-    ? (quantDtypeName(quant) || bytesToDtype(cfg.weight_dtype_bytes || 2))
-    : actDtype;
-  const dtypes = [];
-  for (let i = 0; i < numInputs; i++) {
-    if (i === 1 && WEIGHT_ROLES.has(op.role)) {
-      dtypes.push(wDtype);
-    } else {
-      dtypes.push(actDtype);
-    }
-  }
-  return dtypes;
-}
-
+// The server resolves shapes: each op carries `display` = {sym, concrete,
+// dtypes}. The page used to work this out for itself, with its own symbol
+// resolver, its own byte-width-to-dtype table, its own copy of the
+// quantization name map and of the weight-role set -- four transcriptions of
+// Python that already existed, and the resolver disagreed with its Python
+// twin on additive composites like "S+C". Rendering is all that is left here.
 function fmtShapeGraph(shapes, op) {
-  if (!shapes || shapes.length === 0) return '—';
-  const dtypes = op ? getOpDtypes(op, shapes.length) : [];
-  const parts = shapes.map((tensorDims, idx) => {
-    const resolved = tensorDims.map(d => symTooltip(d));
-    const innerHtml = resolved.map(r => r.html).join(', ');
-    const concreteParts = resolved.map(r => r.concrete).filter(c => c !== null);
-    const allConcrete = concreteParts.length === tensorDims.length;
-    const dtype = dtypes[idx] || '';
-    // Symbolic part without dtype
-    const symPart = `[${innerHtml}]`;
-    // Concrete part with dtype appended inside bracket
-    const concretePart = allConcrete
-      ? `[${concreteParts.join(', ')}${dtype ? ', ' + dtype : ''}]`
-      : null;
-    return { sym: symPart, concrete: concretePart };
-  });
-  const symHtml = parts.map(p => p.sym).join(' × ');
-  const allResolved = parts.every(p => p.concrete !== null);
-  if (allResolved) {
-    const concreteHtml = parts.map(p => p.concrete).join(' × ');
-    return `${symHtml} <span style="color:#888;font-size:0.85em">${concreteHtml}</span>`;
-  }
-  return symHtml;
+  if (!shapes || shapes.length === 0) return '\u2014';
+  const d = op && op.display;
+  if (!d || !d.sym) return shapes.map(t => `[${t.join(', ')}]`).join(' \u00d7 ');
+
+  const sym = d.sym.map(dimsOf =>
+    '[' + dimsOf.map(x => /^[0-9]+$/.test(String(x))
+      ? x : `<span class="sym-dim">${x}</span>`).join(', ') + ']').join(' \u00d7 ');
+
+  if (!d.concrete) return sym;
+  const concrete = d.concrete.map((dimsOf, i) => {
+    const dt = (d.dtypes || [])[i];
+    return '[' + dimsOf.join(', ') + (dt ? ', ' + dt : '') + ']';
+  }).join(' \u00d7 ');
+  return `${sym} <span style="color:#888;font-size:0.85em">${concrete}</span>`;
 }
 
 function fmtAI2(ai) {
