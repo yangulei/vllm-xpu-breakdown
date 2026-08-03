@@ -13,6 +13,11 @@ Coverage is a property of the profile, not of a hand-maintained adapter table.
 Every op the model dispatched is benchmarkable, on XPU and CUDA alike, without
 writing an adapter for it.
 
+What an op *name* means — is it a matmul, a collective, plumbing, an op that
+indexes into a table rather than streaming it — is not decided here. That
+vocabulary lives in `breakdown/core/opnames.py`, shared with reconstruction and
+the cost model, so a new op is described once and every stage picks it up.
+
 
 ## Stages
 
@@ -82,9 +87,12 @@ was zero-filled.)
 
 ### Cost-model credibility
 
-Utilization above `MAX_CREDIBLE_UTIL` means the analytic FLOPs/bytes overstate
-this op's traffic. It is reported as `check_cost_model`, never silently retired
-as `at_roofline` — so the brief tells the agent to fix the cost model first.
+Utilization above `RankConfig.max_credible_util` means the analytic
+FLOPs/bytes overstate this op's traffic. It is reported as `check_cost_model`,
+never silently retired as `at_roofline` — so the brief tells the agent to fix
+the cost model first. It and `fidelity_floor` are `RankConfig` fields rather
+than constants, because re-ranking a finished run with a different tolerance is
+exactly what you do when deciding whether an op really is at the roof.
 
 
 ## Timing

@@ -28,9 +28,14 @@ DEVICE = _detect_device_via_torch() or "xpu"
 STAGE = "profile"
 
 # ---- Config Cache ----
-# Persists successfully loaded model configs to disk so they appear as suggestions.
+# Persists successfully loaded model configs to disk so they appear as
+# suggestions. Anchored to the *package* root rather than to this file: this
+# module moved one directory deeper when profiling.py became a package, and a
+# path relative to __file__ would have silently moved the cache with it,
+# orphaning every config already fetched.
 
-_CONFIG_CACHE_DIR = Path(__file__).parent / "output" / "config_cache"
+_CONFIG_CACHE_DIR = (Path(__file__).resolve().parent.parent
+                     / "output" / "config_cache")
 
 
 _config_cache_lock = threading.Lock()

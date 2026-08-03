@@ -12,6 +12,14 @@ It required a per-architecture builder, silently drifted as vLLM changed ops,
 and could not know what quantization or compilation actually dispatched. Profile
 first; derive shapes from what ran.
 
+Two things this package deliberately does *not* own. The **model vocabulary**
+— which names are matmuls, collectives, MoE compute, plumbing — lives in
+`breakdown/core/opnames.py`, shared with the classifier, the cost model and the
+benchmark; `rules.py` holds only what is specific to reading a *trace*. And a
+**symbolic dimension** is an expression, parsed by `breakdown/core/dims.py`;
+this package builds them, and everything downstream reads them through the same
+parser rather than by string surgery.
+
 
 ## Module Order
 
