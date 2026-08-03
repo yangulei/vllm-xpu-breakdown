@@ -291,6 +291,67 @@ def _rank0_first(rank_files: list[str]) -> list[str]:
     )]
 
 
+def fit_max_model_len(max_model_len: int, query_len: int | None,
+                      context_len: int | None, max_tokens: int) -> int:
+    """``max_model_len`` grown to cover the decode budget, if it must be.
+
+    +16 of slack for the chat template's own tokens.
+    """
+    if not query_len:
+        return int(max_model_len)
+    needed = int(query_len) + int(context_len or 0) + int(max_tokens) + 16
+    return max(int(max_model_len), needed)
+
+
+def trace_download_name(result: dict, which: str, device: str,
+                        trace_path: str) -> str:
+    """The descriptive filename a downloaded trace is served under.
+
+    Every profiled parameter is in the name, which is what makes
+    download -> upload a lossless round trip: :func:`_parse_trace_filename` is
+    the exact inverse, and the two must move together. They now sit together
+    too -- the builder used to be thirty lines inside the Flask route, where a
+    change to it would not obviously break the parser.
+
+    ``ctx`` is the block-aligned prefix-cache context the prefill attends to,
+    ``in`` the query length (new prefill tokens, S), ``out`` the number of
+    generated decode tokens, ``bs`` the pass's batch. The model id is reduced
+    to its final path component.
+    """
+    if which == "prefill":
+        pass_tag, pass_bs, gen = "_prefill", result.get("prefill_batch_size"), 1
+    elif which == "decode":
+        pass_tag = "_decode"
+        pass_bs = result.get("decode_batch_size", result.get("batch_size", 1))
+        gen = result.get("max_tokens", "")
+    else:
+        # Tag the filename only when the run really has distinct passes.
+        pass_tag = "_decode" if result.get("two_pass") else ""
+        pass_bs = result.get("decode_batch_size", result.get("batch_size", 1))
+        gen = result.get("max_tokens", "")
+
+    bs = pass_bs if pass_bs is not None else result.get("batch_size", 1)
+    quant = result.get("quantization")
+    return (
+        f"vllm_trace_{result['model_id'].split('/')[-1]}_{device.upper()}"
+        f"_{result.get('mode', 'eager')}{pass_tag}"
+        f"_ctx{result.get('context_len_aligned') or result.get('context_len') or 0}"
+        f"_in{result.get('query_len') or 0}_out{gen}_bs{bs}"
+        f"_tp{result.get('tp_size', 1) or 1}"
+        f"{f'_{quant}' if quant else ''}"
+        f"_{result.get('profiled_layers', 'all')}layers"
+        f"{'.json.gz' if trace_path.endswith('.gz') else '.json'}")
+
+
+def trace_path_for(result: dict, which: str) -> str | None:
+    """The stored trace file a download request refers to."""
+    if which == "prefill":
+        return result.get("prefill_trace_file")
+    if which == "decode":
+        return result.get("decode_trace_file") or result.get("trace_file")
+    return result.get("trace_file")
+
+
 def _parse_trace_filename(name: str) -> dict:
     """Recover profiling config from a download-endpoint trace filename.
 
@@ -520,6 +581,15 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             phase (often 32/64/128). See ``prefill_batch_size``. ``None`` falls
             back to ``batch_size``.
     """
+    # The engine must fit the longest sequence it will ever see: cached context
+    # + new query tokens + the decode tokens we generate. The caller sizes
+    # max_model_len from query+context, which leaves no decode headroom, so the
+    # bump belongs here -- it used to live in the HTTP route, which meant the
+    # headless path never got it and a CLI profile could fail engine start-up
+    # with a request longer than max_model_len.
+    max_model_len = fit_max_model_len(max_model_len, query_len, context_len,
+                                      max_tokens)
+
     try:
         from vllm import LLM, SamplingParams, TokensPrompt
 

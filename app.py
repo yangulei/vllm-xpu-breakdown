@@ -17,7 +17,6 @@ import logging
 import os
 import sys
 import threading
-from typing import Any
 
 from flask import Flask, Response, jsonify, request, send_file, send_from_directory
 
@@ -41,7 +40,6 @@ from breakdown.profiling import (
     _load_cached_config,
     _load_cached_model_ids,
     _profile_lock,
-    _profile_template_for,
     _run_profile,
     _save_config_cache,
 )
@@ -50,14 +48,10 @@ from breakdown.model_info import (
     min_profile_layers,
     summarize_config,
 )
-from breakdown import shape_matrix
 from breakdown.core import devices as bench_devices
 from breakdown.bench import (
     history as bench_history,
-    rank as bench_rank,
     reports as bench_reports,
-    resolve as bench_resolve,
-    runner as bench_runner,
     spec as bench_spec,
     store as bench_store,
 )
@@ -210,13 +204,10 @@ def start_profile():
     if dev_err:
         return jsonify({"ok": False, "error": dev_err}), 400
 
-    # The engine must fit the whole sequence it will ever see: cached context +
-    # new query tokens + the decode tokens we generate. The frontend sizes
-    # max_model_len from Query+Context; bump it to also cover the decode budget.
-    if query_len:
-        needed = int(query_len) + int(context_len or 0) + int(max_tokens) + 16
-        if needed > int(max_model_len):
-            max_model_len = needed
+    # _run_profile applies this too; recording the effective value on the run
+    # keeps the settings the UI shows equal to the ones the engine used.
+    max_model_len = profiling.fit_max_model_len(max_model_len, query_len,
+                                                context_len, max_tokens)
 
     run_id = profiling.begin(model_id, {
         "mode": mode,
@@ -339,54 +330,17 @@ def download_trace():
         result = profiling._profile_state["result"]
 
     which = (request.args.get("pass") or "").strip().lower()
-    if which == "prefill":
-        trace_path = result.get("prefill_trace_file")
-        pass_tag = "_prefill"
-        pass_bs = result.get("prefill_batch_size")
-        pass_gen = 1  # prefill pass generates a single token
-    elif which == "decode":
-        trace_path = result.get("decode_trace_file") or result.get("trace_file")
-        pass_tag = "_decode"
-        pass_bs = result.get("decode_batch_size", result.get("batch_size", 1))
-        pass_gen = result.get("max_tokens", "")
-    else:
-        trace_path = result.get("trace_file")
-        # Tag the filename only when the run actually has distinct passes.
-        pass_tag = "_decode" if result.get("two_pass") else ""
-        pass_bs = result.get("decode_batch_size", result.get("batch_size", 1))
-        pass_gen = result.get("max_tokens", "")
-
+    trace_path = profiling.trace_path_for(result, which)
     if not trace_path or not os.path.isfile(trace_path):
         return jsonify({"ok": False, "error": "Trace file not found"}), 404
 
-    # Build a descriptive filename encoding the profiled configuration:
-    #   vllm_trace_{model}_{mode}[_prefill|_decode]_ctx{context}_in{query}_out{gen}_bs{bs}_tp{tp}_{n}layers.json.gz
-    # where "ctx" is the block-aligned prefix-cache context the prefill attends
-    # to, "in" is the query length (new prefill tokens, S), "out" is the number
-    # of generated decode tokens, and "bs" is the pass's batch. The model id is
-    # reduced to its final path component (org prefix dropped).
-    model_short = result["model_id"].split("/")[-1]
-    mode = result.get("mode", "eager")
-    bs = pass_bs if pass_bs is not None else result.get("batch_size", 1)
-    ctx = result.get("context_len_aligned") or result.get("context_len") or 0
-    qin = result.get("query_len") or 0
-    gen = pass_gen
-    tp = result.get("tp_size", 1) or 1
-    quant = result.get("quantization")
-    layers = result.get("profiled_layers", "all")
-    device = _DEVICE.upper()
-    ext = ".json.gz" if trace_path.endswith(".gz") else ".json"
-    quant_part = f"_{quant}" if quant else ""
-    download_name = (
-        f"vllm_trace_{model_short}_{device}_{mode}{pass_tag}_ctx{ctx}_in{qin}"
-        f"_out{gen}_bs{bs}_tp{tp}{quant_part}_{layers}layers{ext}"
-    )
-
+    name = profiling.trace_download_name(result, which, _DEVICE, trace_path)
     return send_file(
         trace_path,
-        mimetype="application/gzip" if ext == ".json.gz" else "application/json",
+        mimetype=("application/gzip" if name.endswith(".gz")
+                  else "application/json"),
         as_attachment=True,
-        download_name=download_name,
+        download_name=name,
     )
 
 
@@ -445,78 +399,12 @@ def export_shape_matrix():
 def bench_plan():
     """Sweep the profiled graph into replay cases for a new benchmark run.
 
-    The op set and the operands come from the profile, so this endpoint needs a
+    The op set and the operands come from the profile, so this needs a
     completed profiling run for the requested model/quantization - the same
     precondition the Shape Matrix export has.
     """
-    data = request.json or {}
-    model_id = data.get("model_id")
-    if not model_id:
-        return jsonify({"ok": False, "error": "No model_id specified"}), 400
-
-    template, settings, err = _profile_template_for(model_id,
-                                                    data.get("quantization"))
-    if err:
-        return jsonify({"ok": False, "error": err}), 400
-
-    sweep = {k: data.get(k, v) for k, v in shape_matrix.DEFAULT_SWEEP.items()}
-    tp_sizes = sweep.get("tp_sizes") or [1]
-    configs = shape_matrix.build_configs(**sweep)
-    if shape_matrix.estimate_row_count(template, configs) > \
-            shape_matrix.MAX_MATRIX_ROWS:
-        return jsonify({"ok": False, "error": "Sweep too large - reduce it"}), 400
-
-    rows = shape_matrix.build_rows(template, configs)
-    device = data.get("device") or bench_devices.detect_device()
-    # The largest swept TP is the widest collective the run will replay, so the
-    # selection must contain at least that many devices.
-    ok, device_ids, dev_err = service._bench_device_ids(data, device,
-                                                need=max(int(t) for t in tp_sizes))
-    if not ok:
-        return jsonify({"ok": False, "error": dev_err}), 400
-    cases, coverage = bench_spec.build_cases(rows, device=device)
-
-    run_id = data.get("run_id") or bench_store.make_run_id(
-        model_id, int(tp_sizes[0]), device)
-    paths = bench_store.run_paths(run_id).ensure()
-    bench_runner.write_cases(cases, paths.cases)
-    # The Shape Matrix is the run's input, not a separate artifact: persist the
-    # swept rows so the report workbook can carry the shape space alongside the
-    # measurements taken on it.
-    bench_store.write_json(paths.rows, {
-        "model_id": model_id,
-        "quantization": data.get("quantization"),
-        "info": shape_matrix.build_info_rows(model_id, template, settings),
-        "rows": rows,
-    })
-
-    # Classify before benchmarking, so the plan can say what will *not* be
-    # measured - and why - instead of the run silently omitting it.
-    status: dict[str, Any] = {}
-    for case in cases:
-        if case.op not in status:
-            st, detail = bench_resolve.classify(case.op, case.args,
-                                                launch=case.launch)
-            status[case.op] = {"status": st, "detail": detail,
-                               "backend": case.backend}
-    by_status: dict[str, list] = {}
-    for op, st in status.items():
-        by_status.setdefault(st["status"], []).append(op)
-    coverage.update({"op_status": status, "ops_by_status": by_status,
-                     "device": device, "device_ids": device_ids,
-                     "sweep": configs})
-    bench_store.write_json(paths.plan, coverage)
-    bench_store.RunMeta(
-        run_id=run_id, model_id=model_id, device=device, tp=int(tp_sizes[0]),
-        device_name=bench_devices.device_name(device), device_ids=device_ids,
-        sku=bench_devices.sku_for_device(bench_devices.device_name(device)),
-        smoke=bool(data.get("smoke")),
-        sweep={**sweep, "configs": len(configs)}).write(paths)
-
-    return jsonify({"ok": True, "run_id": run_id, "rows": len(rows),
-                    "cases": len(cases), "coverage": coverage})
-
-
+    payload, status = service.plan(request.json or {})
+    return jsonify(payload), status
 
 
 @app.route("/api/bench/run", methods=["POST"])
@@ -624,42 +512,12 @@ def bench_results():
 @app.route("/api/bench/targets")
 def bench_targets():
     """The ranked optimization targets of a run (recomputed with ?refresh=1)."""
-    runs = bench_store.list_runs()
-    run_id = request.args.get("run_id") or (runs[0]["run_id"] if runs else None)
-    if not run_id:
-        return jsonify({"ok": False, "error": "no benchmark runs yet"}), 404
-    paths = bench_store.run_paths(run_id)
-    meta = bench_store.read_meta(paths)
-    if request.args.get("refresh") not in ("1", "true") and \
-            os.path.isfile(paths.targets):
-        with open(paths.targets) as fh:
-            return jsonify({"ok": True, "run_id": run_id,
-                            "targets": json.load(fh)})
-
-    records = bench_store.read_results(paths.results)
-    if not records:
-        return jsonify({"ok": False,
-                        "error": f"run {run_id} has no benchmark results"}), 400
-    rc = bench_rank.RankConfig(
-        target_util=float(request.args.get(
-            "target_util", bench_rank.DEFAULT_TARGET_UTIL)),
-        tp=meta.get("tp"), top=int(request.args.get("top", 0)),
-        run_id=run_id,
-        provenance={"run_id": run_id, "commits": meta.get("commits") or {}})
-    try:
-        doc = bench_rank.rank(records, rc)
-    except ValueError as exc:
-        return jsonify({"ok": False, "error": str(exc)}), 400
-    bench_store.write_json(paths.targets, doc)
-    try:
-        conn = bench_history.connect(
-            bench_history.db_path(bench_store.bench_root()))
-        bench_history.ingest(conn, meta or {"run_id": run_id}, records, doc)
-    except Exception as exc:  # noqa: BLE001 - history is best-effort
-        logger.warning("bench history ingest failed: %s", exc)
-    return jsonify({"ok": True, "run_id": run_id, "targets": doc})
-
-
+    payload, status = service.targets(
+        request.args.get("run_id"),
+        refresh=request.args.get("refresh") in ("1", "true"),
+        target_util=request.args.get("target_util"),
+        top=request.args.get("top", 0))
+    return jsonify(payload), status
 
 
 @app.route("/api/bench/report")

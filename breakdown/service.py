@@ -13,11 +13,15 @@ from __future__ import annotations
 import json
 import logging
 import os
+from typing import Any
 from dataclasses import asdict
 
 from breakdown import profiling, runs, shape_matrix, shape_matrix_xlsx
 from breakdown.shape_derive import _bytes_to_dtype
 from breakdown.core import devices as bench_devices
+from breakdown.bench import history as bench_history
+from breakdown.bench import rank as bench_rank
+from breakdown.bench import resolve as bench_resolve
 from breakdown.bench import runner as bench_runner
 from breakdown.bench import spec as bench_spec
 from breakdown.bench import store as bench_store
@@ -212,3 +216,127 @@ def shape_matrix_workbook(data: dict) -> tuple[bytes | None, str, str]:
     tag = cfg.get("quantization") or _bytes_to_dtype(cfg.get("dtype_bytes", 2))
     name = f"vllm_xpu_shape_matrix_{model_id.replace('/', '_')}_{tag}.xlsx"
     return payload, name, ""
+
+
+def plan(data: dict) -> tuple[dict, int]:
+    """Sweep the profiled graph into a new benchmark run's replay cases.
+
+    ``(payload, http_status)``. The whole body used to sit in the Flask route,
+    which meant the CLI reached the same artifacts by a second, slightly
+    different path -- and the two could drift without a test noticing. One
+    function, two callers.
+    """
+    model_id = data.get("model_id")
+    if not model_id:
+        return {"ok": False, "error": "No model_id specified"}, 400
+
+    template, settings, err = profiling._profile_template_for(
+        model_id, data.get("quantization"))
+    if err:
+        return {"ok": False, "error": err}, 400
+
+    sweep = {k: data.get(k, v) for k, v in shape_matrix.DEFAULT_SWEEP.items()}
+    tp_sizes = sweep.get("tp_sizes") or [1]
+    configs = shape_matrix.build_configs(**sweep)
+    if shape_matrix.estimate_row_count(template, configs) > \
+            shape_matrix.MAX_MATRIX_ROWS:
+        return {"ok": False, "error": "Sweep too large - reduce it"}, 400
+
+    rows = shape_matrix.build_rows(template, configs)
+    device = data.get("device") or bench_devices.detect_device()
+    # The largest swept TP is the widest collective the run will replay, so the
+    # selection must contain at least that many devices.
+    ok, device_ids, dev_err = _bench_device_ids(
+        data, device, need=max(int(t) for t in tp_sizes))
+    if not ok:
+        return {"ok": False, "error": dev_err}, 400
+
+    cases, coverage = bench_spec.build_cases(rows, device=device)
+    run_id = data.get("run_id") or bench_store.make_run_id(
+        model_id, int(tp_sizes[0]), device)
+    paths = bench_store.run_paths(run_id).ensure()
+    bench_runner.write_cases(cases, paths.cases)
+    # The Shape Matrix is the run's input, not a separate artifact: persist the
+    # swept rows so the report workbook can carry the shape space alongside the
+    # measurements taken on it.
+    bench_store.write_json(paths.rows, {
+        "model_id": model_id,
+        "quantization": data.get("quantization"),
+        "info": shape_matrix.build_info_rows(model_id, template, settings),
+        "rows": rows,
+    })
+
+    # Classify before benchmarking, so the plan can say what will *not* be
+    # measured - and why - instead of the run silently omitting it.
+    status: dict[str, Any] = {}
+    for case in cases:
+        if case.op not in status:
+            st, detail = bench_resolve.classify(case.op, case.args,
+                                                launch=case.launch)
+            status[case.op] = {"status": st, "detail": detail,
+                               "backend": case.backend}
+    by_status: dict[str, list] = {}
+    for op, st in status.items():
+        by_status.setdefault(st["status"], []).append(op)
+    coverage.update({"op_status": status, "ops_by_status": by_status,
+                     "device": device, "device_ids": device_ids,
+                     "sweep": configs})
+    bench_store.write_json(paths.plan, coverage)
+    name = bench_devices.device_name(device)
+    bench_store.RunMeta(
+        run_id=run_id, model_id=model_id, device=device, tp=int(tp_sizes[0]),
+        device_name=name, device_ids=device_ids,
+        sku=bench_devices.sku_for_device(name),
+        smoke=bool(data.get("smoke")),
+        sweep={**sweep, "configs": len(configs)}).write(paths)
+
+    return ({"ok": True, "run_id": run_id, "rows": len(rows),
+             "cases": len(cases), "coverage": coverage}, 200)
+
+
+def targets(run_id: str | None, *, refresh: bool = False,
+            target_util: float | None = None, top: int = 0
+            ) -> tuple[dict, int]:
+    """A run's ranked targets, ranking them if needed.
+
+    ``targets.json`` is written once and served from disk afterwards, because
+    ranking a large run is not free and the UI polls this. ``refresh`` re-ranks
+    -- which is what you do after changing a tolerance.
+    """
+    if not run_id:
+        runs_ = bench_store.list_runs()
+        run_id = runs_[0]["run_id"] if runs_ else None
+    if not run_id:
+        return {"ok": False, "error": "no benchmark runs yet"}, 404
+
+    paths = bench_store.run_paths(run_id)
+    meta = bench_store.read_meta(paths)
+    if not refresh and os.path.isfile(paths.targets):
+        with open(paths.targets) as fh:
+            return {"ok": True, "run_id": run_id, "targets": json.load(fh)}, 200
+
+    records = bench_store.read_results(paths.results)
+    if not records:
+        return ({"ok": False,
+                 "error": f"run {run_id} has no benchmark results"}, 400)
+
+    rc = bench_rank.RankConfig(
+        target_util=(bench_rank.DEFAULT_TARGET_UTIL if target_util is None
+                     else float(target_util)),
+        tp=meta.get("tp"), top=int(top), run_id=run_id,
+        provenance={"run_id": run_id, "commits": meta.get("commits") or {}})
+    try:
+        doc = bench_rank.rank(records, rc)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}, 400
+    bench_store.write_json(paths.targets, doc)
+
+    # History is best-effort: a regression database that cannot be written is
+    # not a reason to fail the ranking the caller asked for.
+    try:
+        conn = bench_history.connect(
+            bench_history.db_path(bench_store.bench_root()))
+        bench_history.ingest(conn, meta or {"run_id": run_id}, records, doc)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("bench history ingest failed: %s", exc)
+    return {"ok": True, "run_id": run_id, "targets": doc}, 200
