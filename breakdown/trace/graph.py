@@ -16,7 +16,8 @@ from .forest import (
     _compute_sub_dev, _deepest_at, _forest_has_named_modules,
     _hoist_modules_under_ops)
 from .kernels import (
-    _attribute_kernels, _collect_kernel_launches, _kernel_leaf_coverage)
+    KernelLaunch, _attribute_kernels, _collect_kernel_launches,
+    _kernel_leaf_coverage)
 from .shapes import (
     _infer_attention_kernel_shapes, _infer_hidden_activation_ops)
 from .phases import _classify_steps, _pass_token_dim
@@ -53,17 +54,30 @@ def build_forest(events: list[dict]) -> tuple[list[_Raw], float]:
     conservation invariant - no kernel's time is dropped - is checkable from
     outside.
     """
+    roots, device_us, _launches = _build_forest(events)
+    return roots, device_us
+
+
+def _build_forest(events: list[dict]
+                  ) -> tuple[list[_Raw], float, list[KernelLaunch]]:
+    """:func:`build_forest`, also handing back the launches it collected.
+
+    ``kernel_coverage`` needs the same launch list to check attribution, and
+    used to re-derive it by scanning the whole event list twice more (once for
+    the worker thread, once for the kernels). On a real trace that is millions
+    of events for a list the forest pass had already built.
+    """
     roots = _build_raw_forest(events)
     if not roots:
-        return [], 0.0
+        return [], 0.0, []
     worker_tid, _named = _worker_tid(events)
     launches = _collect_kernel_launches(events, worker_tid)
-    device_us = sum(dur for _ts, _n, dur, _f in launches)
+    device_us = sum(k.device_us for k in launches)
     _attribute_kernels(roots, launches)
     roots = _hoist_modules_under_ops(roots)
     _coalesce_duplicate_child_modules(roots)
     _compute_sub_dev(roots)
-    return roots, device_us
+    return roots, device_us, launches
 
 
 # ===================================================================
@@ -217,18 +231,16 @@ def kernel_coverage(trace_path: str, batch_size: int = 1) -> dict[str, float]:
     step, which must all land on a leaf).
     """
     events = _load_trace(trace_path).get("traceEvents", [])
-    roots, _device_us = build_forest(events)
+    roots, _device_us, launches = _build_forest(events)
     if not roots:
         return {"n_total": 0, "n_device_events": 0, "n_in_step": 0}
-    worker_tid, _named = _worker_tid(events)
-    launches = _collect_kernel_launches(events, worker_tid)
     out = dict(_kernel_leaf_coverage(roots, launches))
     out["n_device_events"] = sum(
         1 for e in events if e.get("cat") in _DEVICE_KERNEL_CATEGORIES)
     prefill, decode, _, _ = _classify_steps(roots, batch_size)
     spans = [(r.ts, r.end) for r in prefill + decode]
-    in_step = [(ts, dur) for ts, _n, dur, _f in launches
-               if any(a <= ts < b for a, b in spans)]
+    in_step = [(k.host_ts, k.device_us) for k in launches
+               if any(a <= k.host_ts < b for a, b in spans)]
     out["n_in_step"] = len(in_step)
     out["in_step_us"] = sum(d for _t, d in in_step)
     out["n_in_step_dropped"] = sum(

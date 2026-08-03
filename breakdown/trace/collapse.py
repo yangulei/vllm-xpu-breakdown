@@ -7,11 +7,11 @@ from __future__ import annotations
 
 from ..cost import estimate_flops, estimate_memory
 from ..classifier import classify_op
-from ..core.opnames import MATMUL_BASES
-from ..trace_common import _infer_role, _strip_instance_idx
+from ..core.opnames import MATMUL_BASES, base_of, collective_role
+from ..trace_common import _strip_instance_idx
 from ..core.opnames import PLUMBING_OPS
 from .rules import (
-    _KNOWN_MODULE_ROLES, _disambiguate_child_name,
+    _KNOWN_MODULE_ROLES, _disambiguate_child_name, _infer_role,
     _module_display_name, _output_shape, _rowparallel_shape_role)
 from .forest import _Raw
 
@@ -186,16 +186,9 @@ def _finalize_node(
         )
         # A collective is its own role, never the enclosing projection's; a
         # projection matmul takes the role of the module that owns it.
-        low_op = raw.label.lower()
-        op_base = low_op.split("::")[-1]
-        op_role = None
-        if "all_reduce" in low_op or "allreduce" in low_op:
-            op_role = "all_reduce"
-        elif "all_gather" in low_op or "allgather" in low_op:
-            op_role = "all_gather"
-        elif "reduce_scatter" in low_op or "reducescatter" in low_op:
-            op_role = "reduce_scatter"
-        elif module_role_override and op_base in MATMUL_BASES:
+        op_role = collective_role(raw.label) or None
+        if op_role is None and module_role_override \
+                and base_of(raw.label) in MATMUL_BASES:
             op_role = module_role_override
         role = op_role \
             or _infer_role(module_path + [merged["module_type"]], raw.label) \

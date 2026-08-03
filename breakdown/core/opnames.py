@@ -132,6 +132,27 @@ def is_collective(op_name: str | None) -> bool:
     return any(kw in low for kw in COLLECTIVE_KEYWORDS)
 
 
+#: Collective op -> the role it is reported under, longest spelling first so
+#: ``allgather`` is not claimed by a shorter marker.
+_COLLECTIVE_ROLES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("all_reduce", "allreduce"), "all_reduce"),
+    (("all_gather", "allgather", "_allgather_base"), "all_gather"),
+    (("reduce_scatter", "reducescatter", "_reduce_scatter_base"),
+     "reduce_scatter"),
+    (("all_to_all", "alltoall"), "all_to_all"),
+)
+
+
+def collective_role(op_name: str | None) -> str:
+    """Which collective this is, or ``""``.
+
+    A collective is its own role, never the enclosing projection's: an
+    all-reduce sitting inside ``o_proj`` is interconnect time, and labelling it
+    ``o_proj`` would fold it into the projection's cost.
+    """
+    return first_family(op_name, _COLLECTIVE_ROLES)
+
+
 def is_python_launched(op_name: str | None) -> bool:
     """True for an op with no dispatcher schema, launched from Python."""
     return namespace_of(op_name or "") in PYTHON_LAUNCHED_NAMESPACES

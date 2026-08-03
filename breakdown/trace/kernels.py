@@ -9,7 +9,7 @@ as an op of the module that launched it. A capture-time ``kernel::`` span
 from __future__ import annotations
 
 
-from typing import Any
+from typing import Any, NamedTuple
 from ..trace_common import is_launcher_frame, parse_kernel_span
 from ..core.opnames import PLUMBING_OPS
 from .rules import (
@@ -19,12 +19,27 @@ from .events import _PY_FRAME_RE
 from .forest import _Raw, _deepest_at, _enclosing_module
 
 
+class KernelLaunch(NamedTuple):
+    """One device kernel, and where on the host it was launched from.
+
+    A plain 4-tuple before, which every reader had to count positionally --
+    ``for ts, _n, dur, _f in launches`` appears in three files with three
+    different throwaway names for the same fields.
+    """
+
+    #: Host timestamp of the launch site, which is what charges the kernel to
+    #: the deepest node whose interval contains it.
+    host_ts: float
+    name: str
+    device_us: float
+    #: ``{file, line, func}`` of the Python frame that launched it, or ``None``
+    #: when a ``cpu_op`` already covers the launch.
+    frame: dict[str, Any] | None
+
+
 def _collect_kernel_launches(events: list[dict], worker_tid: Any
-                             ) -> list[tuple[float, str, float,
-                                             dict[str, Any] | None]]:
-    """Collect every device kernel as ``(host_launch_ts, name, device_us,
-    launcher_frame)``, where the frame is ``{file, line, func}`` of the Python
-    function that launched it (``None`` when a ``cpu_op`` covers it).
+                             ) -> list[KernelLaunch]:
+    """Collect every device kernel with its host launch site.
 
     Only genuine *device* events (``_DEVICE_KERNEL_CATEGORIES`` — real
     ``kernel``/``gpu_memcpy``/``gpu_memset``) are surfaced. Each is linked to the
@@ -105,7 +120,7 @@ def _collect_kernel_launches(events: list[dict], worker_tid: Any
                 if ext is None or ext not in ext_to_ts:
                     continue
                 ts = ext_to_ts[ext]
-            launches.append((ts, name, dur, launcher(ts)))
+            launches.append(KernelLaunch(ts, name, dur, launcher(ts)))
         elif cat in _RUNTIME_CATEGORIES and not has_device_kernel:
             # Runtime-only trace: no device-kernel events were captured, so the
             # launch-API call is the only signal of GPU work. Emit actual launch
@@ -116,7 +131,7 @@ def _collect_kernel_launches(events: list[dict], worker_tid: Any
             if "launch" not in low and "enqueue" not in low:
                 continue
             ts = evt.get("ts", 0)
-            launches.append((ts, name, dur, launcher(ts)))
+            launches.append(KernelLaunch(ts, name, dur, launcher(ts)))
     return launches
 
 

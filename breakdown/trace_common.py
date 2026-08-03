@@ -1,8 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Torch-free helpers shared by trace parsing / reconstruction.
+"""Torch-free helpers shared by trace parsing and reconstruction.
 
 Kept free of any PyTorch/vLLM imports so that static analysis and offline trace
-reconstruction work without an ML stack installed.
+reconstruction work without an ML stack installed -- and, since this module is
+the *shared* half, free of model vocabulary too. What lives here is how a span
+is encoded and decoded, how a launcher frame is recognized, and which events
+are profiler infrastructure: facts about the trace format, not about vLLM.
+
+The model vocabulary lives in :mod:`breakdown.trace.rules`. ``_infer_role``
+used to sit here and matched on ``QKVParallelLinear``, ``RowParallelLinear``,
+``VocabParallelEmbedding`` and a dozen more -- exactly the coupling this
+module's contract says it does not have.
 """
 
 from __future__ import annotations
@@ -282,95 +290,3 @@ def _strip_instance_idx(class_name: str) -> str:
     return class_name
 
 
-def _infer_role(module_path: list[str], op_name: str) -> str | None:
-    """Infer the op role from its enclosing module hierarchy.
-
-    Args:
-        module_path: List of nn.Module class names (outermost first),
-                     e.g. ['OPTDecoderLayer', 'OPTAttention', 'QKVParallelLinear']
-        op_name: The operator name, e.g. 'aten::linear', 'aten::mm'
-
-    Returns:
-        Role string matching static graph op roles, or None if not identifiable.
-    """
-    if not module_path:
-        return None
-
-    innermost = module_path[-1]
-
-    # Embedding
-    if "VocabParallelEmbedding" in innermost or "Embedding" in innermost:
-        return "embedding"
-
-    # QKV projection
-    if "QKVParallel" in innermost:
-        return "qkv_proj"
-
-    # Rotary embedding
-    if "Rotary" in innermost or "rotary" in op_name.lower():
-        return "rotary_emb"
-
-    # Q/K norms (Qwen3-style QK normalization)
-    if "Norm" in innermost:
-        # Check if inside Attention module → likely q_norm or k_norm
-        in_attention = any("Attention" in p for p in module_path[:-1])
-        if in_attention:
-            # Distinguish by module name hints
-            lower_inner = innermost.lower()
-            if "q_norm" in lower_inner or "q_layernorm" in lower_inner:
-                return "q_norm"
-            if "k_norm" in lower_inner or "k_layernorm" in lower_inner:
-                return "k_norm"
-            # Fallback: generic attention norm (will be disambiguated later)
-            return "attention_norm"
-        # Determine which norm based on position in layer
-        return "norm"
-
-    # Attention kernel / cache ops
-    if "Attention" in innermost and "Attention" not in _strip_instance_idx(innermost).replace("Attention", "", 1):
-        # innermost IS an Attention module (not just contains "Attention" as part of larger name)
-        if "attention" in op_name.lower() or "flash_attn" in op_name.lower():
-            return "attention"
-        if "cache" in op_name.lower():
-            return "cache_store"
-        if "rotary" in op_name.lower():
-            return "rotary_emb"
-        if "norm" in op_name.lower():
-            return "attention_norm"
-        if op_name in ("aten::linear", "aten::mm", "aten::addmm"):
-            return "attention"  # fallback for attention internal ops
-        return "attention"
-
-    # Row/Column parallel inside Attention → o_proj
-    if "RowParallel" in innermost and any("Attention" in p for p in module_path[:-1]):
-        return "o_proj"
-
-    # Row/Column parallel inside MLP → down_proj / gate_up_proj
-    if "RowParallel" in innermost and any("MLP" in p or "Mlp" in p or "MoE" in p for p in module_path[:-1]):
-        return "down_proj"
-    if ("ColumnParallel" in innermost or "MergedColumn" in innermost) and \
-       any("MLP" in p or "Mlp" in p or "MoE" in p for p in module_path[:-1]):
-        return "gate_up_proj"
-
-    # Generic ColumnParallel at decoder layer level (MLP without MLP wrapper, like OPT)
-    if "ColumnParallel" in innermost or "MergedColumn" in innermost:
-        return "gate_up_proj"
-    if "RowParallel" in innermost:
-        # Disambiguation: check if parent is attention-like
-        if any("Attention" in p for p in module_path[:-1]):
-            return "o_proj"
-        return "down_proj"
-
-    # Logits / LM head
-    if "Logits" in innermost or "lm_head" in innermost.lower():
-        return "lm_head"
-
-    # Activation functions
-    if "silu" in op_name.lower() or "gelu" in op_name.lower() or "relu" in op_name.lower():
-        return "activation"
-
-    # Cache ops outside Attention module
-    if "cache" in op_name.lower():
-        return "cache_store"
-
-    return None
