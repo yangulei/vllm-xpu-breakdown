@@ -104,7 +104,7 @@ class _UploadTestBase(unittest.TestCase):
         appmod.app.config["TESTING"] = True
         self.client = appmod.app.test_client()
         with profiling_module._profile_lock:
-            profiling_module._profile_state = {"status": "idle", "result": None,
+            profiling_module.runstate._profile_state = {"status": "idle", "result": None,
                                      "error": None, "model_id": None}
 
     def _post(self, names):
@@ -120,47 +120,47 @@ class _UploadTestBase(unittest.TestCase):
 
 class TestUploadTwoPass(_UploadTestBase):
     def test_pair_reconstructs_both_phases(self):
-        with mock.patch.object(profiling_module, "_build_result_from_traces",
+        with mock.patch.object(profiling_module.uploads, "_build_result_from_traces",
                                side_effect=_fake_build):
             resp = self._post([DEC_NAME, PRE_NAME])  # order shouldn't matter
         self.assertEqual(resp.status_code, 200)
         self.assertTrue(resp.get_json()["ok"])
 
-        res = profiling_module._profile_state["result"]
+        res = profiling_module.runstate._profile_state["result"]
         self.assertTrue(res["two_pass"])
         # Both phases present — the bug was "decode only".
         self.assertEqual(res["graph"]["prefill"]["name"], "prefill_root")
         self.assertEqual(res["graph"]["decode"]["name"], "decode_root")
 
     def test_batches_recovered_from_filenames(self):
-        with mock.patch.object(profiling_module, "_build_result_from_traces",
+        with mock.patch.object(profiling_module.uploads, "_build_result_from_traces",
                                side_effect=_fake_build):
             self._post([PRE_NAME, DEC_NAME])
-        res = profiling_module._profile_state["result"]
+        res = profiling_module.runstate._profile_state["result"]
         self.assertEqual(res["prefill_batch_size"], 1)
         self.assertEqual(res["decode_batch_size"], 32)
         self.assertEqual(res["batch_size"], 32)
 
     def test_symbols_combined(self):
-        with mock.patch.object(profiling_module, "_build_result_from_traces",
+        with mock.patch.object(profiling_module.uploads, "_build_result_from_traces",
                                side_effect=_fake_build):
             self._post([PRE_NAME, DEC_NAME])
-        sym = profiling_module._profile_state["result"]["graph"]["symbols"]
+        sym = profiling_module.runstate._profile_state["result"]["graph"]["symbols"]
         self.assertEqual(sym["S"], 1536)   # from prefill pass
         self.assertEqual(sym["S+C"], 3584)
         self.assertEqual(sym["B"], 32)     # from decode pass
 
     def test_both_trace_files_retained_for_download(self):
-        with mock.patch.object(profiling_module, "_build_result_from_traces",
+        with mock.patch.object(profiling_module.uploads, "_build_result_from_traces",
                                side_effect=_fake_build):
             self._post([PRE_NAME, DEC_NAME])
-        res = profiling_module._profile_state["result"]
+        res = profiling_module.runstate._profile_state["result"]
         self.assertTrue(res["prefill_trace_file"].endswith(".json.gz"))
         self.assertIn("prefill", os.path.basename(res["prefill_trace_file"]))
         self.assertIn("decode", os.path.basename(res["decode_trace_file"]))
 
     def test_result_endpoint_reports_both_traces(self):
-        with mock.patch.object(profiling_module, "_build_result_from_traces",
+        with mock.patch.object(profiling_module.uploads, "_build_result_from_traces",
                                side_effect=_fake_build):
             self._post([PRE_NAME, DEC_NAME])
         data = self.client.get("/api/profile/result").get_json()["data"]
@@ -170,10 +170,10 @@ class TestUploadTwoPass(_UploadTestBase):
         self.assertNotIn("prefill_trace_file", data)
 
     def test_context_and_query_recovered(self):
-        with mock.patch.object(profiling_module, "_build_result_from_traces",
+        with mock.patch.object(profiling_module.uploads, "_build_result_from_traces",
                                side_effect=_fake_build):
             self._post([PRE_NAME, DEC_NAME])
-        res = profiling_module._profile_state["result"]
+        res = profiling_module.runstate._profile_state["result"]
         self.assertEqual(res["query_len"], 1536)
         self.assertEqual(res["context_len"], 2048)
         self.assertEqual(res["context_len_aligned"], 2048)
@@ -181,11 +181,11 @@ class TestUploadTwoPass(_UploadTestBase):
 
 class TestUploadSinglePass(_UploadTestBase):
     def test_lone_decode_file_is_decode_only(self):
-        with mock.patch.object(profiling_module, "_build_result_from_traces",
+        with mock.patch.object(profiling_module.uploads, "_build_result_from_traces",
                                side_effect=_fake_build):
             resp = self._post([DEC_NAME])
         self.assertEqual(resp.status_code, 200)
-        res = profiling_module._profile_state["result"]
+        res = profiling_module.runstate._profile_state["result"]
         self.assertFalse(res.get("two_pass", False))
         self.assertEqual(res["graph"]["decode"]["name"], "decode_root")
         self.assertIsNone(res["graph"]["prefill"])

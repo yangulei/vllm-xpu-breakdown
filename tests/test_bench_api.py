@@ -79,8 +79,8 @@ class BenchApiTest(unittest.TestCase):
         os.environ["BREAKDOWN_BENCH_ROOT"] = self.tmp.name
         import app as app_module
         from breakdown import profiling as profiling_module
-        self._saved = profiling_module._profile_state
-        profiling_module._profile_state = {
+        self._saved = profiling_module.runstate._profile_state
+        profiling_module.runstate._profile_state = {
             "status": "done", "result": {"graph": _graph()}, "error": None,
             "model_id": "Qwen/Qwen3-4B",
             "settings": {"query_len": 128, "context_len": 0,
@@ -91,7 +91,7 @@ class BenchApiTest(unittest.TestCase):
     def tearDown(self):
         import app as app_module
         from breakdown import profiling as profiling_module
-        profiling_module._profile_state = self._saved
+        profiling_module.runstate._profile_state = self._saved
         os.environ.pop("BREAKDOWN_BENCH_ROOT", None)
         self.tmp.cleanup()
 
@@ -127,7 +127,7 @@ class TestPlan(BenchApiTest):
     def test_plan_refuses_without_a_matching_profile(self):
         import app as app_module
         from breakdown import profiling as profiling_module
-        profiling_module._profile_state = {"status": "idle", "result": None}
+        profiling_module.runstate._profile_state = {"status": "idle", "result": None}
         self.assertEqual(self._plan().status_code, 400)
 
     def test_plan_writes_the_run_artifacts(self):
@@ -329,7 +329,7 @@ class TestBenchOps(BenchApiTest):
             "input_shapes": [], "recorded_shapes": [], "input_dtypes": [],
             "input_args": [], "memory_bytes": 0, "flops": 0,
             "device_time_us": 1.0}]
-        profiling_module._profile_state = {**profiling_module._profile_state,
+        profiling_module.runstate._profile_state = {**profiling_module.runstate._profile_state,
                                      "result": {"graph": graph}}
         data = json.loads(self.client.get("/api/bench/ops").data)
         self.assertNotIn("aten::t", [o["op"] for o in data["ops"]])
@@ -337,7 +337,7 @@ class TestBenchOps(BenchApiTest):
     def test_ops_endpoint_is_empty_without_a_profile(self):
         import app as app_module
         from breakdown import profiling as profiling_module
-        profiling_module._profile_state = {"status": "idle", "result": None,
+        profiling_module.runstate._profile_state = {"status": "idle", "result": None,
                                      "model_id": None}
         data = json.loads(self.client.get("/api/bench/ops").data)
         self.assertTrue(data["ok"])

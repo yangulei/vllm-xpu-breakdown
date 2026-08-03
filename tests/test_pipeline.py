@@ -434,7 +434,7 @@ class TestQueryContextProfiling(unittest.TestCase):
 
         client = app_module.app.test_client()
         with patch.object(app_module.threading, "Thread", _fake_thread), \
-                patch.object(profiling_module, "_profile_state",
+                patch.object(profiling_module.runstate, "_profile_state",
                              runs.RunState(result=None, model_id=None,
                                            settings=None)):
             resp = client.post("/api/profile", json={

@@ -33,15 +33,15 @@ def _write_trace(tmpdir: str, name: str, marker: str) -> str:
 class TestTraceDownload(unittest.TestCase):
     def setUp(self):
         self.client = app.test_client()
-        self._saved_state = profiling_module._profile_state
+        self._saved_state = profiling_module.runstate._profile_state
         self.tmp = tempfile.TemporaryDirectory()
 
     def tearDown(self):
-        profiling_module._profile_state = self._saved_state
+        profiling_module.runstate._profile_state = self._saved_state
         self.tmp.cleanup()
 
     def _set_state(self, result: dict):
-        profiling_module._profile_state = {
+        profiling_module.runstate._profile_state = {
             "status": "done",
             "result": result,
             "error": None,

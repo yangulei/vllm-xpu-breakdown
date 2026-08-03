@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Profiling: run vLLM once, and turn the traces into a reconstructed graph.
+"""Running vLLM once, under the profiler.
 
-This is everything between "the user pressed Profile" and "there is a graph":
+Everything between "the user pressed Profile" and "there are trace files":
 building the engine for a reduced-layer, prefix-cached, exact-length run,
-installing the capture-time hooks, choosing which of the TP ranks' traces to
-read, and merging a two-pass (separate prefill/decode batch) run into one
-result.
+pinning the scheduler so a batch is not chunked into partial waves,
+installing the capture-time hooks, and driving the warmup and profiled passes.
 
 It lives here rather than in ``app.py`` because none of it is about HTTP: the
 CLI, the tests and the fixture capture tool all need the same run, and the web
@@ -15,121 +14,19 @@ from __future__ import annotations
 
 import functools
 import importlib
-import json
 import logging
 import os
-import re
-import threading
 import time
 import traceback
-from pathlib import Path
-from typing import Any
 
-from breakdown import runs
 from breakdown.model_info import (
     fetch_model_config, min_profile_layers, summarize_config)
-from breakdown.op_breakdown import backend_totals, summarize_ops
-from breakdown.trace import build_graph_from_trace
-from breakdown.trace_common import _detect_device_via_torch
+from breakdown.profiling import runstate
+from breakdown.profiling.runstate import save_state
+from breakdown.profiling.traces import (
+    _build_result_from_traces, _merge_two_pass_result)
 
 logger = logging.getLogger("vllm_xpu_breakdown")
-
-#: The accelerator this host has. Cached at import: it cannot change while the
-#: process runs.
-DEVICE = _detect_device_via_torch() or "xpu"
-
-#: The stage name the profile's runs are stored under (see :mod:`breakdown.runs`).
-STAGE = "profile"
-
-# ---- Config Cache ----
-# Persists successfully loaded model configs to disk so they appear as suggestions.
-
-_CONFIG_CACHE_DIR = Path(__file__).parent / "output" / "config_cache"
-
-
-_config_cache_lock = threading.Lock()
-
-
-def _cache_key(model_id: str) -> str:
-    """Convert model_id to a safe filename."""
-    return model_id.replace("/", "__")
-
-
-def _save_config_cache(model_id: str, config: dict[str, Any]) -> None:
-    """Persist config.json to disk cache."""
-    key = _cache_key(model_id)
-    path = _CONFIG_CACHE_DIR / f"{key}.json"
-    with _config_cache_lock:
-        path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
-
-
-def _load_cached_model_ids() -> list[str]:
-    """Return list of model IDs that have been successfully cached."""
-    ids: list[str] = []
-    with _config_cache_lock:
-        for p in sorted(_CONFIG_CACHE_DIR.glob("*.json")):
-            ids.append(p.stem.replace("__", "/"))
-    return ids
-
-
-def _load_cached_config(model_id: str) -> dict[str, Any] | None:
-    """Load a cached config from disk, or None if not cached."""
-    key = _cache_key(model_id)
-    path = _CONFIG_CACHE_DIR / f"{key}.json"
-    if path.exists():
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    return None
-
-
-#: The current (or last) profiling run. A profile is the input to every later
-#: stage, so it is also **persisted** to ``output/profile/<run_id>/state.json``
-#: (:func:`save_state`): a server restart, or a second browser tab, used to lose
-#: the run everything downstream is derived from, and the only way back was to
-#: profile again - minutes on a real model.
-_profile_state = runs.RunState(result=None, model_id=None, settings=None)
-
-#: Kept as a name because the routes take it around the state they mutate.
-_profile_lock = _profile_state.lock
-
-
-def state() -> dict[str, Any]:
-    """The current profiling state (restored from disk on first use)."""
-    with _profile_lock:
-        if _profile_state["status"] == "idle":
-            _restore_latest()
-        return _profile_state
-
-
-def begin(model_id: str, settings: dict[str, Any]) -> str:
-    """Mark a run as started and return its id."""
-    return _profile_state.begin(runs.new_run_id(model_id.split("/")[-1]),
-                                model_id=model_id, settings=settings)
-
-
-def save_state() -> None:
-    """Persist the current state, so it outlives this process."""
-    run_id = _profile_state.get("run_id")
-    if not run_id:
-        return
-    try:
-        runs.write_state(STAGE, run_id, _profile_state)
-    except OSError:
-        logger.warning("could not persist the profile run", exc_info=True)
-
-
-def _restore_latest() -> None:
-    """Adopt the newest completed run on disk, if there is one."""
-    found = runs.latest_state(STAGE)
-    if not found:
-        return
-    run_id, saved = found
-    if saved.get("status") != "done" or not saved.get("result"):
-        return
-    _profile_state.update(saved)
-    _profile_state["run_id"] = run_id
-    logger.info("restored profile run %s (%s)", run_id, saved.get("model_id"))
-
 
 # ---- Profile API ----
 
@@ -228,68 +125,6 @@ def _get_vocab_size(llm, summary: dict, default: int = 32000) -> int:
 # ``_prefill``/``_decode`` pass tag and the ``_device_mode`` before it) lets the
 # upload endpoint recover the full profiled configuration, making a
 # download -> upload reconstruction a lossless round-trip.
-_TRACE_NAME_RE = re.compile(
-    r"_(?P<device>XPU|CUDA|GPU|CPU)_(?P<mode>eager|compile)"
-    r"(?:_(?P<pass>prefill|decode))?"
-    r"_ctx(?P<ctx>\d+)_in(?P<qin>\d+)_out(?P<gen>[A-Za-z0-9]+)"
-    r"_bs(?P<bs>\d+)_tp(?P<tp>\d+)"
-    r"(?:_(?P<quant>[A-Za-z0-9]+))?_(?P<layers>[A-Za-z0-9]+)layers",
-    re.IGNORECASE,
-)
-
-
-# Rank marker in a raw vLLM per-rank trace filename, e.g.
-#   dp0_pp0_tp0_dcp0_ep0_rank0.<id>.pt.trace.json.gz
-# The tensor-parallel rank is encoded as ``rank<N>`` (preferred) or ``tp<N>``.
-_RANK_NAME_RE = re.compile(r"rank[-_]?(?P<rank>\d+)", re.IGNORECASE)
-
-
-_TP_RANK_NAME_RE = re.compile(r"(?:^|[_/])tp(?P<rank>\d+)", re.IGNORECASE)
-
-
-def _trace_rank(path: str) -> int | None:
-    """Extract the tensor-parallel rank index from a raw trace filename.
-
-    vLLM writes one trace per rank. Two naming forms occur in the wild:
-    ``…_tp<N>_…_rank<N>.<id>.pt.trace.json.gz`` and
-    ``<id>-rank-<N>.<id>.pt.trace.json.gz`` — hence the optional ``[-_]``
-    separator. Returns the rank as an int (``rank<N>`` preferred, ``tp<N>``
-    fallback), or ``None`` when no rank marker is present (e.g. a merged or
-    descriptive name).
-    """
-    name = os.path.basename(path or "")
-    m = _RANK_NAME_RE.search(name) or _TP_RANK_NAME_RE.search(name)
-    if not m:
-        return None
-    try:
-        return int(m.group("rank"))
-    except (TypeError, ValueError):
-        return None
-
-
-def _rank0_first(rank_files: list[str]) -> list[str]:
-    """Reorder trace files so the tensor-parallel **rank-0** file comes first.
-
-    Multi-rank traces arrive sorted by mtime (whichever rank flushed last), so
-    ``rank_files[0]`` is not necessarily rank 0. The rank-1..N allreduce (and
-    other collectives) can idle much longer than rank 0 waiting to synchronize,
-    which inflates their device time; rank 0 is the representative worker, so
-    the OP breakdown, reconstructed graph and downloadable trace are all built
-    from it. This lifts the file whose name encodes ``rank0``/``tp0`` to the
-    front (stable order otherwise). If no file carries a rank marker, the list
-    is returned unchanged.
-    """
-    if len(rank_files) <= 1:
-        return list(rank_files)
-    ranked = [(f, _trace_rank(f)) for f in rank_files]
-    if all(r is None for _, r in ranked):
-        return list(rank_files)
-    # rank-0 first; unknown ranks sorted last, otherwise stable by rank index.
-    return [f for f, _ in sorted(
-        ranked,
-        key=lambda fr: (fr[1] is None, fr[1] if fr[1] is not None else 0),
-    )]
-
 
 def fit_max_model_len(max_model_len: int, query_len: int | None,
                       context_len: int | None, max_tokens: int) -> int:
@@ -301,92 +136,6 @@ def fit_max_model_len(max_model_len: int, query_len: int | None,
         return int(max_model_len)
     needed = int(query_len) + int(context_len or 0) + int(max_tokens) + 16
     return max(int(max_model_len), needed)
-
-
-def trace_download_name(result: dict, which: str, device: str,
-                        trace_path: str) -> str:
-    """The descriptive filename a downloaded trace is served under.
-
-    Every profiled parameter is in the name, which is what makes
-    download -> upload a lossless round trip: :func:`_parse_trace_filename` is
-    the exact inverse, and the two must move together. They now sit together
-    too -- the builder used to be thirty lines inside the Flask route, where a
-    change to it would not obviously break the parser.
-
-    ``ctx`` is the block-aligned prefix-cache context the prefill attends to,
-    ``in`` the query length (new prefill tokens, S), ``out`` the number of
-    generated decode tokens, ``bs`` the pass's batch. The model id is reduced
-    to its final path component.
-    """
-    if which == "prefill":
-        pass_tag, pass_bs, gen = "_prefill", result.get("prefill_batch_size"), 1
-    elif which == "decode":
-        pass_tag = "_decode"
-        pass_bs = result.get("decode_batch_size", result.get("batch_size", 1))
-        gen = result.get("max_tokens", "")
-    else:
-        # Tag the filename only when the run really has distinct passes.
-        pass_tag = "_decode" if result.get("two_pass") else ""
-        pass_bs = result.get("decode_batch_size", result.get("batch_size", 1))
-        gen = result.get("max_tokens", "")
-
-    bs = pass_bs if pass_bs is not None else result.get("batch_size", 1)
-    quant = result.get("quantization")
-    return (
-        f"vllm_trace_{result['model_id'].split('/')[-1]}_{device.upper()}"
-        f"_{result.get('mode', 'eager')}{pass_tag}"
-        f"_ctx{result.get('context_len_aligned') or result.get('context_len') or 0}"
-        f"_in{result.get('query_len') or 0}_out{gen}_bs{bs}"
-        f"_tp{result.get('tp_size', 1) or 1}"
-        f"{f'_{quant}' if quant else ''}"
-        f"_{result.get('profiled_layers', 'all')}layers"
-        f"{'.json.gz' if trace_path.endswith('.gz') else '.json'}")
-
-
-def trace_path_for(result: dict, which: str) -> str | None:
-    """The stored trace file a download request refers to."""
-    if which == "prefill":
-        return result.get("prefill_trace_file")
-    if which == "decode":
-        return result.get("decode_trace_file") or result.get("trace_file")
-    return result.get("trace_file")
-
-
-def _parse_trace_filename(name: str) -> dict:
-    """Recover profiling config from a download-endpoint trace filename.
-
-    Returns a dict with keys ``pass`` (``"prefill"``/``"decode"``/``None``),
-    ``mode``, ``device``, ``context_len``, ``query_len``, ``gen``,
-    ``batch_size``, ``tp``, ``quantization`` and ``profiled_layers`` (``None``
-    when the name encodes ``all`` layers). An unrecognized name yields ``{}``.
-    """
-    m = _TRACE_NAME_RE.search(name or "")
-    if not m:
-        return {}
-    g = m.groupdict()
-
-    def _int(v: str | None) -> int | None:
-        try:
-            return int(v)  # type: ignore[arg-type]
-        except (TypeError, ValueError):
-            return None
-
-    quant = g.get("quant")
-    if quant and quant.lower() in ("none", "auto"):
-        quant = None
-    return {
-        "device": (g.get("device") or "").upper(),
-        "mode": (g.get("mode") or "").lower(),
-        "pass": (g.get("pass") or "").lower() or None,
-        "context_len": _int(g.get("ctx")),
-        "query_len": _int(g.get("qin")),
-        "gen": _int(g.get("gen")),
-        "batch_size": _int(g.get("bs")),
-        "tp": _int(g.get("tp")),
-        "quantization": quant,
-        "profiled_layers": _int(g.get("layers")),  # "all" -> None
-    }
-
 
 def _scheduler_pin(prefill_batch: int, decode_batch: int,
                    query_len: int) -> dict[str, int]:
@@ -413,128 +162,6 @@ def _scheduler_pin(prefill_batch: int, decode_batch: int,
         "max_num_seqs": max_batch,
         "max_num_batched_tokens": max(prefill_step_tokens, max_batch, 2048),
     }
-
-
-def _build_result_from_traces(
-    rank_files: list[str],
-    *,
-    model_id: str,
-    summary: dict,
-    tp_size: int,
-    batch_size: int,
-    mode: str = "eager",
-    max_model_len: int | None = None,
-    max_tokens: int | None = None,
-    quantization: str | None = None,
-    profiled_layers: int | None = None,
-    actual_layers: int | None = None,
-    layer_scale: float = 1.0,
-    trace_file: str | None = None,
-    query_len: int | None = None,
-    context_len: int | None = None,
-) -> dict:
-    """Parse one or more trace files and build the profile result dict.
-
-    Shared by the live profiler (``_run_profile``) and the trace-upload
-    endpoint so both paths reconstruct the model graph and op breakdown the
-    same way. With TP>1, vLLM writes one trace per rank; the ranks 1..N idle
-    longer on collectives (their allreduce device time is inflated by the wait
-    to synchronize with rank 0), so **rank 0 is always used** as the
-    representative worker for the op breakdown, the reconstructed graph and the
-    downloadable trace. ``_rank0_first`` lifts the ``rank0``/``tp0`` file to the
-    front regardless of the mtime order the files arrive in; the other ranks are
-    ignored.
-    """
-    rank_files = _rank0_first(rank_files)
-
-    profile_result = {
-        "model_id": model_id,
-        "mode": mode,
-        "batch_size": batch_size,
-        "max_model_len": max_model_len,
-        "max_tokens": max_tokens,
-        "tp_size": tp_size,
-        "quantization": quantization,
-        "summary": summary,
-        "profiled_layers": profiled_layers,
-        "actual_layers": actual_layers,
-        "layer_scale": layer_scale,
-        "trace_file": trace_file if trace_file is not None else rank_files[0],
-    }
-
-    # Reconstruct the model graph directly from the profiler trace. This is the
-    # single source of truth: the flat op breakdown below is an aggregation of
-    # it, not a second parse of the trace, so the table and the tree can never
-    # disagree. A failure here is fatal — a result without a graph has nothing
-    # in it.
-    graph = build_graph_from_trace(
-        rank_files[0],
-        summary=summary,
-        tp_size=tp_size,
-        batch_size=batch_size,
-        quantization=quantization,
-        query_len=query_len,
-        context_len=context_len,
-    )
-    graph["profiled_layers"] = profiled_layers
-    graph["actual_layers"] = actual_layers
-    graph["layer_scale"] = layer_scale
-    profile_result["graph"] = graph
-
-    ops = summarize_ops(graph)
-    profile_result["ops"] = ops
-    profile_result["backends"] = backend_totals(ops)
-    profile_result["total_device_time_us"] = round(
-        sum(o["device_time_us"] for o in ops), 2)
-
-    return profile_result
-
-
-def _merge_two_pass_result(pre: dict, dec: dict,
-                           prefill_bs: int, decode_bs: int) -> dict:
-    """Splice a prefill-batch pass and a decode-batch pass into one result.
-
-    Real serving decouples the phases: prefill typically runs ~1 sequence at a
-    time while decode batches many concurrent sequences. A single
-    ``llm.generate`` call cannot express that (it prefills and decodes the same
-    batch), so we profile two passes and merge them here:
-
-    - ``pre`` — full result from a pass run at ``prefill_bs`` (its **prefill**
-      phase is the faithful one; ``S`` = query_len).
-    - ``dec`` — full result from a pass run at ``decode_bs`` (its **decode**
-      phase is faithful; ``B`` = decode_bs).
-
-    The merged result keeps the decode pass as the base (its op breakdown
-    reflects the steady-state, throughput-bound decode batch) and overlays the
-    prefill pass's prefill graph tree, so the reconstructed graph shows
-    prefill@``prefill_bs`` together with decode@``decode_bs``.
-    """
-    result = dict(dec)
-    result["batch_size"] = decode_bs
-    result["prefill_batch_size"] = prefill_bs
-    result["decode_batch_size"] = decode_bs
-    result["two_pass"] = True
-    # Retain BOTH passes' trace files so the trace-download endpoint can serve
-    # either phase. ``trace_file`` (inherited from the decode pass via
-    # ``dict(dec)``) stays the default so existing clients are unaffected.
-    result["prefill_trace_file"] = pre.get("trace_file")
-    result["decode_trace_file"] = dec.get("trace_file")
-
-    gpre = pre.get("graph") or {}
-    gdec = dec.get("graph") or {}
-    graph = dict(gdec)
-    graph["prefill"] = gpre.get("prefill")
-    # Symbols: the decode pass supplies ``B`` (decode batch); the prefill pass
-    # supplies the prefill token dims ``S`` / ``S+C`` / ``C``.
-    sym = dict(gdec.get("symbols") or {})
-    presym = gpre.get("symbols") or {}
-    for k in ("S", "S+C", "C"):
-        if k in presym:
-            sym[k] = presym[k]
-    graph["symbols"] = sym
-    result["graph"] = graph
-    return result
-
 
 def _run_profile(model_id: str, mode: str, max_model_len: int,
                  batch_size: int, max_tokens: int, prompt: str,
@@ -972,16 +599,16 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
         if cache_hit_note:
             profile_result["cache_hit_note"] = cache_hit_note
 
-        with _profile_lock:
-            _profile_state["status"] = "done"
-            _profile_state["result"] = profile_result
-            _profile_state["error"] = None
+        with runstate._profile_lock:
+            runstate._profile_state["status"] = "done"
+            runstate._profile_state["result"] = profile_result
+            runstate._profile_state["error"] = None
         save_state()
 
     except Exception:
-        with _profile_lock:
-            _profile_state["status"] = "error"
-            _profile_state["error"] = traceback.format_exc()
+        with runstate._profile_lock:
+            runstate._profile_state["status"] = "error"
+            runstate._profile_state["error"] = traceback.format_exc()
         save_state()
     finally:
         os.environ.pop("VLLM_TORCH_COMPILE_LEVEL", None)
@@ -991,224 +618,3 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
                 dist.destroy_process_group()
         except Exception:
             pass
-
-
-def _norm_quant(q: object) -> str | None:
-    """Normalize a quantization selection: "", "auto", "none" → None."""
-    if not q or str(q).lower() in ("auto", "none"):
-        return None
-    return str(q).lower()
-
-
-def _profile_template_for(model_id: str, quantization: object = None
-                          ) -> tuple[dict, dict | None, str | None]:
-    """The latest completed profile graph, validated against a request.
-
-    Returns ``(template, profile_settings, error)``; ``error`` is a
-    user-facing message when the state cannot serve this model/quantization.
-    Shared by the Shape Matrix export and the ``/api/perf/*`` pipeline.
-    """
-    with _profile_lock:
-        state_status = _profile_state["status"]
-        state_model = _profile_state.get("model_id")
-        state_result = _profile_state.get("result")
-        profile_settings = _profile_state.get("settings")
-    if state_status != "done" or not state_result:
-        return {}, None, (
-            "The Shape Matrix is derived from a profiling run, but no "
-            "completed run is available. Run a profile first.")
-    template = state_result.get("graph")
-    if not template or not (template.get("prefill") or template.get("decode")):
-        return {}, None, ("The latest profile has no reconstructed graph to "
-                          "derive shapes from.")
-    if state_model and state_model != model_id:
-        return {}, None, (f"Latest profile is for '{state_model}', not "
-                          f"'{model_id}'. Profile that model or switch the "
-                          "model ID.")
-
-    # The derived shapes/dtypes/memory are only valid for the quantization the
-    # run actually used, so the requested quantization must match the profiled
-    # one.
-    requested_quant = _norm_quant(quantization)
-    profiled_quant = _norm_quant(
-        (profile_settings or {}).get("quantization")
-        if profile_settings else
-        template.get("config", {}).get("quantization")
-    )
-    if requested_quant != profiled_quant:
-        return {}, None, (
-            f"Latest profile used quantization '{profiled_quant or 'none'}', "
-            f"not '{requested_quant or 'none'}'. Re-profile with the requested "
-            "quantization or change the selection.")
-    return template, profile_settings, None
-
-
-def is_running() -> bool:
-    with _profile_lock:
-        return _profile_state["status"] == "running"
-
-
-def save_uploads(files: list[tuple[str, Any]]) -> list[tuple[str, dict]]:
-    """Persist uploaded traces under ``output/traces``.
-
-    Each file keeps its original (descriptive) name, because that name is how
-    the configuration is recovered - the download endpoint writes
-    ``..._{mode}[_prefill|_decode]_ctx{C}_in{S}_out{gen}_bs{B}_tp{TP}...``
-    precisely so an upload does not have to be re-described by hand.
-
-    ``files`` is ``[(filename, save_fn), ...]``; ``save_fn(dest)`` writes it.
-    """
-    from werkzeug.utils import secure_filename
-    trace_dir = os.path.abspath("output/traces")
-    os.makedirs(trace_dir, exist_ok=True)
-    saved: list[tuple[str, dict]] = []
-    for filename, save in files:
-        orig = os.path.basename(filename or "")
-        name = secure_filename(filename) or "uploaded_trace.json"
-        dest = os.path.join(trace_dir, name)
-        save(dest)
-        saved.append((dest, _parse_trace_filename(orig)))
-    return saved
-
-
-def build_from_uploads(saved: list[tuple[str, dict]], form) -> tuple[bool, str]:
-    """Reconstruct a profile from uploaded traces. ``(ok, error)``.
-
-    Mirrors the live profiler so a **download -> upload round-trip** rebuilds
-    the same graph on a machine with no accelerator: a ``_prefill`` + ``_decode``
-    pair rebuilds *both* phases (each with its own batch/query size, spliced by
-    :func:`_merge_two_pass_result`), and an untagged upload rebuilds a single
-    run from its rank-0 file.
-    """
-    model_id = (form.get("model_id") or "").strip()
-
-    # Recover the profiled configuration from the descriptive download
-    # filenames, falling back to explicit form fields (form always wins).
-    metas = [m for _, m in saved if m]
-
-    def _from_names(key: str, default=None):
-        for m in metas:
-            v = m.get(key)
-            if v is not None and v != "":
-                return v
-        return default
-
-    mode = form.get("mode") or _from_names("mode") or "eager"
-    tp_size = int(form.get("tensor_parallel_size") or form.get("tp_size")
-                  or _from_names("tp") or 1)
-    quant_form = form.get("quantization")
-    quantization = (quant_form if quant_form not in (None, "", "auto", "none")
-                    else _from_names("quantization"))
-    if quantization in ("", "auto", "none"):
-        quantization = None
-    query_len = form.get("query_len") or _from_names("query_len")
-    query_len = int(query_len) if query_len else None
-    context_len = form.get("context_len") or _from_names("context_len")
-    context_len = int(context_len) if context_len else None
-
-    # Split the uploads by pass tag. A prefill file + a decode file form a
-    # two-pass pair (each may itself carry extra rank files); anything without a
-    # tag is a plain single run (rank-0 first).
-    pre = [(p, m) for p, m in saved if m.get("pass") == "prefill"]
-    dec = [(p, m) for p, m in saved if m.get("pass") == "decode"]
-    untagged = [(p, m) for p, m in saved if not m.get("pass")]
-    two_pass = bool(pre) and bool(dec)
-
-    if two_pass:
-        pf_batch = (pre[0][1].get("batch_size")
-                    or int(form.get("prefill_batch_size") or 1))
-        dc_batch = (dec[0][1].get("batch_size")
-                    or int(form.get("decode_batch_size")
-                            or form.get("batch_size") or 1))
-        batch_size = dc_batch
-    else:
-        batch_size = int(form.get("batch_size")
-                         or _from_names("batch_size") or 1)
-        pf_batch = dc_batch = batch_size
-
-    # Fetch model config for shape symbols / summary (best-effort).
-    try:
-        summary = summarize_config(fetch_model_config(model_id)) if model_id else {}
-    except Exception:
-        summary = {}
-
-    actual_layers = form.get("actual_layers") or summary.get("num_layers")
-    actual_layers = int(actual_layers) if actual_layers else None
-    profiled_layers = (form.get("num_profile_layers")
-                       or _from_names("profiled_layers") or actual_layers)
-    profiled_layers = int(profiled_layers) if profiled_layers else None
-    layer_scale = (
-        actual_layers / profiled_layers
-        if actual_layers and profiled_layers else 1.0
-    )
-
-    with _profile_lock:
-        _profile_state.clear()
-        _profile_state.update({
-            "status": "running",
-            "result": None,
-            "error": None,
-            "model_id": model_id,
-            "settings": {
-                "mode": mode,
-                "batch_size": batch_size,
-                "prefill_batch_size": pf_batch if two_pass else None,
-                "decode_batch_size": dc_batch if two_pass else None,
-                "tp_size": tp_size,
-                "quantization": quantization,
-                "query_len": query_len,
-                "context_len": context_len,
-                "uploaded": True,
-            },
-            "run_id": runs.new_run_id((model_id or "upload").split("/")[-1]),
-        })
-
-    def _build(rank_files: list[str], bsz: int, qlen: int | None) -> dict:
-        return _build_result_from_traces(
-            rank_files[:tp_size] if len(rank_files) >= tp_size else rank_files,
-            model_id=model_id,
-            summary=summary,
-            tp_size=tp_size,
-            batch_size=bsz,
-            mode=mode,
-            quantization=quantization,
-            profiled_layers=profiled_layers,
-            actual_layers=actual_layers,
-            layer_scale=layer_scale,
-            query_len=qlen,
-            context_len=context_len,
-        )
-
-    try:
-        if two_pass:
-            # Mirror the live two-pass build: the prefill pass supplies the
-            # prefill tree (S = query_len), the decode pass is the steady-state
-            # base (B = decode_batch); ``_merge_two_pass_result`` splices them.
-            res_pre = _build([p for p, _ in pre], pf_batch, query_len or None)
-            res_dec = _build([p for p, _ in dec], dc_batch,
-                             1 if query_len else None)
-            result = _merge_two_pass_result(res_pre, res_dec, pf_batch, dc_batch)
-        else:
-            group = untagged or dec or pre
-            # A lone decode-tagged pass computes 1 new token/seq (query forced
-            # to 1); otherwise use the recovered query length.
-            qlen = (1 if (not untagged and dec and query_len)
-                    else (query_len or None))
-            result = _build([p for p, _ in group], batch_size, qlen)
-
-        result["query_len"] = query_len or None
-        result["context_len"] = context_len or None
-        result["context_len_aligned"] = context_len or None
-        with _profile_lock:
-            _profile_state["status"] = "done"
-            _profile_state["result"] = result
-            _profile_state["error"] = None
-    except Exception:
-        err = traceback.format_exc()
-        with _profile_lock:
-            _profile_state["status"] = "error"
-            _profile_state["error"] = err
-        save_state()
-        return False, err
-    save_state()
-    return True, ""
