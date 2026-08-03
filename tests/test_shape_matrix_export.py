@@ -247,16 +247,22 @@ class TestShapeMatrixExport(unittest.TestCase):
         wb = load_workbook(io.BytesIO(resp.data))
         ws = wb["Qwen3-4B"]
 
-        # Find qkv_proj - its symbolic shape should have "S" symbolic and
-        # model constants resolved to numbers
+        # Find qkv_proj - its symbolic shape must name its dimensions rather
+        # than repeat the concrete Shape column beside it.
         for r in range(2, 200):
             if ws.cell(r, 6).value and "qkv_proj" in ws.cell(r, 6).value:
                 sym = ws.cell(r, 10).value
-                # S stays symbolic, H is resolved to number
+                # The token dim stays symbolic ...
                 self.assertIn("S", sym)
                 self.assertIn("\u00d7", sym)
-                # H (2560) should be resolved to its numeric value
-                self.assertIn("2560", sym)
+                # ... and so do the model constants: the hidden size is "H",
+                # not "2560", and the fused projection width is a per-rank
+                # shard even at TP=1.
+                self.assertIn("H", sym)
+                self.assertIn("QKV/TP", sym)
+                self.assertNotIn("2560", sym)
+                # The concrete numbers live in the Shape column.
+                self.assertIn("2560", ws.cell(r, 11).value)
                 return
         self.fail("qkv_proj not found")
 

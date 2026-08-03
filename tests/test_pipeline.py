@@ -147,12 +147,14 @@ class TestModelInfo(unittest.TestCase):
 
     def test_config_dims_become_symbols(self):
         # The config's structural dims are what a swept shape is written in.
+        # The tensor-parallel-sharded ones carry ``/TP`` even at TP=1, so a
+        # TP sweep has something to divide.
         from breakdown.trace.symbols import SymbolTable
         table = SymbolTable(summarize_config(
             fetch_model_config(QWEN3_4B_MODEL_ID)), tp_size=1)
-        self.assertEqual(table.value[2560], "H")
-        self.assertEqual(table.value[9728], "I")
-        self.assertEqual(table.value[151936], "V")
+        self.assertEqual(table.value[2560], "H")       # replicated
+        self.assertEqual(table.value[9728], "I/TP")    # column-parallel
+        self.assertEqual(table.value[151936], "V/TP")  # vocab-parallel
         self.assertEqual(table.legend["n_h"], 32)
         self.assertEqual(table.legend["n_kv"], 8)
 
@@ -1819,7 +1821,7 @@ class TestGraphFromTrace(unittest.TestCase):
         self.assertEqual(gemm["input_shapes"][0], ["topk·S", "H"])
         self.assertEqual(gemm["input_shapes"][2][0], "topk·S")
         # the fused gate_up width is a config constant, not an observed value
-        self.assertEqual(gemm["input_shapes"][1][2], "2·I_moe")
+        self.assertEqual(gemm["input_shapes"][1][2], "2·I_moe/TP")
         self.assertEqual(g["symbols"]["topk"], 4)
 
         # and it re-resolves at a *different* sweep point, which is the point
@@ -2232,7 +2234,7 @@ class TestGraphFromTrace(unittest.TestCase):
         attn = next(o for o in ops
                     if o["name"] == "flash_xpu::minimax_m3_sparse_attn_decode")
         self.assertEqual(attn["recorded_shapes"], [[tokens, 3, 8]])  # [S, n_h, d]
-        self.assertEqual(attn["input_shapes"], [["S", "n_h", "d"]])
+        self.assertEqual(attn["input_shapes"], [["S", "n_h/TP", "d"]])
         self.assertEqual(attn["input_dtypes"], ["bfloat16"])
         idx = next(o for o in ops
                    if o["name"] == "flash_xpu::minimax_m3_index_decode")
@@ -2479,6 +2481,39 @@ class TestSymbolicShapeCompleteness(unittest.TestCase):
         # Head-count per-rank dims resolve (position of the leak the user saw).
         self.assertEqual(val_to_sym[16], "n_h/TP")
         self.assertEqual(val_to_sym[1], "n_kv/TP")
+
+    def test_a_tp1_profile_still_marks_the_sharded_dims(self):
+        """``/TP`` must be present even at TP=1, or a TP sweep divides nothing.
+
+        The shard used to be inferred from the arithmetic alone (register
+        ``val // tp`` as ``sym/TP`` when ``tp > 1``), so a TP=1 profile
+        produced a graph with no ``/TP`` anywhere. Qwen3-4B swept over
+        ``tp_sizes=[1, 2, 4]`` then produced 1824 matrix rows whose TP=1, TP=2
+        and TP=4 shapes were byte-identical, and the benchmark's ``(op, args)``
+        de-duplication collapsed them into 214 cases all labelled ``tp=1``.
+        """
+        from breakdown.trace.symbols import SymbolTable
+        table = SymbolTable(self.M3_SUMMARY, 1)
+        v = table.value
+        # Projections, heads, expert widths and the vocabulary are per-rank.
+        self.assertEqual(v[9216], "QKV/TP")
+        self.assertEqual(v[10240], "QKV_idx/TP")
+        self.assertEqual(v[8192], "n_h·d/TP")
+        self.assertEqual(v[64], "n_h/TP")
+        self.assertEqual(v[4], "n_kv/TP")
+        self.assertEqual(v[12288], "I/TP")
+        self.assertEqual(v[3072], "I_moe/TP")
+        self.assertEqual(v[200064], "V/TP")
+        # The residual stream, the head dim and the rope cache are replicated.
+        self.assertEqual(v[6144], "H")
+        self.assertEqual(v[128], "d")
+        self.assertEqual(v[1048576], "P")
+        # The legend still holds the *whole* value, so ``QKV/TP`` re-resolves
+        # to the recorded dim at TP=1 and halves at TP=2.
+        from breakdown.core import dims
+        legend = dict(table.legend)
+        self.assertEqual(dims.resolve("QKV/TP", legend), 9216)
+        self.assertEqual(dims.resolve("QKV/TP", {**legend, "TP": 2}), 4608)
 
     def test_runtime_dims_symbolized_with_observed_values(self):
         from breakdown.trace.symbols import symbolize_allocations

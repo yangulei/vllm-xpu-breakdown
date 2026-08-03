@@ -17,7 +17,10 @@ There is **one** resolution, applied to every dim in a fixed order:
    Needed because a value can mean two things at once: MiniMax-M3's index-head
    count equals ``num_kv_heads`` and its top-k block count equals ``n_h/TP``,
    so a value-keyed table alone cannot represent both.
-4. **constant** — a config constant, or its ``/TP`` shard.
+4. **constant** — a config constant, or its ``/TP`` shard. Which constants are
+   sharded is *declared* (:data:`SHARDED_SYMBOLS`), not inferred from the
+   arithmetic, so a TP=1 profile still says ``QKV/TP`` and a TP sweep has
+   something to divide.
 5. **allocation** — what remains is a run-specific allocation size (a paged
    KV-cache slot count, an MoE scratch buffer). It gets an observed-value
    symbol so nothing structural is left as a bare integer, with the value
@@ -37,6 +40,24 @@ from .rules import _msa_kernel_layout
 # Concrete dims at or below this value are structural constants (k/v pair,
 # real/imag split, singleton broadcasts), not dimensions to symbolize.
 _TRIVIAL_MAX = 2
+
+#: Symbols whose recorded value is a **per-rank shard**: vLLM splits these
+#: across tensor-parallel ranks, so the dim a trace records is already
+#: ``full // TP`` and its symbol must say ``/TP`` — *at every TP, including 1*.
+#:
+#: Without this the shard was inferred purely from the arithmetic (``register
+#: val // tp as sym/TP when tp > 1``), so a TP=1 profile produced a graph with
+#: no ``/TP`` anywhere. Sweeping TP then divided nothing: Qwen3-4B at
+#: ``tp_sizes=[1,2,4]`` produced 1824 matrix rows whose TP=1, TP=2 and TP=4
+#: shapes were byte-identical, which collapsed under the benchmark's
+#: ``(op, args)`` de-duplication into 214 cases all labelled ``tp=1``.
+#:
+#: ``H`` and ``d`` are deliberately absent: the residual stream and the head
+#: dimension are replicated on every rank.
+SHARDED_SYMBOLS: frozenset[str] = frozenset({
+    "n_h", "n_kv", "n_h·d", "QKV", "QKV_idx", "I", "2·I",
+    "I_moe", "2·I_moe", "V", "n_idx",
+})
 
 
 # ===================================================================
@@ -67,13 +88,22 @@ class SymbolTable:
 
     # -- construction ------------------------------------------------
     def add(self, sym: str, val: int | None, shard: bool = True) -> None:
-        """Register a config constant, and its per-rank shard when it splits."""
+        """Register a config constant, and its per-rank shard when it splits.
+
+        A symbol in :data:`SHARDED_SYMBOLS` names a dim vLLM splits across
+        ranks, so the *recorded* value is the shard and takes the ``/TP`` name
+        even at TP=1, where it numerically equals the whole. Any other symbol
+        still gets a ``sym/TP`` entry as a fallback for a dim that happens to
+        equal ``val // TP``, but only when TP actually divides it.
+        """
         if not val or val <= 0:
             return
         self.legend.setdefault(sym, val)
+        if shard and val % self.tp == 0:
+            per_rank = val // self.tp
+            if sym in SHARDED_SYMBOLS or per_rank != val:
+                self.value.setdefault(per_rank, f"{sym}/TP")
         self.value.setdefault(val, sym)
-        if shard and self.tp > 1 and val % self.tp == 0:
-            self.value.setdefault(val // self.tp, f"{sym}/TP")
 
     def add_scoped(self, sym: str, val: int | None, axis: int, ndim: int,
                    applies: Callable[[str], bool], shard: bool = True) -> None:
@@ -91,7 +121,8 @@ class SymbolTable:
         per_rank = val
         if shard and self.tp > 1 and val % self.tp == 0:
             per_rank = val // self.tp
-        name = f"{sym}/TP" if per_rank != val else sym
+        sharded = shard and sym in SHARDED_SYMBOLS
+        name = f"{sym}/TP" if (sharded or per_rank != val) else sym
         self.scoped.append((applies, axis, ndim, per_rank, name))
 
     def _build(self, summary: dict) -> None:

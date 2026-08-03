@@ -134,7 +134,13 @@ applied per dim:
    semantically correct.
 
 4. **Constant** — a config constant or its `/TP` shard, looked up from the
-   value → symbol table.
+   value → symbol table. Which constants are sharded is *declared*
+   (`symbols.SHARDED_SYMBOLS`), not inferred from the arithmetic: heads,
+   projections, expert widths and the vocabulary are per-rank, while the
+   residual stream `H`, the head dim `d` and the rope cache `P` are
+   replicated. Inferring it — "register `val // TP` as `sym/TP` when TP > 1" —
+   meant a TP=1 profile produced a graph with no `/TP` anywhere, and a TP
+   sweep over it divided nothing.
 
 5. **Allocation** — what remains is a run-specific allocation size (a paged
    KV-cache slot count, an MoE scratch buffer). It gets an observed-value

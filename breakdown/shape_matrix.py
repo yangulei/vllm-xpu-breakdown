@@ -105,8 +105,9 @@ def build_rows(template: dict, configs: list[dict]) -> list[dict[str, Any]]:
                 shape_str = _format_op_shape_with_dtypes(
                     op, symbols, graph_cfg, recorded_dtypes=recorded_dtypes)
 
-                # Symbolic shape: keep only config variables (S, B, C, TP)
-                # symbolic, resolve model constants to numbers.
+                # Symbolic shape: what each dimension *is*. Every registered
+                # symbol stays named (``[S, H] × [QKV/TP, H]``); the numbers
+                # are the neighbouring ``Shape`` column's job.
                 sym_shapes = op.get("input_shapes", [])
                 if sym_shapes:
                     sym_parts = []

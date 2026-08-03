@@ -288,6 +288,8 @@ coming back.
 | The same operand reads `f16` in one artifact and `fp16` in another | `dtypes.Dtype.label` (one vocabulary) | `test_core_dtypes.py::TestLabels` |
 | `2·I_moe` resolves to `3072` plus an unlexable tail | `dims._tokens` (longest registered name wins) | `test_core_dims.py::TestLexingAgainstTheSymbolTable` |
 | A display shape folds a swept variable into a bare number | `dims.partial`, `dims.is_variable_name` | `test_core_dims.py::TestDisplayForm` |
+| A "symbolic" shape is a copy of the concrete one beside it (`[S, 2560] × [6144, 2560]`) | `dims.partial` (`keep=None` keeps every registered name) | `test_core_dims.py::TestDisplayForm`, `test_shape_matrix_export.py::test_symbolic_shapes_column` |
+| A TP=1 profile has no `/TP`, so a TP sweep divides nothing and every TP collapses to one case | `symbols.SHARDED_SYMBOLS` (declared, not inferred from the arithmetic) | `test_pipeline.py::TestSymbolicShapeCompleteness` (`a_tp1_profile_still_marks_the_sharded_dims`) |
 | A shard resolves to 0 and every kernel rejects the shape | `dims.is_sharded` (clamp to 1) | `test_core_dims.py::TestSharding` |
 | `index_topk` is claimed by the MoE family and named after the router | `opnames.first_family` (order-dependent tables) | `test_core_opnames.py::TestFamilies` |
 | An op is a collective to one stage and not to another | `opnames.COLLECTIVE_NAMESPACES` (one list) | `test_core_opnames.py::TestCollectives` |

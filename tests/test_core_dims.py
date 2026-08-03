@@ -113,11 +113,26 @@ class TestSharding(unittest.TestCase):
 
 
 class TestDisplayForm(unittest.TestCase):
-    def test_constants_fold_and_swept_symbols_stay(self):
-        """A reader needs to see which dimension moves when the sweep moves."""
-        self.assertEqual(dims.resolve_display("topk·S", SYMBOLS), "4·S")
-        self.assertEqual(dims.resolve_display("H/TP", SYMBOLS), "6144/TP")
-        self.assertEqual(dims.resolve_display("H", SYMBOLS), "6144")
+    def test_named_dimensions_stay_named(self):
+        """A symbolic shape must say what a dimension *is*.
+
+        The display form used to fold every model constant to a number and
+        keep only ``S``/``B``/``C``/``TP``, which made it a near-copy of the
+        concrete shape printed beside it and hid both the dimension's identity
+        and whether it was a per-rank shard.
+        """
+        self.assertEqual(dims.resolve_display("topk·S", SYMBOLS), "topk·S")
+        self.assertEqual(dims.resolve_display("H/TP", SYMBOLS), "H/TP")
+        self.assertEqual(dims.resolve_display("H", SYMBOLS), "H")
+
+    def test_an_explicit_keep_set_still_folds_constants(self):
+        """The narrow form is still available to a caller that asks for it."""
+        self.assertEqual(
+            dims.resolve_display("topk·S", SYMBOLS, keep=dims.VARIABLES),
+            "4·S")
+        self.assertEqual(
+            dims.resolve_display("H/TP", SYMBOLS, keep=dims.VARIABLES),
+            "6144/TP")
 
     def test_a_registered_composite_of_variables_stays_symbolic(self):
         """``S+C`` is a *symbol*, so the lexer takes it whole -- correct for
@@ -129,11 +144,20 @@ class TestDisplayForm(unittest.TestCase):
         """The old display resolver fell through to full resolution for any
         ``+`` composite that was not made *entirely* of variables, so a mixed
         expression lost its variable entirely and printed a bare number."""
-        self.assertEqual(dims.resolve_display("H+S", SYMBOLS), "6144+S")
+        self.assertEqual(dims.resolve_display("H+S", SYMBOLS), "H+S")
+        self.assertEqual(
+            dims.resolve_display("H+S", SYMBOLS, keep=dims.VARIABLES),
+            "6144+S")
 
-    def test_an_unresolvable_dim_displays_as_itself(self):
+    def test_an_unregistered_dim_displays_as_itself(self):
         self.assertEqual(dims.resolve_display("n_idx/TP", {"TP": 4}),
                          "n_idx/TP")
+
+    def test_a_literal_is_still_a_number(self):
+        """Only *names* survive; an unnamed arithmetic subtree still folds."""
+        self.assertEqual(dims.resolve_display("128", SYMBOLS), "128")
+        self.assertEqual(dims.resolve_display(2, SYMBOLS), "2")
+        self.assertEqual(dims.resolve_display("2·4", SYMBOLS), "8")
 
 
 class TestNoEval(unittest.TestCase):

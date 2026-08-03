@@ -9,7 +9,7 @@ places used to interpret those strings and no two agreed:
   textual substitution -- longest name first, so ``2·I`` was not eaten by
   ``I`` -- and then ran the result through ``eval`` behind an AST whitelist.
 * ``shape_derive._partially_resolve_dim`` re-implemented the same walk to keep
-  ``S``/``B``/``C``/``TP`` symbolic, with its own splitting rules.
+  the swept symbols legible, with its own splitting rules.
 * the browser had a third implementation in JavaScript, which silently failed
   on ``S+C``: it split on ``·`` only, so an additive composite came back as
   the bare string and the tooltip showed no number at all.
@@ -32,7 +32,8 @@ import re
 from dataclasses import dataclass
 
 #: Symbols the sweep varies. Everything else is a model constant fixed by
-#: ``config.json``, so these are the ones a display form keeps symbolic.
+#: ``config.json``. The display form keeps *every* registered name symbolic by
+#: default; this set is the narrower ``keep`` a caller can ask for explicitly.
 VARIABLES: frozenset[str] = frozenset({"S", "B", "C", "TP"})
 
 #: The multiplication sign used in shape strings (U+00B7 MIDDLE DOT). It reads
@@ -237,17 +238,30 @@ def is_variable_name(name: str, keep: frozenset[str] = VARIABLES) -> bool:
 
 
 def partial(dim: Dim, symbols: dict[str, int],
-            keep: frozenset[str] = VARIABLES) -> Dim:
+            keep: frozenset[str] | None = None) -> Dim:
     """Fold every subtree that does not mention a kept symbol.
 
-    This is the display form: model constants from ``config.json`` become
-    numbers, while the symbols the sweep varies stay legible, so a reader sees
-    ``2048·S`` rather than either ``n_h·d·S`` or a number that hides which
-    dimension moves when the sweep moves.
+    This is the display form. ``keep`` defaults to *every name the symbol table
+    knows*, so a shape displays as what its dimensions **are** — ``[S, H] x
+    [QKV/TP, H]`` — with the numbers alongside it (``display["concrete"]``, the
+    Shape Matrix's ``Shape`` column) and in the legend.
+
+    It used to keep only ``S``/``B``/``C``/``TP`` and fold every model constant
+    to a number. That made the symbolic form a near-copy of the concrete one --
+    Qwen3-4B's qkv_proj read ``[S, 2560] x [6144, 2560]`` beside ``[128, 2560,
+    bf16] x [6144, 2560, bf16]`` -- and it hid the one thing the reader wants
+    from a *symbolic* shape: which model dimension an operand is, and whether
+    it is a per-rank shard. Pass an explicit ``keep`` to get the old narrower
+    form.
     """
+    def is_kept(name: str) -> bool:
+        if keep is not None:
+            return name in keep or is_variable_name(name, keep)
+        return name in symbols or is_variable_name(name, VARIABLES)
+
     def mentions_kept(node: Dim) -> bool:
         if isinstance(node, Sym):
-            return node.name in keep or is_variable_name(node.name, keep)
+            return is_kept(node.name)
         if isinstance(node, BinOp):
             return mentions_kept(node.left) or mentions_kept(node.right)
         return False
@@ -289,12 +303,18 @@ def resolve(dim, symbols: dict[str, int]):
 
 
 def resolve_display(dim, symbols: dict[str, int],
-                    keep: frozenset[str] = VARIABLES) -> str:
-    """A dim rendered with constants folded and swept symbols kept."""
+                    keep: frozenset[str] | None = None) -> str:
+    """A dim rendered symbolically, with only unnamed subtrees folded.
+
+    ``keep`` defaults to every name in ``symbols`` — see :func:`partial`.
+    """
     if isinstance(dim, (int, float)):
         return str(int(dim))
     text = str(dim)
-    if text in keep or is_variable_name(text, keep):
+    if keep is None:
+        if text in symbols or is_variable_name(text, VARIABLES):
+            return text
+    elif text in keep or is_variable_name(text, keep):
         return text
     try:
         return render(partial(parse(text, symbols), symbols, keep))
