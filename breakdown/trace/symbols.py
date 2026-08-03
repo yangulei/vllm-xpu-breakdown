@@ -373,4 +373,4 @@ def _dim_is(sym: Any, value: int) -> bool:
     """True if a (possibly symbolic) shape entry is the KV-head dimension."""
     if isinstance(sym, int):
         return sym == value
-    return isinstance(sym, str) and sym.split("/")[0] in ("n_kv", "n_h·d_kv")
+    return isinstance(sym, str) and sym.split("/")[0] == "n_kv"

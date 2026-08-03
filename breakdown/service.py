@@ -20,7 +20,6 @@ from typing import Any
 from breakdown import profiling, shape_matrix, shape_matrix_xlsx
 from breakdown.shape_derive import _bytes_to_dtype
 from breakdown.bench import devices as bench_devices
-from breakdown.bench import rank as bench_rank
 from breakdown.bench import runner as bench_runner
 from breakdown.bench import spec as bench_spec
 from breakdown.bench import store as bench_store

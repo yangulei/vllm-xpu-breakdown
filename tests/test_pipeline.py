@@ -30,7 +30,7 @@ from breakdown.cost import dtype_size, estimate_flops, estimate_memory
 from breakdown import profiling
 from breakdown.classifier import Backend, classify_op
 from breakdown.model_info import fetch_model_config, summarize_config
-from breakdown.profiler import _is_overhead_event
+from breakdown.trace_common import _is_overhead_event
 from breakdown import profiling
 from breakdown.trace import build_graph_from_trace
 from tests.helpers import device_time, find_op, graph_of, iter_ops

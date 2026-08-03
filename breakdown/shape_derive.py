@@ -12,10 +12,7 @@ the row builder that consumes it.
 """
 from __future__ import annotations
 
-from typing import Any
-
-from breakdown.cost import (
-    _prod, dtype_size, estimate_flops, estimate_memory, op_bytes)
+from breakdown.cost import _prod, op_bytes
 
 
 # Roles whose 2nd input tensor (index 1) is a weight matrix

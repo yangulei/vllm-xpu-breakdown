@@ -233,26 +233,6 @@ def _get_vocab_size(llm, summary: dict, default: int = 32000) -> int:
     return int(vs) if vs and vs > 512 else default
 
 
-def _collect_node_names(node: dict | None) -> set[str]:
-    """Set of all display ``name`` values in a graph tree (for diagnostics)."""
-    if not node:
-        return set()
-    out = {node.get("name", "")}
-    for c in node.get("children", []):
-        out |= _collect_node_names(c)
-    return out
-
-
-def _collect_module_types(node: dict | None) -> set[str]:
-    """Set of all ``module_type`` (class) values in a graph tree."""
-    if not node:
-        return set()
-    out = {node.get("module_type", "")}
-    for c in node.get("children", []):
-        out |= _collect_module_types(c)
-    return out
-
-
 # Descriptive trace filename produced by the download endpoint, e.g.
 #   vllm_trace_MiniMax-M3_XPU_eager_decode_ctx2048_in1536_out8_bs32_tp4_6layers.json.gz
 # The stable ``_ctx…_in…_out…_bs…_tp…[_quant]_…layers`` tail (plus the optional

@@ -26,9 +26,9 @@ from typing import Any, Iterable
 # Re-exported so ``bench.rank`` / ``bench.reports`` keep one import site for
 # "how expensive is this op, and against which roof".
 from ..cost import (  # noqa: F401
-    bound_of, cache_resident, compute_peak, effective_bw_gbs, kernel_seconds,
-    memory_unit, op_ai, ridge_ai, roof_unit, roofline_bound_us,
-    roofline_detail, uses_matrix_engine, utilization, utilization_detail)
+    compute_peak, effective_bw_gbs, kernel_seconds, ridge_ai,
+    roofline_bound_us, roofline_detail, uses_matrix_engine, utilization,
+    utilization_detail)
 
 #: Seconds a worker spends importing torch/vLLM before its first case.
 DEFAULT_STARTUP_S = 60.0

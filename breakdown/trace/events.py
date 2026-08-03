@@ -25,11 +25,6 @@ def _load_trace(path: str) -> dict:
         return json.load(f)
 
 
-def _parse_input_dims(args: dict) -> list[list[int]]:
-    """Extract numeric input shapes from a cpu_op's args."""
-    return _parse_input_dims_types(args)[0]
-
-
 def _normalize_dtype(t: Any) -> str:
     """Normalize a trace dtype token to a ``DTYPE_BYTES`` key.
 
@@ -154,14 +149,6 @@ def _parse_input_dims_types(args: dict) -> tuple[list[list[int]], list[str]]:
             shapes.append(shape)
             dtypes.append(raw_dt)
     return shapes, dtypes
-
-
-def _first_dtype(args: dict) -> str:
-    """First concrete input dtype, e.g. 'c10::BFloat16' → 'bfloat16'."""
-    for name in _parse_input_dims_types(args)[1]:
-        if name in DTYPE_BYTES:
-            return name
-    return ""
 
 
 #: The launch-machinery vocabulary lives in :mod:`breakdown.trace_common` so the

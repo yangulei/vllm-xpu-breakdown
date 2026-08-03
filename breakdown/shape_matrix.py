@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from breakdown.cost import estimate_flops, estimate_memory
 from breakdown.shape_derive import (
     _MAX_MATRIX_ROWS,
     _config_symbols,
@@ -23,8 +24,6 @@ from breakdown.shape_derive import (
     _partially_resolve_dim,
     _profile_op_memory,
     _resolve_shape_ints,
-    estimate_flops,
-    estimate_memory,
 )
 
 MAX_MATRIX_ROWS = _MAX_MATRIX_ROWS

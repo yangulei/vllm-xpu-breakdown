@@ -12,19 +12,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import functools
-import importlib
-import io
 import json
 import logging
 import os
-import re
 import sys
 import threading
-import time
-import traceback
-from dataclasses import asdict
-from pathlib import Path
 from typing import Any
 
 from flask import Flask, Response, jsonify, request, send_file, send_from_directory
@@ -41,24 +33,13 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from breakdown.cost import (
-    dtype_size,
-    estimate_flops,
-    estimate_memory,
-)
-from breakdown.classifier import Backend, classify_op
-from breakdown.op_breakdown import backend_totals, summarize_ops
-from breakdown.trace import build_graph_from_trace
+from breakdown.op_breakdown import summarize_ops
 from breakdown.trace_common import _detect_device_via_torch
 from breakdown import profiling, service
 from breakdown.profiling import (
-    _build_result_from_traces,
     _CONFIG_CACHE_DIR,
     _load_cached_config,
     _load_cached_model_ids,
-    _merge_two_pass_result,
-    _norm_quant,
-    _parse_trace_filename,
     _profile_lock,
     _profile_template_for,
     _run_profile,
@@ -69,8 +50,7 @@ from breakdown.model_info import (
     min_profile_layers,
     summarize_config,
 )
-from breakdown.registry import ALL_VLLM_XPU_OPS
-from breakdown import shape_matrix, shape_matrix_xlsx
+from breakdown import shape_matrix
 from breakdown.bench import (
     devices as bench_devices,
     history as bench_history,
@@ -408,15 +388,6 @@ def download_trace():
         as_attachment=True,
         download_name=download_name,
     )
-
-
-from breakdown.shape_derive import (  # noqa: F401  (re-exported for tests)
-    _MAX_MATRIX_ROWS,
-    _WEIGHT_ROLES,
-    _bytes_to_dtype,
-)
-
-
 
 
 

@@ -156,27 +156,6 @@ MODULE_CATEGORIES: dict[str, str] = {
 }
 
 
-def discover_runtime_ops() -> dict[str, list[str]]:
-    """Introspect loaded torch.ops to find vllm custom-kernel ops at runtime.
-
-    Returns a dict mapping namespace to list of op names.
-    Only works after vllm (xpu or cuda) has been imported.
-    """
-    import torch
-    result: dict[str, list[str]] = {}
-    for ns_name in ("_C", "_C_cache_ops", "_moe_C", "_xpu_C", "_cuda_C", "vllm"):
-        ns = getattr(torch.ops, ns_name, None)
-        if ns is None:
-            continue
-        ops = []
-        for name in dir(ns):
-            if not name.startswith("_"):
-                ops.append(name)
-        if ops:
-            result[ns_name] = ops
-    return result
-
-
 def get_op_module(op_name: str) -> str | None:
     """Return the module key for a known vllm-xpu-kernels op, or None."""
     for module, ops in STATIC_REGISTRY.items():

@@ -297,7 +297,6 @@ def _infer_role(module_path: list[str], op_name: str) -> str | None:
         return None
 
     innermost = module_path[-1]
-    parent = module_path[-2] if len(module_path) >= 2 else ""
 
     # Embedding
     if "VocabParallelEmbedding" in innermost or "Embedding" in innermost:
