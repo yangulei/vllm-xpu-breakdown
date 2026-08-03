@@ -54,7 +54,8 @@ class TestAdaptiveBudget(unittest.TestCase):
     """``budget=None`` derives the per-case budget from the profiled shapes."""
 
     def test_each_op_is_measured_with_its_own_derived_budget(self):
-        from breakdown.bench import devices, estimate
+        from breakdown.bench import estimate
+        from breakdown.core import devices
 
         cheap = BenchCase(op="op_cheap", args=[], device="cpu",
                           traced_device_time_us=2.0, traced_comparable=True)

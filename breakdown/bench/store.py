@@ -31,6 +31,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from breakdown import runs
+
 #: Repos whose commit changes measured performance.
 PROVENANCE_REPOS = (
     "vllm-xpu-kernels",
@@ -221,12 +223,7 @@ def read_meta(paths: RunPaths) -> dict[str, Any]:
 
 def write_json(path: str, obj: Any) -> str:
     """Atomic JSON write (a run killed mid-write must not lose the old file)."""
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w") as fh:
-        json.dump(obj, fh, indent=2)
-    os.replace(tmp, path)
-    return path
+    return runs.write_json(path, obj, indent=2)
 
 
 def read_results(path: str) -> list[dict[str, Any]]:

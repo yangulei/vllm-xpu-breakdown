@@ -13,13 +13,11 @@ from __future__ import annotations
 import json
 import logging
 import os
-import threading
 from dataclasses import asdict
-from typing import Any
 
-from breakdown import profiling, shape_matrix, shape_matrix_xlsx
+from breakdown import profiling, runs, shape_matrix, shape_matrix_xlsx
 from breakdown.shape_derive import _bytes_to_dtype
-from breakdown.bench import devices as bench_devices
+from breakdown.core import devices as bench_devices
 from breakdown.bench import runner as bench_runner
 from breakdown.bench import spec as bench_spec
 from breakdown.bench import store as bench_store
@@ -31,14 +29,10 @@ logger = logging.getLogger("vllm_xpu_breakdown")
 #: The current (or last) benchmark job. Benchmark runs are long, so the web
 #: layer starts one in a thread and polls it; the CLI runs it in the
 #: foreground. Both go through the same runner.
-_bench_state: dict[str, Any] = {
-    "status": "idle",     # idle | running | done | error
-    "run_id": None,
-    "error": None,
-    "ops": [],            # per-op progress
-    "result": None,
-}
-_bench_lock = threading.Lock()
+_bench_state = runs.RunState(ops=[], result=None)
+
+#: Kept as a name because the routes take it around the state they mutate.
+_bench_lock = _bench_state.lock
 
 def _bench_device_ids(data: dict, device: str, need: int = 0
                       ) -> tuple[bool, list[int], str | None]:
@@ -75,14 +69,10 @@ def _run_bench(run_id: str, device: str, budget: float | None,
                **bench_devices.visibility_env(device, device_ids or [])}
         result = bench_runner.run(cases, paths, device, budget=budget, ops=ops,
                                   env=env, on_op=progress)
-        with _bench_lock:
-            _bench_state["status"] = "done"
-            _bench_state["result"] = result.to_dict()
+        _bench_state.finish(result=result.to_dict())
     except Exception as exc:  # noqa: BLE001 - surfaced to the client
         logger.exception("bench run failed")
-        with _bench_lock:
-            _bench_state["status"] = "error"
-            _bench_state["error"] = str(exc)
+        _bench_state.fail(exc)
 
 
 def _bench_matrix(paths) -> dict | None:

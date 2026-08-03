@@ -34,7 +34,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-from breakdown.bench import devices, estimate
+from breakdown.bench import estimate
+from breakdown.core import devices
 
 #: Bump when the meaning of a ``targets.json`` field changes; the optimizer
 #: skill reads this before trusting the file.

@@ -145,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-flush-cache", action="store_true")
     a = p.parse_args(argv)
 
-    from breakdown.bench import devices
+    from breakdown.core import devices
 
     device = a.device or devices.detect_device()
     cases = load_cases(a.cases, a.op)

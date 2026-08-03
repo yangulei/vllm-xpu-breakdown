@@ -322,7 +322,7 @@ def effective_bw_gbs(nbytes: float, peaks: dict[str, float]
     A kernel whose operands are cache-resident routinely exceeds the DRAM peak;
     measuring it against DRAM produced "utilization 300 % of peak" warnings that
     said nothing about the kernel. The right roof for such an op is the
-    last-level-cache bandwidth (see :data:`breakdown.bench.devices.SKU_PEAKS`).
+    last-level-cache bandwidth (see :data:`breakdown.core.devices.SKU_PEAKS`).
     """
     cbw = float(peaks.get("cache_bw_gbs") or 0)
     if cbw and cache_resident(nbytes, peaks):

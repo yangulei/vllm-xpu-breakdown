@@ -286,7 +286,7 @@ class TestDeviceSelection(BenchApiTest):
         self.assertIn("device index", json.loads(resp.data)["error"])
 
     def test_plan_records_the_selection_on_the_run(self):
-        from breakdown.bench import devices as dev
+        from breakdown.core import devices as dev
         if not dev.device_count("cpu") and not dev.available()["count"]:
             self.skipTest("no accelerator on this host")
         avail = dev.available()
@@ -297,7 +297,7 @@ class TestDeviceSelection(BenchApiTest):
         self.assertEqual(meta["device_ids"], avail["indexes"][:1])
 
     def test_plan_refuses_fewer_devices_than_the_widest_tp(self):
-        from breakdown.bench import devices as dev
+        from breakdown.core import devices as dev
         avail = dev.available()
         if avail["count"] < 1:
             self.skipTest("no accelerator on this host")

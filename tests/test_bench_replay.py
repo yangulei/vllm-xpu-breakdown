@@ -15,7 +15,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from breakdown.bench import devices, runner, store  # noqa: E402
+from breakdown.core import devices, runner, store  # noqa: E402
 from breakdown.bench.spec import BenchCase, build_cases  # noqa: E402
 
 DEVICE = devices.detect_device()

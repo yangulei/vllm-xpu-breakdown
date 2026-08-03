@@ -14,7 +14,7 @@ import sys
 import time
 from typing import Any
 
-from ..bench import devices as bench_devices
+from ..core import devices as bench_devices
 from ..bench import store as bench_store
 from .manager import MANAGER
 from .prompt import build_prompt, candidates, targets_by_op

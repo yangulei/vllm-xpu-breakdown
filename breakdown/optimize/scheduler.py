@@ -19,7 +19,7 @@ from __future__ import annotations
 import threading
 from typing import Any
 
-from ..bench import devices as bench_devices
+from ..core import devices as bench_devices
 
 
 class LeaseError(RuntimeError):

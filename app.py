@@ -51,8 +51,8 @@ from breakdown.model_info import (
     summarize_config,
 )
 from breakdown import shape_matrix
+from breakdown.core import devices as bench_devices
 from breakdown.bench import (
-    devices as bench_devices,
     history as bench_history,
     rank as bench_rank,
     reports as bench_reports,

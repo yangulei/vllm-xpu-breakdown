@@ -87,17 +87,10 @@ def _load_cached_config(model_id: str) -> dict[str, Any] | None:
 #: (:func:`save_state`): a server restart, or a second browser tab, used to lose
 #: the run everything downstream is derived from, and the only way back was to
 #: profile again - minutes on a real model.
-_profile_state: dict[str, Any] = {
-    "status": "idle",   # idle | running | done | error
-    "result": None,
-    "error": None,
-    "model_id": None,
-    "settings": None,
-    "run_id": None,
-}
+_profile_state = runs.RunState(result=None, model_id=None, settings=None)
 
-
-_profile_lock = threading.Lock()
+#: Kept as a name because the routes take it around the state they mutate.
+_profile_lock = _profile_state.lock
 
 
 def state() -> dict[str, Any]:
@@ -110,12 +103,8 @@ def state() -> dict[str, Any]:
 
 def begin(model_id: str, settings: dict[str, Any]) -> str:
     """Mark a run as started and return its id."""
-    run_id = runs.new_run_id(model_id.split("/")[-1])
-    with _profile_lock:
-        _profile_state.update({"status": "running", "result": None,
-                               "error": None, "model_id": model_id,
-                               "settings": settings, "run_id": run_id})
-    return run_id
+    return _profile_state.begin(runs.new_run_id(model_id.split("/")[-1]),
+                                model_id=model_id, settings=settings)
 
 
 def save_state() -> None:

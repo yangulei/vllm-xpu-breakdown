@@ -24,7 +24,8 @@ from typing import Any, Callable, Iterable
 
 from breakdown.core.dtypes import size as dtype_bytes
 
-from breakdown.bench import devices, estimate, resolve, store
+from breakdown.bench import estimate, resolve, store
+from breakdown.core import devices
 from breakdown.bench.spec import BenchCase, group_by_op
 from breakdown.bench.worker import bench_env
 

@@ -32,7 +32,8 @@ import re
 from collections import Counter, defaultdict
 from typing import Any, Iterable
 
-from breakdown.bench import devices, estimate
+from breakdown.bench import estimate
+from breakdown.core import devices
 from breakdown.shape_matrix import MATRIX_HEADERS
 
 COLUMNS = [

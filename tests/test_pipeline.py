@@ -27,7 +27,7 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from breakdown.cost import dtype_size, estimate_flops, estimate_memory
-from breakdown import profiling
+from breakdown import profiling, runs
 from breakdown.classifier import Backend, classify_op
 from breakdown.model_info import fetch_model_config, summarize_config
 from breakdown.trace_common import _is_overhead_event
@@ -435,8 +435,8 @@ class TestQueryContextProfiling(unittest.TestCase):
         client = app_module.app.test_client()
         with patch.object(app_module.threading, "Thread", _fake_thread), \
                 patch.object(profiling_module, "_profile_state",
-                             {"status": "idle", "result": None, "error": None,
-                              "model_id": None}):
+                             runs.RunState(result=None, model_id=None,
+                                           settings=None)):
             resp = client.post("/api/profile", json={
                 "model_id": "Qwen/Qwen3-4B-Instruct-2507",
                 "query_len": 2048,

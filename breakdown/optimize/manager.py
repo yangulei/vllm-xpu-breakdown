@@ -21,7 +21,7 @@ import threading
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
-from ..bench import devices as bench_devices
+from ..core import devices as bench_devices
 from .prompt import build_prompt, launchability, targets_by_op
 from .scheduler import DevicePool, LeaseError
 from .session import (

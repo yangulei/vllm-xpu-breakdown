@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import threading
 import time
 from typing import Any
 
@@ -44,24 +45,35 @@ def new_run_id(prefix: str = "") -> str:
     return f"{prefix}-{stamp}" if prefix else stamp
 
 
-def write_state(stage: str, run_id: str, state: dict[str, Any]) -> str:
-    """Persist a run's state atomically.
+def write_json(path: str, obj: Any, indent: int | None = None) -> str:
+    """Write JSON so a reader never sees a half-written file.
 
-    Atomically because the UI polls this file's stage while a worker thread
-    writes it: a half-written state.json read by a poll is an error the reader
-    cannot distinguish from a failed run.
+    The UI polls these files while a worker thread writes them, and a truncated
+    read is an error the reader cannot tell apart from a failed run. Writing to
+    a temporary in the same directory and renaming makes the swap atomic, and a
+    crash mid-write leaves the previous file intact rather than no file at all.
+
+    There were two of these, one here and one in ``bench.store``, differing
+    only in how they named the temporary.
     """
-    path = os.path.join(run_dir(stage, run_id, create=True), "state.json")
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as fh:
-            json.dump(state, fh, default=str)
+            json.dump(obj, fh, indent=indent, default=str)
         os.replace(tmp, path)
     except BaseException:
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
     return path
+
+
+def write_state(stage: str, run_id: str, state: dict[str, Any]) -> str:
+    """Persist a run's state atomically."""
+    return write_json(
+        os.path.join(run_dir(stage, run_id, create=True), "state.json"), state)
 
 
 def read_state(stage: str, run_id: str) -> dict[str, Any] | None:
@@ -93,3 +105,56 @@ def latest_state(stage: str) -> tuple[str, dict[str, Any]] | None:
         if state is not None:
             return run_id, state
     return None
+
+
+class RunState(dict):
+    """A stage's current (or last) job, and the lock guarding it.
+
+    The profile and the benchmark each grew their own copy of this: a
+    module-level ``{status, run_id, error, ...}`` dict, a ``threading.Lock``
+    beside it, and the same four transitions written out by hand. They are one
+    concept -- "a long job a worker thread runs and an HTTP route polls" -- so
+    they get one implementation.
+
+    It is a ``dict`` subclass rather than a wrapper because the routes and the
+    tests already treat the state as a mapping, and because a test that swaps
+    in a plain dict to stage a scenario should keep working.
+    """
+
+    #: ``idle`` before anything ran, then ``running`` -> ``done`` | ``error``.
+    STATUSES = ("idle", "running", "done", "error")
+
+    def __init__(self, **fields: Any) -> None:
+        super().__init__(status="idle", run_id=None, error=None, **fields)
+        #: Re-entrant so a transition may be taken while the caller holds it.
+        self.lock = threading.RLock()
+        self._initial = dict(self)
+
+    def begin(self, run_id: str, **fields: Any) -> str:
+        """Start a job: clear the previous result and stamp the new id."""
+        with self.lock:
+            self.update(self._initial)
+            self.update(status="running", run_id=run_id, error=None, **fields)
+        return run_id
+
+    def finish(self, **fields: Any) -> None:
+        with self.lock:
+            self.update(status="done", error=None, **fields)
+
+    def fail(self, error: BaseException | str) -> None:
+        with self.lock:
+            self.update(status="error", error=str(error))
+
+    def reset(self) -> None:
+        with self.lock:
+            self.update(self._initial)
+
+    @property
+    def running(self) -> bool:
+        with self.lock:
+            return self.get("status") == "running"
+
+    def snapshot(self) -> dict[str, Any]:
+        """A plain-dict copy, safe to serialize while the worker writes."""
+        with self.lock:
+            return dict(self)

@@ -18,7 +18,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from breakdown.bench import devices as bench_devices  # noqa: E402
+from breakdown.core import devices as bench_devices  # noqa: E402
 from breakdown.optimize import scheduler  # noqa: E402
 from breakdown.optimize.manager import OptimizeManager  # noqa: E402
 
