@@ -31,7 +31,11 @@ Reconstruction and the shape matrix work on any machine, from a saved trace.
 The web UI accepts either a HuggingFace model ID or a local model directory
 containing `config.json`, for example `/root/code/models/kimi-k3-xpu-text`.
 Enter either value in **Model** and select **Load Config**; the same identifier
-or path is passed to vLLM when profiling starts.
+or path is passed to vLLM when profiling starts. Profiles use vLLM's text-only
+mode, so local text-only copies of multimodal checkpoints do not need vision
+processor assets. For recurrent linear-attention models such as Kimi-K3, the
+UI selects Decode Batch 1 and profiling caps memory utilization at 0.5 to leave
+headroom for the recurrent-state gather during XPU startup.
 
 ## The four stages
 

@@ -20,7 +20,10 @@ execution because the span is opened at dispatch time.
 
 The installer is a module-level function so it can be shipped across the vLLM
 worker boundary via ``LLM.apply_model`` (which runs it in the process that owns
-the model, where the forwards — and the profiler — actually run).
+the model, where the forwards — and the profiler — actually run). vLLM V1's
+secure RPC codec does not serialize Python callables, so the profiling app
+temporarily enables vLLM's pickle fallback while sending these trusted local
+functions and restores the previous policy when the run ends.
 """
 from __future__ import annotations
 

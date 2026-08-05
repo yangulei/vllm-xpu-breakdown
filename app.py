@@ -209,6 +209,17 @@ def start_profile():
     prefill_batch_size = data.get("prefill_batch_size")
     decode_batch_size = data.get("decode_batch_size")
 
+    try:
+        model_summary = summarize_config(fetch_model_config(model_id))
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    effective_decode_batch = int(decode_batch_size or batch_size)
+    batch_error = profiling._validate_profile_batch(
+        model_summary, effective_decode_batch
+    )
+    if batch_error:
+        return jsonify({"ok": False, "error": batch_error}), 400
+
     # Device selection: comma-separated indexes of the devices actually present.
     # A TP=N run needs N of them, so an under-sized or non-existent selection is
     # refused here rather than failing deep inside engine start-up.

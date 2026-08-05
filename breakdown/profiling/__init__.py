@@ -43,12 +43,17 @@ from breakdown.profiling.traces import (  # noqa: F401
 )
 from breakdown.profiling.launch import (  # noqa: F401
     _build_layer_override,
+    _configure_text_only_profile,
+    _enable_trusted_apply_model_serialization,
     _get_block_size,
     _get_vocab_size,
     _make_token_ids,
+    _profile_gpu_memory_utilization,
+    _restore_trusted_apply_model_serialization,
     _run_profile,
     _scheduler_pin,
     _set_num_hidden_layers,
+    _validate_profile_batch,
     fit_max_model_len,
 )
 from breakdown.profiling.uploads import (  # noqa: F401

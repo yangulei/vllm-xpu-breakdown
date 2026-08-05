@@ -690,6 +690,13 @@ async function loadConfig() {
     modelSummary = data.summary;
     showModelSummary(modelId, data.summary);
 
+    // Recurrent linear-attention models such as Kimi-K3 keep a large state per
+    // concurrent sequence. A decode batch of 32 can OOM a 32 GiB XPU during
+    // vLLM's startup warmup, before profiling starts.
+    if (data.summary.linear_attention) {
+      document.getElementById('decode-batch-size').value = 1;
+    }
+
     // Update quant dropdown default label (profile tab)
     const mq = data.summary.quant_method;
     const autoLabel = mq ? `${mq.toUpperCase()} (default)` : 'None (default)';

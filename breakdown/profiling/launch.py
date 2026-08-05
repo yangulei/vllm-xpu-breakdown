@@ -163,6 +163,46 @@ def _scheduler_pin(prefill_batch: int, decode_batch: int,
         "max_num_batched_tokens": max(prefill_step_tokens, max_batch, 2048),
     }
 
+
+def _configure_text_only_profile(engine_kwargs: dict) -> None:
+    """Disable multimodal processing for the app's text-only prompts."""
+    engine_kwargs["language_model_only"] = True
+
+
+def _validate_profile_batch(summary: dict, decode_batch: int) -> str | None:
+    """Return an actionable error for unsafe recurrent-state batches."""
+    if summary.get("linear_attention") and decode_batch > 1:
+        return (
+            "This model uses recurrent linear attention with a large state per "
+            "sequence. Decode Batch greater than 1 can exhaust XPU memory during "
+            "vLLM startup warmup. Set Decode Batch to 1 and retry."
+        )
+    return None
+
+
+def _profile_gpu_memory_utilization(
+    summary: dict, requested: float | None
+) -> float | None:
+    """Leave headroom for recurrent-state gathers during XPU warmup."""
+    if not summary.get("linear_attention"):
+        return requested
+    return min(float(requested), 0.5) if requested is not None else 0.5
+
+
+def _enable_trusted_apply_model_serialization() -> str | None:
+    """Allow this app's trusted hook functions through vLLM V1 RPC."""
+    previous = os.environ.get("VLLM_ALLOW_INSECURE_SERIALIZATION")
+    os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
+    return previous
+
+
+def _restore_trusted_apply_model_serialization(previous: str | None) -> None:
+    """Restore the serialization policy that preceded a profiling run."""
+    if previous is None:
+        os.environ.pop("VLLM_ALLOW_INSECURE_SERIALIZATION", None)
+    else:
+        os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = previous
+
 def _run_profile(model_id: str, mode: str, max_model_len: int,
                  batch_size: int, max_tokens: int, prompt: str,
                  num_profile_layers: int | None = None,
@@ -217,6 +257,7 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
     max_model_len = fit_max_model_len(max_model_len, query_len, context_len,
                                       max_tokens)
 
+    serialization_policy = _enable_trusted_apply_model_serialization()
     try:
         from vllm import LLM, SamplingParams, TokensPrompt
 
@@ -241,18 +282,6 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
         trace_dir = os.path.abspath("output/traces")
         os.makedirs(trace_dir, exist_ok=True)
 
-        # ``LLM.apply_model`` ships a *callable* to the worker process, which
-        # vLLM refuses to serialize unless this is set — it raises
-        # ``TypeError: Object of type <class 'function'> is not serializable``.
-        # Both capture-time paths go through ``apply_model``: the ``module::``
-        # span hooks (the primary source of real module names) and the
-        # ``named_modules()`` reference tree. Without it BOTH fail, and the run
-        # silently degrades to the heavy meta-device fallback with class-only
-        # names. The callables we send are our own module-level functions, not
-        # untrusted input. Must be set before the engine core process is
-        # spawned, since the worker reads it at startup.
-        os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
-
         engine_kwargs: dict = {
             "model": model_id,
             "max_model_len": max_model_len,
@@ -273,15 +302,16 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
 
         # Optionally cap device memory usage (leaves headroom for vLLM's init
         # footprint on small-VRAM cards; None keeps vLLM's default).
-        if gpu_memory_utilization is not None:
-            engine_kwargs["gpu_memory_utilization"] = gpu_memory_utilization
+        effective_memory_utilization = _profile_gpu_memory_utilization(
+            summary, gpu_memory_utilization
+        )
+        if effective_memory_utilization is not None:
+            engine_kwargs["gpu_memory_utilization"] = effective_memory_utilization
 
-        # Vision-language models: disable multimodal memory profiling so the run
-        # captures the language-model ops on a text prompt. This avoids vLLM's
-        # dummy image/video profiling path through the vision tower (which the
-        # static graph already covers) and keeps the profile focused on the LLM.
-        if summary.get("vit_hidden_size"):
-            engine_kwargs["limit_mm_per_prompt"] = {"image": 0, "video": 0}
+        # Every generated prompt is text-only. This explicit mode also handles
+        # local text-only copies of multimodal checkpoints that omit processor
+        # assets and no longer expose enough config to detect the vision tower.
+        _configure_text_only_profile(engine_kwargs)
 
         # Sparse-attention models (e.g. MiniMax-M3) select fixed-size KV blocks
         # via the lightning indexer, so the KV-cache block size must match the
@@ -611,6 +641,7 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
             runstate._profile_state["error"] = traceback.format_exc()
         save_state()
     finally:
+        _restore_trusted_apply_model_serialization(serialization_policy)
         os.environ.pop("VLLM_TORCH_COMPILE_LEVEL", None)
         try:
             import torch.distributed as dist
