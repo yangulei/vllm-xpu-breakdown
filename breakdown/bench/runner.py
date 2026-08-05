@@ -211,35 +211,56 @@ def _run_collective(op: str, cases: list[BenchCase], paths: store.RunPaths,
     deliberate: a 4-rank all-reduce replayed on 1 rank is not a slower
     all-reduce, it is a different operation, and recording it as a measurement
     would corrupt the ranking.
+
+    A launch that fails or hangs still gets a record per case. Only rank 0
+    writes results, so a group that never formed writes nothing at all - and an
+    op with no records is indistinguishable from an op that was never planned.
+    The failure has to be *reported*, like every other unmeasurable case.
     """
-    from breakdown.bench import collective, devices as dev_mod
+    from breakdown.bench import collective
 
     worlds = sorted({max(int(c.tp or 1), 1) for c in cases})
-    have = dev_mod.device_count(device)
+    have = devices.device_count(device)
     logs: list[str] = []
     error = ""
     for world in worlds:
+        peers = [c for c in cases if int(c.tp or 1) == world]
         if world <= 1:
             error = "profiled at TP=1: no collective to replay"
             _append(paths.results, [collective._rec(c, "skipped", world,
                                                     error=error)
-                                    for c in cases if int(c.tp or 1) == world])
+                                    for c in peers])
             continue
         if have < world:
             error = (f"needs {world} devices for TP={world}, {have} present")
             _append(paths.results, [collective._rec(c, "needs_ranks", world,
                                                     error=error)
-                                    for c in cases if int(c.tp or 1) == world])
+                                    for c in peers])
             continue
         ok, out = collective.launch(op, world, paths.cases, paths.results,
                                     device, budget, timeout, env)
         logs.append(out)
         if not ok:
             error = _last_error(out) or f"collective launch failed (TP={world})"
+            done = _recorded_case_ids(paths.results)
+            _append(paths.results, [collective._rec(c, "failed", world,
+                                                    error=error)
+                                    for c in peers if c.case_id not in done])
     if logs:
         with open(log_path, "w") as fh:
             fh.write("\n".join(logs))
     return error
+
+
+def _recorded_case_ids(path: str) -> set[str]:
+    """Which cases already have a record - so a retry does not double-count.
+
+    Shares :mod:`breakdown.bench.collective`'s notion of a record's identity;
+    two different answers to "is this case already measured" is how duplicate
+    rows get into a run.
+    """
+    from breakdown.bench import collective
+    return collective._case_ids(path)
 
 
 def _append(path: str, records: list[dict[str, Any]]) -> None:

@@ -131,3 +131,51 @@ class TestProbeRestoration(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCollectiveReporting(unittest.TestCase):
+    """A collective that cannot be measured must still appear in the run."""
+
+    def test_a_failed_launch_records_every_case(self):
+        """Only rank 0 writes results, so a group that never forms writes
+        nothing - and an op with no records looks exactly like an op that was
+        never planned. The failure has to be reported like any other."""
+        from unittest import mock
+
+        from breakdown.bench import collective
+
+        cases = [BenchCase(op="c10d::allreduce_", tp=4, device="cpu",
+                           args=[{"kind": "tensor", "dims": [8],
+                                  "dtype": "bfloat16"}]),
+                 BenchCase(op="c10d::allreduce_", tp=4, device="cpu",
+                           args=[{"kind": "tensor", "dims": [16],
+                                  "dtype": "bfloat16"}])]
+        with tempfile.TemporaryDirectory() as d:
+            paths = store.RunPaths(d, "coll").ensure()
+            with mock.patch.object(runner.devices, "device_count",
+                                   return_value=4), \
+                 mock.patch.object(collective, "launch",
+                                   return_value=(False, "[TIMEOUT after 5s]")):
+                err = runner._run_collective(
+                    "c10d::allreduce_", cases, paths, "cpu", 0.1, 5, {},
+                    os.path.join(paths.logs, "coll.log"))
+            records = store.read_results(paths.results)
+        self.assertTrue(err)
+        self.assertEqual(len(records), 2)
+        self.assertEqual({r["status"] for r in records}, {"failed"})
+
+    def test_fewer_devices_than_ranks_is_reported_not_measured(self):
+        from unittest import mock
+
+        cases = [BenchCase(op="c10d::allreduce_", tp=4, device="cpu",
+                           args=[{"kind": "tensor", "dims": [8],
+                                  "dtype": "bfloat16"}])]
+        with tempfile.TemporaryDirectory() as d:
+            paths = store.RunPaths(d, "coll2").ensure()
+            with mock.patch.object(runner.devices, "device_count",
+                                   return_value=1):
+                runner._run_collective("c10d::allreduce_", cases, paths, "cpu",
+                                       0.1, 5, {},
+                                       os.path.join(paths.logs, "c.log"))
+            records = store.read_results(paths.results)
+        self.assertEqual([r["status"] for r in records], ["needs_ranks"])

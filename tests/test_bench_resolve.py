@@ -11,6 +11,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -315,6 +316,98 @@ class TestWorkerEnvironment(unittest.TestCase):
         from breakdown.bench import collective
         src = inspect.getsource(collective)
         self.assertIn("SYCL_CACHE_PERSISTENT", src)
+
+    def test_a_rank_is_told_how_many_peers_share_the_node(self):
+        # Without LOCAL_RANK/LOCAL_WORLD_SIZE oneCCL cannot read the node
+        # topology from the environment and has to infer it; vLLM's own XPU
+        # worker sets both before forming its group, and the replay stands in
+        # for that worker.
+        from breakdown.bench.collective import _rank_env
+        env = _rank_env({}, rank=2, world_size=4)
+        self.assertEqual(env["RANK"], "2")
+        self.assertEqual(env["LOCAL_RANK"], "2")
+        self.assertEqual(env["LOCAL_WORLD_SIZE"], "4")
+        self.assertEqual(env["CCL_ATL_TRANSPORT"], "ofi")
+
+    def test_a_deadlocked_rendezvous_is_retried_on_a_fresh_port(self):
+        # The XCCL transport deadlocks intermittently on PCIe-connected cards:
+        # every rank enqueues its collectives and all of them then block in
+        # synchronize(). One unlucky attempt used to end the whole run, with
+        # every op planned after it left unmeasured.
+        from breakdown.bench import collective
+
+        seen: list[int] = []
+
+        def fake_once(op, world, cases, out, device, budget, timeout, env,
+                      port):
+            seen.append(port)
+            ok = len(seen) == 3
+            return ok, f"port={port}"
+
+        with mock.patch.object(collective, "_launch_once", fake_once):
+            ok, log = collective.launch("c10d::allreduce_", 4, "c.json",
+                                        "o.jsonl", "xpu", 0.1, 5,
+                                        {}, port=29591, attempts=3)
+        self.assertTrue(ok)
+        self.assertEqual(len(seen), 3)
+        self.assertEqual(len(set(seen)), 3, "a killed rank can leave the "
+                                            "previous port bound")
+        self.assertIn("attempt 3", log)
+
+    def test_a_retry_does_not_record_a_case_twice(self):
+        # A hung attempt is rarely empty: rank 0 streams a record per case, so
+        # it usually measured the small shapes and wedged on a large one.
+        # Appending the next attempt's output on top recorded those cases
+        # twice, and the op's latency was then averaged over duplicate rows.
+        import json
+
+        from breakdown.bench import collective
+
+        with tempfile.TemporaryDirectory() as d:
+            cases_path = os.path.join(d, "cases.json")
+            out_path = os.path.join(d, "results.jsonl")
+            cases = [BenchCase(op="c10d::allreduce_", tp=4, device="xpu",
+                               args=[{"kind": "tensor", "dims": [n],
+                                      "dtype": "bfloat16"}])
+                     for n in (8, 16)]
+            with open(cases_path, "w") as fh:
+                json.dump([c.to_dict() for c in cases], fh)
+
+            calls = {"n": 0}
+
+            def fake_once(op, world, cpath, out, device, budget, timeout, env,
+                          port):
+                calls["n"] += 1
+                # attempt 1 measures the first case then hangs; attempt 2
+                # measures both.
+                done = cases if calls["n"] > 1 else cases[:1]
+                with open(out, "w") as fh:
+                    for c in done:
+                        fh.write(json.dumps(
+                            collective._rec(c, "ok", world)) + "\n")
+                return calls["n"] > 1, "log"
+
+            with mock.patch.object(collective, "_launch_once", fake_once):
+                ok, _ = collective.launch("c10d::allreduce_", 4, cases_path,
+                                          out_path, "xpu", 0.1, 5, {},
+                                          attempts=3)
+            with open(out_path) as fh:
+                ids = [json.loads(line)["case_id"] for line in fh if line.strip()]
+        self.assertTrue(ok)
+        self.assertEqual(len(ids), 2, "each case is recorded exactly once")
+        self.assertEqual(sorted(ids), sorted(c.case_id for c in cases))
+
+    def test_every_attempt_failing_is_reported_not_swallowed(self):
+        from breakdown.bench import collective
+
+        with mock.patch.object(collective, "_launch_once",
+                               lambda *a, **k: (False, "TIMEOUT")):
+            ok, log = collective.launch("c10d::allreduce_", 4, "c.json",
+                                        "o.jsonl", "xpu", 0.1, 5, {},
+                                        attempts=2)
+        self.assertFalse(ok)
+        self.assertIn("attempt 1/2", log)
+        self.assertIn("attempt 2/2", log)
 
 
 class TestOperandAllocation(unittest.TestCase):

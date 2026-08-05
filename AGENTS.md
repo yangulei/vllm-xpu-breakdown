@@ -340,6 +340,10 @@ coming back.
 | An unmodelled op is silently retired | `RankConfig.max_credible_util` -> `check_cost_model` | `test_bench_rank.py` |
 | A bad shape wedges the device and fails every later op | `runner` (one process per op) | `test_bench_replay.py` (GPU) |
 | Collective ranks desynchronize / oneCCL segfaults | `collective.launch` (fixed schedule, no persistent cache) | `test_bench_resolve.py::TestWorkerEnvironment` |
+| A collective hangs and the twenty ops planned after it are never measured | `collective.launch` (retry on a fresh port), `collective._init_process_group` (`device_id`) | `test_bench_resolve.py::TestWorkerEnvironment` |
+| A retried collective records the same case twice, averaging its latency over duplicate rows | `collective._merge_records` / `_rec_key` | `test_bench_resolve.py` (`a_retry_does_not_record_a_case_twice`) |
+| A collective that never formed its group vanishes from the run instead of failing | `runner._run_collective` (backfill) | `test_bench_runner.py::TestCollectiveReporting` |
+| A hung collective reports `TIMEOUT` and nothing else | `collective._launch_once` (drain the pipe after the kill) | `test_bench_runner.py::TestCollectiveReporting` |
 | Every worker re-pays AOT/JIT on its first case | `worker.bench_env` | `test_bench_resolve.py::TestWorkerEnvironment` |
 | A several-hundred-MB operand times out its worker | `inputs.make_tensor` (target dtype) | `test_bench_resolve.py::TestOperandAllocation` |
 | A partial re-run deletes the rest of the run | `runner.run` | `test_bench_rank.py` |

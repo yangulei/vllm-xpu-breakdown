@@ -126,8 +126,29 @@ Two hard-won rules:
 2. **`SYCL_CACHE_PERSISTENT` disabled.** The persistent SYCL cache makes
    oneCCL segfault with no Python traceback.
 
+Three more, learned from a run that died at its third op:
+
+3. **The group is formed with `device_id`.** Without it the backend has to
+   guess which GPU the rank owns (it says so: *"using GPU 0 as device used by
+   this process is currently unknown ... can potentially cause a hang"*), and a
+   later `barrier()` runs on whatever device the current context happens to be.
+4. **A hang is retried, on a fresh port.** The XCCL transport on
+   PCIe-connected Battlemage cards intermittently deadlocks *inside the device
+   queue*: every rank enqueues its collectives and all of them then block in
+   `torch.xpu.synchronize`. It reproduces in twenty lines of plain torch with
+   none of this code involved, so it cannot be configured away — only
+   survived. One unlucky attempt used to end the whole run, leaving the twenty
+   ops planned after it unmeasured.
+5. **Attempts are merged by case, not appended.** A hung attempt is rarely
+   empty — rank 0 streams a record as each case finishes — so appending the
+   retry's output recorded the measured cases twice and averaged the op's
+   latency over duplicate rows.
+
 Fewer devices than the profiled TP is reported as `needs_ranks`, never measured
-on fewer.
+on fewer. A launch that fails every attempt records each of its cases as
+`failed` with the timeout as the reason: only rank 0 writes results, so a group
+that never forms writes nothing, and an op with no records is indistinguishable
+from an op that was never planned.
 
 
 ## The Recipe Table (`recipes/table.py`)

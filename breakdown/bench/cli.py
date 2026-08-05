@@ -22,8 +22,9 @@ import os
 import sys
 from typing import Any
 
+from breakdown.core import devices
 from breakdown.bench import (
-    devices, history as history_mod, rank as rank_mod, reports, runner, store,
+    history as history_mod, rank as rank_mod, reports, runner, store,
 )
 from breakdown.bench.spec import BenchCase, build_cases
 
