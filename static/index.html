@@ -187,7 +187,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sa
     <h2>Model</h2>
     <div class="model-input-row">
       <input type="text" id="model-input" class="model-input"
-             placeholder="Enter model ID (e.g., Qwen/Qwen3-4B-Instruct-2507)"
+              placeholder="HuggingFace ID or local path (e.g., /root/code/models/kimi-k3-xpu-text)"
              list="model-suggestions">
       <datalist id="model-suggestions">
         <option value="Qwen/Qwen3-4B-Instruct-2507">
@@ -679,7 +679,11 @@ async function loadConfig() {
   if (!modelId) return;
 
   try {
-    const resp = await fetch('/api/model/' + encodeURIComponent(modelId));
+    const resp = await fetch('/api/model', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({model_id: modelId}),
+    });
     const data = await resp.json();
     if (!data.ok) { alert('Error: ' + data.error); return; }
 

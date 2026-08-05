@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fetch and summarize HuggingFace model configs."""
+"""Load and summarize local or HuggingFace model configs."""
 
 from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 from typing import Any
 
 
@@ -33,10 +34,28 @@ def _normalize_layerwise_value(value: Any) -> Any:
 
 
 def fetch_model_config(model_id: str) -> dict[str, Any]:
-    """Fetch config.json from HuggingFace Hub.
+    """Load config.json from a local model directory or HuggingFace Hub.
 
     Respects HF_ENDPOINT env variable for mirror support (e.g., hf-mirror.com).
     """
+    local_path = Path(model_id).expanduser()
+    if local_path.is_dir():
+        config_path = local_path / "config.json"
+        if not config_path.is_file():
+            raise RuntimeError(
+                f"Local model directory does not contain config.json: {local_path}"
+            )
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"Invalid JSON in {config_path}: {e}") from e
+        if not isinstance(config, dict):
+            raise RuntimeError(f"Model config must be a JSON object: {config_path}")
+        return config
+
+    if local_path.is_absolute():
+        raise RuntimeError(f"Local model directory does not exist: {local_path}")
+
     # Try huggingface_hub first
     try:
         from huggingface_hub import hf_hub_download

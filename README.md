@@ -28,6 +28,11 @@ python app.py --port 8080        # then open http://localhost:8080
 Needs torch-xpu and vLLM, and an Intel XPU for the stages that touch hardware.
 Reconstruction and the shape matrix work on any machine, from a saved trace.
 
+The web UI accepts either a HuggingFace model ID or a local model directory
+containing `config.json`, for example `/root/code/models/kimi-k3-xpu-text`.
+Enter either value in **Model** and select **Load Config**; the same identifier
+or path is passed to vLLM when profiling starts.
+
 ## The four stages
 
 ### 1. Profile — what actually runs
