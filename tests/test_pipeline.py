@@ -125,6 +125,24 @@ def _make_mock_trace(ops: list[dict], kernels: list[dict] | None = None) -> dict
 class TestModelInfo(unittest.TestCase):
     """Test model config fetching for Qwen/Qwen3-4B-Instruct-2507."""
 
+    def test_fetch_config_from_local_model_directory(self):
+        with tempfile.TemporaryDirectory() as model_dir:
+            expected = {
+                "architectures": ["LocalModelForCausalLM"],
+                "hidden_size": 1024,
+                "num_hidden_layers": 12,
+            }
+            config_path = os.path.join(model_dir, "config.json")
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(expected, f)
+
+            self.assertEqual(fetch_model_config(model_dir), expected)
+
+    def test_fetch_config_from_local_directory_requires_config_json(self):
+        with tempfile.TemporaryDirectory() as model_dir:
+            with self.assertRaisesRegex(RuntimeError, "does not contain config.json"):
+                fetch_model_config(model_dir)
+
     def test_fetch_config(self):
         config = fetch_model_config(QWEN3_4B_MODEL_ID)
         self.assertIsInstance(config, dict)
@@ -381,6 +399,37 @@ class TestFlaskAPI(unittest.TestCase):
     def test_model_endpoint_invalid(self):
         resp = self.client.get("/api/model/nonexistent/model-xyz-999")
         self.assertNotEqual(resp.status_code, 200)
+
+    def test_model_endpoint_loads_local_model_directory(self):
+        with tempfile.TemporaryDirectory() as model_dir:
+            config = {
+                "architectures": ["LocalModelForCausalLM"],
+                "hidden_size": 2048,
+                "num_hidden_layers": 24,
+                "num_attention_heads": 16,
+            }
+            with open(
+                os.path.join(model_dir, "config.json"), "w", encoding="utf-8"
+            ) as f:
+                json.dump(config, f)
+
+            with patch("app._save_config_cache"):
+                resp = self.client.post("/api/model", json={"model_id": model_dir})
+
+        data = resp.get_json()
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["config"], config)
+        self.assertEqual(data["summary"]["architecture"], "LocalModelForCausalLM")
+        self.assertEqual(data["summary"]["num_layers"], 24)
+
+    def test_model_endpoint_rejects_missing_local_directory(self):
+        resp = self.client.post(
+            "/api/model", json={"model_id": "/missing/local/model"}
+        )
+        data = resp.get_json()
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("does not exist", data["error"])
 
 
 # ===================================================================

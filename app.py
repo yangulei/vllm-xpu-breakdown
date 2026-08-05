@@ -101,13 +101,29 @@ def get_cached_models():
 
 @app.route("/api/model/<path:model_id>")
 def get_model_config(model_id: str):
-    """Fetch config.json from HuggingFace (or cache) and return summary."""
+    """Load a HuggingFace model config by ID and return its summary."""
+    return _model_config_response(model_id)
+
+
+@app.post("/api/model")
+def post_model_config():
+    """Load a model config by HuggingFace ID or local model directory."""
+    data = request.get_json(silent=True) or {}
+    model_id = data.get("model_id")
+    if not isinstance(model_id, str) or not model_id.strip():
+        return jsonify({"ok": False, "error": "model_id is required"}), 400
+    return _model_config_response(model_id.strip())
+
+
+def _model_config_response(model_id: str):
+    """Load, summarize, and cache a model config for an API response."""
     try:
-        # Try cache first
-        config = _load_cached_config(model_id)
-        if config is None:
+        if os.path.isdir(os.path.expanduser(model_id)):
             config = fetch_model_config(model_id)
-        # Cache on success
+        else:
+            config = _load_cached_config(model_id)
+            if config is None:
+                config = fetch_model_config(model_id)
         _save_config_cache(model_id, config)
         summary = summarize_config(config)
         return jsonify({

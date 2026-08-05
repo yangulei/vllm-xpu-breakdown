@@ -213,7 +213,8 @@ requires a bump.
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/api/model/<hf_id>` | GET | Fetch/summarize HF model config (+ `min_profile_layers`) |
+| `/api/model/<hf_id>` | GET | Fetch/summarize a HuggingFace model config (+ `min_profile_layers`) |
+| `/api/model` | POST | Load/summarize a HuggingFace ID or local model directory from JSON `model_id` |
 | `/api/cached-models` | GET | Previously loaded model ids |
 | `/api/devices` | GET | Accelerators present on this host |
 | `/api/profile` | POST | Start an async profiling run |
