@@ -302,6 +302,7 @@ coming back.
 |---|---|---|
 | Module names collapse to class heuristics | `module_hooks.install_module_span_hooks`, `forest._build_raw_forest` | `test_module_spans.py::TestNamedSpanReconstruction` |
 | Python-launched kernels have no shapes or cannot be replayed | `kernel_hooks`, `kernels._apply_recorded_args` | `test_kernel_spans.py` |
+| A package launcher is unresolved with "relative import with no known parent package" | `bench.resolve._import_file` (preserve the recorded file's package identity) | `test_bench_resolve.py::TestResolve` (`test_a_recorded_package_file_keeps_relative_imports_working`) |
 | Trace file is not valid JSON after a capture | `trace_common.kernel_span_label` (base64) | `test_kernel_spans.py::TestKernelSpanHelpers` |
 | Prefill phase vanishes; both phases identical | `phases._partition_steps` (subtree size, not device time) | `test_pipeline.py::TestPhasePartition` |
 | Phases inverted on a two-pass decode capture | `phases._classify_steps` (`token_dim > batch_size`) | `test_pipeline.py::TestPhasePartition` |
