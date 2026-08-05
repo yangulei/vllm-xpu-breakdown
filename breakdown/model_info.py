@@ -207,6 +207,10 @@ def summarize_config(config: dict[str, Any]) -> dict[str, Any]:
         sparse_cfg = {}
     use_sparse_attention = bool(sparse_cfg.get("use_sparse_attention"))
 
+    linear_attn_cfg = tget("linear_attn_config")
+    if not isinstance(linear_attn_cfg, dict):
+        linear_attn_cfg = {}
+
     return {
         "architecture": architecture,
         "model_type": config.get("model_type", "unknown"),
@@ -254,6 +258,12 @@ def summarize_config(config: dict[str, Any]) -> dict[str, Any]:
         "sparse_num_index_heads": sparse_cfg.get("sparse_num_index_heads"),
         "sparse_topk_blocks": sparse_cfg.get("sparse_topk_blocks"),
         "sparse_block_size": sparse_cfg.get("sparse_block_size"),
+        # Recurrent linear attention (e.g. Kimi-K3 KDA) keeps a large state per
+        # concurrent sequence. On 32 GiB XPU devices, a large decode batch can
+        # OOM during vLLM's startup warmup before profiling begins.
+        "linear_attention": bool(linear_attn_cfg),
+        "linear_attention_num_heads": linear_attn_cfg.get("num_heads"),
+        "linear_attention_head_dim": linear_attn_cfg.get("head_dim"),
         # Vision encoder (VL models)
         "vit_hidden_size": _get_vit_config(config, "hidden_size"),
         "vit_num_layers": _get_vit_config(config, "num_hidden_layers"),

@@ -183,6 +183,16 @@ class TestModelInfo(unittest.TestCase):
         self.assertEqual(summary["num_experts_per_tok"], 8)
         self.assertEqual(summary["n_shared_experts"], 1)
 
+    def test_summarize_config_detects_recurrent_linear_attention(self):
+        summary = summarize_config({
+            "architectures": ["KimiK3ForConditionalGeneration"],
+            "linear_attn_config": {"num_heads": 96, "head_dim": 128},
+        })
+
+        self.assertTrue(summary["linear_attention"])
+        self.assertEqual(summary["linear_attention_num_heads"], 96)
+        self.assertEqual(summary["linear_attention_head_dim"], 128)
+
 
 # ===================================================================
 # Classifier Tests
@@ -430,6 +440,64 @@ class TestFlaskAPI(unittest.TestCase):
         data = resp.get_json()
         self.assertEqual(resp.status_code, 400)
         self.assertIn("does not exist", data["error"])
+
+
+class TestProfileEngineConfig(unittest.TestCase):
+    def test_profile_uses_language_model_only_mode(self):
+        from breakdown.profiling import _configure_text_only_profile
+
+        engine_kwargs = {}
+        _configure_text_only_profile(engine_kwargs)
+
+        self.assertTrue(engine_kwargs["language_model_only"])
+        self.assertNotIn("limit_mm_per_prompt", engine_kwargs)
+
+    def test_recurrent_linear_attention_requires_decode_batch_one(self):
+        from breakdown.profiling import _validate_profile_batch
+
+        self.assertIsNone(_validate_profile_batch({"linear_attention": True}, 1))
+        self.assertIn(
+            "Set Decode Batch to 1",
+            _validate_profile_batch({"linear_attention": True}, 32),
+        )
+        self.assertIsNone(_validate_profile_batch({"linear_attention": False}, 32))
+
+    def test_recurrent_linear_attention_caps_gpu_memory_utilization(self):
+        from breakdown.profiling import _profile_gpu_memory_utilization
+
+        linear = {"linear_attention": True}
+        dense = {"linear_attention": False}
+        self.assertEqual(_profile_gpu_memory_utilization(linear, None), 0.5)
+        self.assertEqual(_profile_gpu_memory_utilization(linear, 0.92), 0.5)
+        self.assertEqual(_profile_gpu_memory_utilization(linear, 0.4), 0.4)
+        self.assertIsNone(_profile_gpu_memory_utilization(dense, None))
+        self.assertEqual(_profile_gpu_memory_utilization(dense, 0.92), 0.92)
+
+    def test_apply_model_serialization_policy_is_restored(self):
+        from breakdown.profiling import (
+            _enable_trusted_apply_model_serialization,
+            _restore_trusted_apply_model_serialization,
+        )
+
+        key = "VLLM_ALLOW_INSECURE_SERIALIZATION"
+        original = os.environ.pop(key, None)
+        try:
+            previous = _enable_trusted_apply_model_serialization()
+            self.assertIsNone(previous)
+            self.assertEqual(os.environ[key], "1")
+            _restore_trusted_apply_model_serialization(previous)
+            self.assertNotIn(key, os.environ)
+
+            os.environ[key] = "0"
+            previous = _enable_trusted_apply_model_serialization()
+            self.assertEqual(previous, "0")
+            _restore_trusted_apply_model_serialization(previous)
+            self.assertEqual(os.environ[key], "0")
+        finally:
+            if original is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = original
 
 
 # ===================================================================

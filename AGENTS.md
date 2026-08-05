@@ -354,6 +354,8 @@ coming back.
 | Symptom if broken | Holder | Test |
 |---|---|---|
 | Module and kernel spans silently absent | `profiling.launch` (`VLLM_ALLOW_INSECURE_SERIALIZATION`) | — (logged at ERROR with the hook count) |
+| A text-only local multimodal checkpoint asks for missing processor assets | `profiling.launch._configure_text_only_profile` | `test_pipeline.py::TestProfileEngineConfig` |
+| Kimi-K3 OOMs gathering recurrent state during startup | `profiling.launch._validate_profile_batch`, `_profile_gpu_memory_utilization` | `test_pipeline.py::TestProfileEngineConfig` |
 | A headless profile dies at engine start-up: request longer than `max_model_len` | `profiling.fit_max_model_len` (applied in `_run_profile`, not in the route) | `test_pipeline.py::TestQueryContextProfiling` |
 | Decode dispatched in partial waves (`29 + 3`) | `profiling.launch._scheduler_pin` | `test_two_pass_merge.py::TestSchedulerPin` |
 | A prefill/decode batch pair collapses to one pass | `profiling.traces._merge_two_pass_result` | `test_two_pass_merge.py` |
