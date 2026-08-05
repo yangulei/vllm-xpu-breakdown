@@ -178,8 +178,13 @@ def _import_file(path: str) -> Any:
     as, and the two differ: the same xattention wrapper is
     ``vllm/models/minimax_m3/xpu/ops/xattention.py`` in one checkout and
     ``vllm/model_executor/models/minimax_m3/xattention.py`` in another. Import
-    by dotted path and the op is unresolvable in half the installs; import by
-    location and it always resolves to the code that actually ran.
+    by a guessed dotted path and the op is unresolvable in half the installs.
+    But importing every file under a synthetic top-level name is also wrong:
+    package-relative imports such as ``from .chunk_intra import ...`` then fail
+    with "no known parent package". Recover the dotted name from the contiguous
+    ``__init__.py`` chain when one exists, verify that it resolves to the exact
+    recorded file, and only then fall back to a location import for standalone
+    launchers.
     """
     if not os.path.isfile(path):
         raise ResolveError(f"the launcher file no longer exists: {path}")
@@ -191,6 +196,15 @@ def _import_file(path: str) -> Any:
         f = getattr(mod, "__file__", None)
         if f and os.path.abspath(f) == target:
             return mod
+    package_name = _package_name(path)
+    if package_name:
+        try:
+            mod = importlib.import_module(package_name)
+        except Exception as exc:  # noqa: BLE001 - report the real import error
+            raise ResolveError(f"cannot import {path}: {exc}") from exc
+        imported = getattr(mod, "__file__", None)
+        if imported and os.path.abspath(imported) == target:
+            return mod
     spec = importlib.util.spec_from_file_location(
         "breakdown_launcher_" + str(abs(hash(path))), path)
     if spec is None or spec.loader is None:
@@ -201,6 +215,19 @@ def _import_file(path: str) -> Any:
     except Exception as exc:  # noqa: BLE001 - any import error is a resolve error
         raise ResolveError(f"cannot import {path}: {exc}") from exc
     return mod
+
+
+def _package_name(path: str) -> str:
+    """Return the dotted package name implied by adjacent ``__init__.py`` files."""
+    stem, ext = os.path.splitext(os.path.basename(path))
+    if ext != ".py":
+        return ""
+    parts = [] if stem == "__init__" else [stem]
+    parent = os.path.dirname(os.path.abspath(path))
+    while os.path.isfile(os.path.join(parent, "__init__.py")):
+        parts.insert(0, os.path.basename(parent))
+        parent = os.path.dirname(parent)
+    return ".".join(parts) if len(parts) > 1 else ""
 
 
 def resolve(op: str, slots: list[dict] | None = None,

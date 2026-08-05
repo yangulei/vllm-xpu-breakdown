@@ -77,6 +77,20 @@ cache consistent with its block table and sequence lengths. Attention is
 normally the heaviest op in the model; refusing it would leave the dominant
 kernel unmeasured and un-rankable.
 
+The MLA wrappers are different: their context also owns the selected backend,
+projection weights, and metadata that are not wrapper operands. Until a trace
+records a context-free MLA kernel boundary, they are reported as
+`not_replayable` with that reason rather than left `unresolved` or replayed with
+invented state.
+
+### Recorded launcher imports
+
+Python-launched kernels resolve from the exact file captured in their launcher
+frame. Package files keep their real dotted module name so sibling imports such
+as `from .chunk_intra import ...` work; standalone files fall back to a direct
+location import. The resolved module must still point to the exact recorded
+file, so an installed package from another checkout is never substituted.
+
 ### Fidelity
 
 A case measured at the profiled shape carries the trace's own `device_time_us`.

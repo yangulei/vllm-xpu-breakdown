@@ -76,6 +76,13 @@ def _plain_tensor(ctx: Ctx):
 # is the point: the plan reports it with the reason instead of dropping it.
 skip("vllm::unified_attention",
      "reads KV cache + attention metadata from vLLM's forward context")
+skip("vllm::unified_mla_kv_cache_update",
+     "reads the MLA cache + slot mapping from vLLM's forward context; the "
+     "recorded wrapper operands do not contain that context")
+skip("vllm::unified_mla_attention_with_output",
+     "reads the MLA backend, cache, metadata, and projection weights from "
+     "vLLM's forward context; the recorded wrapper operands cannot rebuild "
+     "the standalone attention call")
 skip("vllm::moe_forward_shared",
      "fused MoE dispatch wrapper; its router/expert/shared-expert kernels "
      "are benchmarked as their own ops")

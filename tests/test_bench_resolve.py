@@ -92,6 +92,37 @@ class TestResolve(unittest.TestCase):
         self.assertEqual(r.kind, "python_api")
         self.assertEqual(r.fn.__name__, "my_fused_kernel")
 
+    def test_a_recorded_package_file_keeps_relative_imports_working(self):
+        """A file-location import must not erase the launcher's package.
+
+        Kimi-K3's KDA launchers import sibling modules with ``from .``. Loading
+        them under a synthetic top-level name made four real kernels unresolved
+        with "attempted relative import with no known parent package".
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            package = os.path.join(tmp, "launchers")
+            os.mkdir(package)
+            with open(os.path.join(package, "__init__.py"), "w"):
+                pass
+            with open(os.path.join(package, "helper.py"), "w") as fh:
+                fh.write("VALUE = 7\n")
+            path = os.path.join(package, "kernel.py")
+            with open(path, "w") as fh:
+                fh.write("from .helper import VALUE\n\n")
+                fh.write("def launch(x):\n    return x + VALUE\n")
+            with mock.patch.object(sys, "path", [tmp, *sys.path]):
+                r = resolve.resolve(
+                    "triton::_package_kernel", None,
+                    launch={"file": path, "line": 3, "func": "launch"})
+            self.assertEqual(r.fn(5), 12)
+
+    def test_context_bound_mla_wrappers_are_explained_not_unresolved(self):
+        for op in ("vllm::unified_mla_kv_cache_update",
+                   "vllm::unified_mla_attention_with_output"):
+            status, detail = resolve.classify(op)
+            self.assertEqual(status, "not_replayable")
+            self.assertIn("forward context", detail)
+
     def test_a_python_launched_kernel_without_a_frame_is_refused(self):
         # Never guessed: no recorded launcher means no callable, and a wrong
         # callable would measure a different kernel.
