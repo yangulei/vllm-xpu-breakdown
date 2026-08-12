@@ -294,6 +294,7 @@ def _run_profile(model_id: str, mode: str, max_model_len: int,
                 "torch_profiler_with_flops": True,
                 "torch_profiler_use_gzip": True,
             },
+            "trust_remote_code": True,
         }
 
         # Always use dummy weights for profiling — timing doesn't depend on
